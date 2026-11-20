@@ -4,6 +4,7 @@ import {
   onEvent,
   type AppWindowGroup,
   type AudioState,
+  type FlyoutKind,
   type PinItem,
   type TestBarConfig,
 } from '../lib/ipc';
@@ -52,9 +53,9 @@ export const TaskbarView: React.FC = () => {
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
       onEvent<AudioState>('audio-updated', setAudio),
       onEvent<string>('layout-updated', setLayout),
-      onEvent<boolean>('start-visibility', setStartOpen),
+      onEvent<boolean>('start-state', setStartOpen),
       onEvent<{ kind: string }>('flyout-show', (f) => setActiveFlyout(f.kind)),
-      onEvent<void>('flyout-hidden', () => setActiveFlyout('')),
+      onEvent<void>('flyout-hide', () => setActiveFlyout('')),
     ];
     return () => {
       subs.forEach((p) => p.then((u) => u()));
@@ -140,7 +141,7 @@ export const TaskbarView: React.FC = () => {
   };
 
   const openFlyoutAt = (
-    kind: 'tray' | 'quick' | 'calendar' | 'preview' | 'ctx_app' | 'ctx_taskbar',
+    kind: FlyoutKind,
     el: HTMLElement,
     width: number,
     height: number,
@@ -194,7 +195,7 @@ export const TaskbarView: React.FC = () => {
     e.stopPropagation();
     if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
     const hasWins = Boolean(item.group && item.group.windows.length > 0);
-    openFlyoutAt('ctx_app', e.currentTarget as HTMLElement, 248, hasWins ? 270 : 196, false, {
+    openFlyoutAt('context_app', e.currentTarget as HTMLElement, 248, hasWins ? 270 : 196, false, {
       id: item.id,
       pinId: item.pinId,
       name: item.name,
@@ -209,7 +210,7 @@ export const TaskbarView: React.FC = () => {
     e.preventDefault();
     ipc('open_flyout', {
       req: {
-        kind: 'ctx_taskbar',
+        kind: 'context_bar',
         anchorXLogical: e.clientX,
         anchorInTaskbar: true,
         width: 244,
@@ -328,9 +329,9 @@ export const TaskbarView: React.FC = () => {
           </button>
 
           <button
-            className={`tb-tray-btn ${activeFlyout === 'quick' ? 'open' : ''}`}
+            className={`tb-tray-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''}`}
             title={`Звук: ${audio?.masterMuted ? 'Выкл' : `${audio?.masterVolume ?? 0}%`}`}
-            onClick={(e) => openFlyoutAt('quick', e.currentTarget, 330, 290, false)}
+            onClick={(e) => openFlyoutAt('sound', e.currentTarget, 330, 290, false)}
             onWheel={handleSoundWheel}
             onAuxClick={handleSoundAux}
           >

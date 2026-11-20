@@ -163,8 +163,20 @@ export interface NetworkInfo {
   speedLabel: string;
 }
 
+export type FlyoutKind =
+  | 'preview'
+  | 'tray'
+  | 'sound'
+  | 'calendar'
+  | 'context_app'
+  | 'context_bar'
+  | 'osd'
+  | 'quick'
+  | 'ctx_app'
+  | 'ctx_taskbar';
+
 export interface FlyoutRequest {
-  kind: 'tray' | 'quick' | 'calendar' | 'preview' | 'ctx_app' | 'ctx_taskbar' | 'ctx_tray';
+  kind: FlyoutKind;
   anchorXLogical: number;
   anchorInTaskbar: boolean;
   width: number;

@@ -34,7 +34,7 @@ export const FlyoutView: React.FC = () => {
         setTrayHover('');
         if (r.kind === 'tray') {
           ipc<TrayAppItem[]>('get_tray_apps').then(setTrayApps).catch(() => {});
-        } else if (r.kind === 'quick') {
+        } else if (r.kind === 'sound' || r.kind === 'quick') {
           ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
           ipc<NetworkInfo>('get_network_info').then(setNet).catch(() => {});
         } else if (r.kind === 'preview') {
@@ -49,7 +49,7 @@ export const FlyoutView: React.FC = () => {
           });
         }
       }),
-      onEvent<void>('flyout-hidden', () => {
+      onEvent<void>('flyout-hide', () => {
         setReq(null);
         setTrayCtxItem(null);
       }),
@@ -150,7 +150,7 @@ export const FlyoutView: React.FC = () => {
   }
 
   // 2. QUICK SOUND & MIXER
-  if (req.kind === 'quick') {
+  if (req.kind === 'sound' || req.kind === 'quick') {
     const devs = (audio?.devices ?? []).slice(0, 3);
     const sessions = (audio?.sessions ?? []).slice(0, 4);
     return (
@@ -361,7 +361,7 @@ export const FlyoutView: React.FC = () => {
   }
 
   // 5. RIGHT-CLICK CONTEXT MENU ON TASKBAR APP (NATIVE-GRADE + END TASK)
-  if (req.kind === 'ctx_app') {
+  if (req.kind === 'context_app' || req.kind === 'ctx_app') {
     const p = req.payload as {
       id: string;
       pinId?: string;
@@ -475,7 +475,7 @@ export const FlyoutView: React.FC = () => {
   }
 
   // 6. RIGHT-CLICK ON EMPTY TASKBAR
-  if (req.kind === 'ctx_taskbar') {
+  if (req.kind === 'context_bar' || req.kind === 'ctx_taskbar') {
     const p = req.payload as { barMode?: string };
     const nextMode = p.barMode === 'edge' ? 'dock' : 'edge';
     return (

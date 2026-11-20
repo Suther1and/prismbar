@@ -23,7 +23,7 @@
         "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "resizable": true,
+        "resizable": false,
         "visible": false,
         "focus": false
       },
@@ -38,7 +38,7 @@
         "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "resizable": true,
+        "resizable": false,
         "visible": false,
         "focus": false
       },
@@ -53,13 +53,13 @@
         "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "resizable": true,
+        "resizable": false,
         "visible": false,
         "focus": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

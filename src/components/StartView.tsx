@@ -92,7 +92,7 @@ export const StartView: React.FC = () => {
       onEvent<TelemetryState>('telemetry-updated', setTelem),
       onEvent<ClipboardEntry[]>('clipboard-updated', setClips),
       onEvent<PeripheralBattery[]>('peripherals-updated', setPeriphs),
-      onEvent<boolean>('start-visibility', (vis) => {
+      onEvent<boolean>('start-state', (vis) => {
         if (!vis) {
           setSearchOpen(false);
           setQuery('');

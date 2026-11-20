@@ -1,6 +1,7 @@
 pub mod apps_indexer;
 pub mod audio;
 pub mod config;
+pub mod coordinator;
 pub mod media;
 pub mod system_widgets;
 pub mod telemetry;
@@ -8,29 +9,40 @@ pub mod win_shell;
 pub mod windows_tracker;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use apps_indexer::{IndexedApp, SteamGame};
 use audio::AudioState;
 use config::{CustomSpace, PinItem, TestBarConfig};
+use coordinator::{
+    compute_appbar_rect, BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect,
+    WindowCoordinator,
+};
 use media::MediaState;
 use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, TrayAppItem};
 use telemetry::TelemetryState;
 use win_shell::ShellHookEvent;
 use windows_tracker::AppWindowGroup;
 
+static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+
 pub struct AppState {
     pub config: Mutex<TestBarConfig>,
     pub installed_apps: Mutex<Vec<IndexedApp>>,
     pub steam_games: Mutex<Vec<SteamGame>>,
     pub hide_native: bool,
-    pub start_open: AtomicBool,
-    pub flyout_open: AtomicBool,
-    pub flyout_kind: Mutex<String>,
-    pub last_start_toggle_ms: AtomicU64,
+    pub coordinator: Mutex<WindowCoordinator>,
+    pub overlay_open: Arc<AtomicBool>,
     pub taskbar_content_width: Mutex<i32>,
+}
+
+impl AppState {
+    fn sync_overlay_flag(&self, coord: &WindowCoordinator) {
+        self.overlay_open
+            .store(coord.has_open_overlay(), Ordering::Release);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -38,6 +50,13 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn monotonic_ms() -> u64 {
+    MONOTONIC_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 fn win_hwnd(win: &WebviewWindow) -> Option<isize> {
@@ -50,13 +69,32 @@ fn scale_factor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
+fn primary_monitor_pixel_rect() -> PixelRect {
+    let mon = win_shell::primary_monitor_rect();
+    PixelRect::new(mon.left, mon.top, mon.right, mon.bottom)
+}
+
+fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
+    let mut rects = Vec::with_capacity(3);
+    for label in ["taskbar", "start", "flyout"] {
+        if let Some(win) = app.get_webview_window(label) {
+            if let Some(hwnd) = win_hwnd(&win) {
+                if let Some(r) = win_shell::get_window_pixel_rect(hwnd) {
+                    rects.push(r);
+                }
+            }
+        }
+    }
+    rects
+}
+
 fn position_taskbar_window(app: &AppHandle, bar_mode: &str, logical_content_w: i32) {
     let Some(tb) = app.get_webview_window("taskbar") else { return };
     let Some(hwnd) = win_hwnd(&tb) else { return };
     let sf = tb.scale_factor().unwrap_or(1.0);
     let mon = win_shell::primary_monitor_rect();
 
-    let (w_px, h_px, x_px, y_px) = if bar_mode == "edge" {
+    let (w_px, h_px, x_px, y_px) = if BarMode::from_config_str(bar_mode) == BarMode::Edge {
         let h = (52.0 * sf).round() as i32;
         (mon.width, h, mon.left, mon.bottom - h)
     } else {
@@ -69,62 +107,174 @@ fn position_taskbar_window(app: &AppHandle, bar_mode: &str, logical_content_w: i
         (w, h, x, y)
     };
 
-    win_shell::set_window_bounds(hwnd, x_px, y_px, w_px, h_px, Some(true), true);
+    // Never force visibility here so fullscreen suppression cannot leak on bounds updates.
+    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
 }
 
-fn show_start_window(app: &AppHandle, show: bool) {
-    let state = app.state::<AppState>();
-    let Some(win) = app.get_webview_window("start") else { return };
-    let Some(hwnd) = win_hwnd(&win) else { return };
+fn position_start_window(app: &AppHandle, hwnd: isize) {
+    let sf = scale_factor(app);
+    let mon = win_shell::primary_monitor_rect();
+    let max_w = ((mon.width as f64 / sf) - 32.0).min(1084.0).max(860.0);
+    let max_h = ((mon.height as f64 / sf) - 96.0).min(660.0).max(560.0);
+    let w_px = (max_w * sf).round() as i32;
+    let h_px = (max_h * sf).round() as i32;
+    let bar_gap = (78.0 * sf).round() as i32;
+    let x_px = mon.left + (mon.width - w_px) / 2;
+    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 16);
 
-    if show {
-        // Close any open flyout first
-        show_flyout_hidden(app);
+    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
+}
 
-        let sf = scale_factor(app);
-        let mon = win_shell::primary_monitor_rect();
-        let max_w = ((mon.width as f64 / sf) - 32.0).min(1084.0).max(860.0);
-        let max_h = ((mon.height as f64 / sf) - 96.0).min(660.0).max(560.0);
-        let w_px = (max_w * sf).round() as i32;
-        let h_px = (max_h * sf).round() as i32;
-        let bar_gap = (78.0 * sf).round() as i32;
-        let x_px = mon.left + (mon.width - w_px) / 2;
-        let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 16);
+fn position_flyout_window(app: &AppHandle, hwnd: isize, req: &FlyoutRequest) {
+    let sf = scale_factor(app);
+    let mon = win_shell::primary_monitor_rect();
 
-        win_shell::set_window_bounds(hwnd, x_px, y_px, w_px, h_px, Some(true), false);
-        let _ = win.set_focus();
-        state.start_open.store(true, Ordering::SeqCst);
-        let _ = app.emit("start-visibility", true);
+    let anchor_screen_x_px = if !req.anchor_x_logical.is_finite() {
+        mon.left + mon.width / 2
+    } else if req.anchor_in_taskbar {
+        if let Some(tb) = app.get_webview_window("taskbar") {
+            let pos = tb.outer_position().map(|p| p.x).unwrap_or(mon.left);
+            pos + (req.anchor_x_logical * sf).round() as i32
+        } else {
+            mon.left + mon.width / 2
+        }
     } else {
-        win_shell::set_window_bounds(hwnd, 0, 0, 1, 1, Some(false), true);
-        state.start_open.store(false, Ordering::SeqCst);
-        let _ = app.emit("start-visibility", false);
-    }
+        mon.left + (req.anchor_x_logical * sf).round() as i32
+    };
+
+    let req_w = req.width.clamp(1, 2000);
+    let req_h = req.height.clamp(1, 2000);
+    let w_px = ((req_w + 24) as f64 * sf).round() as i32;
+    let h_px = ((req_h + 24) as f64 * sf).round() as i32;
+    let is_edge = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map(|c| BarMode::from_config_str(&c.bar_mode) == BarMode::Edge)
+        .unwrap_or(false);
+    // Account for `.flyout-root`'s 12px bottom padding so Preview sits flush and click flyouts sit 10px above.
+    let gap_logical = match (is_edge, req.kind) {
+        (true, FlyoutKind::Preview) => 40.0,
+        (true, _) => 50.0,
+        (false, FlyoutKind::Preview) => 52.0,
+        (false, _) => 62.0,
+    };
+    let bar_gap = (gap_logical * sf).round() as i32;
+
+    let mut x_px = anchor_screen_x_px - w_px / 2;
+    x_px = x_px.clamp(mon.left + 8, (mon.right - w_px - 8).max(mon.left + 8));
+    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
+
+    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
 }
 
-fn show_flyout_hidden(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    if let Some(win) = app.get_webview_window("flyout") {
-        if let Some(hwnd) = win_hwnd(&win) {
-            win_shell::set_window_bounds(hwnd, 0, 0, 1, 1, Some(false), true);
+fn apply_coordinator_actions(
+    app: &AppHandle,
+    actions: &CoordinatorActions,
+    flyout_req: Option<&FlyoutRequest>,
+) {
+    // 1. Hide outgoing surfaces first to avoid overlap flicker
+    if actions.flyout_visible == Some(false) {
+        win_shell::set_flyout_non_activating(false);
+        if let Some(fly) = app.get_webview_window("flyout") {
+            if let Some(hwnd) = win_hwnd(&fly) {
+                win_shell::set_window_visible(hwnd, false, true);
+            }
         }
     }
-    state.flyout_open.store(false, Ordering::SeqCst);
-    if let Ok(mut k) = state.flyout_kind.lock() {
-        k.clear();
+    if actions.start_visible == Some(false) {
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                win_shell::set_window_visible(hwnd, false, true);
+            }
+        }
     }
-    let _ = app.emit("flyout-hidden", ());
+
+    // 2. Taskbar visibility (fullscreen auto-hide / restore)
+    if let Some(tb_vis) = actions.taskbar_visible {
+        if let Some(tb) = app.get_webview_window("taskbar") {
+            if let Some(hwnd) = win_hwnd(&tb) {
+                win_shell::set_window_visible(hwnd, tb_vis, true);
+            }
+        }
+    }
+
+    // 3. Show incoming surfaces via visibility only (never 1x1 shrink or per-open GWL_EXSTYLE flip)
+    if actions.start_visible == Some(true) {
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                position_start_window(app, hwnd);
+                win_shell::set_window_visible(hwnd, true, false);
+                let _ = win.set_focus();
+            }
+        }
+    }
+
+    if actions.flyout_visible == Some(true) {
+        if let Some(fly) = app.get_webview_window("flyout") {
+            if let Some(hwnd) = win_hwnd(&fly) {
+                let non_activating = actions.flyout_non_activating.unwrap_or(false);
+                win_shell::set_flyout_non_activating(non_activating);
+                if let Some(req) = flyout_req {
+                    position_flyout_window(app, hwnd, req);
+                }
+                win_shell::set_window_visible(hwnd, true, non_activating);
+                if !non_activating {
+                    let _ = fly.set_focus();
+                }
+            }
+        }
+    }
+
+    // 4. Emit canonical + legacy events
+    if let Some(vis) = actions.emit_start_state {
+        let _ = app.emit("start-state", vis);
+        let _ = app.emit("start-visibility", vis);
+    }
+    if actions.emit_flyout_hide {
+        let _ = app.emit("flyout-hide", ());
+        let _ = app.emit("flyout-hidden", ());
+    }
+    if actions.emit_flyout_show {
+        if let Some(req) = flyout_req {
+            let _ = app.emit("flyout-show", req);
+        }
+    }
+}
+
+fn close_start_and_flyout(app: &AppHandle, close_start: bool, close_flyout: bool) {
+    let state = app.state::<AppState>();
+    let now = monotonic_ms();
+    let (start_act, flyout_act) = {
+        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let s = if close_start {
+            coord.request_toggle_start(Some(false), now)
+        } else {
+            CoordinatorActions::default()
+        };
+        let f = if close_flyout {
+            coord.request_close_flyout()
+        } else {
+            CoordinatorActions::default()
+        };
+        state.sync_overlay_flag(&coord);
+        (s, f)
+    };
+    apply_coordinator_actions(app, &start_act, None);
+    apply_coordinator_actions(app, &flyout_act, None);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlyoutRequest {
-    pub kind: String, // "tray" | "quick" | "calendar" | "preview" | "ctx_app" | "ctx_taskbar" | "ctx_tray"
+    pub kind: FlyoutKind,
     pub anchor_x_logical: f64, // relative to taskbar window left, or screen logical X
     pub anchor_in_taskbar: bool,
     pub width: i32,
     pub height: i32,
+    #[serde(default)]
     pub no_activate: bool,
+    #[serde(default)]
     pub payload: serde_json::Value,
 }
 
@@ -144,7 +294,26 @@ fn set_bar_mode(app: AppHandle, state: State<AppState>, mode: String) -> Result<
         cfg.clone()
     };
     let cw = *state.taskbar_content_width.lock().unwrap();
+    if state.hide_native {
+        if let Some(tb) = app.get_webview_window("taskbar") {
+            if let Some(hwnd) = win_hwnd(&tb) {
+                let dpi = (tb.scale_factor().unwrap_or(1.0) * 96.0).round() as u32;
+                let appbar = compute_appbar_rect(
+                    primary_monitor_pixel_rect(),
+                    dpi,
+                    BarMode::from_config_str(&updated.bar_mode),
+                );
+                win_shell::register_appbar(hwnd, appbar.height());
+            }
+        }
+    }
     position_taskbar_window(&app, &updated.bar_mode, cw);
+    let actions = state
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .on_taskbar_bounds_updated();
+    apply_coordinator_actions(&app, &actions, None);
     let _ = app.emit("config-updated", &updated);
     Ok(updated)
 }
@@ -167,84 +336,57 @@ fn resize_taskbar_dock(app: AppHandle, state: State<AppState>, logical_width: i3
     *state.taskbar_content_width.lock().unwrap() = logical_width;
     let mode = state.config.lock().unwrap().bar_mode.clone();
     position_taskbar_window(&app, &mode, logical_width);
+    let actions = state
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .on_taskbar_bounds_updated();
+    apply_coordinator_actions(&app, &actions, None);
 }
 
 #[tauri::command]
 fn toggle_start(app: AppHandle, state: State<AppState>, force: Option<bool>) {
-    let now = now_ms();
-    let prev = state.last_start_toggle_ms.load(Ordering::SeqCst);
-    if force.is_none() && now.saturating_sub(prev) < 160 {
-        return;
-    }
-    state.last_start_toggle_ms.store(now, Ordering::SeqCst);
-    let currently_open = state.start_open.load(Ordering::SeqCst);
-    let next = force.unwrap_or(!currently_open);
-    show_start_window(&app, next);
-}
-
-#[tauri::command]
-fn open_flyout(app: AppHandle, state: State<AppState>, req: FlyoutRequest) {
-    // Toggle off if clicking same flyout button again (except hover preview which updates in place)
-    let cur_open = state.flyout_open.load(Ordering::SeqCst);
-    let cur_kind = state.flyout_kind.lock().unwrap().clone();
-    if cur_open && cur_kind == req.kind && req.kind != "preview" && !req.kind.starts_with("ctx_") {
-        show_flyout_hidden(&app);
-        return;
-    }
-
-    if req.kind != "preview" {
-        if state.start_open.load(Ordering::SeqCst) {
-            show_start_window(&app, false);
-        }
-    }
-
-    let Some(fly) = app.get_webview_window("flyout") else { return };
-    let Some(hwnd) = win_hwnd(&fly) else { return };
-    let sf = scale_factor(&app);
-    let mon = win_shell::primary_monitor_rect();
-
-    let anchor_screen_x_px = if req.anchor_in_taskbar {
-        if let Some(tb) = app.get_webview_window("taskbar") {
-            let pos = tb.outer_position().map(|p| p.x).unwrap_or(mon.left);
-            pos + (req.anchor_x_logical * sf).round() as i32
-        } else {
-            mon.left + mon.width / 2
-        }
-    } else {
-        mon.left + (req.anchor_x_logical * sf).round() as i32
+    let actions = {
+        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let act = coord.request_toggle_start(force, monotonic_ms());
+        state.sync_overlay_flag(&coord);
+        act
     };
-
-    let w_px = ((req.width + 24) as f64 * sf).round() as i32;
-    let h_px = ((req.height + 24) as f64 * sf).round() as i32;
-    let bar_gap = (70.0 * sf).round() as i32;
-
-    let mut x_px = anchor_screen_x_px - w_px / 2;
-    x_px = x_px.clamp(mon.left + 8, mon.right - w_px - 8);
-    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
-
-    win_shell::style_overlay_window(hwnd, req.no_activate);
-    win_shell::set_window_bounds(hwnd, x_px, y_px, w_px, h_px, Some(true), req.no_activate);
-    if !req.no_activate {
-        let _ = fly.set_focus();
-    }
-
-    state.flyout_open.store(true, Ordering::SeqCst);
-    *state.flyout_kind.lock().unwrap() = req.kind.clone();
-    let _ = app.emit("flyout-show", &req);
+    apply_coordinator_actions(&app, &actions, None);
 }
 
 #[tauri::command]
-fn close_flyout(app: AppHandle) {
-    show_flyout_hidden(&app);
+fn open_flyout(app: AppHandle, state: State<AppState>, mut req: FlyoutRequest) {
+    req.no_activate = req.kind.is_non_activating();
+    let actions = {
+        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let act = coord.request_open_flyout(req.kind, monotonic_ms());
+        state.sync_overlay_flag(&coord);
+        act
+    };
+    apply_coordinator_actions(&app, &actions, Some(&req));
+}
+
+#[tauri::command]
+fn close_flyout(app: AppHandle, state: State<AppState>) {
+    let actions = {
+        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let act = coord.request_close_flyout();
+        state.sync_overlay_flag(&coord);
+        act
+    };
+    apply_coordinator_actions(&app, &actions, None);
 }
 
 #[tauri::command]
 fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
-    if !state.flyout_open.load(Ordering::SeqCst) {
-        return;
-    }
-    let kind = state.flyout_kind.lock().unwrap().clone();
-    if kind != "preview" {
+    let is_preview = state
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active_flyout()
+        == Some(FlyoutKind::Preview);
+    if !is_preview {
         return;
     }
     let Some(fly) = app.get_webview_window("flyout") else { return };
@@ -265,7 +407,13 @@ fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
             }
         }
     }
-    show_flyout_hidden(&app);
+    let actions = {
+        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let act = coord.request_close_preview();
+        state.sync_overlay_flag(&coord);
+        act
+    };
+    apply_coordinator_actions(&app, &actions, None);
 }
 
 #[tauri::command]
@@ -280,7 +428,7 @@ fn get_window_thumbnail(hwnd: isize) -> Option<String> {
 
 #[tauri::command]
 fn focus_window(app: AppHandle, hwnd: isize, toggle_minimize: bool) {
-    show_flyout_hidden(&app);
+    close_start_and_flyout(&app, false, true);
     windows_tracker::focus_or_toggle_window(hwnd, toggle_minimize);
 }
 
@@ -297,15 +445,14 @@ fn kill_process_pid(pid: u32) -> Result<(), String> {
 #[tauri::command]
 fn launch_item(app: AppHandle, target: String, as_admin: bool, close_start: bool) -> Result<(), String> {
     if close_start {
-        show_start_window(&app, false);
-        show_flyout_hidden(&app);
+        close_start_and_flyout(&app, true, true);
     }
     windows_tracker::launch_target(&target, as_admin)
 }
 
 #[tauri::command]
 fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
-    show_start_window(&app, false);
+    close_start_and_flyout(&app, true, false);
     for t in targets {
         if !t.trim().is_empty() {
             let _ = windows_tracker::launch_target(&t, false);
@@ -396,14 +543,36 @@ fn add_custom_space(app: AppHandle, state: State<AppState>, name: String) -> Res
     Ok(updated)
 }
 
-#[tauri::command]
-fn pick_folder() -> Option<String> {
-    apps_indexer::pick_folder_dialog()
+fn refocus_start_if_open(app: &AppHandle, state: &AppState) {
+    let start_open = state
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_start_open();
+    if start_open {
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                win_shell::force_focus_window(hwnd);
+            }
+            let _ = win.set_focus();
+        }
+    }
 }
 
 #[tauri::command]
-fn pick_file() -> Option<String> {
-    apps_indexer::pick_file_dialog()
+fn pick_folder(app: AppHandle, state: State<AppState>) -> Option<String> {
+    let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+    let picked = apps_indexer::pick_folder_dialog();
+    refocus_start_if_open(&app, &state);
+    picked
+}
+
+#[tauri::command]
+fn pick_file(app: AppHandle, state: State<AppState>) -> Option<String> {
+    let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+    let picked = apps_indexer::pick_file_dialog();
+    refocus_start_if_open(&app, &state);
+    picked
 }
 
 #[tauri::command]
@@ -547,15 +716,14 @@ pub fn run(hide_native: bool) {
 
     let initial_cfg = config::load_config();
 
+    let overlay_open = Arc::new(AtomicBool::new(false));
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
         installed_apps: Mutex::new(Vec::new()),
         steam_games: Mutex::new(Vec::new()),
         hide_native,
-        start_open: AtomicBool::new(false),
-        flyout_open: AtomicBool::new(false),
-        flyout_kind: Mutex::new(String::new()),
-        last_start_toggle_ms: AtomicU64::new(0),
+        coordinator: Mutex::new(WindowCoordinator::new()),
+        overlay_open: Arc::clone(&overlay_open),
         taskbar_content_width: Mutex::new(620),
     };
 
@@ -616,12 +784,27 @@ pub fn run(hide_native: bool) {
                 if let Some(hwnd) = win_hwnd(&tb) {
                     win_shell::style_overlay_window(hwnd, true);
                     let sf = tb.scale_factor().unwrap_or(1.0);
+                    let mode = app.state::<AppState>().config.lock().unwrap().bar_mode.clone();
                     if hide_native {
                         win_shell::hide_native_taskbar();
-                        win_shell::register_appbar(hwnd, (58.0 * sf).round() as i32);
+                        let dpi = (sf * 96.0).round() as u32;
+                        let appbar = compute_appbar_rect(
+                            primary_monitor_pixel_rect(),
+                            dpi,
+                            BarMode::from_config_str(&mode),
+                        );
+                        win_shell::register_appbar(hwnd, appbar.height());
                     }
-                    let mode = app.state::<AppState>().config.lock().unwrap().bar_mode.clone();
                     position_taskbar_window(&handle, &mode, 620);
+                    let show_tb = app
+                        .state::<AppState>()
+                        .coordinator
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .should_show_taskbar();
+                    if show_tb {
+                        win_shell::set_window_visible(hwnd, true, true);
+                    }
                 }
             }
 
@@ -632,11 +815,14 @@ pub fn run(hide_native: bool) {
                 let h_blur = handle.clone();
                 start_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
-                        let st = h_blur.state::<AppState>();
-                        let elapsed = now_ms().saturating_sub(st.last_start_toggle_ms.load(Ordering::SeqCst));
-                        if elapsed > 220 && st.start_open.load(Ordering::SeqCst) {
-                            show_start_window(&h_blur, false);
-                        }
+                        let actions = {
+                            let st = h_blur.state::<AppState>();
+                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+                            let act = coord.on_start_focus_lost(monotonic_ms());
+                            st.sync_overlay_flag(&coord);
+                            act
+                        };
+                        apply_coordinator_actions(&h_blur, &actions, None);
                     }
                 });
             }
@@ -644,31 +830,64 @@ pub fn run(hide_native: bool) {
             if let Some(fly_win) = app.get_webview_window("flyout") {
                 if let Some(hwnd) = win_hwnd(&fly_win) {
                     win_shell::style_overlay_window(hwnd, false);
+                    win_shell::install_flyout_noactivate_subclass(hwnd);
                 }
                 let h_blur = handle.clone();
                 fly_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
-                        let st = h_blur.state::<AppState>();
-                        let kind = st.flyout_kind.lock().unwrap().clone();
-                        if kind != "preview" && st.flyout_open.load(Ordering::SeqCst) {
-                            show_flyout_hidden(&h_blur);
-                        }
+                        let actions = {
+                            let st = h_blur.state::<AppState>();
+                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+                            let act = coord.on_flyout_focus_lost(monotonic_ms());
+                            st.sync_overlay_flag(&coord);
+                            act
+                        };
+                        apply_coordinator_actions(&h_blur, &actions, None);
                     }
                 });
             }
 
-            // Global lone-Win key hook & Ctrl+Alt+Shift+Esc emergency restore
+            // Global lone-Win key hook, global click-outside & Ctrl+Alt+Shift+Esc emergency restore.
+            // Dispatch off the low-level hook thread onto the main GUI thread.
             let h_hook = handle.clone();
+            let hook_overlay_open = Arc::clone(&overlay_open);
             win_shell::start_shell_hook_thread(move |ev| match ev {
                 ShellHookEvent::ToggleStart => {
-                    let st = h_hook.state::<AppState>();
-                    let cur = st.start_open.load(Ordering::SeqCst);
-                    st.last_start_toggle_ms.store(now_ms(), Ordering::SeqCst);
-                    show_start_window(&h_hook, !cur);
+                    let h = h_hook.clone();
+                    let _ = h_hook.run_on_main_thread(move || {
+                        let actions = {
+                            let st = h.state::<AppState>();
+                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+                            let act = coord.request_toggle_start(None, monotonic_ms());
+                            st.sync_overlay_flag(&coord);
+                            act
+                        };
+                        apply_coordinator_actions(&h, &actions, None);
+                    });
+                }
+                ShellHookEvent::GlobalMouseDown(x, y) => {
+                    if !hook_overlay_open.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let h = h_hook.clone();
+                    let _ = h_hook.run_on_main_thread(move || {
+                        let rects = active_shell_window_rects(&h);
+                        let actions = {
+                            let st = h.state::<AppState>();
+                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+                            let act = coord.on_global_mouse_down(x, y, &rects, monotonic_ms());
+                            st.sync_overlay_flag(&coord);
+                            act
+                        };
+                        apply_coordinator_actions(&h, &actions, None);
+                    });
                 }
                 ShellHookEvent::EmergencyRestore => {
-                    win_shell::restore_native_taskbar();
-                    h_hook.exit(0);
+                    let h = h_hook.clone();
+                    let _ = h_hook.run_on_main_thread(move || {
+                        win_shell::restore_native_taskbar();
+                        h.exit(0);
+                    });
                 }
             });
 
@@ -695,8 +914,8 @@ pub fn run(hide_native: bool) {
             // Fast lightweight poller for open windows, keyboard layout, and fullscreen auto-hide
             let h_fast = handle.clone();
             std::thread::spawn(move || {
-                let mut was_fullscreen = false;
                 let mut last_layout = String::new();
+                let mut last_fs = false;
                 loop {
                     let groups = windows_tracker::list_open_window_groups();
                     let _ = h_fast.emit("windows-updated", &groups);
@@ -708,22 +927,20 @@ pub fn run(hide_native: bool) {
                     }
 
                     let fs = win_shell::is_fullscreen_active();
-                    if fs != was_fullscreen {
-                        was_fullscreen = fs;
-                        if let Some(tb) = h_fast.get_webview_window("taskbar") {
-                            if fs {
-                                let _ = tb.hide();
-                                show_start_window(&h_fast, false);
-                                show_flyout_hidden(&h_fast);
-                            } else {
-                                let _ = tb.show();
-                            }
-                        }
-                    }
-
-                    // Ensure native taskbar stays hidden if explorer.exe restarted
-                    if hide_native && !was_fullscreen {
-                        // Lightweight check every 10 ticks handled below
+                    if fs != last_fs {
+                        last_fs = fs;
+                        let h = h_fast.clone();
+                        let _ = h_fast.run_on_main_thread(move || {
+                            let actions = {
+                                let st = h.state::<AppState>();
+                                let mut coord =
+                                    st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+                                let act = coord.on_fullscreen_changed(fs);
+                                st.sync_overlay_flag(&coord);
+                                act
+                            };
+                            apply_coordinator_actions(&h, &actions, None);
+                        });
                     }
 
                     std::thread::sleep(std::time::Duration::from_millis(650));

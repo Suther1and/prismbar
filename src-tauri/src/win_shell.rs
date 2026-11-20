@@ -20,20 +20,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
-    ABM_SETPOS, APPBARDATA, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    ABM_SETPOS, APPBARDATA, QUNS_ACCEPTS_NOTIFICATIONS, QUNS_APP, QUNS_BUSY, QUNS_NOT_PRESENT,
+    QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
-    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, RegisterWindowMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE,
-    SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-    SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    CallNextHookEx, CallWindowProcW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    PostMessageW,
+    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
+    GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE,
+    MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_SETWORKAREA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDPROC,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
+
+use crate::coordinator::{classify_fullscreen, ForegroundWindowInfo, NotificationState, PixelRect};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const HOTKEY_EMERGENCY_ID: i32 = 0x7B01;
@@ -43,6 +48,9 @@ static NATIVE_HIDDEN: AtomicBool = AtomicBool::new(false);
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static WIN_COMBO_USED: AtomicBool = AtomicBool::new(false);
 static HOOK_CALLBACK: OnceLock<Box<dyn Fn(ShellHookEvent) + Send + Sync>> = OnceLock::new();
+static FLYOUT_SUBCLASSED_HWND: AtomicIsize = AtomicIsize::new(0);
+static FLYOUT_ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+static FLYOUT_NON_ACTIVATING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 pub enum ShellHookEvent {
@@ -168,6 +176,86 @@ pub fn point_inside_hwnd(hwnd_raw: isize, x: i32, y: i32) -> bool {
     }
 }
 
+pub fn get_window_pixel_rect(hwnd_raw: isize) -> Option<PixelRect> {
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            Some(PixelRect::new(r.left, r.top, r.right, r.bottom))
+        } else {
+            None
+        }
+    }
+}
+
+/// Positions and resizes a window in physical pixels without activating it and
+/// without changing its visibility (never passes `SWP_SHOWWINDOW`).
+pub fn position_window(hwnd_raw: isize, x: i32, y: i32, w: i32, h: i32) {
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    }
+}
+
+/// Subclasses the pre-warmed `flyout` window once so non-activating flyouts
+/// (`preview`, `osd`) return `MA_NOACTIVATE` on `WM_MOUSEACTIVATE` without
+/// flipping `GWL_EXSTYLE` + `SWP_FRAMECHANGED` per open.
+pub fn install_flyout_noactivate_subclass(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    if FLYOUT_SUBCLASSED_HWND
+        .compare_exchange(0, hwnd_raw, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        let current_proc = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if current_proc != 0 {
+            FLYOUT_ORIG_WNDPROC.store(current_proc, Ordering::SeqCst);
+        }
+        let prev = SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            flyout_wnd_proc as *const () as usize as isize,
+        );
+        if prev != 0 {
+            FLYOUT_ORIG_WNDPROC.store(prev, Ordering::SeqCst);
+        } else {
+            FLYOUT_ORIG_WNDPROC.store(0, Ordering::SeqCst);
+            FLYOUT_SUBCLASSED_HWND.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+pub fn set_flyout_non_activating(non_activating: bool) {
+    FLYOUT_NON_ACTIVATING.store(non_activating, Ordering::SeqCst);
+}
+
+unsafe extern "system" fn flyout_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if hwnd.0 as isize == FLYOUT_SUBCLASSED_HWND.load(Ordering::SeqCst) {
+        if msg == WM_MOUSEACTIVATE && FLYOUT_NON_ACTIVATING.load(Ordering::SeqCst) {
+            return LRESULT(MA_NOACTIVATE as isize);
+        }
+        let orig = FLYOUT_ORIG_WNDPROC.load(Ordering::SeqCst);
+        if orig != 0 {
+            let prev_proc: WNDPROC = Some(std::mem::transmute(orig));
+            return CallWindowProcW(prev_proc, hwnd, msg, wparam, lparam);
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 pub fn set_window_visible(hwnd_raw: isize, visible: bool, no_activate: bool) {
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut _);
@@ -289,7 +377,9 @@ pub fn register_appbar(hwnd_raw: isize, reserve_height_px: i32) {
             },
             ..Default::default()
         };
-        SHAppBarMessage(ABM_NEW, &mut abd);
+        if prev != hwnd_raw {
+            SHAppBarMessage(ABM_NEW, &mut abd);
+        }
         SHAppBarMessage(ABM_QUERYPOS, &mut abd);
         abd.rc.top = abd.rc.bottom - reserve_height_px;
         SHAppBarMessage(ABM_SETPOS, &mut abd);
@@ -333,40 +423,60 @@ pub fn run_watchdog(parent_pid: u32) {
 }
 
 /// Detects fullscreen games / video players on primary monitor so taskbar can auto-hide.
+/// Gathers Win32 state and delegates strictly to `coordinator::classify_fullscreen`.
 pub fn is_fullscreen_active() -> bool {
     unsafe {
-        if let Ok(state) = SHQueryUserNotificationState() {
-            if state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN {
-                return true;
+        let notif_state = match SHQueryUserNotificationState() {
+            Ok(state) if state == QUNS_NOT_PRESENT => NotificationState::NotPresent,
+            Ok(state) if state == QUNS_BUSY => NotificationState::Busy,
+            Ok(state) if state == QUNS_RUNNING_D3D_FULL_SCREEN => {
+                NotificationState::RunningD3dFullScreen
             }
-        }
+            Ok(state) if state == QUNS_PRESENTATION_MODE => NotificationState::PresentationMode,
+            Ok(state) if state == QUNS_ACCEPTS_NOTIFICATIONS => {
+                NotificationState::AcceptsNotifications
+            }
+            Ok(state) if state == QUNS_QUIET_TIME => NotificationState::QuietTime,
+            Ok(state) if state == QUNS_APP => NotificationState::App,
+            _ => NotificationState::Unknown,
+        };
+
+        let mon = primary_monitor_rect();
+        let mon_rect = PixelRect::new(mon.left, mon.top, mon.right, mon.bottom);
+
         let fg = GetForegroundWindow();
-        if fg.0.is_null() || !IsWindowVisible(fg).as_bool() {
-            return false;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(fg, Some(&mut pid));
-        if pid == GetCurrentProcessId() {
-            return false;
-        }
-        let mut cls_buf = [0u16; 64];
-        let len = GetClassNameW(fg, &mut cls_buf);
-        if len > 0 {
-            let cls = String::from_utf16_lossy(&cls_buf[..len as usize]);
-            if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-                return false;
+        let fg_info = if fg.0.is_null() {
+            None
+        } else {
+            let visible = IsWindowVisible(fg).as_bool() && !IsIconic(fg).as_bool();
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            let is_own_process = pid == GetCurrentProcessId();
+
+            let mut cls_buf = [0u16; 256];
+            let len = GetClassNameW(fg, &mut cls_buf);
+            let class_name = if len > 0 {
+                String::from_utf16_lossy(&cls_buf[..len as usize])
+            } else {
+                String::new()
+            };
+
+            let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
+            let mut rect = RECT::default();
+            if GetWindowRect(fg, &mut rect).is_ok() {
+                Some(ForegroundWindowInfo {
+                    visible,
+                    is_own_process,
+                    class_name,
+                    style,
+                    rect: PixelRect::new(rect.left, rect.top, rect.right, rect.bottom),
+                })
+            } else {
+                None
             }
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(fg, &mut rect).is_ok() {
-            let mon = primary_monitor_rect();
-            let covers = rect.left <= mon.left
-                && rect.top <= mon.top
-                && rect.right >= mon.right
-                && rect.bottom >= mon.bottom;
-            return covers;
-        }
-        false
+        };
+
+        classify_fullscreen(notif_state, fg_info.as_ref(), mon_rect)
     }
 }
 
@@ -510,5 +620,118 @@ pub fn create_hidden_message_window(class_name: &str) -> Option<HWND> {
 pub fn post_close_to_hwnd(hwnd_raw: isize) {
     unsafe {
         let _ = PostMessageW(HWND(hwnd_raw as *mut _), windows::Win32::UI::WindowsAndMessaging::WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, SendMessageW, MA_ACTIVATE, WS_POPUP,
+    };
+
+    static SUBCLASS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestWindowGuard {
+        hwnd: HWND,
+        reset_subclass_statics: bool,
+    }
+
+    impl Drop for TestWindowGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if self.reset_subclass_statics {
+                    let orig = FLYOUT_ORIG_WNDPROC.load(Ordering::SeqCst);
+                    if orig != 0 {
+                        let _ = SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, orig);
+                    }
+                    FLYOUT_SUBCLASSED_HWND.store(0, Ordering::SeqCst);
+                    FLYOUT_ORIG_WNDPROC.store(0, Ordering::SeqCst);
+                    FLYOUT_NON_ACTIVATING.store(false, Ordering::SeqCst);
+                }
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+    }
+
+    fn create_hidden_static_window() -> HWND {
+        unsafe {
+            let cls = wide("STATIC");
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(cls.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                10,
+                10,
+                100,
+                100,
+                HWND::default(),
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW STATIC failed")
+        }
+    }
+
+    #[test]
+    fn position_window_updates_rect_without_showing_hidden_window() {
+        let hwnd = create_hidden_static_window();
+        let _guard = TestWindowGuard {
+            hwnd,
+            reset_subclass_statics: false,
+        };
+
+        unsafe {
+            assert!(!IsWindowVisible(hwnd).as_bool());
+            position_window(hwnd.0 as isize, 120, 140, 320, 240);
+            assert!(
+                !IsWindowVisible(hwnd).as_bool(),
+                "position_window must never force a hidden window visible"
+            );
+
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect).expect("GetWindowRect failed");
+            assert_eq!(rect.left, 120);
+            assert_eq!(rect.top, 140);
+            assert_eq!(rect.right, 440);
+            assert_eq!(rect.bottom, 380);
+        }
+    }
+
+    #[test]
+    fn flyout_subclass_handles_wm_mouseactivate_by_mode() {
+        let _lock = SUBCLASS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FLYOUT_SUBCLASSED_HWND.store(0, Ordering::SeqCst);
+        FLYOUT_ORIG_WNDPROC.store(0, Ordering::SeqCst);
+        FLYOUT_NON_ACTIVATING.store(false, Ordering::SeqCst);
+
+        let hwnd = create_hidden_static_window();
+        let _guard = TestWindowGuard {
+            hwnd,
+            reset_subclass_statics: true,
+        };
+        let hwnd_raw = hwnd.0 as isize;
+
+        install_flyout_noactivate_subclass(hwnd_raw);
+        let orig_after_first = FLYOUT_ORIG_WNDPROC.load(Ordering::SeqCst);
+        assert_ne!(orig_after_first, 0);
+        assert_eq!(FLYOUT_SUBCLASSED_HWND.load(Ordering::SeqCst), hwnd_raw);
+
+        // Idempotent re-install must not overwrite original WndProc with flyout_wnd_proc
+        install_flyout_noactivate_subclass(hwnd_raw);
+        assert_eq!(FLYOUT_ORIG_WNDPROC.load(Ordering::SeqCst), orig_after_first);
+
+        unsafe {
+            set_flyout_non_activating(true);
+            let res_noact = SendMessageW(hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0));
+            assert_eq!(res_noact, LRESULT(MA_NOACTIVATE as isize));
+
+            set_flyout_non_activating(false);
+            let res_act = SendMessageW(hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0));
+            assert_eq!(res_act, LRESULT(MA_ACTIVATE as isize));
+        }
     }
 }
