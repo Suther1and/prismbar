@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, OsStr};
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS,
@@ -20,16 +20,17 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE,
-    PROCESS_SYNCHRONIZE,
+    CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, WaitForSingleObject,
+    INFINITE, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_ESCAPE, VK_LWIN, VK_RWIN,
+    GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL,
+    VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
@@ -41,16 +42,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassExW,
+    IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
-    CREATESTRUCTW, GWLP_USERDATA, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_TOPMOST,
-    KBDLLHOOKSTRUCT, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE,
-    SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSEXW, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN,
+    SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE, WM_QUIT,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDPROC, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
 };
 
 use crate::coordinator::{
@@ -61,6 +63,11 @@ use crate::coordinator::{
 pub const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\TestBar_SingleInstance_v1";
 pub const WM_APPBAR_CALLBACK: u32 = WM_APP + 10;
 pub const WM_APPBAR_UPDATE_MODE: u32 = WM_APP + 12;
+pub const HOOK_EVENT_CHANNEL_CAPACITY: usize = 64;
+pub const VK_DUMMY_MASK: u16 = 0xE8;
+pub const LLKHF_INJECTED_FLAG: u32 = 0x0000_0010;
+pub const LLKHF_LOWER_IL_INJECTED_FLAG: u32 = 0x0000_0002;
+pub const LLKHF_ALTDOWN_FLAG: u32 = 0x0000_0020;
 
 const APPBAR_MSG_WND_CLASS: &str = "TestBarAppBarMsgWnd";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -75,12 +82,17 @@ static ORIGINAL_WORKAREA: Mutex<Option<WorkAreaSnapshot>> = Mutex::new(None);
 static APPBAR_CLASS_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
 static APPBAR_MSG_WINDOW: Mutex<Option<AppBarMessageWindow>> = Mutex::new(None);
 
-static WIN_DOWN: AtomicBool = AtomicBool::new(false);
-static WIN_COMBO_USED: AtomicBool = AtomicBool::new(false);
-static HOOK_CALLBACK: OnceLock<Box<dyn Fn(ShellHookEvent) + Send + Sync>> = OnceLock::new();
+static HOOK_OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+static HOOK_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
 static FLYOUT_SUBCLASSED_HWND: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_NON_ACTIVATING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_overlay_open_hint(open: bool) {
+    HOOK_OVERLAY_OPEN.store(open, Ordering::Release);
+}
 
 pub fn is_restore_in_progress() -> bool {
     RESTORE_IN_PROGRESS.load(Ordering::SeqCst)
@@ -94,7 +106,7 @@ pub fn ensure_process_dpi_aware() {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellHookEvent {
     ToggleStart,
     EmergencyRestore,
@@ -1371,11 +1383,17 @@ pub fn run_watchdog(args: WatchdogArgs) {
     restore_native_taskbar_internal(args.work_area, true);
 }
 
-/// Detects fullscreen games / video players on primary monitor so taskbar can auto-hide.
-/// Gathers Win32 state and delegates strictly to `coordinator::classify_fullscreen`.
-pub fn is_fullscreen_active() -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullscreenSnapshot {
+    pub notification_state: NotificationState,
+    pub foreground: Option<ForegroundWindowInfo>,
+    pub primary_monitor: PixelRect,
+}
+
+/// Captures the Win32 inputs required by `coordinator::classify_fullscreen`.
+pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
     unsafe {
-        let notif_state = match SHQueryUserNotificationState() {
+        let notification_state = match SHQueryUserNotificationState() {
             Ok(state) if state == QUNS_NOT_PRESENT => NotificationState::NotPresent,
             Ok(state) if state == QUNS_BUSY => NotificationState::Busy,
             Ok(state) if state == QUNS_RUNNING_D3D_FULL_SCREEN => {
@@ -1391,10 +1409,10 @@ pub fn is_fullscreen_active() -> bool {
         };
 
         let mon = primary_monitor_rect();
-        let mon_rect = PixelRect::new(mon.left, mon.top, mon.right, mon.bottom);
+        let primary_monitor = PixelRect::new(mon.left, mon.top, mon.right, mon.bottom);
 
         let fg = GetForegroundWindow();
-        let fg_info = if fg.0.is_null() {
+        let foreground = if fg.0.is_null() {
             None
         } else {
             let visible = IsWindowVisible(fg).as_bool() && !IsIconic(fg).as_bool();
@@ -1425,30 +1443,325 @@ pub fn is_fullscreen_active() -> bool {
             }
         };
 
-        classify_fullscreen(notif_state, fg_info.as_ref(), mon_rect)
+        FullscreenSnapshot {
+            notification_state,
+            foreground,
+            primary_monitor,
+        }
     }
 }
 
-/// Low-level keyboard hook that intercepts ONLY lone Win tap (leaving Win+E/D/R/L/V/Shift+S untouched)
+/// Detects fullscreen games / video players on primary monitor so taskbar can auto-hide.
+/// Gathers Win32 state and delegates strictly to `coordinator::classify_fullscreen`.
+pub fn is_fullscreen_active() -> bool {
+    let snap = query_fullscreen_snapshot();
+    classify_fullscreen(
+        snap.notification_state,
+        snap.foreground.as_ref(),
+        snap.primary_monitor,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTransition {
+    Down,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinKeyAction {
+    None,
+    ToggleStart,
+}
+
+/// Pure, Win32-independent state machine for `WH_KEYBOARD_LL` lone-Win detection (AD-3).
+/// Ignores injected events (`LLKHF_INJECTED` / `LLKHF_LOWER_IL_INJECTED`) and `VK_DUMMY_MASK` (`0xE8`),
+/// tracks `VK_LWIN` and `VK_RWIN` independently, preserves auto-repeat combo state, and emits
+/// `WinKeyAction::ToggleStart` strictly on a true lone Win press-and-release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WinKeyStateMachine {
+    lwin_down: bool,
+    rwin_down: bool,
+    combo_used: bool,
+}
+
+impl WinKeyStateMachine {
+    pub const fn new() -> Self {
+        Self {
+            lwin_down: false,
+            rwin_down: false,
+            combo_used: false,
+        }
+    }
+
+    pub fn is_any_win_down(&self) -> bool {
+        self.lwin_down || self.rwin_down
+    }
+
+    /// Reconciles tracked Win key flags against physical key state (e.g. after `Win+L`,
+    /// UAC, or `Ctrl+Alt+Del` swallowed `Win Up` on the Secure Desktop).
+    pub(crate) fn reconcile_physical_win_keys(
+        &mut self,
+        lwin_physically_down: bool,
+        rwin_physically_down: bool,
+    ) {
+        if !lwin_physically_down {
+            self.lwin_down = false;
+        }
+        if !rwin_physically_down {
+            self.rwin_down = false;
+        }
+        if !self.lwin_down && !self.rwin_down {
+            self.combo_used = false;
+        }
+    }
+
+    pub(crate) fn mark_combo_used(&mut self) {
+        if self.is_any_win_down() {
+            self.combo_used = true;
+        }
+    }
+
+    pub fn on_key_event(&mut self, vk: u16, transition: KeyTransition, flags: u32) -> WinKeyAction {
+        if (flags & (LLKHF_INJECTED_FLAG | LLKHF_LOWER_IL_INJECTED_FLAG)) != 0
+            || vk == VK_DUMMY_MASK
+        {
+            return WinKeyAction::None;
+        }
+
+        let alt_down = (flags & LLKHF_ALTDOWN_FLAG) != 0;
+
+        if vk == VK_LWIN.0 || vk == VK_RWIN.0 {
+            let (this_down, other_down) = if vk == VK_LWIN.0 {
+                (&mut self.lwin_down, self.rwin_down)
+            } else {
+                (&mut self.rwin_down, self.lwin_down)
+            };
+
+            match transition {
+                KeyTransition::Down => {
+                    let was_this_down = *this_down;
+                    *this_down = true;
+                    if !was_this_down {
+                        if other_down || alt_down {
+                            // Dual-Win or Alt+Win chord: never treat as a lone Win tap.
+                            self.combo_used = true;
+                        } else {
+                            // Fresh lone Win press from idle.
+                            self.combo_used = false;
+                        }
+                    } else if alt_down {
+                        self.combo_used = true;
+                    }
+                    // Auto-repeat (was_this_down == true) preserves existing combo_used state.
+                    WinKeyAction::None
+                }
+                KeyTransition::Up => {
+                    let was_this_down = *this_down;
+                    *this_down = false;
+                    if !was_this_down {
+                        if !other_down {
+                            self.combo_used = false;
+                        }
+                        return WinKeyAction::None;
+                    }
+                    if other_down {
+                        // Other Win key is still held (dual-Win chord): stay marked as combo
+                        // and wait until both Win keys have been released.
+                        self.combo_used = true;
+                        return WinKeyAction::None;
+                    }
+                    let was_combo = self.combo_used || alt_down;
+                    self.combo_used = false;
+                    if was_combo {
+                        WinKeyAction::None
+                    } else {
+                        WinKeyAction::ToggleStart
+                    }
+                }
+            }
+        } else {
+            // Only non-Win KeyDown while Win is held indicates a shortcut chord;
+            // releasing a key pressed prior to Win (fast typing rollover) must not poison lone Win.
+            if transition == KeyTransition::Down && self.is_any_win_down() {
+                self.combo_used = true;
+            }
+            WinKeyAction::None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEnqueueResult {
+    Sent,
+    DroppedFull,
+    Disconnected,
+}
+
+#[derive(Clone)]
+pub struct HookEventSender {
+    tx: mpsc::SyncSender<ShellHookEvent>,
+    dropped_count: Arc<AtomicU64>,
+}
+
+impl HookEventSender {
+    /// Non-blocking enqueue safe for `WH_KEYBOARD_LL` and `WH_MOUSE_LL` callbacks.
+    pub fn try_send(&self, event: ShellHookEvent) -> HookEnqueueResult {
+        match self.tx.try_send(event) {
+            Ok(()) => HookEnqueueResult::Sent,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                HookEnqueueResult::DroppedFull
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => HookEnqueueResult::Disconnected,
+        }
+    }
+
+    /// Blocking send reserved strictly for post-unhook critical delivery (e.g. `EmergencyRestore`).
+    pub fn send_blocking(&self, event: ShellHookEvent) -> Result<(), ShellHookEvent> {
+        self.tx.send(event).map_err(|e| e.0)
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Bounded hook event channel (`capacity = 64`) decoupling low-level Win32 hook callbacks
+/// from coordinator/IPC dispatch on a dedicated worker thread (AD-3).
+pub struct HookEventChannel {
+    sender: HookEventSender,
+    receiver: mpsc::Receiver<ShellHookEvent>,
+}
+
+impl Default for HookEventChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HookEventChannel {
+    pub fn new() -> Self {
+        Self::with_capacity(HOOK_EVENT_CHANNEL_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let clamped_capacity = capacity.max(1);
+        let (tx, receiver) = mpsc::sync_channel(clamped_capacity);
+        let dropped_count = Arc::new(AtomicU64::new(0));
+        Self {
+            sender: HookEventSender { tx, dropped_count },
+            receiver,
+        }
+    }
+
+    pub fn sender(&self) -> HookEventSender {
+        self.sender.clone()
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.sender.dropped_count()
+    }
+
+    pub fn into_parts(self) -> (HookEventSender, mpsc::Receiver<ShellHookEvent>) {
+        (self.sender, self.receiver)
+    }
+
+    /// Spawns a dedicated worker thread that drains events into `on_event`.
+    /// Panics inside `on_event` are caught so the worker continues draining subsequent events
+    /// and exits cleanly once all `HookEventSender` handles drop.
+    pub fn spawn_worker<F>(self, on_event: F) -> (HookEventSender, std::thread::JoinHandle<()>)
+    where
+        F: Fn(ShellHookEvent) + Send + 'static,
+    {
+        let (sender, receiver) = self.into_parts();
+        let handle = std::thread::spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    on_event(event);
+                }));
+            }
+        });
+        (sender, handle)
+    }
+}
+
+thread_local! {
+    static HOOK_WIN_KEY_STATE: Cell<WinKeyStateMachine> = const { Cell::new(WinKeyStateMachine::new()) };
+    static HOOK_EVENT_SENDER: RefCell<Option<HookEventSender>> = const { RefCell::new(None) };
+}
+
+struct HookThreadGuard;
+
+impl Drop for HookThreadGuard {
+    fn drop(&mut self) {
+        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                let _ = guard.take();
+            }
+        });
+        let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
+        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+        HOOK_THREAD_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Posts `WM_QUIT` to the active global shell hook thread so it unhooks cleanly and drops its sender.
+pub(crate) fn stop_shell_hook_thread() {
+    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Low-level keyboard & mouse hook thread that intercepts ONLY lone Win taps
+/// (leaving Win+E/D/R/L/V/Shift+S/Tab untouched), forwards global mouse clicks via
+/// non-blocking `try_send` into a bounded `sync_channel(64)` drained by a dedicated worker,
 /// and registers global emergency restore hotkey `Ctrl+Alt+Shift+Esc`.
 pub fn start_shell_hook_thread<F>(on_event: F)
 where
-    F: Fn(ShellHookEvent) + Send + Sync + 'static,
+    F: Fn(ShellHookEvent) + Send + 'static,
 {
-    let _ = HOOK_CALLBACK.set(Box::new(on_event));
-    std::thread::spawn(|| unsafe {
-        let _ = RegisterHotKey(
+    if HOOK_THREAD_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let (sender, _worker_handle) = HookEventChannel::new().spawn_worker(on_event);
+    std::thread::spawn(move || unsafe {
+        let _active_guard = HookThreadGuard;
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
+        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+            *slot.borrow_mut() = Some(sender);
+        });
+
+        let hotkey_ok = RegisterHotKey(
             HWND::default(),
             HOTKEY_EMERGENCY_ID,
             MOD_CONTROL | MOD_ALT | MOD_SHIFT,
             VK_ESCAPE.0 as u32,
-        );
+        )
+        .is_ok();
 
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
         let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), None, 0);
+
+        if !hotkey_ok && hook.is_err() && mouse_hook.is_err() {
+            return;
+        }
+
         let mut msg = MSG::default();
         let mut emergency_triggered = false;
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
+        loop {
+            let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+            if ret.0 <= 0 {
+                break;
+            }
             if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_EMERGENCY_ID {
                 emergency_triggered = true;
                 break;
@@ -1464,28 +1777,75 @@ where
         if let Ok(mh) = mouse_hook {
             let _ = UnhookWindowsHookEx(mh);
         }
-        let _ = UnregisterHotKey(HWND::default(), HOTKEY_EMERGENCY_ID);
+        if hotkey_ok {
+            let _ = UnregisterHotKey(HWND::default(), HOTKEY_EMERGENCY_ID);
+        }
+
+        let sender = HOOK_EVENT_SENDER
+            .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut g| g.take()))
+            .ok()
+            .flatten();
+        let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
 
         if emergency_triggered {
             if NATIVE_HIDDEN.load(Ordering::SeqCst) {
                 restore_native_taskbar_nonblocking();
             }
-            if let Some(cb) = HOOK_CALLBACK.get() {
-                cb(ShellHookEvent::EmergencyRestore);
+            if let Some(tx) = sender {
+                let _ = tx.send_blocking(ShellHookEvent::EmergencyRestore);
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PhysicalKeySnapshot {
+    lwin_down: bool,
+    rwin_down: bool,
+    modifier_down: bool,
+}
+
+fn is_vk_physically_down(vk: VIRTUAL_KEY) -> bool {
+    unsafe { GetAsyncKeyState(vk.0 as i32) < 0 }
+}
+
+fn query_physical_keys() -> PhysicalKeySnapshot {
+    PhysicalKeySnapshot {
+        lwin_down: is_vk_physically_down(VK_LWIN),
+        rwin_down: is_vk_physically_down(VK_RWIN),
+        modifier_down: is_vk_physically_down(VK_CONTROL)
+            || is_vk_physically_down(VK_SHIFT)
+            || is_vk_physically_down(VK_MENU),
+    }
+}
+
+fn dispatch_ll_mouse_event(msg: u32, x: i32, y: i32, overlay_open: bool) {
+    if msg != WM_LBUTTONDOWN && msg != WM_RBUTTONDOWN && msg != WM_MBUTTONDOWN {
+        return;
+    }
+    if !overlay_open {
+        return;
+    }
+    let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+        if let Ok(guard) = slot.try_borrow() {
+            if let Some(sender) = guard.as_ref() {
+                let _ = sender.try_send(ShellHookEvent::GlobalMouseDown(x, y));
             }
         }
     });
 }
 
 unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        let msg = wparam.0 as u32;
-        if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+    if code == HC_ACTION as i32 && lparam.0 != 0 {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            if let Some(cb) = HOOK_CALLBACK.get() {
-                cb(ShellHookEvent::GlobalMouseDown(ms.pt.x, ms.pt.y));
-            }
-        }
+            dispatch_ll_mouse_event(
+                wparam.0 as u32,
+                ms.pt.x,
+                ms.pt.y,
+                HOOK_OVERLAY_OPEN.load(Ordering::Acquire),
+            );
+        }));
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
@@ -1499,7 +1859,7 @@ fn send_dummy_mask_key() {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(0xE8),
+                        wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
                         ..Default::default()
                     },
                 },
@@ -1508,7 +1868,7 @@ fn send_dummy_mask_key() {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(0xE8),
+                        wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
                         dwFlags: KEYEVENTF_KEYUP,
                         ..Default::default()
                     },
@@ -1519,33 +1879,83 @@ fn send_dummy_mask_key() {
     }
 }
 
-unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let vk = kb.vkCode as u16;
-        let msg = wparam.0 as u32;
-        let is_win = vk == VK_LWIN.0 || vk == VK_RWIN.0;
+fn dispatch_ll_keyboard_event<FQuery, FMask>(
+    msg: u32,
+    vk_code: u32,
+    flags: u32,
+    query_physical: FQuery,
+    send_mask: FMask,
+) where
+    FQuery: FnOnce() -> PhysicalKeySnapshot,
+    FMask: FnOnce(),
+{
+    let transition = match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => KeyTransition::Down,
+        WM_KEYUP | WM_SYSKEYUP => KeyTransition::Up,
+        _ => return,
+    };
+    let Ok(vk) = u16::try_from(vk_code) else {
+        return;
+    };
+    let is_injected_or_mask = (flags & (LLKHF_INJECTED_FLAG | LLKHF_LOWER_IL_INJECTED_FLAG)) != 0
+        || vk == VK_DUMMY_MASK;
+    let is_win = vk == VK_LWIN.0 || vk == VK_RWIN.0;
 
-        if is_win {
-            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                if !WIN_DOWN.swap(true, Ordering::SeqCst) {
-                    WIN_COMBO_USED.store(false, Ordering::SeqCst);
-                }
-            } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
-                let was_down = WIN_DOWN.swap(false, Ordering::SeqCst);
-                let combo = WIN_COMBO_USED.swap(false, Ordering::SeqCst);
-                if was_down && !combo {
-                    // Lone Win tap detected! Suppress native Start via mask key & toggle TestBar Start.
-                    send_dummy_mask_key();
-                    if let Some(cb) = HOOK_CALLBACK.get() {
-                        cb(ShellHookEvent::ToggleStart);
+    let action = HOOK_WIN_KEY_STATE
+        .try_with(|cell| {
+            let mut state = cell.get();
+            if !is_injected_or_mask && transition == KeyTransition::Down {
+                if state.is_any_win_down() || is_win {
+                    let phys = query_physical();
+                    if state.is_any_win_down() {
+                        state.reconcile_physical_win_keys(phys.lwin_down, phys.rwin_down);
                     }
+                    let act = state.on_key_event(vk, transition, flags);
+                    if is_win && phys.modifier_down {
+                        state.mark_combo_used();
+                    }
+                    cell.set(state);
+                    return act;
                 }
             }
-        } else if WIN_DOWN.load(Ordering::SeqCst) && vk != 0xE8 {
-            // Any other key pressed while Win is held -> OS shortcut (Win+E, Win+D, Win+Shift+S, etc.)
-            WIN_COMBO_USED.store(true, Ordering::SeqCst);
+            let act = state.on_key_event(vk, transition, flags);
+            cell.set(state);
+            act
+        })
+        .unwrap_or(WinKeyAction::None);
+
+    if action == WinKeyAction::ToggleStart {
+        // Enqueue ToggleStart first; only suppress native Start via mask key if enqueued.
+        let result = HOOK_EVENT_SENDER
+            .try_with(|slot| {
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|sender| sender.try_send(ShellHookEvent::ToggleStart))
+                    })
+                    .unwrap_or(HookEnqueueResult::Disconnected)
+            })
+            .unwrap_or(HookEnqueueResult::Disconnected);
+        if result == HookEnqueueResult::Sent {
+            send_mask();
         }
+    }
+}
+
+unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && lparam.0 != 0 {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            dispatch_ll_keyboard_event(
+                wparam.0 as u32,
+                kb.vkCode,
+                kb.flags.0,
+                query_physical_keys,
+                send_dummy_mask_key,
+            );
+        }));
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
@@ -2307,5 +2717,456 @@ mod tests {
     fn primary_monitor_dpi_returns_valid_dpi() {
         let dpi = primary_monitor_dpi();
         assert!(dpi >= 96, "expected DPI >= 96, got {dpi}");
+    }
+
+    #[test]
+    fn win_key_state_machine_lone_tap_repeat_and_stray_keyup() {
+        let mut sm = WinKeyStateMachine::new();
+        let lwin = VK_LWIN.0;
+        let rwin = VK_RWIN.0;
+
+        // Stray keyups from idle return None and keep idle state
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Up, 0), WinKeyAction::None);
+        assert!(!sm.is_any_win_down());
+
+        // Lone LWin tap
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert!(sm.is_any_win_down());
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+        assert!(!sm.is_any_win_down());
+
+        // Lone RWin tap
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+        assert!(!sm.is_any_win_down());
+
+        // Lone LWin held with OS key auto-repeat still emits ToggleStart on release
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+        assert!(!sm.is_any_win_down());
+    }
+
+    #[test]
+    fn win_key_state_machine_preserves_os_chords_and_repeat_after_combo() {
+        let mut sm = WinKeyStateMachine::new();
+        let lwin = VK_LWIN.0;
+        let rwin = VK_RWIN.0;
+
+        // Standard Win+<key> shortcuts: Win+E/D/R/L/V/Tab
+        for vk in [0x45u16, 0x44, 0x52, 0x4C, 0x56, 0x09] {
+            assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+            assert_eq!(sm.on_key_event(vk, KeyTransition::Down, 0), WinKeyAction::None);
+            assert_eq!(sm.on_key_event(vk, KeyTransition::Up, 0), WinKeyAction::None);
+            assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::None);
+        }
+
+        // Win+Shift+S
+        let shift = 0xA0u16; // VK_LSHIFT
+        let key_s = 0x53u16;
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(shift, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_s, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_s, KeyTransition::Up, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(shift, KeyTransition::Up, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::None);
+
+        // LWin released before E Up
+        let key_e = 0x45u16;
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_e, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_e, KeyTransition::Up, 0), WinKeyAction::None);
+
+        // LWin auto-repeat AFTER E Down must NEVER clear combo_used
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_e, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_e, KeyTransition::Up, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::None);
+
+        // Next lone Win tap after chords succeeds cleanly
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+    }
+
+    #[test]
+    fn win_key_state_machine_ignores_injected_and_dummy_mask_and_handles_dual_win() {
+        use windows::Win32::UI::WindowsAndMessaging::{LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED};
+
+        assert_eq!(LLKHF_INJECTED_FLAG, LLKHF_INJECTED.0);
+        assert_eq!(LLKHF_LOWER_IL_INJECTED_FLAG, LLKHF_LOWER_IL_INJECTED.0);
+
+        let mut sm = WinKeyStateMachine::new();
+        let lwin = VK_LWIN.0;
+        let rwin = VK_RWIN.0;
+
+        // Injected Win taps are completely ignored
+        for inj_flag in [LLKHF_INJECTED_FLAG, LLKHF_LOWER_IL_INJECTED_FLAG] {
+            assert_eq!(
+                sm.on_key_event(lwin, KeyTransition::Down, inj_flag),
+                WinKeyAction::None
+            );
+            assert!(!sm.is_any_win_down());
+            assert_eq!(
+                sm.on_key_event(lwin, KeyTransition::Up, inj_flag),
+                WinKeyAction::None
+            );
+        }
+
+        // Injected non-Win keys and 0xE8 mask key during a real lone Win hold do NOT poison it
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(0x45, KeyTransition::Down, LLKHF_INJECTED_FLAG),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(0x45, KeyTransition::Down, LLKHF_LOWER_IL_INJECTED_FLAG),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(VK_DUMMY_MASK, KeyTransition::Down, 0),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(VK_DUMMY_MASK, KeyTransition::Up, 0),
+            WinKeyAction::None
+        );
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+
+        // Dual-Win overlapping chords in every release order never trigger ToggleStart
+        let dual_sequences = [
+            [(lwin, KeyTransition::Down), (rwin, KeyTransition::Down), (lwin, KeyTransition::Up), (rwin, KeyTransition::Up)],
+            [(lwin, KeyTransition::Down), (rwin, KeyTransition::Down), (rwin, KeyTransition::Up), (lwin, KeyTransition::Up)],
+            [(rwin, KeyTransition::Down), (lwin, KeyTransition::Down), (rwin, KeyTransition::Up), (lwin, KeyTransition::Up)],
+            [(rwin, KeyTransition::Down), (lwin, KeyTransition::Down), (lwin, KeyTransition::Up), (rwin, KeyTransition::Up)],
+        ];
+        for seq in dual_sequences {
+            for (vk, tr) in seq {
+                assert_eq!(sm.on_key_event(vk, tr, 0), WinKeyAction::None);
+            }
+            assert!(!sm.is_any_win_down());
+            // State is never wedged: subsequent lone Win tap succeeds immediately
+            assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, 0), WinKeyAction::None);
+            assert_eq!(sm.on_key_event(lwin, KeyTransition::Up, 0), WinKeyAction::ToggleStart);
+        }
+    }
+
+    #[test]
+    fn hook_event_channel_burst_drop_fifo_drain_panic_survival_and_disconnect() {
+        // 1. Burst > 64 events while receiver is not yet draining
+        let channel = HookEventChannel::new();
+        assert_eq!(HOOK_EVENT_CHANNEL_CAPACITY, 64);
+        let producer = channel.sender();
+
+        for i in 0..HOOK_EVENT_CHANNEL_CAPACITY {
+            assert_eq!(
+                producer.try_send(ShellHookEvent::GlobalMouseDown(i as i32, i as i32)),
+                HookEnqueueResult::Sent
+            );
+        }
+        assert_eq!(producer.dropped_count(), 0);
+
+        // Excess events return DroppedFull immediately without blocking and increment dropped_count
+        let excess = 25usize;
+        for i in 0..excess {
+            assert_eq!(
+                producer.try_send(ShellHookEvent::GlobalMouseDown(1000 + i as i32, 0)),
+                HookEnqueueResult::DroppedFull
+            );
+        }
+        assert_eq!(producer.dropped_count(), excess as u64);
+        assert_eq!(channel.dropped_count(), excess as u64);
+
+        // Spawn worker to drain all 64 buffered events in exact FIFO order + blocking EmergencyRestore
+        let drained = Arc::new(Mutex::new(Vec::new()));
+        let drained_clone = Arc::clone(&drained);
+        let (worker_sender, worker_handle) = channel.spawn_worker(move |ev| {
+            drained_clone.lock().unwrap().push(ev);
+        });
+
+        // Post-unhook critical delivery via send_blocking succeeds even after a full burst
+        worker_sender
+            .send_blocking(ShellHookEvent::EmergencyRestore)
+            .expect("send_blocking should deliver EmergencyRestore");
+
+        drop(producer);
+        drop(worker_sender);
+        worker_handle
+            .join()
+            .expect("worker thread must exit cleanly when all senders drop");
+
+        let events = drained.lock().unwrap();
+        assert_eq!(events.len(), HOOK_EVENT_CHANNEL_CAPACITY + 1);
+        for i in 0..HOOK_EVENT_CHANNEL_CAPACITY {
+            assert_eq!(events[i], ShellHookEvent::GlobalMouseDown(i as i32, i as i32));
+        }
+        assert_eq!(events[HOOK_EVENT_CHANNEL_CAPACITY], ShellHookEvent::EmergencyRestore);
+
+        // 2. Worker survives a panicking callback via catch_unwind and continues draining
+        let panic_channel = HookEventChannel::new();
+        let after_panic = Arc::new(Mutex::new(Vec::new()));
+        let after_panic_clone = Arc::clone(&after_panic);
+        let (tx, jh) = panic_channel.spawn_worker(move |ev| {
+            if ev == ShellHookEvent::GlobalMouseDown(-1, -1) {
+                panic!("simulated worker callback panic");
+            }
+            after_panic_clone.lock().unwrap().push(ev);
+        });
+        assert_eq!(tx.try_send(ShellHookEvent::ToggleStart), HookEnqueueResult::Sent);
+        assert_eq!(
+            tx.try_send(ShellHookEvent::GlobalMouseDown(-1, -1)),
+            HookEnqueueResult::Sent
+        );
+        assert_eq!(
+            tx.try_send(ShellHookEvent::EmergencyRestore),
+            HookEnqueueResult::Sent
+        );
+        drop(tx);
+        jh.join().expect("worker must survive panicking callback");
+        assert_eq!(
+            *after_panic.lock().unwrap(),
+            vec![ShellHookEvent::ToggleStart, ShellHookEvent::EmergencyRestore]
+        );
+
+        // 3. Disconnected receiver returns Disconnected on try_send and Err on send_blocking
+        let (dead_sender, rx) = HookEventChannel::new().into_parts();
+        drop(rx);
+        assert_eq!(
+            dead_sender.try_send(ShellHookEvent::ToggleStart),
+            HookEnqueueResult::Disconnected
+        );
+        assert_eq!(
+            dead_sender.send_blocking(ShellHookEvent::EmergencyRestore),
+            Err(ShellHookEvent::EmergencyRestore)
+        );
+
+        // 4. with_capacity(0) clamps to capacity 1 so try_send is never degenerate
+        let (cap0_tx, cap0_rx) = HookEventChannel::with_capacity(0).into_parts();
+        assert_eq!(
+            cap0_tx.try_send(ShellHookEvent::ToggleStart),
+            HookEnqueueResult::Sent
+        );
+        assert_eq!(
+            cap0_tx.try_send(ShellHookEvent::ToggleStart),
+            HookEnqueueResult::DroppedFull
+        );
+        assert_eq!(cap0_tx.dropped_count(), 1);
+        assert_eq!(cap0_rx.recv().unwrap(), ShellHookEvent::ToggleStart);
+    }
+
+    #[test]
+    fn win_key_state_machine_realistic_flags_rollover_altdown_and_reconcile() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            LLKHF_ALTDOWN, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLKHF_UP,
+        };
+
+        assert_eq!(LLKHF_ALTDOWN_FLAG, LLKHF_ALTDOWN.0);
+        let ext = LLKHF_EXTENDED.0;
+        let up = LLKHF_UP.0;
+        let alt = LLKHF_ALTDOWN.0;
+        let inj = LLKHF_INJECTED.0;
+        let low_inj = LLKHF_LOWER_IL_INJECTED.0;
+
+        let mut sm = WinKeyStateMachine::new();
+        let lwin = VK_LWIN.0;
+        let rwin = VK_RWIN.0;
+        let key_a = 0x41u16;
+        let key_l = 0x4Cu16;
+
+        // Realistic Win32 flags: LLKHF_EXTENDED on down, LLKHF_EXTENDED | LLKHF_UP on up
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up),
+            WinKeyAction::ToggleStart
+        );
+
+        // Combined injected bitmasks (LLKHF_EXTENDED | LLKHF_INJECTED, etc.) are completely ignored
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(key_a, KeyTransition::Down, ext | inj),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up | inj),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(key_a, KeyTransition::Down, up | low_inj),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up),
+            WinKeyAction::ToggleStart
+        );
+
+        // Typing rollover: A Down -> LWin Down -> A Up -> LWin Up still triggers ToggleStart
+        assert_eq!(sm.on_key_event(key_a, KeyTransition::Down, 0), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_a, KeyTransition::Up, up), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up),
+            WinKeyAction::ToggleStart
+        );
+
+        // Alt+Win via LLKHF_ALTDOWN on Win Down or Win Up never triggers ToggleStart
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Down, ext | alt),
+            WinKeyAction::None
+        );
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up | alt),
+            WinKeyAction::None
+        );
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up | alt),
+            WinKeyAction::None
+        );
+
+        // Win+L loses LWin Up on Secure Desktop -> reconcile_physical_win_keys clears stuck state
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(sm.on_key_event(key_l, KeyTransition::Down, 0), WinKeyAction::None);
+        assert!(sm.is_any_win_down());
+        sm.reconcile_physical_win_keys(false, false);
+        assert!(!sm.is_any_win_down());
+
+        // Both LWin and RWin immediately work again after reconciliation
+        assert_eq!(sm.on_key_event(lwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(lwin, KeyTransition::Up, ext | up),
+            WinKeyAction::ToggleStart
+        );
+        assert_eq!(sm.on_key_event(rwin, KeyTransition::Down, ext), WinKeyAction::None);
+        assert_eq!(
+            sm.on_key_event(rwin, KeyTransition::Up, ext | up),
+            WinKeyAction::ToggleStart
+        );
+    }
+
+    #[test]
+    fn ll_keyboard_and_mouse_dispatch_wiring_mask_order_modifiers_reconcile_and_overlay_gate() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            LLKHF_ALTDOWN, LLKHF_EXTENDED, LLKHF_UP, WM_MOUSEMOVE,
+        };
+
+        struct HookTlsResetGuard;
+        impl Drop for HookTlsResetGuard {
+            fn drop(&mut self) {
+                let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                    if let Ok(mut g) = slot.try_borrow_mut() {
+                        *g = None;
+                    }
+                });
+                let _ = HOOK_WIN_KEY_STATE.try_with(|c| c.set(WinKeyStateMachine::new()));
+            }
+        }
+        let _reset = HookTlsResetGuard;
+
+        let ext = LLKHF_EXTENDED.0;
+        let up = LLKHF_UP.0;
+        let alt = LLKHF_ALTDOWN.0;
+        let lwin = VK_LWIN.0 as u32;
+        let rwin = VK_RWIN.0 as u32;
+        let key_l = 0x4Cu32;
+
+        let (sender, rx) = HookEventChannel::with_capacity(2).into_parts();
+        HOOK_WIN_KEY_STATE.with(|c| c.set(WinKeyStateMachine::new()));
+        HOOK_EVENT_SENDER.with(|slot| *slot.borrow_mut() = Some(sender.clone()));
+
+        let idle_phys = || PhysicalKeySnapshot::default();
+        let mask_calls = Cell::new(0u32);
+        let inc_mask = || mask_calls.set(mask_calls.get() + 1);
+
+        // 1. Thread-local persistence across WM_KEYDOWN/WM_KEYUP & try_send-before-mask
+        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 0);
+        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 1);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
+
+        // 2. WM_SYSKEYDOWN / WM_SYSKEYUP with LLKHF_ALTDOWN never triggers ToggleStart or mask
+        dispatch_ll_keyboard_event(WM_SYSKEYDOWN, lwin, ext | alt, idle_phys, inc_mask);
+        dispatch_ll_keyboard_event(WM_SYSKEYUP, lwin, ext | up | alt, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 1);
+        assert!(rx.try_recv().is_err());
+
+        // 3. Pre-held Ctrl/Shift/Alt detected via physical key snapshot suppresses lone Win
+        dispatch_ll_keyboard_event(
+            WM_KEYDOWN,
+            lwin,
+            ext,
+            || PhysicalKeySnapshot {
+                lwin_down: false,
+                rwin_down: false,
+                modifier_down: true,
+            },
+            inc_mask,
+        );
+        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 1);
+        assert!(rx.try_recv().is_err());
+
+        // 4. Win+L Secure Desktop lost LWin Up: next LWin tap reconciles physical state and succeeds
+        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
+        dispatch_ll_keyboard_event(
+            WM_KEYDOWN,
+            key_l,
+            0,
+            || PhysicalKeySnapshot {
+                lwin_down: true,
+                rwin_down: false,
+                modifier_down: false,
+            },
+            inc_mask,
+        );
+        // LWin Up is lost; user unlocks desktop and taps RWin -> physical LWin is up -> succeeds!
+        dispatch_ll_keyboard_event(WM_KEYDOWN, rwin, ext, idle_phys, inc_mask);
+        dispatch_ll_keyboard_event(WM_KEYUP, rwin, ext | up, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 2);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
+
+        // 5. Out-of-range vkCode (> u16::MAX) is ignored safely without truncation
+        dispatch_ll_keyboard_event(WM_KEYDOWN, (1u32 << 16) | lwin, ext, idle_phys, inc_mask);
+        dispatch_ll_keyboard_event(WM_KEYUP, (1u32 << 16) | lwin, ext | up, idle_phys, inc_mask);
+        assert_eq!(mask_calls.get(), 2);
+        assert!(rx.try_recv().is_err());
+
+        // 6. When channel is full, try_send returns DroppedFull and mask key is NOT invoked
+        assert_eq!(
+            sender.try_send(ShellHookEvent::GlobalMouseDown(1, 1)),
+            HookEnqueueResult::Sent
+        );
+        assert_eq!(
+            sender.try_send(ShellHookEvent::GlobalMouseDown(2, 2)),
+            HookEnqueueResult::Sent
+        );
+        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
+        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
+        assert_eq!(
+            mask_calls.get(),
+            2,
+            "send_dummy_mask_key must NOT run when ToggleStart was dropped on full channel"
+        );
+        assert_eq!(sender.dropped_count(), 1);
+        let _ = rx.try_recv().unwrap();
+        let _ = rx.try_recv().unwrap();
+
+        // 7. Mouse dispatch is gated by overlay_open across L/R/M button downs
+        dispatch_ll_mouse_event(WM_LBUTTONDOWN, 10, 20, false);
+        dispatch_ll_mouse_event(WM_RBUTTONDOWN, 30, 40, false);
+        dispatch_ll_mouse_event(WM_MBUTTONDOWN, 50, 60, false);
+        assert!(rx.try_recv().is_err());
+
+        dispatch_ll_mouse_event(WM_MOUSEMOVE, 99, 99, true); // non-click ignored
+        dispatch_ll_mouse_event(WM_LBUTTONDOWN, 10, 20, true);
+        dispatch_ll_mouse_event(WM_RBUTTONDOWN, 30, 40, true);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(10, 20));
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(30, 40));
+        dispatch_ll_mouse_event(WM_MBUTTONDOWN, 50, 60, true);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(50, 60));
     }
 }

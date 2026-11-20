@@ -238,6 +238,13 @@ impl WindowCoordinator {
         !self.fullscreen_suppressed
     }
 
+    /// Returns `true` only when `taskbar` bounds updates (`SetWindowPos`) may be applied.
+    /// While fullscreen suppression is active, callers must record logical state without
+    /// touching Win32 window position, Z-order, or visibility.
+    pub fn should_apply_taskbar_bounds(&self) -> bool {
+        !self.fullscreen_suppressed
+    }
+
     pub fn is_modal_picker_active(&self) -> bool {
         self.modal_picker_depth > 0
     }
@@ -442,6 +449,30 @@ impl WindowCoordinator {
             actions.taskbar_visible = Some(true);
         }
         actions
+    }
+
+    /// Single-authority fullscreen re-evaluation (AD-6).
+    /// Always classifies via `classify_fullscreen` and transitions suppression state cleanly.
+    pub fn reevaluate_fullscreen(
+        &mut self,
+        notification_state: NotificationState,
+        foreground: Option<&ForegroundWindowInfo>,
+        primary_monitor: PixelRect,
+    ) -> CoordinatorActions {
+        let is_fullscreen = classify_fullscreen(notification_state, foreground, primary_monitor);
+        self.on_fullscreen_changed(is_fullscreen)
+    }
+
+    /// Handles `ABN_FULLSCREENAPP` hints strictly as an immediate trigger to re-evaluate
+    /// `classify_fullscreen`, never trusting raw `lparam` (`_hint_entering`) on its own.
+    pub fn on_appbar_fullscreen_hint(
+        &mut self,
+        _hint_entering: bool,
+        notification_state: NotificationState,
+        foreground: Option<&ForegroundWindowInfo>,
+        primary_monitor: PixelRect,
+    ) -> CoordinatorActions {
+        self.reevaluate_fullscreen(notification_state, foreground, primary_monitor)
     }
 
     /// Bounds updates (`resize_taskbar_dock`, `set_bar_mode`) must never force
@@ -1130,5 +1161,118 @@ mod tests {
         let dismissed = coord.on_start_focus_lost(3200);
         assert_eq!(dismissed.start_visible, Some(false));
         assert!(!coord.is_start_open());
+    }
+
+    #[test]
+    fn appbar_fullscreen_hint_uses_single_authority_and_gates_bounds() {
+        let mon = mon_1080p();
+        let maximized_app = ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "Chrome_WidgetWin_1".to_string(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            rect: mon,
+        };
+        let borderless_game = ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "UnrealWindow".to_string(),
+            style: 0x9000_0000,
+            rect: mon,
+        };
+
+        let mut coord = WindowCoordinator::new();
+        assert!(coord.should_apply_taskbar_bounds());
+
+        // ABN_FULLSCREENAPP(true) over a normal maximized desktop app must NOT hide taskbar
+        let false_alarm = coord.on_appbar_fullscreen_hint(
+            true,
+            NotificationState::Busy,
+            Some(&maximized_app),
+            mon,
+        );
+        assert_eq!(false_alarm, CoordinatorActions::default());
+        assert!(!coord.is_fullscreen_suppressed());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
+
+        // Open Start before entering true fullscreen
+        let _ = coord.request_toggle_start(Some(true), 100);
+        assert!(coord.is_start_open());
+
+        // ABN_FULLSCREENAPP(false) while D3D fullscreen is active still enters suppression (ignores raw lparam)
+        let d3d_enter = coord.on_appbar_fullscreen_hint(
+            false,
+            NotificationState::RunningD3dFullScreen,
+            Some(&maximized_app),
+            mon,
+        );
+        assert_eq!(d3d_enter.taskbar_visible, Some(false));
+        assert_eq!(d3d_enter.start_visible, Some(false));
+        assert_eq!(d3d_enter.emit_start_state, Some(false));
+        assert!(coord.is_fullscreen_suppressed());
+        assert!(!coord.should_show_taskbar());
+        assert!(!coord.should_apply_taskbar_bounds());
+
+        // Bounds updates while suppressed remain blocked
+        assert_eq!(coord.on_taskbar_bounds_updated(), CoordinatorActions::default());
+        assert!(!coord.should_apply_taskbar_bounds());
+
+        // ABN_FULLSCREENAPP(false) while a borderless game is still covering monitor stays suppressed
+        let still_fs = coord.on_appbar_fullscreen_hint(
+            false,
+            NotificationState::AcceptsNotifications,
+            Some(&borderless_game),
+            mon,
+        );
+        assert_eq!(still_fs, CoordinatorActions::default());
+        assert!(coord.is_fullscreen_suppressed());
+        assert!(!coord.should_apply_taskbar_bounds());
+
+        // Exiting to desktop/normal window restores taskbar & bounds updates even if hint claims true
+        let exit = coord.on_appbar_fullscreen_hint(
+            true,
+            NotificationState::AcceptsNotifications,
+            Some(&maximized_app),
+            mon,
+        );
+        assert_eq!(exit.taskbar_visible, Some(true));
+        assert!(!coord.is_fullscreen_suppressed());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
+    }
+
+    #[test]
+    fn startup_reevaluate_fullscreen_suppresses_initial_bounds_and_visibility() {
+        let mon = mon_1080p();
+        let borderless_game = ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "UnityWndClass".to_string(),
+            style: 0x9000_0000,
+            rect: mon,
+        };
+
+        let mut coord = WindowCoordinator::new();
+        let startup_act = coord.reevaluate_fullscreen(
+            NotificationState::AcceptsNotifications,
+            Some(&borderless_game),
+            mon,
+        );
+        assert_eq!(startup_act.taskbar_visible, Some(false));
+        assert!(coord.is_fullscreen_suppressed());
+        assert!(!coord.should_show_taskbar());
+        assert!(!coord.should_apply_taskbar_bounds());
+
+        // Once game exits, reevaluate_fullscreen restores taskbar
+        let exit_act = coord.reevaluate_fullscreen(
+            NotificationState::AcceptsNotifications,
+            None,
+            mon,
+        );
+        assert_eq!(exit_act.taskbar_visible, Some(true));
+        assert!(!coord.is_fullscreen_suppressed());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
     }
 }

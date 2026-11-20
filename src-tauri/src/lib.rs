@@ -9,7 +9,7 @@ pub mod win_shell;
 pub mod windows_tracker;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
@@ -36,14 +36,29 @@ pub struct AppState {
     pub overlay_open: Arc<AtomicBool>,
     pub fullscreen_suppressed: Arc<AtomicBool>,
     pub taskbar_content_width: Mutex<i32>,
+    pub dpi_override: AtomicU32,
 }
 
 impl AppState {
     fn sync_overlay_flag(&self, coord: &WindowCoordinator) {
-        self.overlay_open
-            .store(coord.has_open_overlay(), Ordering::Release);
+        let overlay_open = coord.has_open_overlay();
+        self.overlay_open.store(overlay_open, Ordering::Release);
+        win_shell::set_overlay_open_hint(overlay_open);
         self.fullscreen_suppressed
             .store(coord.is_fullscreen_suppressed(), Ordering::Release);
+    }
+
+    fn set_dpi_override(&self, dpi: u32) {
+        self.dpi_override.store(dpi, Ordering::Release);
+    }
+
+    fn clear_dpi_override(&self) {
+        self.dpi_override.store(0, Ordering::Release);
+    }
+
+    fn current_dpi_override(&self) -> Option<u32> {
+        let dpi = self.dpi_override.load(Ordering::Acquire);
+        (dpi > 0).then_some(dpi)
     }
 }
 
@@ -71,16 +86,41 @@ fn scale_factor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
-fn reevaluate_fullscreen(app: &AppHandle) {
-    let fs = win_shell::is_fullscreen_active();
-    let actions = {
-        let st = app.state::<AppState>();
-        let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-        let act = coord.on_fullscreen_changed(fs);
-        st.sync_overlay_flag(&coord);
-        act
+fn apply_fullscreen_snapshot(
+    state: &AppState,
+    hint_entering: Option<bool>,
+    snap: &win_shell::FullscreenSnapshot,
+) -> CoordinatorActions {
+    let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+    let act = match hint_entering {
+        Some(entering) => coord.on_appbar_fullscreen_hint(
+            entering,
+            snap.notification_state,
+            snap.foreground.as_ref(),
+            snap.primary_monitor,
+        ),
+        None => coord.reevaluate_fullscreen(
+            snap.notification_state,
+            snap.foreground.as_ref(),
+            snap.primary_monitor,
+        ),
     };
+    state.sync_overlay_flag(&coord);
+    act
+}
+
+fn reevaluate_fullscreen(app: &AppHandle) -> CoordinatorActions {
+    let snap = win_shell::query_fullscreen_snapshot();
+    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), None, &snap);
     apply_coordinator_actions(app, &actions, None);
+    actions
+}
+
+fn reevaluate_fullscreen_with_hint(app: &AppHandle, hint_entering: bool) -> CoordinatorActions {
+    let snap = win_shell::query_fullscreen_snapshot();
+    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), Some(hint_entering), &snap);
+    apply_coordinator_actions(app, &actions, None);
+    actions
 }
 
 fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
@@ -97,35 +137,104 @@ fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
     rects
 }
 
-fn position_taskbar_window(
-    app: &AppHandle,
+fn effective_taskbar_scale_factor(dpi_override: Option<u32>, fallback_sf: f64) -> f64 {
+    if let Some(dpi) = dpi_override.filter(|&d| d > 0) {
+        dpi as f64 / 96.0
+    } else if fallback_sf.is_finite() && fallback_sf > 0.0 {
+        fallback_sf
+    } else {
+        1.0
+    }
+}
+
+fn compute_taskbar_bounds(
+    mon: win_shell::MonitorRect,
+    sf: f64,
     bar_mode: &str,
     logical_content_w: i32,
-    dpi_override: Option<u32>,
-) {
-    let Some(tb) = app.get_webview_window("taskbar") else { return };
-    let Some(hwnd) = win_hwnd(&tb) else { return };
-    let sf = dpi_override
-        .filter(|&d| d > 0)
-        .map(|d| d as f64 / 96.0)
-        .unwrap_or_else(|| tb.scale_factor().unwrap_or(1.0));
-    let mon = win_shell::primary_monitor_rect();
-
-    let (w_px, h_px, x_px, y_px) = if BarMode::from_config_str(bar_mode) == BarMode::Edge {
-        let h = (52.0 * sf).round() as i32;
-        (mon.width, h, mon.left, mon.bottom - h)
+) -> PixelRect {
+    let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
+    let mon_w = mon.width.max(0);
+    let mon_h = mon.height.max(0);
+    if BarMode::from_config_str(bar_mode) == BarMode::Edge {
+        let h = ((52.0 * sf).round() as i32).clamp(0, mon_h);
+        PixelRect::new(mon.left, mon.bottom - h, mon.left + mon_w, mon.bottom)
     } else {
         // Dock mode: exact capsule width + subtle shadow margin so desktop left/right stays natively clickable
-        let w = ((logical_content_w.clamp(380, 1600) + 28) as f64 * sf).round() as i32;
-        let w = w.min(mon.width - 16);
-        let h = (68.0 * sf).round() as i32;
-        let x = mon.left + (mon.width - w) / 2;
+        let desired_w = ((logical_content_w.clamp(380, 1600) + 28) as f64 * sf).round() as i32;
+        let max_w = (mon_w - 16).max(0);
+        let w = desired_w.clamp(0, max_w);
+        let h = ((68.0 * sf).round() as i32).clamp(0, mon_h);
+        let x = mon.left + (mon_w - w) / 2;
         let y = mon.bottom - h;
-        (w, h, x, y)
+        PixelRect::new(x, y, x + w, y + h)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskbarLayoutInput {
+    bar_mode: String,
+    logical_content_w: i32,
+    dpi_override: Option<u32>,
+}
+
+fn read_taskbar_layout_if_allowed(state: &AppState) -> Option<TaskbarLayoutInput> {
+    let allow = state
+        .coordinator
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .should_apply_taskbar_bounds();
+    if !allow {
+        return None;
+    }
+    let bar_mode = state
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bar_mode
+        .clone();
+    let logical_content_w = *state
+        .taskbar_content_width
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Some(TaskbarLayoutInput {
+        bar_mode,
+        logical_content_w,
+        dpi_override: state.current_dpi_override(),
+    })
+}
+
+#[cfg(test)]
+fn plan_taskbar_bounds_update(
+    state: &AppState,
+    mon: win_shell::MonitorRect,
+    fallback_sf: f64,
+) -> Option<PixelRect> {
+    let input = read_taskbar_layout_if_allowed(state)?;
+    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf);
+    Some(compute_taskbar_bounds(
+        mon,
+        sf,
+        &input.bar_mode,
+        input.logical_content_w,
+    ))
+}
+
+fn position_taskbar_window(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let Some(input) = read_taskbar_layout_if_allowed(&st) else {
+        return;
     };
+    let Some(tb) = app.get_webview_window("taskbar") else { return };
+    let Some(hwnd) = win_hwnd(&tb) else { return };
+    let fallback_sf = tb.scale_factor().unwrap_or(1.0);
+    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf);
+    let mon = win_shell::primary_monitor_rect();
+
+    let rect = compute_taskbar_bounds(mon, sf, &input.bar_mode, input.logical_content_w);
 
     // Never force visibility here so fullscreen suppression cannot leak on bounds updates.
-    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
+    win_shell::position_window(hwnd, rect.left, rect.top, rect.width(), rect.height());
 }
 
 fn position_start_window(app: &AppHandle, hwnd: isize) {
@@ -185,6 +294,22 @@ fn position_flyout_window(app: &AppHandle, hwnd: isize, req: &FlyoutRequest) {
     win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
 }
 
+fn apply_taskbar_visibility_action<FPos, FVis>(
+    taskbar_visible: Option<bool>,
+    reposition: FPos,
+    set_visible: FVis,
+) where
+    FPos: FnOnce(),
+    FVis: FnOnce(bool),
+{
+    if let Some(tb_vis) = taskbar_visible {
+        if tb_vis {
+            reposition();
+        }
+        set_visible(tb_vis);
+    }
+}
+
 fn apply_coordinator_actions(
     app: &AppHandle,
     actions: &CoordinatorActions,
@@ -208,13 +333,17 @@ fn apply_coordinator_actions(
     }
 
     // 2. Taskbar visibility (fullscreen auto-hide / restore)
-    if let Some(tb_vis) = actions.taskbar_visible {
-        if let Some(tb) = app.get_webview_window("taskbar") {
-            if let Some(hwnd) = win_hwnd(&tb) {
-                win_shell::set_window_visible(hwnd, tb_vis, true);
+    apply_taskbar_visibility_action(
+        actions.taskbar_visible,
+        || position_taskbar_window(app),
+        |tb_vis| {
+            if let Some(tb) = app.get_webview_window("taskbar") {
+                if let Some(hwnd) = win_hwnd(&tb) {
+                    win_shell::set_window_visible(hwnd, tb_vis, true);
+                }
             }
-        }
-    }
+        },
+    );
 
     // 3. Show incoming surfaces via visibility only (never 1x1 shrink or per-open GWL_EXSTYLE flip)
     if actions.start_visible == Some(true) {
@@ -305,16 +434,15 @@ fn get_config(state: State<AppState>) -> TestBarConfig {
 #[tauri::command]
 fn set_bar_mode(app: AppHandle, state: State<AppState>, mode: String) -> Result<TestBarConfig, String> {
     let updated = {
-        let mut cfg = state.config.lock().unwrap();
+        let mut cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
         cfg.bar_mode = if mode == "edge" { "edge".to_string() } else { "dock".to_string() };
         config::save_config(&cfg)?;
         cfg.clone()
     };
-    let cw = *state.taskbar_content_width.lock().unwrap();
     if state.hide_native {
         win_shell::update_appbar_mode(BarMode::from_config_str(&updated.bar_mode));
     }
-    position_taskbar_window(&app, &updated.bar_mode, cw, None);
+    position_taskbar_window(&app);
     let actions = state
         .coordinator
         .lock()
@@ -340,9 +468,11 @@ fn set_autostart(app: AppHandle, state: State<AppState>, enable: bool) -> Result
 
 #[tauri::command]
 fn resize_taskbar_dock(app: AppHandle, state: State<AppState>, logical_width: i32) {
-    *state.taskbar_content_width.lock().unwrap() = logical_width;
-    let mode = state.config.lock().unwrap().bar_mode.clone();
-    position_taskbar_window(&app, &mode, logical_width, None);
+    *state
+        .taskbar_content_width
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = logical_width;
+    position_taskbar_window(&app);
     let actions = state
         .coordinator
         .lock()
@@ -696,6 +826,7 @@ fn power_action(action: String) -> Result<(), String> {
 
 #[tauri::command]
 fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
+    win_shell::stop_shell_hook_thread();
     if state.hide_native {
         win_shell::stop_appbar_message_window();
         win_shell::restore_native_taskbar();
@@ -732,6 +863,7 @@ pub fn run(hide_native: bool) {
 
     let overlay_open = Arc::new(AtomicBool::new(false));
     let fullscreen_suppressed = Arc::new(AtomicBool::new(false));
+    win_shell::set_overlay_open_hint(false);
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
         installed_apps: Mutex::new(Vec::new()),
@@ -741,6 +873,7 @@ pub fn run(hide_native: bool) {
         overlay_open: Arc::clone(&overlay_open),
         fullscreen_suppressed: Arc::clone(&fullscreen_suppressed),
         taskbar_content_width: Mutex::new(620),
+        dpi_override: AtomicU32::new(0),
     };
 
     let app = tauri::Builder::default()
@@ -808,33 +941,28 @@ pub fn run(hide_native: bool) {
                             move |ev| {
                                 let h = h_appbar.clone();
                                 let _ = h_appbar.run_on_main_thread(move || match ev {
-                                    ShellAppBarEvent::FullscreenHint(_) => {
-                                        reevaluate_fullscreen(&h);
+                                    ShellAppBarEvent::FullscreenHint(entering) => {
+                                        let _ = reevaluate_fullscreen_with_hint(&h, entering);
                                     }
                                     ShellAppBarEvent::PositionChanged
                                     | ShellAppBarEvent::TaskbarCreated
                                     | ShellAppBarEvent::DisplayChanged
                                     | ShellAppBarEvent::DpiChanged(_) => {
-                                        let dpi_override = match ev {
-                                            ShellAppBarEvent::DpiChanged(dpi) => Some(dpi),
-                                            _ => None,
-                                        };
-                                        let (bar_mode, cw) = {
-                                            let st = h.state::<AppState>();
-                                            let mode = st
-                                                .config
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .bar_mode
-                                                .clone();
-                                            let cw = *st
-                                                .taskbar_content_width
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            (mode, cw)
-                                        };
-                                        position_taskbar_window(&h, &bar_mode, cw, dpi_override);
-                                        reevaluate_fullscreen(&h);
+                                        match ev {
+                                            ShellAppBarEvent::DpiChanged(dpi) => {
+                                                h.state::<AppState>().set_dpi_override(dpi);
+                                            }
+                                            ShellAppBarEvent::DisplayChanged => {
+                                                h.state::<AppState>().clear_dpi_override();
+                                            }
+                                            _ => {}
+                                        }
+                                        let actions = reevaluate_fullscreen(&h);
+                                        // If fullscreen just exited, apply_coordinator_actions already
+                                        // repositioned the taskbar with the latest DPI/mode/width before showing it.
+                                        if actions.taskbar_visible != Some(true) {
+                                            position_taskbar_window(&h);
+                                        }
                                     }
                                 });
                             },
@@ -843,7 +971,8 @@ pub fn run(hide_native: bool) {
                             return Err(err.into());
                         }
                     }
-                    position_taskbar_window(&handle, &mode, 620, None);
+                    let _ = reevaluate_fullscreen(&handle);
+                    position_taskbar_window(&handle);
                     let show_tb = app
                         .state::<AppState>()
                         .coordinator
@@ -1025,6 +1154,7 @@ pub fn run(hide_native: bool) {
 
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            win_shell::stop_shell_hook_thread();
             if hide_native {
                 win_shell::stop_appbar_message_window();
                 win_shell::restore_native_taskbar();
@@ -1061,5 +1191,241 @@ mod integration_tests {
         let layout = system_widgets::get_keyboard_layout_code();
         assert!(!layout.is_empty());
         println!("Layout OK: {}", layout);
+    }
+
+    fn make_test_app_state(bar_mode: &str, width: i32) -> AppState {
+        let mut cfg = TestBarConfig::default();
+        cfg.bar_mode = bar_mode.to_string();
+        AppState {
+            config: Mutex::new(cfg),
+            installed_apps: Mutex::new(Vec::new()),
+            steam_games: Mutex::new(Vec::new()),
+            hide_native: false,
+            coordinator: Mutex::new(WindowCoordinator::new()),
+            overlay_open: Arc::new(AtomicBool::new(false)),
+            fullscreen_suppressed: Arc::new(AtomicBool::new(false)),
+            taskbar_content_width: Mutex::new(width),
+            dpi_override: AtomicU32::new(0),
+        }
+    }
+
+    #[test]
+    fn taskbar_bounds_suppressed_during_fullscreen_and_repositioned_on_exit() {
+        let mon_rect = PixelRect::new(0, 0, 1920, 1080);
+        let mon = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+            width: 1920,
+            height: 1080,
+        };
+        let borderless_game = coordinator::ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "UnrealWindow".to_string(),
+            style: 0x9000_0000,
+            rect: mon_rect,
+        };
+        let state = make_test_app_state("dock", 620);
+
+        // Normal desktop: bounds update allowed with initial Dock width 620
+        let initial_bounds = plan_taskbar_bounds_update(&state, mon, 1.0)
+            .expect("bounds should be allowed on normal desktop");
+        assert_eq!(initial_bounds.width(), 648);
+        assert_eq!(initial_bounds.height(), 68);
+        assert_eq!(initial_bounds.bottom, 1080);
+
+        // Enter fullscreen -> bounds updates must be suppressed (None)
+        let fs_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::AcceptsNotifications,
+            foreground: Some(borderless_game),
+            primary_monitor: mon_rect,
+        };
+        let enter_act = apply_fullscreen_snapshot(&state, None, &fs_snap);
+        assert_eq!(enter_act.taskbar_visible, Some(false));
+        assert!(state.fullscreen_suppressed.load(Ordering::Acquire));
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+
+        // Simulate resize_taskbar_dock and set_bar_mode mutations while suppressed
+        *state.taskbar_content_width.lock().unwrap() = 840;
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        state.config.lock().unwrap().bar_mode = "edge".to_string();
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+
+        // Exit fullscreen -> taskbar_visible == Some(true) and bounds reflect latest Edge mode
+        let desktop_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::AcceptsNotifications,
+            foreground: None,
+            primary_monitor: mon_rect,
+        };
+        let exit_act = apply_fullscreen_snapshot(&state, None, &desktop_snap);
+        assert_eq!(exit_act.taskbar_visible, Some(true));
+        assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
+
+        let restored_edge = plan_taskbar_bounds_update(&state, mon, 1.0)
+            .expect("bounds should apply on fullscreen exit");
+        assert_eq!(restored_edge, PixelRect::new(0, 1080 - 52, 1920, 1080));
+
+        // Switch back to dock -> reflects recorded logical width 840 (+ 28 shadow margin = 868)
+        state.config.lock().unwrap().bar_mode = "dock".to_string();
+        let restored_dock = plan_taskbar_bounds_update(&state, mon, 1.0)
+            .expect("bounds should apply in dock mode");
+        assert_eq!(restored_dock.width(), 868);
+        assert_eq!(restored_dock.height(), 68);
+    }
+
+    #[test]
+    fn abn_fullscreenapp_hint_reevaluates_via_single_authority_and_syncs_state() {
+        let mon_rect = PixelRect::new(0, 0, 1920, 1080);
+        let mon = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+            width: 1920,
+            height: 1080,
+        };
+        let maximized_app = coordinator::ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "Chrome_WidgetWin_1".to_string(),
+            style: coordinator::WS_CAPTION_FLAG | coordinator::WS_THICKFRAME_FLAG,
+            rect: mon_rect,
+        };
+        let state = make_test_app_state("dock", 620);
+
+        // ABN_FULLSCREENAPP(true) over maximized desktop app keeps taskbar visible & bounds active
+        let max_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::Busy,
+            foreground: Some(maximized_app.clone()),
+            primary_monitor: mon_rect,
+        };
+        let act_max = apply_fullscreen_snapshot(&state, Some(true), &max_snap);
+        assert_eq!(act_max, CoordinatorActions::default());
+        assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
+        assert!(plan_taskbar_bounds_update(&state, mon, 1.0).is_some());
+
+        // ABN_FULLSCREENAPP(false) while D3D fullscreen is active still suppresses taskbar
+        let d3d_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::RunningD3dFullScreen,
+            foreground: Some(maximized_app.clone()),
+            primary_monitor: mon_rect,
+        };
+        let act_d3d = apply_fullscreen_snapshot(&state, Some(false), &d3d_snap);
+        assert_eq!(act_d3d.taskbar_visible, Some(false));
+        assert!(state.fullscreen_suppressed.load(Ordering::Acquire));
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+
+        // ABN_FULLSCREENAPP(true) once D3D exits back to maximized app restores taskbar
+        let act_restore = apply_fullscreen_snapshot(&state, Some(true), &max_snap);
+        assert_eq!(act_restore.taskbar_visible, Some(true));
+        assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
+        assert!(plan_taskbar_bounds_update(&state, mon, 1.0).is_some());
+    }
+
+    #[test]
+    fn apply_taskbar_visibility_action_repositions_before_showing_and_skips_on_hide() {
+        let trace = std::cell::RefCell::new(Vec::new());
+        apply_taskbar_visibility_action(
+            None,
+            || trace.borrow_mut().push("reposition"),
+            |_| trace.borrow_mut().push("visible"),
+        );
+        assert!(trace.borrow().is_empty());
+
+        apply_taskbar_visibility_action(
+            Some(false),
+            || trace.borrow_mut().push("reposition"),
+            |v| trace.borrow_mut().push(if v { "show" } else { "hide" }),
+        );
+        assert_eq!(*trace.borrow(), vec!["hide"]);
+
+        trace.borrow_mut().clear();
+        apply_taskbar_visibility_action(
+            Some(true),
+            || trace.borrow_mut().push("reposition"),
+            |v| trace.borrow_mut().push(if v { "show" } else { "hide" }),
+        );
+        assert_eq!(*trace.borrow(), vec!["reposition", "show"]);
+    }
+
+    #[test]
+    fn dpi_changed_during_fullscreen_persists_until_exit_and_bounds_guard_narrow_and_invalid_sf() {
+        let mon_rect = PixelRect::new(0, 0, 2560, 1440);
+        let mon = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+            width: 2560,
+            height: 1440,
+        };
+        let state = make_test_app_state("dock", 620);
+
+        // Enter fullscreen
+        let fs_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::RunningD3dFullScreen,
+            foreground: None,
+            primary_monitor: mon_rect,
+        };
+        assert_eq!(
+            apply_fullscreen_snapshot(&state, None, &fs_snap).taskbar_visible,
+            Some(false)
+        );
+
+        // DpiChanged(144 = 150%) arrives while fullscreen-suppressed: persisted but bounds stay suppressed
+        state.set_dpi_override(144);
+        assert_eq!(state.current_dpi_override(), Some(144));
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+
+        // Exit fullscreen: bounds immediately use persisted 144 DPI (1.5x), not stale fallback 1.0x
+        let desktop_snap = win_shell::FullscreenSnapshot {
+            notification_state: coordinator::NotificationState::AcceptsNotifications,
+            foreground: None,
+            primary_monitor: mon_rect,
+        };
+        assert_eq!(
+            apply_fullscreen_snapshot(&state, None, &desktop_snap).taskbar_visible,
+            Some(true)
+        );
+        let restored = plan_taskbar_bounds_update(&state, mon, 1.0)
+            .expect("bounds should apply on fullscreen exit");
+        // (620 + 28) * 1.5 = 972, height = 68 * 1.5 = 102
+        assert_eq!(restored.width(), 972);
+        assert_eq!(restored.height(), 102);
+
+        // DisplayChanged clears dpi_override so fallback scale_factor applies again
+        state.clear_dpi_override();
+        assert_eq!(state.current_dpi_override(), None);
+        let after_display_change = plan_taskbar_bounds_update(&state, mon, 1.25).unwrap();
+        // (620 + 28) * 1.25 = 810, height = 68 * 1.25 = 85
+        assert_eq!(after_display_change.width(), 810);
+        assert_eq!(after_display_change.height(), 85);
+
+        // Narrow monitors (< 16px) and non-finite/non-positive scale factors never invert bounds
+        let narrow = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 40,
+            width: 10,
+            height: 40,
+        };
+        for bad_sf in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -2.0] {
+            let dock = compute_taskbar_bounds(narrow, bad_sf, "dock", 620);
+            assert!(dock.width() >= 0 && dock.right >= dock.left);
+            assert!(dock.height() >= 0 && dock.bottom >= dock.top);
+            assert_eq!(dock.width(), 0);
+            assert_eq!(dock.height(), 40);
+
+            let edge = compute_taskbar_bounds(narrow, bad_sf, "edge", 620);
+            assert_eq!(edge.width(), 10);
+            assert_eq!(edge.height(), 40);
+        }
+
+        // Valid HiDPI 200% (sf = 2.0) on normal monitor
+        let hidpi_edge = compute_taskbar_bounds(mon, 2.0, "edge", 620);
+        assert_eq!(hidpi_edge, PixelRect::new(0, 1440 - 104, 2560, 1440));
     }
 }
