@@ -1823,6 +1823,7 @@ pub fn run(hide_native: bool) {
             if let Some(start_win) = app.get_webview_window("start") {
                 if let Some(hwnd) = win_hwnd(&start_win) {
                     win_shell::style_overlay_window(hwnd, false);
+                    position_start_window(&handle, &start_win, hwnd);
                 }
                 let h_blur = handle.clone();
                 start_win.on_window_event(move |ev| {
