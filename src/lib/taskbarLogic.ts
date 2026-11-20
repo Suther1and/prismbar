@@ -61,6 +61,88 @@ export function isInteractiveFlyoutActive(activeFlyout: string): boolean {
   return INTERACTIVE_FLYOUT_KINDS.has(activeFlyout);
 }
 
+export const VOLUME_OSD_WIDTH = 176;
+export const VOLUME_OSD_HEIGHT = 44;
+
+export interface VolumeOsdPayload {
+  volume: number;
+  muted: boolean;
+}
+
+export interface SoundFeedbackPlan {
+  openOsd: boolean;
+  volume: number;
+  muted: boolean;
+  req: FlyoutRequest | null;
+}
+
+export function isSoundFlyoutActive(activeFlyout: string): boolean {
+  return activeFlyout === 'sound' || activeFlyout === 'quick';
+}
+
+/**
+ * Per AD-1 preemption: floating Volume OSD must NEVER overwrite an already-open Quick Sound
+ * flyout (which updates live in place) or any other interactive click flyout.
+ */
+export function shouldOpenVolumeOsd(activeFlyout: string): boolean {
+  if (isSoundFlyoutActive(activeFlyout)) return false;
+  if (isInteractiveFlyoutActive(activeFlyout)) return false;
+  return true;
+}
+
+export function computeNextWheelVolume(currentVolume: number, deltaY: number, step = 4): number {
+  const safeCurrent = Number.isFinite(currentVolume) ? Math.round(currentVolume) : 0;
+  const delta = deltaY < 0 ? step : deltaY > 0 ? -step : 0;
+  return Math.max(0, Math.min(100, safeCurrent + delta));
+}
+
+export function buildVolumeOsdRequest(
+  volume: number,
+  muted: boolean,
+  anchorXLogical: number,
+  monitor: TaskbarMonitor,
+): FlyoutRequest {
+  const clampedVolume = Math.max(0, Math.min(100, Math.round(Number.isFinite(volume) ? volume : 0)));
+  const payload: VolumeOsdPayload = {
+    volume: clampedVolume,
+    muted,
+  };
+  return {
+    kind: 'osd',
+    anchorXLogical,
+    anchorInTaskbar: true,
+    width: VOLUME_OSD_WIDTH,
+    height: VOLUME_OSD_HEIGHT,
+    noActivate: true,
+    monitor,
+    payload,
+  };
+}
+
+export function planSoundFeedbackAction(
+  activeFlyout: string,
+  nextVolume: number,
+  nextMuted: boolean,
+  anchorXLogical: number,
+  monitor: TaskbarMonitor,
+): SoundFeedbackPlan {
+  const volume = Math.max(0, Math.min(100, Math.round(Number.isFinite(nextVolume) ? nextVolume : 0)));
+  if (!shouldOpenVolumeOsd(activeFlyout)) {
+    return {
+      openOsd: false,
+      volume,
+      muted: nextMuted,
+      req: null,
+    };
+  }
+  return {
+    openOsd: true,
+    volume,
+    muted: nextMuted,
+    req: buildVolumeOsdRequest(volume, nextMuted, anchorXLogical, monitor),
+  };
+}
+
 /**
  * Hover preview must never trigger for idle pins, while Start is open, or while an
  * interactive click flyout (tray, sound, calendar, context menu) is active (AD-1).

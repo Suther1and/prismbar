@@ -92,7 +92,7 @@ export const StartView: React.FC = () => {
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
       onEvent<IndexedApp[]>('apps-indexed', setApps),
       onEvent<SteamGame[]>('games-indexed', setGames),
-      onEvent<AudioState>('audio-updated', setAudio),
+      onEvent<AudioState>('audio-mixer-updated', setAudio),
       onEvent<MediaState>('media-updated', setMedia),
       onEvent<TelemetryState>('telemetry-updated', setTelem),
       onEvent<ClipboardEntry[]>('clipboard-updated', setClips),
@@ -780,10 +780,20 @@ export const StartView: React.FC = () => {
                       </div>
                     ) : (
                       mixerSessions.map((s) => (
-                        <div key={s.pid} className={`mix-row ${s.muted ? 'muted' : ''}`}>
+                        <div key={s.id} className={`mix-row ${s.muted ? 'muted' : ''}`}>
                           <button
                             className="mix-mute"
-                            onClick={() => ipc<AudioState>('set_session_volume', { pid: s.pid, volume: s.volume, muted: !s.muted }).then(setAudio)}
+                            onClick={() =>
+                              ipc<AudioState>('set_session_volume', {
+                                pid: s.pid,
+                                pids: s.pids,
+                                appKey: s.id,
+                                volume: s.volume,
+                                muted: !s.muted,
+                              })
+                                .then(setAudio)
+                                .catch(() => {})
+                            }
                           >
                             <VolIcon muted={s.muted} />
                           </button>
@@ -794,7 +804,17 @@ export const StartView: React.FC = () => {
                             min={0}
                             max={100}
                             value={s.muted ? 0 : s.volume}
-                            onChange={(e) => ipc<AudioState>('set_session_volume', { pid: s.pid, volume: Number(e.target.value), muted: false }).then(setAudio)}
+                            onChange={(e) =>
+                              ipc<AudioState>('set_session_volume', {
+                                pid: s.pid,
+                                pids: s.pids,
+                                appKey: s.id,
+                                volume: Number(e.target.value),
+                                muted: false,
+                              })
+                                .then(setAudio)
+                                .catch(() => {})
+                            }
                           />
                           <span className="mix-val">{s.muted ? '0%' : `${s.volume}%`}</span>
                         </div>
@@ -1223,10 +1243,20 @@ export const StartView: React.FC = () => {
                   </button>
                   <div className="mixer-list">
                     {mixerSessions.slice(0, 3).map((s) => (
-                      <div key={s.pid} className={`mix-row ${s.muted ? 'muted' : ''}`}>
+                      <div key={s.id} className={`mix-row ${s.muted ? 'muted' : ''}`}>
                         <button
                           className="mix-mute"
-                          onClick={() => ipc<AudioState>('set_session_volume', { pid: s.pid, volume: s.volume, muted: !s.muted }).then(setAudio)}
+                          onClick={() =>
+                            ipc<AudioState>('set_session_volume', {
+                              pid: s.pid,
+                              pids: s.pids,
+                              appKey: s.id,
+                              volume: s.volume,
+                              muted: !s.muted,
+                            })
+                              .then(setAudio)
+                              .catch(() => {})
+                          }
                         >
                           <VolIcon muted={s.muted} />
                         </button>
@@ -1237,7 +1267,17 @@ export const StartView: React.FC = () => {
                           min={0}
                           max={100}
                           value={s.muted ? 0 : s.volume}
-                          onChange={(e) => ipc<AudioState>('set_session_volume', { pid: s.pid, volume: Number(e.target.value), muted: false }).then(setAudio)}
+                          onChange={(e) =>
+                            ipc<AudioState>('set_session_volume', {
+                              pid: s.pid,
+                              pids: s.pids,
+                              appKey: s.id,
+                              volume: Number(e.target.value),
+                              muted: false,
+                            })
+                              .then(setAudio)
+                              .catch(() => {})
+                          }
                         />
                         <span className="mix-val">{s.muted ? '0%' : `${s.volume}%`}</span>
                       </div>

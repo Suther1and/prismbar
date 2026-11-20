@@ -16,14 +16,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use apps_indexer::{IndexedApp, SteamGame};
-use audio::AudioState;
+use audio::{AudioMasterState, AudioState};
 use config::{CustomSpace, PinItem, TestBarConfig};
 use coordinator::{
     BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect, WindowCoordinator,
 };
 use icon_cache::IconCache;
 use media::MediaState;
-use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, TrayAppItem};
+use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, SessionAlert, TrayAppItem};
 use telemetry::TelemetryState;
 use win_shell::{ShellAppBarEvent, ShellHookEvent, WatchdogArgs};
 use windows_tracker::{AppWindowGroup, JumpListItem};
@@ -173,6 +173,67 @@ fn diff_window_update_targets(
     coord: &WindowCoordinator,
 ) -> Option<Vec<&'static str>> {
     diff_window_update_targets_with_secondary(last_fp, groups, coord, false)
+}
+
+/// Diff-gates lightweight `audio-master-updated` emissions and targets ONLY visible surfaces (AD-6).
+fn diff_audio_master_targets(
+    last: &mut Option<AudioMasterState>,
+    current: &AudioMasterState,
+    coord: &WindowCoordinator,
+    secondary_taskbar_visible: bool,
+) -> Option<Vec<&'static str>> {
+    if last.as_ref() == Some(current) {
+        return None;
+    }
+    *last = Some(current.clone());
+    Some(coord.audio_master_targets_with_secondary(secondary_taskbar_visible))
+}
+
+/// Diff-gates full `audio-mixer-updated` emissions and targets ONLY `"start"` / `"flyout(sound)"` (AD-6).
+/// Returns `None` without advancing `last` when no mixer-capable surface is visible.
+fn diff_audio_mixer_targets(
+    last: &mut Option<AudioState>,
+    current: &AudioState,
+    coord: &WindowCoordinator,
+) -> Option<Vec<&'static str>> {
+    let targets = coord.audio_mixer_targets();
+    if targets.is_empty() {
+        *last = None;
+        return None;
+    }
+    if last.as_ref() == Some(current) {
+        return None;
+    }
+    *last = Some(current.clone());
+    Some(targets)
+}
+
+fn emit_audio_state_targeted(app: &AppHandle, audio_state: &AudioState) {
+    let st = app.state::<AppState>();
+    let sec_vis = st.secondary_taskbar_visible.load(Ordering::Acquire);
+    let (master_targets, mixer_targets) = {
+        let coord = lock_unpoisoned(&st.coordinator);
+        (
+            coord.audio_master_targets_with_secondary(sec_vis),
+            coord.audio_mixer_targets(),
+        )
+    };
+    let master = audio_state.to_master_state();
+    for target in master_targets {
+        let _ = app.emit_to(target, "audio-master-updated", &master);
+    }
+    for target in mixer_targets {
+        let _ = app.emit_to(target, "audio-mixer-updated", audio_state);
+    }
+}
+
+fn emit_session_alerts_if_calendar_open(app: &AppHandle) {
+    let is_cal = lock_unpoisoned(&app.state::<AppState>().coordinator).active_flyout()
+        == Some(FlyoutKind::Calendar);
+    if is_cal {
+        let alerts = system_widgets::get_session_alerts();
+        let _ = app.emit_to("flyout", "session-alerts-updated", &alerts);
+    }
 }
 
 fn dispatch_coordinator<F>(
@@ -452,6 +513,11 @@ fn sync_secondary_taskbar(app: &AppHandle) {
                 let _ = app.emit_to("taskbar-secondary", "windows-updated", &win_snap);
                 let _ = app.emit_to("taskbar-secondary", "layout-updated", &layout);
                 let _ = app.emit_to("taskbar-secondary", "start-state", start_open);
+                let h_sec = app.clone();
+                std::thread::spawn(move || {
+                    let master = audio::get_audio_master_state();
+                    let _ = h_sec.emit_to("taskbar-secondary", "audio-master-updated", &master);
+                });
             }
             return;
         }
@@ -625,6 +691,14 @@ fn apply_coordinator_actions(
         // Hydrate Start immediately on hidden -> visible transition (AD-6)
         let snapshot = lock_unpoisoned(&st.last_window_groups).clone();
         let _ = app.emit_to("start", "windows-updated", &snapshot);
+        let h_aud = app.clone();
+        std::thread::spawn(move || {
+            let aud = audio::get_audio_state();
+            if lock_unpoisoned(&h_aud.state::<AppState>().coordinator).is_start_visible() {
+                let _ = h_aud.emit_to("start", "audio-mixer-updated", &aud);
+                let _ = h_aud.emit_to("start", "audio-master-updated", &aud.to_master_state());
+            }
+        });
     }
 
     if actions.flyout_visible == Some(true) {
@@ -649,6 +723,31 @@ fn apply_coordinator_actions(
         // Hydrate Flyout immediately on hidden -> visible transition (AD-6)
         let snapshot = lock_unpoisoned(&st.last_window_groups).clone();
         let _ = app.emit_to("flyout", "windows-updated", &snapshot);
+        if let Some(req) = flyout_req {
+            match req.kind {
+                FlyoutKind::Sound => {
+                    let h_aud = app.clone();
+                    std::thread::spawn(move || {
+                        let aud = audio::get_audio_state();
+                        if lock_unpoisoned(&h_aud.state::<AppState>().coordinator).active_flyout()
+                            == Some(FlyoutKind::Sound)
+                        {
+                            let _ = h_aud.emit_to("flyout", "audio-mixer-updated", &aud);
+                            let _ = h_aud.emit_to(
+                                "flyout",
+                                "audio-master-updated",
+                                &aud.to_master_state(),
+                            );
+                        }
+                    });
+                }
+                FlyoutKind::Calendar => {
+                    let alerts = system_widgets::get_session_alerts();
+                    let _ = app.emit_to("flyout", "session-alerts-updated", &alerts);
+                }
+                _ => {}
+            }
+        }
     }
 
     // 4. Emit canonical state events
@@ -934,6 +1033,11 @@ fn close_flyout(app: AppHandle) {
 }
 
 #[tauri::command]
+fn close_osd(app: AppHandle) {
+    dispatch_coordinator(&app, None, |coord| coord.request_close_osd());
+}
+
+#[tauri::command]
 fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
     let is_preview =
         lock_unpoisoned(&state.coordinator).active_flyout() == Some(FlyoutKind::Preview);
@@ -1134,10 +1238,19 @@ fn get_audio_state() -> AudioState {
 }
 
 #[tauri::command]
-fn set_master_volume(app: AppHandle, volume: u32, muted: Option<bool>) -> Result<AudioState, String> {
+fn get_audio_master_state() -> AudioMasterState {
+    audio::get_audio_master_state()
+}
+
+#[tauri::command]
+fn set_master_volume(
+    app: AppHandle,
+    volume: u32,
+    muted: Option<bool>,
+) -> Result<AudioState, String> {
     audio::set_master_volume(volume, muted)?;
     let st = audio::get_audio_state();
-    let _ = app.emit("audio-updated", &st);
+    emit_audio_state_targeted(&app, &st);
     Ok(st)
 }
 
@@ -1145,23 +1258,44 @@ fn set_master_volume(app: AppHandle, volume: u32, muted: Option<bool>) -> Result
 fn set_mic_muted(app: AppHandle, muted: bool) -> Result<AudioState, String> {
     audio::set_mic_muted(muted)?;
     let st = audio::get_audio_state();
-    let _ = app.emit("audio-updated", &st);
+    emit_audio_state_targeted(&app, &st);
     Ok(st)
 }
 
 #[tauri::command]
-fn set_session_volume(app: AppHandle, pid: u32, volume: u32, muted: Option<bool>) -> Result<AudioState, String> {
-    audio::set_session_volume(pid, volume, muted)?;
+fn set_session_volume(
+    app: AppHandle,
+    pid: u32,
+    pids: Option<Vec<u32>>,
+    app_key: Option<String>,
+    volume: u32,
+    muted: Option<bool>,
+) -> Result<AudioState, String> {
+    audio::set_session_volume_for_app(
+        pid,
+        pids.as_deref(),
+        app_key.as_deref(),
+        volume,
+        muted,
+    )?;
     let st = audio::get_audio_state();
-    let _ = app.emit("audio-updated", &st);
+    emit_audio_state_targeted(&app, &st);
     Ok(st)
 }
 
 #[tauri::command]
 fn set_audio_device(app: AppHandle, device_id: String) -> Result<AudioState, String> {
-    audio::set_default_audio_device(&device_id)?;
+    if let Err(err) = audio::set_default_audio_device(&device_id) {
+        let _ = system_widgets::push_session_alert(
+            "warn",
+            "Ошибка переключения звука",
+            Some(err.clone()),
+        );
+        emit_session_alerts_if_calendar_open(&app);
+        return Err(err);
+    }
     let st = audio::get_audio_state();
-    let _ = app.emit("audio-updated", &st);
+    emit_audio_state_targeted(&app, &st);
     Ok(st)
 }
 
@@ -1237,8 +1371,49 @@ fn get_peripherals() -> Vec<PeripheralBattery> {
 }
 
 #[tauri::command]
-fn get_tray_apps() -> Vec<TrayAppItem> {
-    system_widgets::list_tray_background_apps()
+fn get_tray_apps(state: State<AppState>) -> Vec<TrayAppItem> {
+    let open_groups = windows_tracker::list_open_window_groups_cached(&state.icon_cache);
+    *lock_unpoisoned(&state.last_window_groups) = open_groups.clone();
+    system_widgets::list_tray_background_apps_cached(&state.icon_cache, &open_groups)
+}
+
+#[tauri::command]
+fn activate_tray_app(
+    app: AppHandle,
+    hwnd: Option<isize>,
+    exe_path: String,
+) -> Result<(), String> {
+    close_start_and_flyout(&app, false, true);
+    system_widgets::activate_tray_app(hwnd, &exe_path)
+}
+
+#[tauri::command]
+fn end_tray_app_task(pids: Vec<u32>) -> Result<(), String> {
+    system_widgets::end_tray_app_task(&pids)
+}
+
+#[tauri::command]
+fn open_native_windows_tray(app: AppHandle) -> Result<(), String> {
+    close_start_and_flyout(&app, false, true);
+    system_widgets::trigger_native_tray_overflow()
+}
+
+#[tauri::command]
+fn get_session_alerts() -> Vec<SessionAlert> {
+    system_widgets::get_session_alerts()
+}
+
+#[tauri::command]
+fn clear_session_alerts(app: AppHandle) -> Vec<SessionAlert> {
+    let list = system_widgets::clear_session_alerts();
+    let _ = app.emit_to("flyout", "session-alerts-updated", &list);
+    list
+}
+
+#[tauri::command]
+fn open_windows_notifications(app: AppHandle) -> Result<(), String> {
+    close_start_and_flyout(&app, false, true);
+    system_widgets::open_windows_notifications()
 }
 
 #[tauri::command]
@@ -1326,6 +1501,7 @@ pub fn run(hide_native: bool) {
             open_flyout,
             resize_flyout,
             close_flyout,
+            close_osd,
             close_preview_if_outside,
             get_open_windows,
             get_icons,
@@ -1347,6 +1523,7 @@ pub fn run(hide_native: bool) {
             pick_folder,
             pick_file,
             get_audio_state,
+            get_audio_master_state,
             set_master_volume,
             set_mic_muted,
             set_session_volume,
@@ -1362,6 +1539,12 @@ pub fn run(hide_native: bool) {
             switch_keyboard_layout,
             get_peripherals,
             get_tray_apps,
+            activate_tray_app,
+            end_tray_app_task,
+            open_native_windows_tray,
+            get_session_alerts,
+            clear_session_alerts,
+            open_windows_notifications,
             get_network_info,
             power_action,
             restore_windows_taskbar_and_exit,
@@ -1396,6 +1579,14 @@ pub fn run(hide_native: bool) {
                                             }
                                             ShellAppBarEvent::DisplayChanged => {
                                                 h.state::<AppState>().clear_dpi_override();
+                                            }
+                                            ShellAppBarEvent::TaskbarCreated => {
+                                                let _ = system_widgets::push_session_alert(
+                                                    "info",
+                                                    "Проводник перезапущен",
+                                                    Some("Панель TestBar и рабочая область восстановлены".to_string()),
+                                                );
+                                                emit_session_alerts_if_calendar_open(&h);
                                             }
                                             _ => {}
                                         }
@@ -1569,13 +1760,65 @@ pub fn run(hide_native: bool) {
                 }
             });
 
-            // Slower poller for audio, media, telemetry, and Bluetooth peripherals
+            // Slower poller for split audio (diff-gated, visible-surface targeted),
+            // media, telemetry, and Bluetooth peripherals
             let h_slow = handle.clone();
             std::thread::spawn(move || {
                 let mut tick = 0u64;
+                let mut last_audio_master: Option<AudioMasterState> = None;
+                let mut last_audio_mixer: Option<AudioState> = None;
                 loop {
-                    let audio_st = audio::get_audio_state();
-                    let _ = h_slow.emit("audio-updated", &audio_st);
+                    let mixer_needed = !lock_unpoisoned(&h_slow.state::<AppState>().coordinator)
+                        .audio_mixer_targets()
+                        .is_empty();
+
+                    if mixer_needed {
+                        let audio_st = audio::get_audio_state();
+                        let master = audio_st.to_master_state();
+                        let (master_targets, mixer_targets) = {
+                            let st = h_slow.state::<AppState>();
+                            let sec_vis = st.secondary_taskbar_visible.load(Ordering::Acquire);
+                            let coord = lock_unpoisoned(&st.coordinator);
+                            (
+                                diff_audio_master_targets(
+                                    &mut last_audio_master,
+                                    &master,
+                                    &coord,
+                                    sec_vis,
+                                ),
+                                diff_audio_mixer_targets(&mut last_audio_mixer, &audio_st, &coord),
+                            )
+                        };
+                        if let Some(targets) = master_targets {
+                            for target in targets {
+                                let _ = h_slow.emit_to(target, "audio-master-updated", &master);
+                            }
+                        }
+                        if let Some(targets) = mixer_targets {
+                            for target in targets {
+                                let _ = h_slow.emit_to(target, "audio-mixer-updated", &audio_st);
+                            }
+                        }
+                    } else {
+                        last_audio_mixer = None;
+                        let master = audio::get_audio_master_state();
+                        let master_targets = {
+                            let st = h_slow.state::<AppState>();
+                            let sec_vis = st.secondary_taskbar_visible.load(Ordering::Acquire);
+                            let coord = lock_unpoisoned(&st.coordinator);
+                            diff_audio_master_targets(
+                                &mut last_audio_master,
+                                &master,
+                                &coord,
+                                sec_vis,
+                            )
+                        };
+                        if let Some(targets) = master_targets {
+                            for target in targets {
+                                let _ = h_slow.emit_to(target, "audio-master-updated", &master);
+                            }
+                        }
+                    }
 
                     let media_st = media::get_media_state();
                     let _ = h_slow.emit("media-updated", &media_st);
@@ -1630,10 +1873,17 @@ mod integration_tests {
         );
 
         let aud = audio::get_audio_state();
+        let master = audio::get_audio_master_state();
+        assert_eq!(aud.master_volume, master.master_volume);
         println!("Audio OK: vol={}%, muted={}, devices={}, sessions={}", aud.master_volume, aud.master_muted, aud.devices.len(), aud.sessions.len());
 
-        let wins = windows_tracker::list_open_window_groups();
+        let cache = Mutex::new(IconCache::default());
+        let wins = windows_tracker::list_open_window_groups_cached(&cache);
         println!("Windows OK: {} groups", wins.len());
+
+        let tray = system_widgets::list_tray_background_apps_cached(&cache, &wins);
+        let tray_with_icons = tray.iter().filter(|t| t.icon_key.is_some()).count();
+        println!("Tray OK: {} background apps ({} with cached icon_key)", tray.len(), tray_with_icons);
 
         let games = apps_indexer::scan_steam_games();
         println!("Steam OK: {} games found", games.len());
@@ -2445,6 +2695,84 @@ mod integration_tests {
         assert!(
             checked_commands >= 10,
             "expected to inspect all tauri commands, found {checked_commands}"
+        );
+    }
+
+    #[test]
+    fn audio_split_diff_gating_targets_only_visible_surfaces_and_skips_unchanged() {
+        let mut coord = WindowCoordinator::new();
+        let mut last_master: Option<AudioMasterState> = None;
+        let mut last_mixer: Option<AudioState> = None;
+
+        let mut full = AudioState {
+            available: true,
+            master_volume: 52,
+            master_muted: false,
+            mic_muted: false,
+            devices: vec![audio::AudioDeviceInfo {
+                id: "d1".into(),
+                name: "Speakers (Realtek)".into(),
+                short_name: "Speakers".into(),
+                is_default: true,
+            }],
+            sessions: vec![],
+        };
+        let master1 = full.to_master_state();
+
+        // 1. Idle desktop: first master poll targets taskbar only; mixer is NEVER emitted
+        assert_eq!(
+            diff_audio_master_targets(&mut last_master, &master1, &coord, false),
+            Some(vec!["taskbar"])
+        );
+        assert_eq!(
+            diff_audio_master_targets(&mut last_master, &master1, &coord, false),
+            None,
+            "identical master state must not re-emit"
+        );
+        assert_eq!(
+            diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
+            None,
+            "mixer must never emit while Start and Quick Sound are hidden"
+        );
+
+        // 2. Open Tray flyout: still no mixer emission, master skips hidden flyout
+        let _ = coord.request_open_flyout(FlyoutKind::Tray, 100);
+        full.master_volume = 56;
+        let master2 = full.to_master_state();
+        assert_eq!(
+            diff_audio_master_targets(&mut last_master, &master2, &coord, true),
+            Some(vec!["taskbar", "taskbar-secondary"])
+        );
+        assert_eq!(diff_audio_mixer_targets(&mut last_mixer, &full, &coord), None);
+
+        // 3. Open Sound flyout: mixer emits to flyout only; identical poll skips
+        let _ = coord.request_open_flyout(FlyoutKind::Sound, 200);
+        assert_eq!(
+            diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
+            Some(vec!["flyout"])
+        );
+        assert_eq!(
+            diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
+            None
+        );
+
+        // 4. Master change while Sound open targets taskbar + secondary + flyout
+        full.master_volume = 60;
+        let master3 = full.to_master_state();
+        assert_eq!(
+            diff_audio_master_targets(&mut last_master, &master3, &coord, true),
+            Some(vec!["taskbar", "taskbar-secondary", "flyout"])
+        );
+
+        // 5. Open Start (closes Sound): mixer emits to start only
+        let _ = coord.request_toggle_start(Some(true), 300);
+        assert_eq!(
+            diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
+            Some(vec!["start"])
+        );
+        assert_eq!(
+            diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
+            None
         );
     }
 }

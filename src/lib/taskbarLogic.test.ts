@@ -5,11 +5,18 @@ import {
   buildBarContextMenuRequest,
   buildPinFromAppContext,
   buildPreviewFlyoutRequest,
+  buildVolumeOsdRequest,
   computeDockLogicalWidth,
+  computeNextWheelVolume,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
+  isSoundFlyoutActive,
+  planSoundFeedbackAction,
   resolveTaskbarMonitor,
+  shouldOpenVolumeOsd,
   shouldTriggerPreviewHover,
+  VOLUME_OSD_HEIGHT,
+  VOLUME_OSD_WIDTH,
   type AppContextPayload,
 } from './taskbarLogic';
 
@@ -197,5 +204,54 @@ describe('Preview hover preemption & flyout payload builders', () => {
     const edgeReq = buildBarContextMenuRequest('edge', 900, 'secondary');
     expect(edgeReq.monitor).toBe('secondary');
     expect(edgeReq.payload).toEqual({ barMode: 'edge' });
+  });
+});
+
+describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => {
+  it('never opens OSD when Quick Sound or another interactive flyout is already open (AD-1)', () => {
+    expect(isSoundFlyoutActive('sound')).toBe(true);
+    expect(isSoundFlyoutActive('quick')).toBe(true);
+    expect(isSoundFlyoutActive('osd')).toBe(false);
+
+    // Allowed when idle, preview, or already showing OSD
+    expect(shouldOpenVolumeOsd('')).toBe(true);
+    expect(shouldOpenVolumeOsd('preview')).toBe(true);
+    expect(shouldOpenVolumeOsd('osd')).toBe(true);
+
+    // Blocked for Quick Sound and all interactive click flyouts
+    for (const active of ['sound', 'quick', 'tray', 'calendar', 'context_app', 'context_bar']) {
+      expect(shouldOpenVolumeOsd(active)).toBe(false);
+    }
+
+    // Open Sound -> updates in place (openOsd = false, req = null)
+    const inPlace = planSoundFeedbackAction('sound', 72, false, 640, 'primary');
+    expect(inPlace).toEqual({ openOsd: false, volume: 72, muted: false, req: null });
+
+    // Idle -> opens non-activating 176x44 OSD above Sound pill
+    const osdPlan = planSoundFeedbackAction('', 72, false, 640, 'secondary');
+    expect(osdPlan.openOsd).toBe(true);
+    expect(osdPlan.req).toEqual({
+      kind: 'osd',
+      anchorXLogical: 640,
+      anchorInTaskbar: true,
+      width: VOLUME_OSD_WIDTH,
+      height: VOLUME_OSD_HEIGHT,
+      noActivate: true,
+      monitor: 'secondary',
+      payload: { volume: 72, muted: false },
+    });
+  });
+
+  it('clamps OSD volume and computes mouse-wheel steps cleanly', () => {
+    const clampedHigh = buildVolumeOsdRequest(140, false, 300, 'primary');
+    expect(clampedHigh.payload).toEqual({ volume: 100, muted: false });
+
+    const clampedLow = buildVolumeOsdRequest(-15, true, 300, 'primary');
+    expect(clampedLow.payload).toEqual({ volume: 0, muted: true });
+
+    expect(computeNextWheelVolume(40, -120)).toBe(44);
+    expect(computeNextWheelVolume(40, 120)).toBe(36);
+    expect(computeNextWheelVolume(0, 120)).toBe(0);
+    expect(computeNextWheelVolume(100, -120)).toBe(100);
   });
 });

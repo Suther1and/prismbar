@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM,
-    RECT, RPC_E_CHANGED_MODE, SIZE, S_FALSE, S_OK, WPARAM,
+    CloseHandle, BOOL, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+    ERROR_SUCCESS, HWND, LPARAM, RECT, RPC_E_CHANGED_MODE, SIZE, STILL_ACTIVE, S_FALSE, S_OK,
+    WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
@@ -22,7 +23,7 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, STGM,
 };
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
     QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
@@ -171,6 +172,26 @@ pub fn process_exe_path(pid: u32) -> Option<String> {
     }
 }
 
+/// Checks whether a Win32 process `pid` is still alive (`STILL_ACTIVE`).
+/// Returns `true` on `ERROR_ACCESS_DENIED` (elevated live process) and `false` if the process
+/// does not exist or has already exited.
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut exit_code: u32 = 0;
+                let ok = GetExitCodeProcess(handle, &mut exit_code).is_ok();
+                let _ = CloseHandle(handle);
+                ok && exit_code == STILL_ACTIVE.0 as u32
+            }
+            Err(err) => err.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        }
+    }
+}
+
 /// Queries the packaged Application User Model ID (AUMID) for a process, if it is a
 /// packaged UWP / MSIX / WinUI3 app. Returns `None` for classic unpackaged Win32 processes.
 pub fn process_aumid(pid: u32) -> Option<String> {
@@ -200,13 +221,13 @@ pub fn process_aumid(pid: u32) -> Option<String> {
 }
 
 /// Enumerates child windows of an `ApplicationFrameHost.exe` top-level window to locate
-/// the hosted UWP child process (preferring `Windows.UI.Core.CoreWindow`, then any child
+/// the hosted UWP child window & PID (preferring `Windows.UI.Core.CoreWindow`, then any child
 /// whose PID differs from `host_pid`).
-fn resolve_uwp_child_pid(host_hwnd: HWND, host_pid: u32) -> Option<u32> {
+pub fn resolve_uwp_core_window_hwnd(host_hwnd: HWND, host_pid: u32) -> Option<(HWND, u32)> {
     struct ChildCtx {
         host_pid: u32,
-        core_window_pid: Option<u32>,
-        fallback_pid: Option<u32>,
+        core_window: Option<(HWND, u32)>,
+        fallback: Option<(HWND, u32)>,
     }
 
     extern "system" fn child_proc(child: HWND, lparam: LPARAM) -> BOOL {
@@ -222,12 +243,12 @@ fn resolve_uwp_child_pid(host_hwnd: HWND, host_pid: u32) -> Option<u32> {
             if len > 0 {
                 let cls = String::from_utf16_lossy(&cls_buf[..len as usize]);
                 if cls == "Windows.UI.Core.CoreWindow" {
-                    ctx.core_window_pid = Some(pid);
+                    ctx.core_window = Some((child, pid));
                     return BOOL(0);
                 }
             }
-            if ctx.fallback_pid.is_none() {
-                ctx.fallback_pid = Some(pid);
+            if ctx.fallback.is_none() {
+                ctx.fallback = Some((child, pid));
             }
             BOOL(1)
         }
@@ -235,13 +256,17 @@ fn resolve_uwp_child_pid(host_hwnd: HWND, host_pid: u32) -> Option<u32> {
 
     let mut ctx = ChildCtx {
         host_pid,
-        core_window_pid: None,
-        fallback_pid: None,
+        core_window: None,
+        fallback: None,
     };
     unsafe {
         let _ = EnumChildWindows(host_hwnd, Some(child_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
-    ctx.core_window_pid.or(ctx.fallback_pid)
+    ctx.core_window.or(ctx.fallback)
+}
+
+fn resolve_uwp_child_pid(host_hwnd: HWND, host_pid: u32) -> Option<u32> {
+    resolve_uwp_core_window_hwnd(host_hwnd, host_pid).map(|(_, pid)| pid)
 }
 
 fn known_friendly_exe_name(stem_lower: &str) -> Option<&'static str> {
@@ -595,6 +620,46 @@ pub fn extract_icon_for_path(path: &str) -> Option<String> {
     extract_icon_for_path_cached(path, fallback_icon_cache())
 }
 
+/// Resolves an icon into the unified `IconCache` for an executable path (preferring
+/// `exe:<hash>` via `SHGetFileInfoW`, falling back to `WM_GETICON`/`GCLP_HICON` on `hwnd`,
+/// then `hwnd:<hwnd>:0`). Used by Tray Overflow so every background app gets its crisp cached icon.
+pub fn resolve_exe_or_hwnd_icon_key(
+    exe_path: &str,
+    hwnd_raw: Option<isize>,
+    cache: &Mutex<IconCache>,
+) -> Option<String> {
+    let trimmed = exe_path.trim();
+    let hwnd = hwnd_raw
+        .filter(|&h| h != 0)
+        .map(|h| HWND(h as *mut _))
+        .unwrap_or_default();
+
+    if !trimmed.is_empty() && !is_application_frame_host(trimmed) {
+        let key = icon_cache::path_icon_key(trimmed);
+        if lock_unpoisoned(cache).get(&key).is_some() {
+            return Some(key);
+        }
+        let extracted =
+            extract_path_icon_raw(trimmed).or_else(|| extract_live_window_hicon(hwnd));
+        if let Some(uri) = extracted {
+            lock_unpoisoned(cache).put(key.clone(), uri);
+            return Some(key);
+        }
+    }
+
+    if let Some(raw) = hwnd_raw.filter(|&h| h != 0) {
+        let key = icon_cache::hwnd_key(raw, 0);
+        if lock_unpoisoned(cache).get(&key).is_some() {
+            return Some(key);
+        }
+        let extracted = extract_live_window_hicon(HWND(raw as *mut _))?;
+        lock_unpoisoned(cache).put(key.clone(), extracted);
+        return Some(key);
+    }
+
+    None
+}
+
 fn resolve_window_icon_key(win: &OpenWindowInfo, cache: &Mutex<IconCache>) -> Option<String> {
     let hwnd = HWND(win.hwnd as *mut _);
 
@@ -899,6 +964,87 @@ fn format_terminate_error(pid: u32, err: windows::core::Error, stage: &str) -> S
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PidTerminateOutcome {
+    Terminated,
+    AlreadyExited,
+    AccessDenied(String),
+    Failed(String),
+}
+
+pub fn summarize_pid_termination_results(results: &[PidTerminateOutcome]) -> Result<(), String> {
+    if results.is_empty() {
+        return Err("Нет активных процессов для завершения".to_string());
+    }
+    let mut terminated = 0usize;
+    let mut already_exited = 0usize;
+    let mut access_denied: Option<String> = None;
+    let mut other_err: Option<String> = None;
+
+    for outcome in results {
+        match outcome {
+            PidTerminateOutcome::Terminated => terminated += 1,
+            PidTerminateOutcome::AlreadyExited => already_exited += 1,
+            PidTerminateOutcome::AccessDenied(msg) => {
+                if access_denied.is_none() {
+                    access_denied = Some(msg.clone());
+                }
+            }
+            PidTerminateOutcome::Failed(msg) => {
+                if other_err.is_none() {
+                    other_err = Some(msg.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(msg) = access_denied {
+        return Err(msg);
+    }
+    if terminated > 0 || (already_exited > 0 && other_err.is_none()) {
+        return Ok(());
+    }
+    Err(other_err.unwrap_or_else(|| "Не удалось завершить процесс".to_string()))
+}
+
+fn terminate_single_pid_outcome(pid: u32) -> PidTerminateOutcome {
+    if pid == 0 {
+        return PidTerminateOutcome::Failed("Некорректный PID процесса".to_string());
+    }
+    unsafe {
+        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) => h,
+            Err(err) => {
+                if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                    return PidTerminateOutcome::AccessDenied(format_terminate_error(
+                        pid, err, "открыть",
+                    ));
+                }
+                if err.code() == ERROR_INVALID_PARAMETER.to_hresult() {
+                    return PidTerminateOutcome::AlreadyExited;
+                }
+                return PidTerminateOutcome::Failed(format_terminate_error(pid, err, "открыть"));
+            }
+        };
+        let res = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+        match res {
+            Ok(()) => PidTerminateOutcome::Terminated,
+            Err(err) => {
+                if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                    PidTerminateOutcome::AccessDenied(format_terminate_error(
+                        pid,
+                        err,
+                        "завершить",
+                    ))
+                } else {
+                    PidTerminateOutcome::Failed(format_terminate_error(pid, err, "завершить"))
+                }
+            }
+        }
+    }
+}
+
 pub fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
     if pid == 0 {
         return Err("Некорректный PID процесса".to_string());
@@ -910,6 +1056,27 @@ pub fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
         let _ = CloseHandle(handle);
         res.map_err(|e| format_terminate_error(pid, e, "завершить"))
     }
+}
+
+/// Terminates all unique non-zero PIDs belonging to a background/multi-process app,
+/// tolerating sibling PIDs that already exited while always propagating OS permission errors.
+pub fn terminate_process_pids(pids: &[u32]) -> Result<(), String> {
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for &pid in pids {
+        if pid != 0 && pid != own_pid && seen.insert(pid) {
+            unique.push(pid);
+        }
+    }
+    if unique.is_empty() {
+        return Err("Нет активных процессов для завершения".to_string());
+    }
+    let outcomes: Vec<PidTerminateOutcome> = unique
+        .into_iter()
+        .map(terminate_single_pid_outcome)
+        .collect();
+    summarize_pid_termination_results(&outcomes)
 }
 
 /// Validates and normalizes target + optional CLI args for direct Win32 `ShellExecuteW`
@@ -1799,5 +1966,28 @@ mod tests {
             match_recent_entries_for_app(r"C:\Windows\explorer.exe", None, &recent, 4);
         assert_eq!(exp_recent.len(), 1);
         assert_eq!(exp_recent[0].title, "testbar");
+    }
+
+    #[test]
+    fn summarize_pid_termination_tolerates_already_exited_and_propagates_access_denied() {
+        assert!(summarize_pid_termination_results(&[]).is_err());
+        assert!(summarize_pid_termination_results(&[
+            PidTerminateOutcome::Terminated,
+            PidTerminateOutcome::AlreadyExited,
+        ])
+        .is_ok());
+
+        let denied = summarize_pid_termination_results(&[
+            PidTerminateOutcome::Terminated,
+            PidTerminateOutcome::AccessDenied("Отказано в доступе".into()),
+        ])
+        .unwrap_err();
+        assert!(denied.contains("Отказано в доступе"));
+
+        let failed = summarize_pid_termination_results(&[PidTerminateOutcome::Failed(
+            "OS error".into(),
+        )])
+        .unwrap_err();
+        assert!(failed.contains("OS error"));
     }
 }

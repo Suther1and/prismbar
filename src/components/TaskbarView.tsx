@@ -8,6 +8,7 @@ import {
   mergeTaskbarItems,
   onEvent,
   type AppWindowGroup,
+  type AudioMasterState,
   type AudioState,
   type FlyoutKind,
   type MergedBarItem,
@@ -18,12 +19,25 @@ import {
   buildBarContextMenuRequest,
   buildPreviewFlyoutRequest,
   computeDockLogicalWidth,
+  computeNextWheelVolume,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
+  planSoundFeedbackAction,
   resolveTaskbarMonitor,
   shouldTriggerPreviewHover,
 } from '../lib/taskbarLogic';
 import { FallbackAppIcon, StartLogoIcon, VolIcon } from './Icons';
+
+function audioStateToMaster(st: AudioState): AudioMasterState {
+  const active = st.devices.find((d) => d.isDefault);
+  return {
+    available: st.available,
+    masterVolume: st.masterVolume,
+    masterMuted: st.masterMuted,
+    micMuted: st.micMuted,
+    defaultDeviceShortName: active?.shortName ?? '',
+  };
+}
 
 export const TaskbarView: React.FC = () => {
   const monitor = useMemo(
@@ -33,18 +47,16 @@ export const TaskbarView: React.FC = () => {
 
   const [config, setConfig] = useState<TestBarConfig | null>(null);
   const [groups, setGroups] = useState<AppWindowGroup[]>([]);
-  const [audio, setAudio] = useState<AudioState | null>(null);
+  const [audioMaster, setAudioMaster] = useState<AudioMasterState | null>(null);
   const [layout, setLayout] = useState('RU');
   const [startOpen, setStartOpen] = useState(false);
   const [activeFlyout, setActiveFlyout] = useState<string>('');
   const [now, setNow] = useState(() => new Date());
   const [iconMap, setIconMap] = useState<Record<string, string>>({});
-  const [volToast, setVolToast] = useState<string | null>(null);
 
   const barRef = useRef<HTMLElement>(null);
   const hoverTimer = useRef<number | null>(null);
   const leaveTimer = useRef<number | null>(null);
-  const volToastTimer = useRef<number | null>(null);
 
   useEffect(() => {
     const t = window.setInterval(() => setNow(new Date()), 1000);
@@ -52,7 +64,6 @@ export const TaskbarView: React.FC = () => {
       window.clearInterval(t);
       if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
       if (leaveTimer.current) window.clearTimeout(leaveTimer.current);
-      if (volToastTimer.current) window.clearTimeout(volToastTimer.current);
     };
   }, []);
 
@@ -61,7 +72,7 @@ export const TaskbarView: React.FC = () => {
       .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
       .catch(() => {});
     ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
-    ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
+    ipc<AudioMasterState>('get_audio_master_state').then(setAudioMaster).catch(() => {});
     ipc<string>('get_keyboard_layout').then(setLayout).catch(() => {});
 
     const subs = [
@@ -69,7 +80,7 @@ export const TaskbarView: React.FC = () => {
         setConfig((prev) => applyConfigUpdate(prev, next)),
       ),
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
-      onEvent<AudioState>('audio-updated', setAudio),
+      onEvent<AudioMasterState>('audio-master-updated', setAudioMaster),
       onEvent<string>('layout-updated', setLayout),
       onEvent<boolean>('start-state', setStartOpen),
       onEvent<{ kind: string }>('flyout-show', (f) => setActiveFlyout(f.kind)),
@@ -244,39 +255,55 @@ export const TaskbarView: React.FC = () => {
     ipc('open_flyout', { req }).catch(() => {});
   };
 
-  const flashVol = (text: string) => {
-    setVolToast(text);
-    if (volToastTimer.current) window.clearTimeout(volToastTimer.current);
-    volToastTimer.current = window.setTimeout(() => setVolToast(null), 1100);
-  };
-
-  const handleSoundWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const cur = audio?.masterVolume ?? 50;
-    const next = Math.max(0, Math.min(100, cur + (e.deltaY < 0 ? 4 : -4)));
-    flashVol(`${next}%`);
-    ipc<AudioState>('set_master_volume', { volume: next, muted: false })
-      .then(setAudio)
+  const applyVolumeChange = (
+    el: HTMLElement,
+    nextVolume: number,
+    nextMuted: boolean,
+  ) => {
+    const plan = planSoundFeedbackAction(
+      activeFlyout,
+      nextVolume,
+      nextMuted,
+      anchorX(el),
+      monitor,
+    );
+    setAudioMaster((prev) => ({
+      available: prev?.available ?? true,
+      masterVolume: plan.volume,
+      masterMuted: plan.muted,
+      micMuted: prev?.micMuted ?? false,
+      defaultDeviceShortName: prev?.defaultDeviceShortName ?? '',
+    }));
+    if (plan.openOsd && plan.req) {
+      ipc('open_flyout', { req: plan.req }).catch(() => {});
+    }
+    ipc<AudioState>('set_master_volume', { volume: plan.volume, muted: plan.muted })
+      .then((st) => setAudioMaster(audioStateToMaster(st)))
       .catch(() => {});
   };
 
-  const handleSoundAux = (e: React.MouseEvent) => {
+  const handleSoundWheel = (e: React.WheelEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    const cur = audioMaster?.masterVolume ?? 0;
+    const next = computeNextWheelVolume(cur, e.deltaY, 4);
+    applyVolumeChange(e.currentTarget, next, false);
+  };
+
+  const handleSoundAux = (e: React.MouseEvent<HTMLButtonElement>) => {
     if (e.button === 1) {
       e.preventDefault();
-      const nextMute = !(audio?.masterMuted ?? false);
-      flashVol(nextMute ? 'Выкл' : `${audio?.masterVolume ?? 50}%`);
-      ipc<AudioState>('set_master_volume', {
-        volume: audio?.masterVolume ?? 50,
-        muted: nextMute,
-      })
-        .then(setAudio)
-        .catch(() => {});
+      const curVol = audioMaster?.masterVolume ?? 0;
+      const nextMute = !(audioMaster?.masterMuted ?? false);
+      applyVolumeChange(e.currentTarget, curVol, nextMute);
     }
   };
 
   const pad2 = (n: number) => String(n).padStart(2, '0');
   const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
   const dateStr = `${pad2(now.getDate())}.${pad2(now.getMonth() + 1)}.${now.getFullYear()}`;
+  const soundTooltip = audioMaster?.defaultDeviceShortName
+    ? `Звук (${audioMaster.defaultDeviceShortName}): ${audioMaster.masterMuted ? 'Выкл' : `${audioMaster.masterVolume}%`}`
+    : `Звук: ${audioMaster?.masterMuted ? 'Выкл' : `${audioMaster?.masterVolume ?? 0}%`}`;
 
   return (
     <div
@@ -338,7 +365,7 @@ export const TaskbarView: React.FC = () => {
             className={`tb-tray-btn chevron ${activeFlyout === 'tray' ? 'open' : ''}`}
             style={{ padding: '0 7px' }}
             title="Фоновые приложения"
-            onClick={(e) => openFlyoutAt('tray', e.currentTarget, 248, 224, false)}
+            onClick={(e) => openFlyoutAt('tray', e.currentTarget, 244, 210, false)}
           >
             <svg className="ic14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
               <polyline points="18 15 12 9 6 15" />
@@ -346,8 +373,7 @@ export const TaskbarView: React.FC = () => {
           </button>
 
           <button
-            className="tb-tray-btn"
-            style={{ fontFamily: '"Cascadia Code", monospace', fontSize: 11.5, fontWeight: 600, padding: '0 7px' }}
+            className="tb-tray-btn tb-lang-btn"
             title="Раскладка клавиатуры"
             onClick={() => ipc<string>('switch_keyboard_layout').then(setLayout).catch(() => {})}
           >
@@ -356,8 +382,8 @@ export const TaskbarView: React.FC = () => {
 
           <button
             className={`tb-tray-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''}`}
-            title={`Звук: ${audio?.masterMuted ? 'Выкл' : `${audio?.masterVolume ?? 0}%`}`}
-            onClick={(e) => openFlyoutAt('sound', e.currentTarget, 330, 290, false)}
+            title={soundTooltip}
+            onClick={(e) => openFlyoutAt('sound', e.currentTarget, 324, 304, false)}
             onWheel={handleSoundWheel}
             onAuxClick={handleSoundAux}
           >
@@ -366,17 +392,12 @@ export const TaskbarView: React.FC = () => {
               <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
               <line x1="12" y1="20" x2="12.01" y2="20" />
             </svg>
-            <VolIcon muted={audio?.masterMuted} />
-            {volToast && (
-              <span style={{ fontFamily: '"Cascadia Code", monospace', fontSize: 11, fontWeight: 600, color: 'var(--accent)' }}>
-                {volToast}
-              </span>
-            )}
+            <VolIcon muted={audioMaster?.masterMuted} />
           </button>
 
           <button
             className={`tb-tray-btn tb-clock ${activeFlyout === 'calendar' ? 'open' : ''}`}
-            onClick={(e) => openFlyoutAt('calendar', e.currentTarget, 310, 292, false)}
+            onClick={(e) => openFlyoutAt('calendar', e.currentTarget, 310, 396, false)}
           >
             <span style={{ fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{timeStr}</span>
             <span style={{ fontSize: 10, color: 'var(--t2)', fontVariantNumeric: 'tabular-nums' }}>{dateStr}</span>

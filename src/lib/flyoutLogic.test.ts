@@ -1,24 +1,32 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { ChevronLeftIcon } from '../components/Icons';
+import { BellIcon, ChevronLeftIcon, ChevronRightIcon, NativeTrayIcon } from '../components/Icons';
 import { TaskbarView } from '../components/TaskbarView';
 import type { AppWindowGroup, FlyoutRequest, OpenWindowInfo } from './ipc';
 import {
   canOpenFileLocation,
   canRunAsAdmin,
+  computeTrayFlyoutHeight,
   FLYOUT_EXIT_MS,
   formatIpcError,
+  formatTrayHeaderLabel,
+  getActiveDeviceIndex,
   INITIAL_FLYOUT_ANIM_STATE,
   isAppContextKind,
   isBarContextKind,
+  OSD_AUTO_CLOSE_MS,
   PREVIEW_LEAVE_COMMAND,
   reduceFlyoutEntered,
   reduceFlyoutHideComplete,
   reduceFlyoutHideStart,
   reduceFlyoutShow,
   removePreviewWindow,
+  stepVolume,
   syncPreviewWindowsFromGroups,
+  TRAY_CARD_WIDTH,
+  TRAY_COLUMNS,
+  TRAY_MIN_CARD_HEIGHT,
 } from './flyoutLogic';
 
 function makeReq(kind: FlyoutRequest['kind']): FlyoutRequest {
@@ -168,5 +176,70 @@ describe('Preview mouse-leave contract, per-window close & context menu guards',
     expect(formatIpcError('Отказано в доступе')).toBe('Отказано в доступе');
     expect(formatIpcError(new Error('Access denied'))).toBe('Access denied');
     expect(formatIpcError(null)).toBe('Не удалось выполнить действие');
+  });
+});
+
+describe('Epic 3: Tray 6-column layout, non-shifting tooltip, OSD & Quick Sound helpers', () => {
+  it('computes 6-column tray dimensions invariant to hover/overlay and always non-empty header', () => {
+    expect(TRAY_COLUMNS).toBe(6);
+    expect(TRAY_CARD_WIDTH).toBe(244);
+
+    // Header text is ALWAYS non-empty so fixed 24px bar never collapses or shifts grid vertically
+    expect(formatTrayHeaderLabel('', 0)).toBe('Фоновые приложения');
+    expect(formatTrayHeaderLabel('   ', 14)).toBe('Фоновые · 14');
+    expect(formatTrayHeaderLabel('Telegram', 14)).toBe('Telegram');
+
+    // Minimum height accommodates the right-click overlay menu even with 0..6 apps
+    expect(computeTrayFlyoutHeight(0)).toBe(TRAY_MIN_CARD_HEIGHT);
+    expect(computeTrayFlyoutHeight(6)).toBe(TRAY_MIN_CARD_HEIGHT);
+    // 18 apps -> 3 rows (3*34 + 2*4 = 110) + 46 = 156 -> still >= TRAY_MIN_CARD_HEIGHT
+    expect(computeTrayFlyoutHeight(18)).toBe(TRAY_MIN_CARD_HEIGHT);
+    // 24 apps -> 4 rows (4*34 + 3*4 = 148) + 46 = 194
+    expect(computeTrayFlyoutHeight(24)).toBe(194);
+    // 42 apps -> capped at 224px scrollable grid + 46 = 270px
+    expect(computeTrayFlyoutHeight(42)).toBe(270);
+    expect(computeTrayFlyoutHeight(80)).toBe(270);
+  });
+
+  it('updates consecutive OSD wheel ticks in place without bumping renderSeq, but replays enter after closing', () => {
+    expect(OSD_AUTO_CLOSE_MS).toBe(1100);
+
+    const openOsd = reduceFlyoutEntered(reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('osd')));
+    expect(openOsd.renderSeq).toBe(1);
+    expect(openOsd.phase).toBe('open');
+
+    // Next wheel tick updates payload in place without replaying flyIn bounce
+    const nextTickReq = { ...makeReq('osd'), payload: { volume: 64, muted: false } };
+    const updated = reduceFlyoutShow(openOsd, nextTickReq);
+    expect(updated.renderSeq).toBe(1);
+    expect(updated.phase).toBe('open');
+    expect(updated.req?.payload).toEqual({ volume: 64, muted: false });
+
+    // Reopening OSD while closing DOES bump renderSeq to cancel exit smoothly
+    const closing = reduceFlyoutHideStart(updated);
+    const reopened = reduceFlyoutShow(closing, nextTickReq);
+    expect(reopened.renderSeq).toBe(2);
+    expect(reopened.phase).toBe('entering');
+  });
+
+  it('resolves sliding device index, wheel volume steps & crisp inline SVG icons', () => {
+    expect(
+      getActiveDeviceIndex([
+        { isDefault: false },
+        { isDefault: true },
+        { isDefault: false },
+      ]),
+    ).toBe(1);
+    expect(getActiveDeviceIndex([{ isDefault: false }, { isDefault: false }])).toBe(0);
+
+    expect(stepVolume(50, -100, 4)).toBe(54);
+    expect(stepVolume(50, 100, 4)).toBe(46);
+    expect(stepVolume(98, -100, 4)).toBe(100);
+    expect(stepVolume(2, 100, 4)).toBe(0);
+
+    for (const Icon of [ChevronRightIcon, BellIcon, NativeTrayIcon]) {
+      const html = renderToStaticMarkup(createElement(Icon));
+      expect(html).toContain('<svg');
+    }
   });
 });

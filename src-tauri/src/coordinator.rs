@@ -299,6 +299,44 @@ impl WindowCoordinator {
         )
     }
 
+    /// Returns visible WebView labels that should receive lightweight `audio-master-updated`
+    /// events (AD-6): always `"taskbar"`, `"taskbar-secondary"` when visible, `"start"` when
+    /// visible, and `"flyout"` only when showing `Sound` or `Osd`.
+    pub fn audio_master_targets_with_secondary(
+        &self,
+        secondary_taskbar_visible: bool,
+    ) -> Vec<&'static str> {
+        let mut targets = Vec::with_capacity(4);
+        targets.push("taskbar");
+        if secondary_taskbar_visible {
+            targets.push("taskbar-secondary");
+        }
+        if self.is_start_visible() {
+            targets.push("start");
+        }
+        if matches!(
+            self.active_flyout,
+            Some(FlyoutKind::Sound | FlyoutKind::Osd)
+        ) {
+            targets.push("flyout");
+        }
+        targets
+    }
+
+    /// Returns visible WebView labels that should receive full `audio-mixer-updated`
+    /// payloads with devices & per-app sessions (AD-6): ONLY `"start"` when visible and
+    /// `"flyout"` when showing `FlyoutKind::Sound`.
+    pub fn audio_mixer_targets(&self) -> Vec<&'static str> {
+        let mut targets = Vec::with_capacity(2);
+        if self.is_start_visible() {
+            targets.push("start");
+        }
+        if self.active_flyout == Some(FlyoutKind::Sound) {
+            targets.push("flyout");
+        }
+        targets
+    }
+
     pub fn active_flyout(&self) -> Option<FlyoutKind> {
         self.active_flyout
     }
@@ -426,6 +464,14 @@ impl WindowCoordinator {
 
     pub fn request_close_preview(&mut self) -> CoordinatorActions {
         if self.active_flyout == Some(FlyoutKind::Preview) {
+            self.request_close_flyout()
+        } else {
+            CoordinatorActions::default()
+        }
+    }
+
+    pub fn request_close_osd(&mut self) -> CoordinatorActions {
+        if self.active_flyout == Some(FlyoutKind::Osd) {
             self.request_close_flyout()
         } else {
             CoordinatorActions::default()
@@ -1388,5 +1434,57 @@ mod tests {
 
         let _ = coord.request_close_flyout();
         assert_eq!(coord.windows_update_targets(), vec!["taskbar"]);
+    }
+
+    #[test]
+    fn audio_master_and_mixer_targets_and_close_osd_guard() {
+        let mut coord = WindowCoordinator::new();
+
+        // Idle desktop: master -> taskbar (+ secondary if visible); mixer -> empty!
+        assert_eq!(coord.audio_master_targets_with_secondary(false), vec!["taskbar"]);
+        assert_eq!(
+            coord.audio_master_targets_with_secondary(true),
+            vec!["taskbar", "taskbar-secondary"]
+        );
+        assert!(coord.audio_mixer_targets().is_empty());
+
+        // Tray or Calendar open: mixer stays empty, flyout does NOT receive audio spam
+        let _ = coord.request_open_flyout(FlyoutKind::Tray, 100);
+        assert_eq!(coord.audio_master_targets_with_secondary(false), vec!["taskbar"]);
+        assert!(coord.audio_mixer_targets().is_empty());
+        // close_osd must NOT dismiss Tray!
+        assert_eq!(coord.request_close_osd(), CoordinatorActions::default());
+        assert_eq!(coord.active_flyout(), Some(FlyoutKind::Tray));
+        let _ = coord.request_close_flyout();
+
+        // OSD open: master targets taskbar + flyout; mixer stays empty!
+        let _ = coord.request_open_flyout(FlyoutKind::Osd, 200);
+        assert_eq!(
+            coord.audio_master_targets_with_secondary(false),
+            vec!["taskbar", "flyout"]
+        );
+        assert!(coord.audio_mixer_targets().is_empty());
+        // close_osd cleanly closes OSD
+        let close_osd = coord.request_close_osd();
+        assert_eq!(close_osd.flyout_visible, Some(false));
+        assert_eq!(coord.active_flyout(), None);
+
+        // Quick Sound open: both master and mixer target flyout (and OSD cannot preempt it)
+        let _ = coord.request_open_flyout(FlyoutKind::Sound, 300);
+        assert_eq!(
+            coord.audio_master_targets_with_secondary(true),
+            vec!["taskbar", "taskbar-secondary", "flyout"]
+        );
+        assert_eq!(coord.audio_mixer_targets(), vec!["flyout"]);
+        assert_eq!(coord.request_close_osd(), CoordinatorActions::default());
+        assert_eq!(coord.active_flyout(), Some(FlyoutKind::Sound));
+
+        // Start open (closes Sound): mixer targets start only
+        let _ = coord.request_toggle_start(Some(true), 400);
+        assert_eq!(
+            coord.audio_master_targets_with_secondary(false),
+            vec!["taskbar", "start"]
+        );
+        assert_eq!(coord.audio_mixer_targets(), vec!["start"]);
     }
 }

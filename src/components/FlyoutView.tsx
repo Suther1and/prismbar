@@ -1,39 +1,64 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  buildCalendarMonthGrid,
+  formatAlertTime,
+  formatSelectedDateHeader,
+  isSameCalendarDay,
+  isViewingTodayMonth,
+  MONTHS_RU,
+  shiftCalendarMonth,
+  WEEKDAYS_SHORT_RU,
+  type CalendarMonthRef,
+} from '../lib/calendarLogic';
+import {
+  fetchIconsBatch,
+  iconCache,
   ipc,
+  isCacheIconKey,
   onEvent,
   type AppWindowGroup,
+  type AudioMasterState,
   type AudioState,
   type FlyoutRequest,
   type JumpListItem,
   type NetworkInfo,
   type OpenWindowInfo,
+  type SessionAlert,
   type TrayAppItem,
 } from '../lib/ipc';
 import {
   canOpenFileLocation,
   canRunAsAdmin,
+  computeTrayFlyoutHeight,
   FLYOUT_EXIT_MS,
   formatIpcError,
+  formatTrayHeaderLabel,
+  getActiveDeviceIndex,
   INITIAL_FLYOUT_ANIM_STATE,
   isAppContextKind,
   isBarContextKind,
+  OSD_AUTO_CLOSE_MS,
   PREVIEW_LEAVE_COMMAND,
   reduceFlyoutEntered,
   reduceFlyoutHideComplete,
   reduceFlyoutHideStart,
   reduceFlyoutShow,
   removePreviewWindow,
+  stepVolume,
   syncPreviewWindowsFromGroups,
+  TRAY_CARD_WIDTH,
   type FlyoutAnimState,
 } from '../lib/flyoutLogic';
 import {
   buildPinFromAppContext,
   type AppContextPayload,
   type BarContextPayload,
+  type VolumeOsdPayload,
 } from '../lib/taskbarLogic';
 import {
+  BellIcon,
   ChevronLeftIcon,
+  ChevronRightIcon,
   ClockRecentIcon,
   CloseWindowIcon,
   ExternalWindowIcon,
@@ -41,6 +66,7 @@ import {
   FolderSvg,
   KillIcon,
   LayoutBarIcon,
+  NativeTrayIcon,
   PinIcon,
   SettingsGearIcon,
   ShieldIcon,
@@ -49,30 +75,34 @@ import {
   XIcon10,
 } from './Icons';
 
-const MONTHS = [
-  'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
-  'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
-];
-
 export const FlyoutView: React.FC = () => {
   const [anim, setAnim] = useState<FlyoutAnimState>(INITIAL_FLYOUT_ANIM_STATE);
   const [trayApps, setTrayApps] = useState<TrayAppItem[]>([]);
+  const [trayIconMap, setTrayIconMap] = useState<Record<string, string>>({});
   const [trayHover, setTrayHover] = useState<string>('');
   const [trayCtxItem, setTrayCtxItem] = useState<TrayAppItem | null>(null);
   const [audio, setAudio] = useState<AudioState | null>(null);
+  const [osdState, setOsdState] = useState<VolumeOsdPayload>({ volume: 0, muted: false });
   const [net, setNet] = useState<NetworkInfo | null>(null);
   const [thumbs, setThumbs] = useState<Record<number, string>>({});
   const [previewGroupKey, setPreviewGroupKey] = useState<string>('');
   const [previewWindows, setPreviewWindows] = useState<OpenWindowInfo[]>([]);
   const [jumpList, setJumpList] = useState<JumpListItem[]>([]);
+  const [alerts, setAlerts] = useState<SessionAlert[]>([]);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [calDate, setCalDate] = useState(() => new Date());
+  const [calView, setCalView] = useState<CalendarMonthRef>(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
+  const [selectedDate, setSelectedDate] = useState<Date>(() => new Date());
 
   const exitTimerRef = useRef<number | null>(null);
+  const osdTimerRef = useRef<number | null>(null);
   const renderSeqRef = useRef<number>(0);
   const activeKindRef = useRef<string>('');
   const previewGroupKeyRef = useRef<string>('');
-  const ctxCardRef = useRef<HTMLDivElement | null>(null);
+  const trayCtxItemRef = useRef<TrayAppItem | null>(null);
+  const autoHeightRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     renderSeqRef.current = anim.renderSeq;
@@ -84,16 +114,43 @@ export const FlyoutView: React.FC = () => {
   }, [previewGroupKey]);
 
   useEffect(() => {
+    trayCtxItemRef.current = trayCtxItem;
+  }, [trayCtxItem]);
+
+  const clearOsdTimer = () => {
+    if (osdTimerRef.current !== null) {
+      window.clearTimeout(osdTimerRef.current);
+      osdTimerRef.current = null;
+    }
+  };
+
+  const armOsdAutoClose = () => {
+    clearOsdTimer();
+    osdTimerRef.current = window.setTimeout(() => {
+      osdTimerRef.current = null;
+      if (activeKindRef.current === 'osd') {
+        ipc('close_osd').catch(() => {});
+      }
+    }, OSD_AUTO_CLOSE_MS);
+  };
+
+  useEffect(() => {
     const subs = [
       onEvent<FlyoutRequest>('flyout-show', (r) => {
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
         }
-        const nextSeq = renderSeqRef.current + 1;
+        const prevKind = activeKindRef.current;
+        const nextSeq =
+          r.kind === 'osd' && prevKind === 'osd' ? renderSeqRef.current : renderSeqRef.current + 1;
         renderSeqRef.current = nextSeq;
         activeKindRef.current = r.kind;
         setAnim((prev) => reduceFlyoutShow(prev, r));
+
+        if (r.kind !== 'osd') {
+          clearOsdTimer();
+        }
         setTrayCtxItem(null);
         setTrayHover('');
         setActionError(null);
@@ -106,10 +163,46 @@ export const FlyoutView: React.FC = () => {
         }
 
         if (r.kind === 'tray') {
-          ipc<TrayAppItem[]>('get_tray_apps').then(setTrayApps).catch(() => {});
+          ipc<TrayAppItem[]>('get_tray_apps')
+            .then((items) => {
+              if (renderSeqRef.current !== nextSeq) return;
+              setTrayApps(items);
+              ipc('resize_flyout', {
+                width: TRAY_CARD_WIDTH,
+                height: computeTrayFlyoutHeight(items.length),
+              }).catch(() => {});
+            })
+            .catch(() => {});
+        } else if (r.kind === 'osd') {
+          const payload = (r.payload ?? {}) as Partial<VolumeOsdPayload>;
+          setOsdState({
+            volume:
+              typeof payload.volume === 'number' && Number.isFinite(payload.volume)
+                ? Math.max(0, Math.min(100, Math.round(payload.volume)))
+                : 0,
+            muted: Boolean(payload.muted),
+          });
+          armOsdAutoClose();
         } else if (r.kind === 'sound' || r.kind === 'quick') {
-          ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
-          ipc<NetworkInfo>('get_network_info').then(setNet).catch(() => {});
+          ipc<AudioState>('get_audio_state')
+            .then((st) => {
+              if (renderSeqRef.current === nextSeq) setAudio(st);
+            })
+            .catch(() => {});
+          ipc<NetworkInfo>('get_network_info')
+            .then((n) => {
+              if (renderSeqRef.current === nextSeq) setNet(n);
+            })
+            .catch(() => {});
+        } else if (r.kind === 'calendar') {
+          const now = new Date();
+          setCalView({ year: now.getFullYear(), month: now.getMonth() });
+          setSelectedDate(now);
+          ipc<SessionAlert[]>('get_session_alerts')
+            .then((list) => {
+              if (renderSeqRef.current === nextSeq) setAlerts(list);
+            })
+            .catch(() => {});
         } else if (r.kind === 'preview') {
           const payload = r.payload as { group?: AppWindowGroup };
           const wins = payload.group?.windows ?? [];
@@ -142,6 +235,7 @@ export const FlyoutView: React.FC = () => {
         }
       }),
       onEvent<void>('flyout-hide', () => {
+        clearOsdTimer();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
@@ -157,7 +251,26 @@ export const FlyoutView: React.FC = () => {
           setActionError(null);
         }, FLYOUT_EXIT_MS);
       }),
-      onEvent<AudioState>('audio-updated', setAudio),
+      onEvent<AudioState>('audio-mixer-updated', (st) => {
+        setAudio(st);
+      }),
+      onEvent<AudioMasterState>('audio-master-updated', (m) => {
+        setAudio((prev) =>
+          prev
+            ? {
+                ...prev,
+                available: m.available,
+                masterVolume: m.masterVolume,
+                masterMuted: m.masterMuted,
+                micMuted: m.micMuted,
+              }
+            : prev,
+        );
+        if (activeKindRef.current === 'osd') {
+          setOsdState({ volume: m.masterVolume, muted: m.masterMuted });
+        }
+      }),
+      onEvent<SessionAlert[]>('session-alerts-updated', setAlerts),
       onEvent<AppWindowGroup[]>('windows-updated', (groups) => {
         if (activeKindRef.current !== 'preview') return;
         const key = previewGroupKeyRef.current;
@@ -172,25 +285,73 @@ export const FlyoutView: React.FC = () => {
     ];
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') ipc('close_flyout').catch(() => {});
+      if (e.key === 'Escape') {
+        if (trayCtxItemRef.current) {
+          setActionError(null);
+          setTrayCtxItem(null);
+        } else {
+          ipc('close_flyout').catch(() => {});
+        }
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
+      clearOsdTimer();
       if (exitTimerRef.current !== null) window.clearTimeout(exitTimerRef.current);
       subs.forEach((p) => p.then((u) => u()));
     };
   }, []);
 
+  // Lazy batch-fetch missing tray icon keys from Rust IconCache into local Map
+  useEffect(() => {
+    if (trayApps.length === 0) return;
+    const missing = new Set<string>();
+    const immediate: Record<string, string> = {};
+
+    for (const item of trayApps) {
+      const k = item.iconKey;
+      if (!isCacheIconKey(k) || trayIconMap[k]) continue;
+      const cached = iconCache.get(k);
+      if (cached) {
+        immediate[k] = cached;
+      } else {
+        missing.add(k);
+      }
+    }
+
+    if (Object.keys(immediate).length > 0) {
+      setTrayIconMap((prev) => ({ ...prev, ...immediate }));
+    }
+    if (missing.size === 0) return;
+
+    let cancelled = false;
+    fetchIconsBatch(Array.from(missing))
+      .then((fetched) => {
+        if (cancelled || Object.keys(fetched).length === 0) return;
+        setTrayIconMap((prev) => ({ ...prev, ...fetched }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [trayApps]);
+
   const req = anim.req;
   const isClosing = anim.phase === 'closing';
   const cardCls = isClosing ? 'closing' : '';
 
-  // Auto-grow context menu flyout cleanly when Jump List items or an OS error banner mount
+  // Auto-fit flyout height cleanly for context menus, Quick Sound, and Calendar (never Tray!)
   useEffect(() => {
     if (!req || isClosing) return;
-    if (!isAppContextKind(req.kind) && !isBarContextKind(req.kind) && !trayCtxItem) return;
-    const el = ctxCardRef.current;
+    const needsAutoHeight =
+      isAppContextKind(req.kind) ||
+      isBarContextKind(req.kind) ||
+      req.kind === 'sound' ||
+      req.kind === 'quick' ||
+      req.kind === 'calendar';
+    if (!needsAutoHeight) return;
+    const el = autoHeightRef.current;
     if (!el) return;
     const syncHeight = () => {
       const h = Math.ceil(el.scrollHeight) + 6;
@@ -202,7 +363,22 @@ export const FlyoutView: React.FC = () => {
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [req?.kind, anim.renderSeq, isClosing, jumpList.length, actionError, trayCtxItem]);
+  }, [
+    req?.kind,
+    anim.renderSeq,
+    isClosing,
+    jumpList.length,
+    actionError,
+    audio?.sessions.length,
+    audio?.devices.length,
+    alerts.length,
+  ]);
+
+  const today = useMemo(() => new Date(), [anim.renderSeq]);
+  const calCells = useMemo(
+    () => buildCalendarMonthGrid(calView.year, calView.month, today, selectedDate),
+    [calView.year, calView.month, today, selectedDate],
+  );
 
   if (!req || anim.phase === 'closed') return null;
 
@@ -216,79 +392,9 @@ export const FlyoutView: React.FC = () => {
       .catch((err) => setActionError(formatIpcError(err)));
   };
 
-  // 1. COMPACT 40-ICON TRAY OVERFLOW (^)
+  // 1. TWO-TIER COMPACT 6-COLUMN TRAY OVERFLOW (^) — ZERO JUMPING / ZERO SHAKING
   if (req.kind === 'tray') {
-    if (trayCtxItem) {
-      return (
-        <div className="flyout-root" data-space="personal">
-          <div
-            key={`${anim.renderSeq}-tray-ctx`}
-            ref={ctxCardRef}
-            className={`flyout-card ctx-card ${cardCls}`}
-            onAnimationEnd={onCardAnimEnd}
-          >
-            <div className="ctx-sec">{trayCtxItem.name}</div>
-            <button
-              className="ctx-item"
-              onClick={() =>
-                runActionAndClose(
-                  ipc('launch_item', {
-                    target: trayCtxItem.exePath,
-                    args: null,
-                    asAdmin: false,
-                    closeStart: false,
-                  }),
-                )
-              }
-            >
-              <ExternalWindowIcon />
-              <span className="ctx-item-label">Открыть</span>
-            </button>
-            <button
-              className="ctx-item"
-              onClick={() =>
-                runActionAndClose(ipc('open_location', { path: trayCtxItem.exePath }))
-              }
-            >
-              <FolderSvg className="ic14" />
-              <span className="ctx-item-label">Открыть расположение файла</span>
-            </button>
-            <div className="ctx-sep" />
-            <button
-              className="ctx-item danger"
-              onClick={() => {
-                setActionError(null);
-                ipc('kill_process_pid', { pid: trayCtxItem.pid })
-                  .then(() => {
-                    setTrayApps((prev) => prev.filter((x) => x.pid !== trayCtxItem.pid));
-                    setTrayCtxItem(null);
-                  })
-                  .catch((err) => setActionError(formatIpcError(err)));
-              }}
-            >
-              <KillIcon />
-              <span className="ctx-item-label">Завершить задачу</span>
-            </button>
-            {actionError && (
-              <div className="ctx-err" role="alert">
-                {actionError}
-              </div>
-            )}
-            <button
-              className="ctx-item"
-              onClick={() => {
-                setActionError(null);
-                setTrayCtxItem(null);
-              }}
-            >
-              <ChevronLeftIcon />
-              <span className="ctx-item-label">Назад к иконкам</span>
-            </button>
-          </div>
-        </div>
-      );
-    }
-
+    const headerLabel = formatTrayHeaderLabel(trayHover, trayApps.length);
     return (
       <div className="flyout-root" data-space="personal">
         <div
@@ -296,50 +402,215 @@ export const FlyoutView: React.FC = () => {
           className={`flyout-card tray-card ${cardCls}`}
           onAnimationEnd={onCardAnimEnd}
         >
-          {trayHover && <div className="tray-tip">{trayHover}</div>}
-          <div className="tray-grid">
-            {trayApps.map((t) => (
-              <button
-                key={t.pid}
-                className="tray-cell"
-                onMouseEnter={() => setTrayHover(t.name)}
-                onMouseLeave={() => setTrayHover('')}
-                onClick={() => {
-                  ipc('launch_item', {
-                    target: t.exePath,
-                    args: null,
-                    asAdmin: false,
-                    closeStart: false,
-                  }).catch(() => {});
-                  close();
-                }}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setActionError(null);
-                  setTrayCtxItem(t);
-                }}
-              >
-                {t.iconData ? (
-                  <img src={t.iconData} alt="" className="native-ic-sm" draggable={false} />
-                ) : (
-                  <FallbackAppIcon iconKey={t.name} size={18} />
-                )}
-              </button>
-            ))}
+          <div className="tray-head">
+            <span className={`tray-tip-label ${trayHover ? 'hovering' : ''}`} title={headerLabel}>
+              {headerLabel}
+            </span>
+            <button
+              type="button"
+              className="tray-native-btn"
+              title="Системный трей Windows (Win+B)"
+              onClick={() => {
+                ipc('open_native_windows_tray').catch(() => {});
+              }}
+            >
+              <NativeTrayIcon className="ic14" />
+            </button>
           </div>
+
+          <div className="tray-grid">
+            {trayApps.length === 0 ? (
+              <div className="tray-empty">Нет фоновых приложений</div>
+            ) : (
+              trayApps.map((t) => {
+                const iconUri =
+                  (t.iconKey ? trayIconMap[t.iconKey] || iconCache.get(t.iconKey) : undefined) ||
+                  t.iconData ||
+                  null;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className="tray-cell"
+                    onMouseEnter={() => setTrayHover(t.name)}
+                    onMouseLeave={() => setTrayHover('')}
+                    onClick={() => {
+                      ipc('activate_tray_app', {
+                        hwnd: t.hwnd ?? null,
+                        exePath: t.exePath,
+                      }).catch(() => {});
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setActionError(null);
+                      setTrayCtxItem(t);
+                    }}
+                  >
+                    {iconUri ? (
+                      <img src={iconUri} alt="" className="native-ic-sm" draggable={false} />
+                    ) : (
+                      <FallbackAppIcon iconKey={t.name} size={18} />
+                    )}
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {trayCtxItem && (
+            <div
+              className="tray-ctx-overlay"
+              onClick={() => {
+                setActionError(null);
+                setTrayCtxItem(null);
+              }}
+            >
+              <div className="tray-ctx-sheet" onClick={(e) => e.stopPropagation()}>
+                <div className="tray-ctx-head">
+                  <span className="ctx-sec" style={{ padding: 0 }}>{trayCtxItem.name}</span>
+                  <button
+                    type="button"
+                    className="tray-ctx-close"
+                    title="Закрыть меню"
+                    onClick={() => {
+                      setActionError(null);
+                      setTrayCtxItem(null);
+                    }}
+                  >
+                    <XIcon10 />
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  className="ctx-item"
+                  onClick={() => {
+                    setActionError(null);
+                    ipc('activate_tray_app', {
+                      hwnd: trayCtxItem.hwnd ?? null,
+                      exePath: trayCtxItem.exePath,
+                    }).catch((err) => setActionError(formatIpcError(err)));
+                  }}
+                >
+                  <ExternalWindowIcon />
+                  <span className="ctx-item-label">Открыть</span>
+                </button>
+
+                {canOpenFileLocation(trayCtxItem.exePath) && (
+                  <button
+                    type="button"
+                    className="ctx-item"
+                    onClick={() =>
+                      runActionAndClose(ipc('open_location', { path: trayCtxItem.exePath }))
+                    }
+                  >
+                    <FolderSvg className="ic14" />
+                    <span className="ctx-item-label">Открыть расположение</span>
+                  </button>
+                )}
+
+                <div className="ctx-sep" />
+
+                <button
+                  type="button"
+                  className="ctx-item danger"
+                  onClick={() => {
+                    setActionError(null);
+                    const pids =
+                      trayCtxItem.allPids.length > 0 ? trayCtxItem.allPids : [trayCtxItem.pid];
+                    ipc('end_tray_app_task', { pids })
+                      .then(() => {
+                        setTrayApps((prev) => prev.filter((x) => x.id !== trayCtxItem.id));
+                        setTrayCtxItem(null);
+                      })
+                      .catch((err) => setActionError(formatIpcError(err)));
+                  }}
+                >
+                  <KillIcon />
+                  <span className="ctx-item-label">Завершить задачу</span>
+                </button>
+
+                {actionError && (
+                  <div className="ctx-err" role="alert">
+                    {actionError}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  // 2. QUICK SOUND & MIXER
-  if (req.kind === 'sound' || req.kind === 'quick') {
-    const devs = (audio?.devices ?? []).slice(0, 3);
-    const sessions = (audio?.sessions ?? []).slice(0, 4);
+  // 2. FLOATING NON-ACTIVATING VOLUME OSD
+  if (req.kind === 'osd') {
+    const pct = osdState.muted ? 0 : osdState.volume;
     return (
       <div className="flyout-root" data-space="personal">
         <div
           key={anim.renderSeq}
+          className={`flyout-card osd-card ${osdState.muted ? 'muted' : ''} ${cardCls}`}
+          onAnimationEnd={onCardAnimEnd}
+        >
+          <span className="osd-ic">
+            <VolIcon muted={osdState.muted} className="ic16" />
+          </span>
+          <div className="osd-track">
+            <div className="osd-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <span className="osd-val">{osdState.muted ? 'Выкл' : `${osdState.volume}%`}</span>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. QUICK SOUND & MIXER (324px, SLIDING 3-DEVICE PILL, MULTI-PROCESS MIXER)
+  if (req.kind === 'sound' || req.kind === 'quick') {
+    const devs = (audio?.devices ?? []).slice(0, 3);
+    const activeDevIdx = getActiveDeviceIndex(devs);
+    const sessions = audio?.sessions ?? [];
+
+    const setMaster = (vol: number, muted: boolean) => {
+      setActionError(null);
+      setAudio((prev) => (prev ? { ...prev, masterVolume: vol, masterMuted: muted } : prev));
+      ipc<AudioState>('set_master_volume', { volume: vol, muted })
+        .then(setAudio)
+        .catch((err) => setActionError(formatIpcError(err)));
+    };
+
+    const setSession = (
+      s: AudioState['sessions'][number],
+      vol: number,
+      muted: boolean,
+    ) => {
+      setActionError(null);
+      setAudio((prev) =>
+        prev
+          ? {
+              ...prev,
+              sessions: prev.sessions.map((item) =>
+                item.id === s.id ? { ...item, volume: vol, muted } : item,
+              ),
+            }
+          : prev,
+      );
+      ipc<AudioState>('set_session_volume', {
+        pid: s.pid,
+        pids: s.pids,
+        appKey: s.id,
+        volume: vol,
+        muted,
+      })
+        .then(setAudio)
+        .catch((err) => setActionError(formatIpcError(err)));
+    };
+
+    return (
+      <div className="flyout-root" data-space="personal">
+        <div
+          key={anim.renderSeq}
+          ref={autoHeightRef}
           className={`flyout-card qs-card ${cardCls}`}
           onAnimationEnd={onCardAnimEnd}
         >
@@ -351,13 +622,30 @@ export const FlyoutView: React.FC = () => {
           </div>
 
           {devs.length > 0 && (
-            <div className="seg-bar" style={{ gridTemplateColumns: `repeat(${devs.length}, 1fr)`, marginBottom: 10 }}>
+            <div
+              className="seg-bar sliding"
+              style={
+                {
+                  gridTemplateColumns: `repeat(${devs.length}, 1fr)`,
+                  marginBottom: 10,
+                  ['--seg-count' as string]: devs.length,
+                  ['--seg-idx' as string]: activeDevIdx,
+                } as React.CSSProperties
+              }
+            >
+              <span className="seg-indicator" aria-hidden="true" />
               {devs.map((d) => (
                 <button
                   key={d.id}
+                  type="button"
                   className={`seg-opt ${d.isDefault ? 'active' : ''}`}
                   title={d.name}
-                  onClick={() => ipc<AudioState>('set_audio_device', { deviceId: d.id }).then(setAudio).catch(() => {})}
+                  onClick={() => {
+                    setActionError(null);
+                    ipc<AudioState>('set_audio_device', { deviceId: d.id })
+                      .then(setAudio)
+                      .catch((err) => setActionError(formatIpcError(err)));
+                  }}
                 >
                   {d.shortName}
                 </button>
@@ -366,23 +654,18 @@ export const FlyoutView: React.FC = () => {
           )}
 
           <div
-            className={`mix-row ${audio?.masterMuted ? 'muted' : ''}`}
-            style={{
-              marginBottom: 10,
-              background: 'rgba(var(--accent-rgb), 0.1)',
-              borderColor: 'rgba(var(--accent-rgb), 0.3)',
+            className={`mix-row qs-master-row ${audio?.masterMuted ? 'muted' : ''}`}
+            onWheel={(e) => {
+              e.preventDefault();
+              const next = stepVolume(audio?.masterVolume ?? 0, e.deltaY, 4);
+              setMaster(next, false);
             }}
           >
             <button
+              type="button"
               className="mix-mute"
-              onClick={() =>
-                ipc<AudioState>('set_master_volume', {
-                  volume: audio?.masterVolume ?? 50,
-                  muted: !(audio?.masterMuted ?? false),
-                })
-                  .then(setAudio)
-                  .catch(() => {})
-              }
+              title={audio?.masterMuted ? 'Включить звук' : 'Выключить звук'}
+              onClick={() => setMaster(audio?.masterVolume ?? 0, !(audio?.masterMuted ?? false))}
             >
               <VolIcon muted={audio?.masterMuted} />
             </button>
@@ -392,31 +675,33 @@ export const FlyoutView: React.FC = () => {
               className="mix-range"
               min={0}
               max={100}
-              value={audio?.masterMuted ? 0 : (audio?.masterVolume ?? 50)}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setAudio((prev) => (prev ? { ...prev, masterVolume: v, masterMuted: false } : prev));
-                ipc<AudioState>('set_master_volume', { volume: v, muted: false })
-                  .then(setAudio)
-                  .catch(() => {});
-              }}
+              value={audio?.masterMuted ? 0 : (audio?.masterVolume ?? 0)}
+              onChange={(e) => setMaster(Number(e.target.value), false)}
             />
-            <span className="mix-val">{audio?.masterMuted ? '0%' : `${audio?.masterVolume ?? 0}%`}</span>
+            <span className="mix-val">
+              {audio?.masterMuted ? '0%' : `${audio?.masterVolume ?? 0}%`}
+            </span>
           </div>
 
-          <div className="mixer-list">
+          <div className="mixer-list qs-mixer-scroll">
             {sessions.length === 0 ? (
-              <div style={{ fontSize: 11.5, color: 'var(--t3)', padding: '6px 4px' }}>Нет активных аудиопотоков</div>
+              <div className="qs-empty">Нет активных аудиопотоков</div>
             ) : (
               sessions.map((s) => (
-                <div key={s.pid} className={`mix-row ${s.muted ? 'muted' : ''}`}>
+                <div
+                  key={s.id}
+                  className={`mix-row ${s.muted ? 'muted' : ''}`}
+                  onWheel={(e) => {
+                    e.preventDefault();
+                    const next = stepVolume(s.volume, e.deltaY, 4);
+                    setSession(s, next, false);
+                  }}
+                >
                   <button
+                    type="button"
                     className="mix-mute"
-                    onClick={() =>
-                      ipc<AudioState>('set_session_volume', { pid: s.pid, volume: s.volume, muted: !s.muted })
-                        .then(setAudio)
-                        .catch(() => {})
-                    }
+                    title={s.muted ? 'Включить звук приложения' : 'Заглушить приложение'}
+                    onClick={() => setSession(s, s.volume, !s.muted)}
                   >
                     <VolIcon muted={s.muted} />
                   </button>
@@ -427,95 +712,146 @@ export const FlyoutView: React.FC = () => {
                     min={0}
                     max={100}
                     value={s.muted ? 0 : s.volume}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      ipc<AudioState>('set_session_volume', { pid: s.pid, volume: v, muted: false })
-                        .then(setAudio)
-                        .catch(() => {});
-                    }}
+                    onChange={(e) => setSession(s, Number(e.target.value), false)}
                   />
                   <span className="mix-val">{s.muted ? '0%' : `${s.volume}%`}</span>
                 </div>
               ))
             )}
           </div>
+
+          {actionError && (
+            <div className="ctx-err" role="alert" style={{ marginTop: 8 }}>
+              {actionError}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  // 3. CALENDAR
+  // 4. INTERACTIVE CLOCK & CALENDAR (310px, DATE SELECTION, "СЕГОДНЯ", LOCAL ALERTS, WIN+N)
   if (req.kind === 'calendar') {
-    const today = new Date();
-    const y = calDate.getFullYear();
-    const m = calDate.getMonth();
-    const first = new Date(y, m, 1);
-    const offset = (first.getDay() + 6) % 7;
-    const daysInMonth = new Date(y, m + 1, 0).getDate();
-    const prevMonthDays = new Date(y, m, 0).getDate();
-    const cells: { d: number; muted: boolean; isToday: boolean }[] = [];
-    for (let i = offset - 1; i >= 0; i--) {
-      cells.push({ d: prevMonthDays - i, muted: true, isToday: false });
-    }
-    for (let d = 1; d <= daysInMonth; d++) {
-      cells.push({
-        d,
-        muted: false,
-        isToday: y === today.getFullYear() && m === today.getMonth() && d === today.getDate(),
-      });
-    }
+    const awayFromToday =
+      !isSameCalendarDay(selectedDate, today) || !isViewingTodayMonth(calView, today);
+    const jumpToToday = () => {
+      const fresh = new Date();
+      setCalView({ year: fresh.getFullYear(), month: fresh.getMonth() });
+      setSelectedDate(fresh);
+    };
 
     return (
       <div className="flyout-root" data-space="personal">
         <div
           key={anim.renderSeq}
+          ref={autoHeightRef}
           className={`flyout-card cal-card ${cardCls}`}
           onAnimationEnd={onCardAnimEnd}
         >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <strong style={{ fontSize: 13.5 }}>{MONTHS[m]} {y}</strong>
-            <div style={{ display: 'flex', gap: 4 }}>
+          <div className="cal-selected-hdr">{formatSelectedDateHeader(selectedDate)}</div>
+
+          <div className="cal-top-bar">
+            <strong className="cal-month-title">
+              {MONTHS_RU[calView.month]} {calView.year}
+            </strong>
+            <div className="cal-nav-group">
               <button
-                className="hdr-btn"
-                style={{ width: 26, height: 26 }}
-                onClick={() => setCalDate(new Date(y, m - 1, 1))}
+                type="button"
+                className={`cal-today-btn ${awayFromToday ? 'active' : ''}`}
+                onClick={jumpToToday}
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="15 18 9 12 15 6" />
-                </svg>
+                Сегодня
               </button>
               <button
-                className="hdr-btn"
-                style={{ width: 26, height: 26 }}
-                onClick={() => setCalDate(new Date(y, m + 1, 1))}
+                type="button"
+                className="hdr-btn cal-nav-btn"
+                title="Предыдущий месяц"
+                onClick={() => setCalView((prev) => shiftCalendarMonth(prev.year, prev.month, -1))}
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="9 18 15 12 9 6" />
-                </svg>
+                <ChevronLeftIcon className="ic14" />
+              </button>
+              <button
+                type="button"
+                className="hdr-btn cal-nav-btn"
+                title="Следующий месяц"
+                onClick={() => setCalView((prev) => shiftCalendarMonth(prev.year, prev.month, 1))}
+              >
+                <ChevronRightIcon className="ic14" />
               </button>
             </div>
           </div>
 
           <div className="cal-grid">
-            {['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((wd) => (
+            {WEEKDAYS_SHORT_RU.map((wd) => (
               <div key={wd} className="cal-wd">{wd}</div>
             ))}
-            {cells.map((c, idx) => (
-              <div
-                key={idx}
-                className={`cal-day ${c.muted ? 'muted' : ''} ${c.isToday ? 'today' : ''}`}
-                onClick={() => setCalDate(new Date())}
+            {calCells.map((c) => (
+              <button
+                key={c.key}
+                type="button"
+                className={`cal-day ${c.inCurrentMonth ? '' : 'muted'} ${c.isToday ? 'today' : ''} ${c.isSelected ? 'selected' : ''}`}
+                onClick={() => {
+                  setSelectedDate(new Date(c.year, c.month, c.day));
+                  if (!c.inCurrentMonth) {
+                    setCalView({ year: c.year, month: c.month });
+                  }
+                }}
               >
-                {c.d}
-              </div>
+                {c.day}
+              </button>
             ))}
           </div>
+
+          <div className="cal-alerts-section">
+            <div className="sec-row" style={{ marginBottom: 6 }}>
+              <span className="sec-title">События TestBar</span>
+              {alerts.length > 0 && (
+                <button
+                  type="button"
+                  className="sec-act"
+                  onClick={() => ipc<SessionAlert[]>('clear_session_alerts').then(setAlerts).catch(() => {})}
+                >
+                  Очистить
+                </button>
+              )}
+            </div>
+
+            {alerts.length === 0 ? (
+              <div className="cal-alerts-empty">Нет системных событий</div>
+            ) : (
+              <div className="cal-alerts-list">
+                {alerts.slice(0, 4).map((a) => (
+                  <div key={a.id} className="cal-alert-row">
+                    <span className={`cal-alert-dot ${a.level}`} />
+                    <div className="cal-alert-body">
+                      <div className="cal-alert-top">
+                        <span className="cal-alert-title">{a.title}</span>
+                        <span className="cal-alert-time">{formatAlertTime(a.timestampMs)}</span>
+                      </div>
+                      {a.detail && <div className="cal-alert-detail">{a.detail}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="cal-notif-btn"
+            onClick={() => {
+              ipc('open_windows_notifications').catch(() => {});
+            }}
+          >
+            <BellIcon className="ic14" />
+            <span>Уведомления Windows</span>
+          </button>
         </div>
       </div>
     );
   }
 
-  // 4. GAPLESS ANIMATED HOVER WINDOW PREVIEW
+  // 5. GAPLESS ANIMATED HOVER WINDOW PREVIEW
   if (req.kind === 'preview') {
     const wins = previewWindows.slice(0, 4);
     return (
@@ -542,6 +878,7 @@ export const FlyoutView: React.FC = () => {
                   {w.title}
                 </span>
                 <button
+                  type="button"
                   className="wp-close"
                   title="Закрыть окно"
                   onClick={(e) => {
@@ -576,7 +913,7 @@ export const FlyoutView: React.FC = () => {
     );
   }
 
-  // 5. RIGHT-CLICK CONTEXT MENU ON TASKBAR APP (JUMP LIST + ADMIN + LOCATION + PIN + END TASK)
+  // 6. RIGHT-CLICK CONTEXT MENU ON TASKBAR APP (JUMP LIST + ADMIN + LOCATION + PIN + END TASK)
   if (isAppContextKind(req.kind)) {
     const p = req.payload as AppContextPayload;
     const pid = p.windows[0]?.pid;
@@ -590,7 +927,7 @@ export const FlyoutView: React.FC = () => {
       <div className="flyout-root" data-space="personal">
         <div
           key={anim.renderSeq}
-          ref={ctxCardRef}
+          ref={autoHeightRef}
           className={`flyout-card ctx-card ${cardCls}`}
           onAnimationEnd={onCardAnimEnd}
         >
@@ -770,7 +1107,7 @@ export const FlyoutView: React.FC = () => {
     );
   }
 
-  // 6. RIGHT-CLICK ON EMPTY TASKBAR
+  // 7. RIGHT-CLICK ON EMPTY TASKBAR
   if (isBarContextKind(req.kind)) {
     const p = req.payload as BarContextPayload;
     const isEdge = p.barMode === 'edge';
@@ -779,7 +1116,7 @@ export const FlyoutView: React.FC = () => {
       <div className="flyout-root" data-space="personal">
         <div
           key={anim.renderSeq}
-          ref={ctxCardRef}
+          ref={autoHeightRef}
           className={`flyout-card ctx-card ${cardCls}`}
           onAnimationEnd={onCardAnimEnd}
         >

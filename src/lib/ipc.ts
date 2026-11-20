@@ -93,13 +93,25 @@ export interface AudioDeviceInfo {
 }
 
 export interface AudioSessionInfo {
+  id: string;
   pid: number;
+  pids: number[];
   name: string;
   volume: number;
   muted: boolean;
+  isActive: boolean;
+}
+
+export interface AudioMasterState {
+  available: boolean;
+  masterVolume: number;
+  masterMuted: boolean;
+  micMuted: boolean;
+  defaultDeviceShortName: string;
 }
 
 export interface AudioState {
+  available: boolean;
   masterVolume: number;
   masterMuted: boolean;
   micMuted: boolean;
@@ -156,10 +168,22 @@ export interface PeripheralBattery {
 }
 
 export interface TrayAppItem {
+  id: string;
+  hwnd?: number | null;
   pid: number;
+  allPids: number[];
   name: string;
   exePath: string;
+  iconKey?: string | null;
   iconData?: string | null;
+}
+
+export interface SessionAlert {
+  id: string;
+  level: 'info' | 'warn' | 'error';
+  title: string;
+  detail?: string | null;
+  timestampMs: number;
 }
 
 export interface NetworkInfo {
