@@ -17,13 +17,12 @@ use apps_indexer::{IndexedApp, SteamGame};
 use audio::AudioState;
 use config::{CustomSpace, PinItem, TestBarConfig};
 use coordinator::{
-    compute_appbar_rect, BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect,
-    WindowCoordinator,
+    BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect, WindowCoordinator,
 };
 use media::MediaState;
 use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, TrayAppItem};
 use telemetry::TelemetryState;
-use win_shell::ShellHookEvent;
+use win_shell::{ShellAppBarEvent, ShellHookEvent, WatchdogArgs};
 use windows_tracker::AppWindowGroup;
 
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -35,6 +34,7 @@ pub struct AppState {
     pub hide_native: bool,
     pub coordinator: Mutex<WindowCoordinator>,
     pub overlay_open: Arc<AtomicBool>,
+    pub fullscreen_suppressed: Arc<AtomicBool>,
     pub taskbar_content_width: Mutex<i32>,
 }
 
@@ -42,6 +42,8 @@ impl AppState {
     fn sync_overlay_flag(&self, coord: &WindowCoordinator) {
         self.overlay_open
             .store(coord.has_open_overlay(), Ordering::Release);
+        self.fullscreen_suppressed
+            .store(coord.is_fullscreen_suppressed(), Ordering::Release);
     }
 }
 
@@ -69,9 +71,16 @@ fn scale_factor(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
-fn primary_monitor_pixel_rect() -> PixelRect {
-    let mon = win_shell::primary_monitor_rect();
-    PixelRect::new(mon.left, mon.top, mon.right, mon.bottom)
+fn reevaluate_fullscreen(app: &AppHandle) {
+    let fs = win_shell::is_fullscreen_active();
+    let actions = {
+        let st = app.state::<AppState>();
+        let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let act = coord.on_fullscreen_changed(fs);
+        st.sync_overlay_flag(&coord);
+        act
+    };
+    apply_coordinator_actions(app, &actions, None);
 }
 
 fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
@@ -88,10 +97,18 @@ fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
     rects
 }
 
-fn position_taskbar_window(app: &AppHandle, bar_mode: &str, logical_content_w: i32) {
+fn position_taskbar_window(
+    app: &AppHandle,
+    bar_mode: &str,
+    logical_content_w: i32,
+    dpi_override: Option<u32>,
+) {
     let Some(tb) = app.get_webview_window("taskbar") else { return };
     let Some(hwnd) = win_hwnd(&tb) else { return };
-    let sf = tb.scale_factor().unwrap_or(1.0);
+    let sf = dpi_override
+        .filter(|&d| d > 0)
+        .map(|d| d as f64 / 96.0)
+        .unwrap_or_else(|| tb.scale_factor().unwrap_or(1.0));
     let mon = win_shell::primary_monitor_rect();
 
     let (w_px, h_px, x_px, y_px) = if BarMode::from_config_str(bar_mode) == BarMode::Edge {
@@ -295,19 +312,9 @@ fn set_bar_mode(app: AppHandle, state: State<AppState>, mode: String) -> Result<
     };
     let cw = *state.taskbar_content_width.lock().unwrap();
     if state.hide_native {
-        if let Some(tb) = app.get_webview_window("taskbar") {
-            if let Some(hwnd) = win_hwnd(&tb) {
-                let dpi = (tb.scale_factor().unwrap_or(1.0) * 96.0).round() as u32;
-                let appbar = compute_appbar_rect(
-                    primary_monitor_pixel_rect(),
-                    dpi,
-                    BarMode::from_config_str(&updated.bar_mode),
-                );
-                win_shell::register_appbar(hwnd, appbar.height());
-            }
-        }
+        win_shell::update_appbar_mode(BarMode::from_config_str(&updated.bar_mode));
     }
-    position_taskbar_window(&app, &updated.bar_mode, cw);
+    position_taskbar_window(&app, &updated.bar_mode, cw, None);
     let actions = state
         .coordinator
         .lock()
@@ -335,7 +342,7 @@ fn set_autostart(app: AppHandle, state: State<AppState>, enable: bool) -> Result
 fn resize_taskbar_dock(app: AppHandle, state: State<AppState>, logical_width: i32) {
     *state.taskbar_content_width.lock().unwrap() = logical_width;
     let mode = state.config.lock().unwrap().bar_mode.clone();
-    position_taskbar_window(&app, &mode, logical_width);
+    position_taskbar_window(&app, &mode, logical_width, None);
     let actions = state
         .coordinator
         .lock()
@@ -688,8 +695,11 @@ fn power_action(action: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn restore_windows_taskbar_and_exit(app: AppHandle) {
-    win_shell::restore_native_taskbar();
+fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
+    if state.hide_native {
+        win_shell::stop_appbar_message_window();
+        win_shell::restore_native_taskbar();
+    }
     app.exit(0);
 }
 
@@ -698,25 +708,30 @@ fn get_icon_for_path(path: String) -> Option<String> {
     windows_tracker::extract_icon_for_path(&path)
 }
 
-pub fn run_watchdog_mode(parent_pid: u32) {
-    win_shell::run_watchdog(parent_pid);
+pub fn run_watchdog_mode(args: WatchdogArgs) {
+    win_shell::run_watchdog(args);
 }
 
 pub fn run(hide_native: bool) {
-    // Panic safety net: always restore native Windows taskbar before unwinding
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        win_shell::restore_native_taskbar();
-        prev_hook(info);
-    }));
+    // Acquire single-instance mutex BEFORE any shell mutation, work-area capture,
+    // panic hook installation, or watchdog spawning (AD-2).
+    let _single_instance = match win_shell::SingleInstanceGuard::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) | Err(_) => return,
+    };
 
     if hide_native {
-        win_shell::spawn_watchdog();
+        win_shell::ensure_process_dpi_aware();
+        let captured_wa =
+            win_shell::capture_and_persist_original_workarea().map(|snap| snap.work_area);
+        win_shell::install_panic_restore_hook();
+        win_shell::spawn_watchdog(captured_wa);
     }
 
     let initial_cfg = config::load_config();
 
     let overlay_open = Arc::new(AtomicBool::new(false));
+    let fullscreen_suppressed = Arc::new(AtomicBool::new(false));
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
         installed_apps: Mutex::new(Vec::new()),
@@ -724,6 +739,7 @@ pub fn run(hide_native: bool) {
         hide_native,
         coordinator: Mutex::new(WindowCoordinator::new()),
         overlay_open: Arc::clone(&overlay_open),
+        fullscreen_suppressed: Arc::clone(&fullscreen_suppressed),
         taskbar_content_width: Mutex::new(620),
     };
 
@@ -783,19 +799,51 @@ pub fn run(hide_native: bool) {
             if let Some(tb) = app.get_webview_window("taskbar") {
                 if let Some(hwnd) = win_hwnd(&tb) {
                     win_shell::style_overlay_window(hwnd, true);
-                    let sf = tb.scale_factor().unwrap_or(1.0);
                     let mode = app.state::<AppState>().config.lock().unwrap().bar_mode.clone();
                     if hide_native {
                         win_shell::hide_native_taskbar();
-                        let dpi = (sf * 96.0).round() as u32;
-                        let appbar = compute_appbar_rect(
-                            primary_monitor_pixel_rect(),
-                            dpi,
+                        let h_appbar = handle.clone();
+                        if let Err(err) = win_shell::start_appbar_message_window(
                             BarMode::from_config_str(&mode),
-                        );
-                        win_shell::register_appbar(hwnd, appbar.height());
+                            move |ev| {
+                                let h = h_appbar.clone();
+                                let _ = h_appbar.run_on_main_thread(move || match ev {
+                                    ShellAppBarEvent::FullscreenHint(_) => {
+                                        reevaluate_fullscreen(&h);
+                                    }
+                                    ShellAppBarEvent::PositionChanged
+                                    | ShellAppBarEvent::TaskbarCreated
+                                    | ShellAppBarEvent::DisplayChanged
+                                    | ShellAppBarEvent::DpiChanged(_) => {
+                                        let dpi_override = match ev {
+                                            ShellAppBarEvent::DpiChanged(dpi) => Some(dpi),
+                                            _ => None,
+                                        };
+                                        let (bar_mode, cw) = {
+                                            let st = h.state::<AppState>();
+                                            let mode = st
+                                                .config
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .bar_mode
+                                                .clone();
+                                            let cw = *st
+                                                .taskbar_content_width
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            (mode, cw)
+                                        };
+                                        position_taskbar_window(&h, &bar_mode, cw, dpi_override);
+                                        reevaluate_fullscreen(&h);
+                                    }
+                                });
+                            },
+                        ) {
+                            win_shell::restore_native_taskbar();
+                            return Err(err.into());
+                        }
                     }
-                    position_taskbar_window(&handle, &mode, 620);
+                    position_taskbar_window(&handle, &mode, 620, None);
                     let show_tb = app
                         .state::<AppState>()
                         .coordinator
@@ -885,7 +933,10 @@ pub fn run(hide_native: bool) {
                 ShellHookEvent::EmergencyRestore => {
                     let h = h_hook.clone();
                     let _ = h_hook.run_on_main_thread(move || {
-                        win_shell::restore_native_taskbar();
+                        if h.state::<AppState>().hide_native {
+                            win_shell::stop_appbar_message_window();
+                            win_shell::restore_native_taskbar();
+                        }
                         h.exit(0);
                     });
                 }
@@ -913,9 +964,9 @@ pub fn run(hide_native: bool) {
 
             // Fast lightweight poller for open windows, keyboard layout, and fullscreen auto-hide
             let h_fast = handle.clone();
+            let fast_fs_suppressed = Arc::clone(&fullscreen_suppressed);
             std::thread::spawn(move || {
                 let mut last_layout = String::new();
-                let mut last_fs = false;
                 loop {
                     let groups = windows_tracker::list_open_window_groups();
                     let _ = h_fast.emit("windows-updated", &groups);
@@ -927,19 +978,10 @@ pub fn run(hide_native: bool) {
                     }
 
                     let fs = win_shell::is_fullscreen_active();
-                    if fs != last_fs {
-                        last_fs = fs;
+                    if fs != fast_fs_suppressed.load(Ordering::Acquire) {
                         let h = h_fast.clone();
                         let _ = h_fast.run_on_main_thread(move || {
-                            let actions = {
-                                let st = h.state::<AppState>();
-                                let mut coord =
-                                    st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-                                let act = coord.on_fullscreen_changed(fs);
-                                st.sync_overlay_flag(&coord);
-                                act
-                            };
-                            apply_coordinator_actions(&h, &actions, None);
+                            reevaluate_fullscreen(&h);
                         });
                     }
 
@@ -966,7 +1008,7 @@ pub fn run(hide_native: bool) {
                     if tick % 10 == 0 {
                         let periphs = system_widgets::get_peripheral_batteries();
                         let _ = h_slow.emit("peripherals-updated", &periphs);
-                        if hide_native {
+                        if hide_native && !win_shell::is_restore_in_progress() {
                             win_shell::hide_native_taskbar();
                         }
                     }
@@ -984,10 +1026,13 @@ pub fn run(hide_native: bool) {
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
             if hide_native {
+                win_shell::stop_appbar_message_window();
                 win_shell::restore_native_taskbar();
             }
         }
     });
+
+    drop(_single_instance);
 }
 
 #[cfg(test)]

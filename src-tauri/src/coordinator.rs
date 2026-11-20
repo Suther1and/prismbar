@@ -83,7 +83,7 @@ pub enum NotificationState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelRect {
     pub left: i32,
     pub top: i32,
