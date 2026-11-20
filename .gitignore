@@ -1,0 +1,22 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# Premature / local build artifacts
+TestBar.exe
+*.exe
+*.msi
+*.nsis
+
+# BMAD local render cache & ephemeral scratch
+_bmad/render/
+_bmad-output/**/reviews/
+_bmad-output/**/.working/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
