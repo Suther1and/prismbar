@@ -23,6 +23,7 @@ covers = ["R1"]
 after = [1]
 hitl = false
 risk = "high"
+refine = true
 
 [[entry]]
 id = 3

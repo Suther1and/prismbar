@@ -3,7 +3,7 @@ title: 'Restore compiling shell baseline, pure WindowCoordinator & automated tes
 type: 'feature'
 ticket: '1'
 created: '2026-11-20'
-status: 'built'
+status: done
 baseline_revision: '5de4961acf2b23e2202220af3e1f613ba7adb4ea'
 route: 'full'
 route_source: 'auto'
