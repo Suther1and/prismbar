@@ -1,0 +1,46 @@
+# Stories for Epic 3: Compact Tray Overflow, WASAPI Audio/Mixer, OSD, Layout & Calendar
+# Table order is build order.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Two-tier compact 6-column Tray Overflow (^) with real hidden-window activation"
+description = "Replaces the sysinfo process-list stub in system_widgets.rs with background hidden-window/tray-app enumeration integrated with IconCache, renders the 244px 6-column icon-only grid in FlyoutView.tsx with a non-shifting floating hover tooltip, activates/restores the target hidden window on left-click, adds an overlay right-click menu (Open / Location via raw_arg helper from 2.4 / End Task), and provides a 1-click native Windows overflow (Win+B) header button."
+verify = "Rust unit tests verify background-app filtering/deduplication against open taskbar windows; frontend tests verify 6-column grid layout and non-shifting tooltip state; pnpm build, pnpm test, and cargo test pass."
+covers = ["R1"]
+after = ["2.5"]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Floating Volume OSD, hardened WASAPI 3-role audio switcher & active-session mixer"
+description = "Moves taskbar scroll-wheel volume feedback into non-activating FlyoutKind::Osd (removing inline volToast jitter from TaskbarView.tsx), upgrades audio.rs to use an RAII COM guard, switch all 3 IPolicyConfig roles with HRESULT error propagation, filter expired/inactive WASAPI sessions and aggregate multi-process app volumes, splits audio-master-updated vs audio-mixer-updated IPC, and adds the sliding 3-device indicator in FlyoutView.tsx."
+verify = "Rust unit tests validate session deduplication/filtering and error propagation; Vitest checks OSD vs open-sound preemption behavior; pnpm build, pnpm test, and cargo test pass."
+covers = ["R2"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Live foreground keyboard layout toggle & interactive Calendar flyout"
+description = "Ensures live foreground RU/EN layout display and toggle on the taskbar and completes the 310px Calendar flyout in FlyoutView.tsx with centered SVG chevrons, month navigation, real clicked-date selection plus Today jump, local TestBar session alerts list, and a 1-click button invoking native Windows Notification Center (Win+N)."
+verify = "Frontend unit tests validate calendar month grid generation, date selection, and Today navigation; pnpm build, pnpm test, and cargo test pass."
+covers = ["R3"]
+after = [2]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Refactor sweep — Epic 3 tray, audio, layout & calendar cleanup"
+description = "Resolves deferred review findings and removes residual legacy audio/tray helpers across audio.rs, system_widgets.rs, TaskbarView.tsx, and FlyoutView.tsx."
+verify = "pnpm build, pnpm test, and cargo test --manifest-path src-tauri/Cargo.toml pass cleanly with zero new warnings."
+covers = ["R1", "R2", "R3"]
+after = [3]
+hitl = false
+risk = "low"

@@ -1,0 +1,46 @@
+# Stories for Epic 4: Start Menu 4 Adaptive Spaces, Universal Pinning, Edit Mode & Type-Anywhere Search
+# Table order is build order.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Start Menu shell, show-time hydration, 4 Spaces + custom & zero-clipping dynamic grids"
+description = "Wires StartView.tsx to show-time start-state hydration and unified IconCache, implements the spring sliding Space selector with hover ghost pill, cursor-tracking .spot-card radial spotlight, and prefers-reduced-motion support from DESIGN.md, removes hard .slice() truncation across Personal/Work/Studio/Games/Custom lists so unlimited user pins wrap/scroll cleanly, and replaces residual Unicode glyphs with inline SVGs."
+verify = "Vitest verifies unlimited pin rendering without clipping across all 4 Spaces + custom spaces and sliding indicator state; pnpm build, pnpm test, and cargo test pass."
+covers = ["R1"]
+after = ["3.4"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Universal Edit Mode, modal-safe Pinning + UWP All Apps, TestBar Settings, Power overlay & Shift layer"
+description = "Enables drag-and-drop reorder across all Space lists (including Work hubs, Work apps, Personal links, Studio tools, and Games) with pixel-centered inline SVG x unpin badges, wraps rfd file/folder pickers in WindowCoordinator modal-guard so Start never closes while picking, extends apps_indexer.rs with UWP shell:AppsFolder discovery and RAII COM guard (removing the 180-app cap and fixing Discord default target args), verifies the TestBar Settings drawer (Dock/Edge, autostart, emergency restore, zero C2 exclusions; reachable from 2.4 empty-bar right-click) and 2-click armed Power overlay, and wires Shift alternate actions to match every shown badge."
+verify = "Rust unit tests verify UWP/Start indexer deduplication and RAII COM safety; Vitest verifies Shift action dispatch, Settings drawer actions, and 2-click Power arming; pnpm build, pnpm test, and cargo test pass."
+covers = ["R2"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Zero-loss type-anywhere RU<->EN search across apps, UWP, games, all Spaces & user files"
+description = "Expands the Start Menu type-anywhere command palette search corpus to include user files (Desktop/Documents/Downloads index), UWP apps, games (consuming games-indexed updated later by 5.3), personalLinks, workApps, studioTools, gameLaunchers, and customSpaces alongside installed apps, guaranteeing zero dropped leading keystrokes on Start open, RU<->EN fuzzy ranking via layoutMap.ts, keyboard arrow selection, Enter launch, and Ctrl+Enter admin launch."
+verify = "Vitest tests verify RU<->EN wrong-layout queries (including 'ntkt' -> Telegram), file/space/UWP search inclusion, ranking order, and Enter/Ctrl+Enter dispatch; pnpm build, pnpm test, and cargo test pass."
+covers = ["R3"]
+after = [2]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Refactor sweep — Epic 4 Start Menu & search cleanup"
+description = "Resolves deferred review items, removes any remaining UI tutorial hint copy or Unicode glyph hacks in StartView.tsx, and splits overly large StartView sections into clean subcomponents without changing behavior."
+verify = "Automated audit confirms zero emoji/tutorial hints in StartView; pnpm build, pnpm test, and cargo test pass cleanly."
+covers = ["R1", "R2", "R3"]
+after = [3]
+hitl = false
+risk = "low"

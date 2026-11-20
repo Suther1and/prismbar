@@ -2,14 +2,9 @@
 type: initiative
 title: "TestBar — Windows 11 Taskbar & Start Menu Replacement"
 parent: none
-sources:
-  - _bmad-output/initiative-testbar/brief-testbar/brief-testbar.md
-  - _bmad-output/initiative-testbar/prd-testbar/prd-testbar.md
-companions:
-  - _bmad-output/initiative-testbar/ux-testbar/ux-testbar.md
-  - _bmad-output/initiative-testbar/ux-testbar/DESIGN.md
-  - _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md
-  - _bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md
+status: in-progress
+sources: [_bmad-output/initiative-testbar/brief-testbar/brief-testbar.md, _bmad-output/initiative-testbar/prd-testbar/prd-testbar.md]
+companions: [_bmad-output/initiative-testbar/ux-testbar/ux-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md, _bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md]
 risk: high
 ---
 
@@ -37,7 +32,7 @@ A Windows 11 daily user runs TestBar as their primary bottom taskbar and Start M
 ## Constraints
 
 - **C1 (prd NFR-04):** Zero DLL injections, hooks into `explorer.exe` memory, or system binary patches.
-- **C2 (brief MVP Boundaries, prd NFR-06):** Strictly dark Obsidian Layered Glass theme only; zero light theme, accent color pickers, VPN toggle, weather widget, calculator, quick notes, monitor layout buttons, Focus/DND filler toggles, «Режимы работы», raw GPU RPM/MHz numbers, emoji, or inline UI tutorial hints (per approved `DESIGN.md` and `EXPERIENCE.md`).
+- **C2 (brief Границы версии 1.0 (MVP), prd NFR-06):** Strictly dark Obsidian Layered Glass theme only; zero light theme, accent color pickers, VPN toggle, weather widget, calculator, quick notes, monitor layout buttons, Focus/DND filler toggles, «Режимы работы», raw GPU RPM/MHz numbers, emoji, or inline UI tutorial hints (per approved `DESIGN.md` and `EXPERIENCE.md`).
 - **C3 (prd NFR-05):** Standalone local Windows 11 build relying solely on the OS-provided WebView2 Runtime without external runtime installers.
 
 ## Done when
@@ -67,7 +62,8 @@ A Windows 11 daily user runs TestBar as their primary bottom taskbar and Start M
 
 ## Notes
 
-- Decision: 2026-11-20 — User-approved UX (`DESIGN.md`, `EXPERIENCE.md`, 2026-11-20) supersedes earlier PRD v1 drafts (`FR-19`, `FR-20`, `FR-21`, `FR-16`) by locking dark-only Obsidian Layered Glass theme, 2 layout modes (Floating Dock and Edge-to-Edge Bar, dropping Split Islands), and explicitly excluding weather, VPN, Focus/DND, calculator, quick notes, monitor buttons, and brightness filler widgets.
+- Decision: 2026-11-20 — User-approved UX (`DESIGN.md`, `EXPERIENCE.md`, 2026-11-20) supersedes earlier PRD v1 drafts (`FR-16`, `FR-19`, `FR-20`, `FR-21`, `FR-22`) by locking dark-only Obsidian Layered Glass theme, fixed `52px` taskbar height with fixed modules, 2 layout modes (Floating Dock and Edge-to-Edge Bar, dropping Split Islands), and explicitly excluding weather, VPN, Focus/DND, calculator, quick notes, monitor buttons, and brightness filler widgets.
 - Decision: 2026-11-20 — The premature prototype committed at git baseline `772e23c` is retained as a brownfield workspace; its broken compilation, Win32/WebView2 lifecycle defects, fake tray module, and UX regressions are fixed systematically through the planned BMAD epics and stories.
 - Source conflict: `prd FR-18` vs brownfield `src-tauri/src/system_widgets.rs` — prototype implemented tray overflow as a process list instead of real tray icons; resolved via `epic-tray-audio-calendar` architectural contract.
 - Decision: 2026-11-20 — Windows 11 24H2/25H2 unpackaged `.exe` constraints settled during Architecture Reviewer Gate (`architecture-testbar.md` AD-7): Tray Overflow (`^`) uses zero-injection Two-Tier background app inspection (activating real hidden app windows) plus 1-click native Windows overflow (`Win+B`) escape hatch; Calendar Notifications displays local TestBar session alerts plus 1-click native Windows Notification Center toggle (`Win+N`) because WinRT `UserNotificationListener` requires MSIX Package Identity.
+- High-risk check: Verify forced-kill watchdog restoration (`taskkill /F /PID`) restores `Shell_TrayWnd` and original HiDPI `SPI_GETWORKAREA` cleanly without requiring `explorer.exe` restart.

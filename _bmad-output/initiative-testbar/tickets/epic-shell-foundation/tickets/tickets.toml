@@ -1,0 +1,58 @@
+# Stories for Epic 1: Core Shell Host, Safe AppBar/Watchdog & 3-Window Lifecycle
+# Table order is build order.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Restore compiling shell baseline, pure WindowCoordinator & automated test harness"
+description = "Creates the Win32-independent WindowCoordinator state machine (3-window visibility, FlyoutKind preemption, 180ms anti-double-toggle debounce, modal picker guard, single fullscreen classifier, DPI AppBar rect math), locks resizable:false and strict local CSP in tauri.conf.json, repairs broken lib.rs/win_shell.rs compilation without 1x1 window shrinking, wires non-activating preview/OSD WndProc behavior and non-blocking GlobalMouseDown dispatch with canonical+alias FlyoutKind/event compatibility, and installs Vitest (pnpm test -> vitest run) with layoutMap.ts unit tests."
+verify = "pnpm build, pnpm test, and cargo test --manifest-path src-tauri/Cargo.toml all exit 0 with passing unit tests for WindowCoordinator, fullscreen classification, DPI AppBar rects, existing config smoke, and RU<->EN layout mapping; launching with --no-hide-native shows a borderless non-resizable taskbar without 1x1 shrink."
+covers = ["R2", "R3", "R5"]
+after = []
+hitl = false
+risk = "high"
+refine = true
+
+[[entry]]
+id = 2
+type = "story"
+title = "Single-instance mutex, top-level AppBar/TaskbarCreated window & HiDPI watchdog recovery"
+description = "Adds the Local\\TestBar_SingleInstance_v1 startup guard, replaces unused TaskbarCreated/message handling with a hidden top-level WS_OVERLAPPED window handling ABN_POSCHANGED, ABN_FULLSCREENAPP, TaskbarCreated, WM_DISPLAYCHANGE, and WM_DPICHANGED, captures and persists the original SPI_GETWORKAREA snapshot to %LOCALAPPDATA%\\TestBar\\recovery-workarea.json, scales Dock (64px) vs Edge (52px) AppBar heights by DPI, installs a Rust panic hook restoring native taskbars, and upgrades --watchdog <pid> --workarea <l,t,r,b> to flush AppBar via dummy HWND and restore exact HiDPI work area."
+verify = "Cargo tests validate work-area snapshot serialization, DPI height calculation, and watchdog argument parsing; second launch exits cleanly without mutating work area, and exit, panic, forced kill, or Ctrl+Alt+Shift+Esc restores Shell_TrayWnd and original HiDPI work area."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Non-blocking global hooks channel & strict fullscreen auto-hide integration"
+description = "Refactors WH_KEYBOARD_LL and WH_MOUSE_LL in win_shell.rs so hook callbacks only enqueue ShellHookEvent values onto a bounded sync_channel(64) via try_send drained by a dedicated coordinator worker thread, verifies lone Win key vs Win+<key> OS shortcut preservation, and routes both ABN_FULLSCREENAPP (from Story 1.2) and periodic checks exclusively through coordinator::classify_fullscreen so maximized desktop apps never false-hide and taskbar resizes never leak over fullscreen games."
+verify = "Unit tests verify lone Win vs Win+chord state transitions, bounded channel drop-on-full safety, and fullscreen suppression preventing taskbar re-show on resize; cargo test, pnpm test, and pnpm build pass with zero hook-thread IPC calls."
+covers = ["R2", "R4"]
+after = [2]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Command-scoped atomic config authority, PinItem matching schema & autostart"
+description = "Upgrades config.rs to schema_version 1 with monotonic revision, adds canonical title (with serde alias 'name'), args, match_exe, match_aumid, and combo_targets fields to polymorphic PinItem (migrating game_combos into kind='combo'), adds pinned_clipboard persistence, supports uniform reorder across every PinItem list (personal, work, work_apps, personal_links, studio, studio_tools, games, game_launchers, taskbar_pins, custom_spaces), removes any full-document save_config overwrite IPC in favor of command-scoped mutations, and verifies HKCU Run autostart."
+verify = "Cargo unit tests verify schema migration/defaults, monotonic revision bumps, atomic tmp+rename persistence, uniform reorder across all 10 PinItem lists, and zero full-document overwrite commands remain; cargo test, pnpm test, and pnpm build pass."
+covers = ["R5"]
+after = [3]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Refactor sweep — Epic 1 shell foundation cleanup"
+description = "Resolves deferred review items and compiler warnings accumulated across Epic 1 shell foundation stories without adding new feature scope."
+verify = "cargo test --manifest-path src-tauri/Cargo.toml, pnpm test, and pnpm build pass with zero errors and zero new warnings across coordinator.rs, win_shell.rs, config.rs, and lib.rs."
+covers = ["R1", "R2", "R3", "R4", "R5"]
+after = [4]
+hitl = false
+risk = "low"

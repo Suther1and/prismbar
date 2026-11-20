@@ -1,0 +1,57 @@
+# Stories for Epic 2: Bottom Taskbar, Real Window Tracking, UWP Icons, Previews & Context Menus
+# Table order is build order.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Unified IconCache service & diff-only visible-window broadcasts"
+description = "Implements src-tauri/src/icon_cache.rs (256-entry LRU, namespaced exe:/aumid:/hwnd:/file: keys, batch get_icons IPC) plus frontend Map cache in src/lib/ipc.ts, and refactors the window tracker poller in lib.rs to emit windows-updated only on actual window/focus diffs targeting visible windows (taskbar + visible start/flyout) carrying icon_key instead of base64 PNG payloads."
+verify = "Cargo unit tests verify IconCache LRU eviction, namespaced key generation, and visible-window diff-only emission logic; Vitest verifies frontend icon batch fetch caching; pnpm build, pnpm test, and cargo test pass."
+covers = ["R1"]
+after = ["1.5"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "UWP & Win32 real icon extraction (RAII COM) and pinned/running deduplication"
+description = "Adds Win32_Storage_Packaging_Appx support and an RAII COM guard in windows_tracker.rs (per AD-5) to resolve packaged UWP windows hosted in ApplicationFrameHost.exe via child CoreWindow PID, GetApplicationUserModelId, and IShellItemImageFactory into IconCache, and matches pinned taskbar PinItems to running windows using canonical match_exe and match_aumid without duplicates."
+verify = "Unit tests validate pinned-to-running merge across Win32 exe paths and UWP AUMIDs without duplicate slots and RAII COM guard behavior; cargo test, pnpm test, and pnpm build pass."
+covers = ["R2"]
+after = [1]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Taskbar Dock/Edge layout, contained capsule hover & gapless live window previews"
+description = "Aligns TaskbarView.tsx and tokens.css to DESIGN.md (52px bar, 42x40px stationary hover slot with 6px margin, inner 24x24px lift, cursor radial glow, Dock/Edge-to-Edge toggle, active/running/multi-window pills) and wires gapless non-activating PrintWindow hover previews in FlyoutView.tsx with click-to-focus and per-window close."
+verify = "Frontend tests verify Dock/Edge layout class contracts and preview hover preemption; pnpm build, pnpm test, and cargo test pass."
+covers = ["R3"]
+after = [2]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Full taskbar context menus: Jump Lists, New Window, Admin, raw-arg Location, End Task & empty bar"
+description = "Implements app right-click context menu in FlyoutView.tsx and windows_tracker.rs (using RAII COM guard) with real recent/task Jump List items, New Window, Run as Admin (escaped target), Open File Location using raw_arg for explorer.exe /select, Pin/Unpin, Close Window(s), and End Task with error reporting, plus empty-bar right-click menu opening Task Manager, Dock/Edge toggle, TestBar Settings view, and Emergency restore."
+verify = "Rust unit tests validate raw explorer.exe /select argument formatting, PowerShell/launch escaping, and Jump List parsing; pnpm build, pnpm test, and cargo test pass."
+covers = ["R4"]
+after = [3]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Refactor sweep — Epic 2 taskbar & window tracking cleanup"
+description = "Resolves deferred review items and removes dead icon/preview paths across icon_cache.rs, windows_tracker.rs, TaskbarView.tsx, and FlyoutView.tsx."
+verify = "pnpm build, pnpm test, and cargo test --manifest-path src-tauri/Cargo.toml pass cleanly with zero new warnings."
+covers = ["R1", "R2", "R3", "R4"]
+after = [4]
+hitl = false
+risk = "low"

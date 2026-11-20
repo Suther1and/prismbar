@@ -1,0 +1,57 @@
+# Stories for Epic 5: Live Media, Clipboard, Telemetry, Peripherals, Steam Games & Standalone .exe Delivery
+# Table order is build order.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Dedicated MTA WinRT SMTC worker, continuous clipboard vault, hidden-window gating & synced peripherals/audio"
+description = "Moves WinRT SMTC session polling and transport commands in media.rs onto a dedicated MTA worker thread (removing thread::sleep from lib.rs IPC), gates slow-poller IPC broadcasts (media, telemetry, peripherals) so hidden windows receive zero background spam while show-time hydration pushes fresh state, persists pinned clipboard entries in config.pinned_clipboard while keeping AddClipboardFormatListener active when Start is hidden, and syncs StartView Personal/Games audio/mic controls and Bluetooth peripheral battery popover with audio-mixer-updated."
+verify = "Rust unit tests verify clipboard history deduplication/pin retention, hidden-window slow-poller suppression, and non-blocking SMTC command dispatch; pnpm build, pnpm test, and cargo test pass."
+covers = ["R1"]
+after = ["3.4", "4.4"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Human-readable CPU/RAM/NVML telemetry, Studio GPU/RAM processes & multi-PID kill"
+description = "Enhances telemetry.rs to aggregate all PIDs per process group for reliable multi-process termination with explicit OS error reporting, exposes real NVML per-process GPU compute/graphics VRAM usage alongside RAM consumers for Studio's strictly single-line Active GPU/RAM Processes list, and verifies graceful fallback when NVML is absent."
+verify = "Rust unit tests validate process-group multi-PID aggregation, VRAM/RAM sorting, and NVML-absent fallback; Vitest checks single-line telemetry formatting; pnpm build, pnpm test, and cargo test pass."
+covers = ["R2"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Dynamic Registry Steam library scanner, 3D cover tilt & 1-click Game Combos"
+description = "Adds Win32_System_Registry SteamPath lookup (with standard path fallbacks) to apps_indexer.rs to replace hardcoded D:\\steam paths (automatically feeding games-indexed into Story 4.3's search corpus), parses libraryfolders.vdf and appmanifest_*.acf with real local hero art, implements interactive 3D hover tilt and Recent(4)/All Games toggle in StartView Games space, and executes polymorphic PinItem combo launches cleanly."
+verify = "Rust unit tests validate VDF/ACF parsing and multi-library Steam path resolution; Vitest checks Recent/All toggle and combo launch invocation; pnpm build, pnpm test, and cargo test pass."
+covers = ["R3"]
+after = [2]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Refactor sweep — Epic 5 hardware, media & games cleanup"
+description = "Resolves deferred review items and compiler warnings accumulated across Stories 5.1-5.3 without adding new feature scope."
+verify = "pnpm build, pnpm test, and cargo test --manifest-path src-tauri/Cargo.toml pass cleanly with zero new warnings across media.rs, telemetry.rs, apps_indexer.rs, and Start panels."
+covers = ["R1", "R2", "R3"]
+after = [3]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Standalone release .exe packaging & full UX/NFR compliance sign-off"
+description = "Finalizes tauri.conf.json standalone local release packaging, runs automated UX compliance checks against DESIGN.md and EXPERIENCE.md Hard Exclusions (zero emoji, zero tutorial hints, prefers-reduced-motion, zero excluded widgets) plus idle resource sanity verification, and builds src-tauri/target/release/testbar.exe via pnpm tauri build."
+verify = "pnpm build, pnpm test, cargo test --manifest-path src-tauri/Cargo.toml, and pnpm tauri build all succeed with zero errors and produce a verified standalone src-tauri/target/release/testbar.exe."
+covers = ["R4"]
+after = ["1.5", "2.5", "3.4", "4.4", 4]
+hitl = false
+risk = "medium"
