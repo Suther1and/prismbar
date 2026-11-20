@@ -2,7 +2,7 @@
 type: initiative
 title: "TestBar — Windows 11 Taskbar & Start Menu Replacement"
 parent: none
-status: in-progress
+status: done
 sources: [_bmad-output/initiative-testbar/brief-testbar/brief-testbar.md, _bmad-output/initiative-testbar/prd-testbar/prd-testbar.md]
 companions: [_bmad-output/initiative-testbar/ux-testbar/ux-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md, _bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md]
 risk: high
