@@ -8,6 +8,7 @@ import {
   BUILTIN_SPACES,
   computeSlidingPillRect,
   CUSTOM_SPACE_ACCENTS,
+  getBatteryColor,
   validateCustomSpaceName,
   type ArmedPowerKind,
   type PowerActionKind,
@@ -179,7 +180,10 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                 <MouseIcon className="ic14" />
                 <span>{mouseBat.percent}%</span>
                 <span className="bat-track">
-                  <i className="bat-fill" style={{ width: `${mouseBat.percent}%`, background: '#34D399' }} />
+                  <i
+                    className="bat-fill"
+                    style={{ width: `${mouseBat.percent}%`, background: getBatteryColor(mouseBat.percent) }}
+                  />
                 </span>
                 <span className="periph-sep" />
               </>
@@ -188,7 +192,10 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
             <span>{audioBat ? `${audioBat.percent}%` : activeDev?.shortName || 'Звук'}</span>
             {audioBat && (
               <span className="bat-track">
-                <i className="bat-fill" style={{ width: `${audioBat.percent}%`, background: '#818CF8' }} />
+                <i
+                  className="bat-fill"
+                  style={{ width: `${audioBat.percent}%`, background: getBatteryColor(audioBat.percent) }}
+                />
               </span>
             )}
           </button>
@@ -385,39 +392,50 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
       {/* PERIPHERALS & AUDIO OUTPUT POPOVER */}
       {periphOpen && (
         <div className="periph-pop" onClick={(e) => e.stopPropagation()}>
-          <div className="periph-pop-title">УСТРОЙСТВА И ВЫВОД</div>
-          {periphs.map((p) => (
-            <div key={p.name} className="pp-row">
-              <span className="pp-ic">
-                {p.kind === 'audio' ? <HeadphonesIcon className="ic14" /> : <MouseIcon className="ic14" />}
-              </span>
-              <div className="pp-meta">
-                <div className="pp-name">{p.name}</div>
-                <div className="pp-sub">Bluetooth</div>
-              </div>
-              <strong className="pp-pct" style={{ color: p.percent > 30 ? '#34D399' : '#FB7185' }}>
-                {p.percent}%
-              </strong>
-            </div>
-          ))}
-          {(audio?.devices ?? []).map((d) => (
-            <div
-              key={d.id}
-              className={`pp-row ${d.isDefault ? 'active' : ''}`}
-              onClick={() => {
-                onSelectAudioDevice(d.id);
-                onClosePeriph();
-              }}
-            >
-              <span className="pp-ic"><VolIcon /></span>
-              <div className="pp-meta">
-                <div className="pp-name">{d.shortName}</div>
-                <div className="pp-sub" style={{ color: d.isDefault ? 'var(--accent)' : 'var(--t3)' }}>
-                  {d.isDefault ? 'Активный вывод' : 'Переключить'}
+          <div className="periph-pop-title">BLUETOOTH-УСТРОЙСТВА</div>
+          {periphs.length === 0 ? (
+            <div className="pp-empty">Нет устройств с датчиком заряда</div>
+          ) : (
+            periphs.map((p) => (
+              <div key={p.name} className="pp-row static">
+                <span className="pp-ic">
+                  {p.kind === 'audio' ? <HeadphonesIcon className="ic14" /> : <MouseIcon className="ic14" />}
+                </span>
+                <div className="pp-meta">
+                  <div className="pp-name">{p.name}</div>
+                  <div className="pp-sub">Bluetooth</div>
                 </div>
+                <strong className="pp-pct" style={{ color: getBatteryColor(p.percent) }}>
+                  {p.percent}%
+                </strong>
               </div>
-            </div>
-          ))}
+            ))
+          )}
+
+          <div className="pp-sec">ВЫВОД ЗВУКА</div>
+          {(audio?.devices ?? []).length === 0 ? (
+            <div className="pp-empty">Устройства вывода не найдены</div>
+          ) : (
+            (audio?.devices ?? []).map((d) => (
+              <button
+                key={d.id}
+                type="button"
+                className={`pp-row ${d.isDefault ? 'active' : ''}`}
+                onClick={() => {
+                  onSelectAudioDevice(d.id);
+                  onClosePeriph();
+                }}
+              >
+                <span className="pp-ic"><VolIcon /></span>
+                <div className="pp-meta">
+                  <div className="pp-name">{d.shortName}</div>
+                  <div className="pp-sub" style={{ color: d.isDefault ? 'var(--accent)' : 'var(--t3)' }}>
+                    {d.isDefault ? 'Активный вывод' : 'Переключить'}
+                  </div>
+                </div>
+              </button>
+            ))
+          )}
         </div>
       )}
     </>

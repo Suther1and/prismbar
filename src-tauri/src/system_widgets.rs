@@ -44,6 +44,7 @@ use crate::windows_tracker::{
 };
 
 const CF_UNICODETEXT: u32 = 13;
+const MAX_CLIPBOARD_ENTRIES: usize = 12;
 const MAX_TRAY_APPS: usize = 48;
 const MAX_SESSION_ALERTS: usize = 8;
 
@@ -53,7 +54,7 @@ const DEVPKEY_BLUETOOTH_BATTERY: DEVPROPKEY = DEVPROPKEY {
     pid: 2,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardEntry {
     pub id: String,
@@ -63,7 +64,7 @@ pub struct ClipboardEntry {
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PeripheralBattery {
     pub name: String,
@@ -103,6 +104,7 @@ pub struct NetworkInfo {
 }
 
 static CLIPBOARD_HISTORY: OnceLock<Mutex<Vec<ClipboardEntry>>> = OnceLock::new();
+static CLIP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static LAST_EXTERNAL_FG: OnceLock<Mutex<isize>> = OnceLock::new();
 static SESSION_ALERTS: OnceLock<Mutex<Vec<SessionAlert>>> = OnceLock::new();
 static ALERT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -257,35 +259,105 @@ fn classify_clip(text: &str) -> (String, Option<String>) {
     ("TXT".to_string(), None)
 }
 
-fn push_clipboard_text(text: String) {
-    let clean = text.replace('\r', "").replace('\n', " ");
-    let trimmed: String = clean.chars().take(180).collect();
-    let (tag, color) = classify_clip(&trimmed);
+pub fn normalize_clipboard_text(text: &str) -> String {
+    text.replace('\r', "")
+        .replace('\n', " ")
+        .trim()
+        .chars()
+        .take(180)
+        .collect()
+}
 
-    if let Ok(mut list) = clipboard_store().lock() {
-        if let Some(pos) = list.iter().position(|c| c.text == trimmed) {
-            let mut item = list.remove(pos);
-            item.tag = tag;
-            list.insert(0, item);
-        } else {
-            let id = format!("clip-{}", now_epoch_ms());
-            list.insert(
-                0,
-                ClipboardEntry {
-                    id,
-                    tag,
-                    text: trimmed,
-                    color,
-                    pinned: false,
-                },
-            );
+fn next_clip_id() -> String {
+    let seq = CLIP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("clip-{}-{seq}", now_epoch_ms())
+}
+
+fn trim_unpinned_overflow(list: &mut Vec<ClipboardEntry>) {
+    list.sort_by_key(|c| !c.pinned);
+    let pinned_count = list.iter().filter(|c| c.pinned).count();
+    let keep_len = MAX_CLIPBOARD_ENTRIES.max(pinned_count);
+    if list.len() > keep_len {
+        list.truncate(keep_len);
+    }
+}
+
+/// Hydrates persisted pinned clipboard texts (from `config.pinned_clipboard`) into the
+/// live vault without duplicating existing entries.
+pub fn hydrate_pinned_clipboard_into(list: &mut Vec<ClipboardEntry>, pinned_texts: &[String]) {
+    for raw in pinned_texts {
+        let trimmed = normalize_clipboard_text(raw);
+        if trimmed.is_empty() {
+            continue;
         }
-        // Keep pinned + recent up to 12 entries
-        list.sort_by_key(|c| !c.pinned);
-        if list.len() > 12 {
-            list.truncate(12);
+        let (tag, color) = classify_clip(&trimmed);
+        if let Some(existing) = list.iter_mut().find(|c| c.text == trimmed) {
+            existing.pinned = true;
+            existing.tag = tag;
+            existing.color = color;
+        } else {
+            list.push(ClipboardEntry {
+                id: next_clip_id(),
+                tag,
+                text: trimmed,
+                color,
+                pinned: true,
+            });
         }
     }
+    trim_unpinned_overflow(list);
+}
+
+pub fn push_clipboard_text_into(list: &mut Vec<ClipboardEntry>, text: &str) {
+    let trimmed = normalize_clipboard_text(text);
+    if trimmed.is_empty() {
+        return;
+    }
+    let (tag, color) = classify_clip(&trimmed);
+
+    if let Some(pos) = list.iter().position(|c| c.text == trimmed) {
+        let mut item = list.remove(pos);
+        item.tag = tag;
+        item.color = color;
+        list.insert(0, item);
+    } else {
+        list.insert(
+            0,
+            ClipboardEntry {
+                id: next_clip_id(),
+                tag,
+                text: trimmed,
+                color,
+                pinned: false,
+            },
+        );
+    }
+    trim_unpinned_overflow(list);
+}
+
+pub fn toggle_clipboard_pin_in(list: &mut Vec<ClipboardEntry>, id: &str) {
+    if let Some(c) = list.iter_mut().find(|c| c.id == id) {
+        c.pinned = !c.pinned;
+    }
+    trim_unpinned_overflow(list);
+}
+
+pub fn clear_unpinned_clipboard_in(list: &mut Vec<ClipboardEntry>) {
+    list.retain(|c| c.pinned);
+}
+
+fn push_clipboard_text(text: String) {
+    if let Ok(mut list) = clipboard_store().lock() {
+        push_clipboard_text_into(&mut list, &text);
+    }
+}
+
+pub fn hydrate_pinned_clipboard(pinned_texts: &[String]) -> Vec<ClipboardEntry> {
+    if let Ok(mut list) = clipboard_store().lock() {
+        hydrate_pinned_clipboard_into(&mut list, pinned_texts);
+        return list.clone();
+    }
+    vec![]
 }
 
 pub fn get_clipboard_history() -> Vec<ClipboardEntry> {
@@ -294,10 +366,7 @@ pub fn get_clipboard_history() -> Vec<ClipboardEntry> {
 
 pub fn toggle_clipboard_pin(id: &str) -> Vec<ClipboardEntry> {
     if let Ok(mut list) = clipboard_store().lock() {
-        if let Some(c) = list.iter_mut().find(|c| c.id == id) {
-            c.pinned = !c.pinned;
-        }
-        list.sort_by_key(|c| !c.pinned);
+        toggle_clipboard_pin_in(&mut list, id);
         return list.clone();
     }
     vec![]
@@ -305,16 +374,17 @@ pub fn toggle_clipboard_pin(id: &str) -> Vec<ClipboardEntry> {
 
 pub fn clear_unpinned_clipboard() -> Vec<ClipboardEntry> {
     if let Ok(mut list) = clipboard_store().lock() {
-        list.retain(|c| c.pinned);
+        clear_unpinned_clipboard_in(&mut list);
         return list.clone();
     }
     vec![]
 }
 
-pub fn start_clipboard_listener<F>(on_change: F)
+pub fn start_clipboard_listener<F>(initial_pinned: &[String], on_change: F)
 where
     F: Fn(Vec<ClipboardEntry>) + Send + Sync + 'static,
 {
+    hydrate_pinned_clipboard(initial_pinned);
     if let Some(initial) = read_clipboard_text() {
         push_clipboard_text(initial);
     }
@@ -1417,5 +1487,63 @@ mod tests {
         assert_eq!(buf.len(), MAX_SESSION_ALERTS);
         assert_eq!(buf[0].title, "Event 11");
         assert_eq!(buf[MAX_SESSION_ALERTS - 1].title, "Event 4");
+    }
+
+    #[test]
+    fn clipboard_hydrates_pinned_entries_deduplicates_and_retains_pins_across_overflow() {
+        let mut vault = Vec::new();
+        hydrate_pinned_clipboard_into(
+            &mut vault,
+            &[
+                "https://github.com/testbar".to_string(),
+                "#38BDF8".to_string(),
+                "   ".to_string(),
+                "#38BDF8".to_string(), // duplicate must be ignored
+                r"C:\Projects\testbar".to_string(),
+            ],
+        );
+
+        assert_eq!(vault.len(), 3);
+        assert!(vault.iter().all(|c| c.pinned));
+        assert_eq!(vault[0].tag, "URL");
+        assert_eq!(vault[1].tag, "HEX");
+        assert_eq!(vault[1].color.as_deref(), Some("#38BDF8"));
+        assert_eq!(vault[2].tag, "PATH");
+        // Unique IDs even when hydrated within the same millisecond
+        let unique_ids: HashSet<&str> = vault.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(unique_ids.len(), 3);
+
+        // Copying an already-pinned snippet deduplicates and preserves `pinned = true`
+        push_clipboard_text_into(&mut vault, "#38BDF8\r\n");
+        assert_eq!(vault.len(), 3);
+        assert!(vault.iter().find(|c| c.text == "#38BDF8").unwrap().pinned);
+
+        // Copying 15 new unpinned entries must NEVER evict any pinned entries
+        for i in 0..15 {
+            push_clipboard_text_into(&mut vault, &format!("unpinned snippet {i}"));
+        }
+        assert_eq!(vault.len(), MAX_CLIPBOARD_ENTRIES);
+        assert_eq!(vault.iter().filter(|c| c.pinned).count(), 3);
+        assert!(vault.iter().any(|c| c.text == "https://github.com/testbar" && c.pinned));
+        assert!(vault.iter().any(|c| c.text == "#38BDF8" && c.pinned));
+        assert!(vault.iter().any(|c| c.text == r"C:\Projects\testbar" && c.pinned));
+        // Most recent unpinned sits directly after pinned entries
+        assert_eq!(vault[3].text, "unpinned snippet 14");
+        assert!(!vault[3].pinned);
+
+        // Unpin one entry, then clear unpinned -> only remaining 2 pins survive
+        let url_id = vault
+            .iter()
+            .find(|c| c.text == "https://github.com/testbar")
+            .unwrap()
+            .id
+            .clone();
+        toggle_clipboard_pin_in(&mut vault, &url_id);
+        assert!(!vault.iter().find(|c| c.id == url_id).unwrap().pinned);
+
+        clear_unpinned_clipboard_in(&mut vault);
+        assert_eq!(vault.len(), 2);
+        assert!(vault.iter().all(|c| c.pinned));
+        assert!(!vault.iter().any(|c| c.text == "https://github.com/testbar"));
     }
 }

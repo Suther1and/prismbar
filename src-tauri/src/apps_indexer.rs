@@ -6,8 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use windows::core::{Interface, GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM,
+};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::UI::Shell::{
@@ -743,38 +747,325 @@ pub fn scan_user_files() -> Vec<IndexedFile> {
     scan_user_files_in_roots(&roots, DEFAULT_USER_FILE_MAX_DEPTH, DEFAULT_USER_FILE_CAP)
 }
 
-fn parse_acf_field(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&needle) {
-            let rest = trimmed[needle.len()..].trim();
-            if let Some(stripped) = rest.strip_prefix('"') {
-                if let Some(end) = stripped.find('"') {
-                    return Some(stripped[..end].to_string());
-                }
+#[derive(Debug, PartialEq, Eq)]
+enum VdfToken {
+    Str(String),
+    LBrace,
+    RBrace,
+}
+
+fn tokenize_vdf(content: &str) -> Vec<VdfToken> {
+    let mut tokens = Vec::new();
+    let bytes = content.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Line comments: // ...
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
             }
+            continue;
+        }
+        if b == b'{' {
+            tokens.push(VdfToken::LBrace);
+            i += 1;
+            continue;
+        }
+        if b == b'}' {
+            tokens.push(VdfToken::RBrace);
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            let mut out = String::new();
+            let mut chars = content[i..].char_indices();
+            let mut consumed = 0usize;
+            while let Some((idx, ch)) = chars.next() {
+                consumed = idx + ch.len_utf8();
+                if ch == '\\' {
+                    if let Some((nidx, next_ch)) = chars.next() {
+                        consumed = nidx + next_ch.len_utf8();
+                        match next_ch {
+                            '\\' => out.push('\\'),
+                            '"' => out.push('"'),
+                            'n' => out.push('\n'),
+                            't' => out.push('\t'),
+                            other => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if ch == '"' {
+                    break;
+                }
+                out.push(ch);
+            }
+            i += consumed;
+            tokens.push(VdfToken::Str(out));
+            continue;
+        }
+        // Unquoted token fallback
+        let start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'{'
+            && bytes[i] != b'}'
+            && bytes[i] != b'"'
+        {
+            i += 1;
+        }
+        tokens.push(VdfToken::Str(content[start..i].to_string()));
+    }
+
+    tokens
+}
+
+fn collect_vdf_kv_pairs(content: &str) -> Vec<(String, String)> {
+    let tokens = tokenize_vdf(content);
+    let mut pairs = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if let VdfToken::Str(ref key) = tokens[i] {
+            if let Some(VdfToken::Str(ref val)) = tokens.get(i + 1) {
+                pairs.push((key.clone(), val.clone()));
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    pairs
+}
+
+fn normalize_steam_dir_str(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut norm = trimmed.replace('/', "\\");
+    while norm.len() > 3 && norm.ends_with('\\') {
+        norm.pop();
+    }
+    let path = PathBuf::from(&norm);
+    if norm.to_ascii_lowercase().ends_with(".exe") {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        Some(path)
+    }
+}
+
+fn read_registry_sz(root: HKEY, subkey: &str, value_name: &str) -> Option<String> {
+    let subkey_w = wide(subkey);
+    let value_w = wide(value_name);
+    let mut byte_len: u32 = 0;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if status != ERROR_SUCCESS || byte_len < 2 || byte_len > 16_384 {
+        return None;
+    }
+    let mut buf = vec![0u16; (byte_len as usize / 2) + 2];
+    let mut actual_bytes = (buf.len() * 2) as u32;
+    let status2 = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            Some(&mut actual_bytes),
+        )
+    };
+    if status2 != ERROR_SUCCESS {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let text = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Resolves ordered, deduplicated Steam root candidates, always placing Windows Registry
+/// paths ahead of standard fallback directories (AD-7).
+pub fn resolve_steam_root_candidates(
+    registry_paths: &[Option<String>],
+    fallback_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in registry_paths
+        .iter()
+        .flatten()
+        .filter_map(|raw| normalize_steam_dir_str(raw))
+        .chain(
+            fallback_paths
+                .iter()
+                .filter_map(|p| normalize_steam_dir_str(&p.to_string_lossy())),
+        )
+    {
+        let key = candidate.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(candidate);
+        }
+    }
+
+    out
+}
+
+fn default_steam_fallback_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(r"C:\Program Files (x86)\Steam"),
+        PathBuf::from(r"C:\Program Files\Steam"),
+        PathBuf::from(r"C:\Steam"),
+        PathBuf::from(r"D:\Steam"),
+        PathBuf::from(r"E:\Steam"),
+    ]
+}
+
+fn query_registry_steam_paths() -> Vec<Option<String>> {
+    vec![
+        read_registry_sz(HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+        read_registry_sz(HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamExe"),
+        read_registry_sz(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Valve\Steam",
+            "InstallPath",
+        ),
+        read_registry_sz(HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+    ]
+}
+
+fn all_steam_root_candidates() -> Vec<PathBuf> {
+    resolve_steam_root_candidates(&query_registry_steam_paths(), &default_steam_fallback_paths())
+}
+
+/// Dynamically detects the installed Steam root directory via Windows Registry
+/// (`HKCU\Software\Valve\Steam\SteamPath`, `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath`)
+/// with standard fallback paths.
+pub fn detect_steam_root() -> Option<PathBuf> {
+    all_steam_root_candidates()
+        .into_iter()
+        .find(|dir| dir.is_dir())
+}
+
+/// Dynamically detects `steam.exe` via Registry `SteamPath` + fallback locations.
+pub fn detect_steam_exe() -> Option<String> {
+    for root in all_steam_root_candidates() {
+        let exe = root.join("steam.exe");
+        if exe.is_file() {
+            return Some(exe.to_string_lossy().to_string());
         }
     }
     None
+}
+
+/// Parses both modern (`"path" "D:\\SteamLibrary"`) and legacy (`"1" "E:\\SteamLib"`)
+/// `libraryfolders.vdf` formats into normalized, deduplicated library directory paths.
+pub fn parse_libraryfolders_vdf(content: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (key, val) in collect_vdf_kv_pairs(content) {
+        let is_modern_path = key.eq_ignore_ascii_case("path");
+        let is_legacy_slot = !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_digit())
+            && (val.contains(":\\") || val.contains(":/") || val.starts_with("\\\\"));
+        if !is_modern_path && !is_legacy_slot {
+            continue;
+        }
+        if let Some(dir) = normalize_steam_dir_str(&val) {
+            let norm_key = dir.to_string_lossy().to_ascii_lowercase();
+            if seen.insert(norm_key) {
+                dirs.push(dir);
+            }
+        }
+    }
+
+    dirs
+}
+
+/// Parses a Steam `appmanifest_<appid>.acf` file into `(app_id, name, last_activity_ts)`.
+/// Skips Steamworks Common Redistributables (`appid == 228980`).
+pub fn parse_appmanifest_acf(content: &str) -> Option<(String, String, u64)> {
+    let mut app_id: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut last_updated: u64 = 0;
+    let mut last_played: u64 = 0;
+
+    for (key, val) in collect_vdf_kv_pairs(content) {
+        if key.eq_ignore_ascii_case("appid") && app_id.is_none() {
+            let id = val.trim().to_string();
+            if !id.is_empty() {
+                app_id = Some(id);
+            }
+        } else if key.eq_ignore_ascii_case("name") && name.is_none() {
+            let clean = val.trim().to_string();
+            if !clean.is_empty() {
+                name = Some(clean);
+            }
+        } else if key.eq_ignore_ascii_case("lastupdated") {
+            if let Ok(ts) = val.trim().parse::<u64>() {
+                last_updated = last_updated.max(ts);
+            }
+        } else if key.eq_ignore_ascii_case("lastplayed") {
+            if let Ok(ts) = val.trim().parse::<u64>() {
+                last_played = last_played.max(ts);
+            }
+        }
+    }
+
+    let id = app_id?;
+    if id == "228980" {
+        return None;
+    }
+    let title = name?;
+    Some((id, title, last_updated.max(last_played)))
+}
+
+fn read_jpeg_data_uri(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() || bytes.len() > 1_800_000 {
+        return None;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:image/jpeg;base64,{b64}"))
 }
 
 fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
     let cache_dir = steam_root.join("appcache").join("librarycache");
     let candidates = [
         cache_dir.join(app_id).join("library_hero.jpg"),
-        cache_dir.join(app_id).join("header.jpg"),
         cache_dir.join(format!("{app_id}_library_hero.jpg")),
+        cache_dir.join(app_id).join("header.jpg"),
         cache_dir.join(format!("{app_id}_header.jpg")),
+        cache_dir.join(app_id).join("library_600x900.jpg"),
+        cache_dir.join(format!("{app_id}_library_600x900.jpg")),
     ];
     for p in candidates {
-        if p.exists() {
-            if let Ok(bytes) = fs::read(&p) {
-                if bytes.len() <= 1_800_000 {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    return Some(format!("data:image/jpeg;base64,{b64}"));
-                }
-            }
+        if let Some(uri) = read_jpeg_data_uri(&p) {
+            return Some(uri);
         }
     }
     // Also scan nested hashed subfolders inside appcache/librarycache/<appid>/
@@ -784,16 +1075,10 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
             for e in entries.flatten() {
                 let sub = e.path();
                 if sub.is_dir() {
-                    for fname in ["library_hero.jpg", "header.jpg"] {
+                    for fname in ["library_hero.jpg", "header.jpg", "library_600x900.jpg"] {
                         let cand = sub.join(fname);
-                        if cand.exists() {
-                            if let Ok(bytes) = fs::read(&cand) {
-                                if bytes.len() <= 1_800_000 {
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(bytes);
-                                    return Some(format!("data:image/jpeg;base64,{b64}"));
-                                }
-                            }
+                        if let Some(uri) = read_jpeg_data_uri(&cand) {
+                            return Some(uri);
                         }
                     }
                 }
@@ -803,42 +1088,45 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
     None
 }
 
-pub fn scan_steam_games() -> Vec<SteamGame> {
-    let steam_roots = [
-        PathBuf::from(r"D:\steam"),
-        PathBuf::from(r"C:\Program Files (x86)\Steam"),
-        PathBuf::from(r"C:\Steam"),
-        PathBuf::from(r"E:\Steam"),
-    ];
-
+/// Pure, testable multi-library Steam scanner given candidate Steam roots.
+pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
     let mut primary_steam: Option<PathBuf> = None;
     let mut library_dirs: Vec<PathBuf> = Vec::new();
-    for root in &steam_roots {
-        if root.exists() {
-            if primary_steam.is_none() {
-                primary_steam = Some(root.clone());
+    let mut seen_libs: HashSet<String> = HashSet::new();
+
+    let mut push_lib = |dir: PathBuf| {
+        if dir.is_dir() {
+            let key = dir.to_string_lossy().to_ascii_lowercase();
+            if seen_libs.insert(key) {
+                library_dirs.push(dir);
             }
-            library_dirs.push(root.clone());
-            let vdf = root.join("steamapps").join("libraryfolders.vdf");
+        }
+    };
+
+    for root in steam_roots {
+        if !root.is_dir() {
+            continue;
+        }
+        if primary_steam.is_none() {
+            primary_steam = Some(root.clone());
+        }
+        push_lib(root.clone());
+
+        for vdf_rel in [
+            Path::new("steamapps").join("libraryfolders.vdf"),
+            Path::new("config").join("libraryfolders.vdf"),
+        ] {
+            let vdf = root.join(vdf_rel);
             if let Ok(content) = fs::read_to_string(&vdf) {
-                for line in content.lines() {
-                    let t = line.trim();
-                    if t.starts_with("\"path\"") {
-                        if let Some(val) = parse_acf_field(t, "path") {
-                            let clean = val.replace("\\\\", "\\");
-                            let p = PathBuf::from(clean);
-                            if p.exists() && !library_dirs.contains(&p) {
-                                library_dirs.push(p);
-                            }
-                        }
-                    }
+                for extra in parse_libraryfolders_vdf(&content) {
+                    push_lib(extra);
                 }
             }
         }
     }
 
     let mut games = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen_app_ids = HashSet::new();
 
     for lib in &library_dirs {
         let steamapps = lib.join("steamapps");
@@ -849,24 +1137,17 @@ pub fn scan_steam_games() -> Vec<SteamGame> {
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if !(fname.starts_with("appmanifest_") && fname.ends_with(".acf")) {
+                let fname_low = fname.to_ascii_lowercase();
+                if !(fname_low.starts_with("appmanifest_") && fname_low.ends_with(".acf")) {
                     continue;
                 }
                 if let Ok(content) = fs::read_to_string(&p) {
-                    let app_id = match parse_acf_field(&content, "appid") {
-                        Some(id) if id != "228980" => id, // skip Steamworks Common Redistributables
-                        _ => continue,
+                    let Some((app_id, name, last_updated)) = parse_appmanifest_acf(&content) else {
+                        continue;
                     };
-                    if !seen.insert(app_id.clone()) {
+                    if !seen_app_ids.insert(app_id.clone()) {
                         continue;
                     }
-                    let name = match parse_acf_field(&content, "name") {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    let last_updated = parse_acf_field(&content, "LastUpdated")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
                     let cover_data = primary_steam
                         .as_deref()
                         .and_then(|sr| load_steam_cover_data(sr, &app_id))
@@ -885,8 +1166,17 @@ pub fn scan_steam_games() -> Vec<SteamGame> {
         }
     }
 
-    games.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
+    games.sort_by(|a, b| {
+        b.last_updated
+            .cmp(&a.last_updated)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     games
+}
+
+pub fn scan_steam_games() -> Vec<SteamGame> {
+    let candidates = all_steam_root_candidates();
+    scan_steam_games_in_roots(&candidates)
 }
 
 pub fn pick_folder_dialog() -> Option<String> {
@@ -1152,5 +1442,150 @@ mod tests {
                     .as_deref()
                     .is_some_and(|k| k.starts_with("aumid:"))
         }));
+    }
+
+    #[test]
+    fn steam_registry_candidate_resolution_prioritizes_registry_and_deduplicates() {
+        let candidates = resolve_steam_root_candidates(
+            &[
+                Some("G:/Games/Steam/".to_string()),
+                Some(r"G:\Games\Steam\steam.exe".to_string()),
+                Some(r"C:\Program Files (x86)\Steam".to_string()),
+                None,
+            ],
+            &[
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\Steam"),
+            ],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(r"G:\Games\Steam"),
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\Steam"),
+            ]
+        );
+    }
+
+    #[test]
+    fn steam_vdf_acf_and_multi_library_scanner_discovers_games_and_hero_covers() {
+        // 1. Parse both modern `"path"` and legacy numeric slot `libraryfolders.vdf`
+        let modern_vdf = r#"
+"libraryfolders"
+{
+    "0"
+    {
+        "path"      "C:\\Program Files (x86)\\Steam"
+        "label"     ""
+    }
+    "1"
+    {
+        "path"      "F:\\SteamLibrary"
+    }
+}
+"#;
+        let modern_dirs = parse_libraryfolders_vdf(modern_vdf);
+        assert_eq!(
+            modern_dirs,
+            vec![
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"F:\SteamLibrary"),
+            ]
+        );
+
+        let legacy_vdf = r#"
+"LibraryFolders"
+{
+    "TimeNextStatsReport" "1700000000"
+    "1" "D:\\Games\\SteamLib"
+    "2" "E:/ExtraSteam/"
+}
+"#;
+        let legacy_dirs = parse_libraryfolders_vdf(legacy_vdf);
+        assert_eq!(
+            legacy_dirs,
+            vec![
+                PathBuf::from(r"D:\Games\SteamLib"),
+                PathBuf::from(r"E:\ExtraSteam"),
+            ]
+        );
+
+        // 2. End-to-end temp multi-library scan with modern VDF, ACF manifests, redist skip & covers
+        let root = make_temp_dir("steam-multi-lib");
+        let primary = root.join("PrimarySteam");
+        let secondary = root.join("SecondDriveLib");
+        fs::create_dir_all(primary.join("steamapps")).unwrap();
+        fs::create_dir_all(primary.join("appcache").join("librarycache").join("2694490")).unwrap();
+        fs::create_dir_all(secondary.join("steamapps")).unwrap();
+
+        let sec_escaped = secondary.to_string_lossy().replace('\\', "\\\\");
+        let prim_escaped = primary.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            primary.join("steamapps").join("libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n  \"0\" {{ \"path\" \"{prim_escaped}\" }}\n  \"1\" {{ \"path\" \"{sec_escaped}\" }}\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        // Game 1 in primary library with nested library_hero.jpg
+        fs::write(
+            primary.join("steamapps").join("appmanifest_2694490.acf"),
+            "\"AppState\"\n{\n  \"appid\" \"2694490\"\n  \"name\" \"Path of Exile 2\"\n  \"LastUpdated\" \"1732000000\"\n  \"LastPlayed\" \"1732500000\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            primary
+                .join("appcache")
+                .join("librarycache")
+                .join("2694490")
+                .join("library_hero.jpg"),
+            b"\xFF\xD8\xFFhero-bytes",
+        )
+        .unwrap();
+
+        // Steamworks Redistributables (228980) must be skipped
+        fs::write(
+            primary.join("steamapps").join("appmanifest_228980.acf"),
+            "\"AppState\"\n{\n  \"appid\" \"228980\"\n  \"name\" \"Steamworks Common Redistributables\"\n  \"LastUpdated\" \"1739999999\"\n}\n",
+        )
+        .unwrap();
+
+        // Game 2 in secondary drive library with flat <appid>_library_600x900.jpg fallback in primary cache
+        fs::write(
+            secondary.join("steamapps").join("appmanifest_570.acf"),
+            "\"AppState\"\n{\n  \"appid\" \"570\"\n  \"name\" \"Dota 2\"\n  \"LastUpdated\" \"1731000000\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            primary
+                .join("appcache")
+                .join("librarycache")
+                .join("570_library_600x900.jpg"),
+            b"\xFF\xD8\xFFportrait-bytes",
+        )
+        .unwrap();
+
+        let games = scan_steam_games_in_roots(&[primary.clone()]);
+        assert_eq!(games.len(), 2);
+        assert_eq!(games[0].app_id, "2694490");
+        assert_eq!(games[0].name, "Path of Exile 2");
+        assert_eq!(games[0].target, "steam://rungameid/2694490");
+        assert_eq!(games[0].last_updated, 1_732_500_000);
+        assert!(games[0]
+            .cover_data
+            .as_deref()
+            .is_some_and(|u| u.starts_with("data:image/jpeg;base64,")));
+
+        assert_eq!(games[1].app_id, "570");
+        assert_eq!(games[1].name, "Dota 2");
+        assert!(games[1]
+            .cover_data
+            .as_deref()
+            .is_some_and(|u| u.starts_with("data:image/jpeg;base64,")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

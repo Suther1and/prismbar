@@ -1,5 +1,5 @@
 import { canRunAsAdmin } from './flyoutLogic';
-import type { IndexedApp, PinItem, TestBarConfig } from './ipc';
+import type { IndexedApp, PinItem, TestBarConfig, TopProcessInfo } from './ipc';
 
 export type StartAnimPhase = 'open' | 'closing';
 
@@ -367,4 +367,189 @@ export function findBannedStartArtifacts(sourceText: string): string[] {
     }
   }
   return hits;
+}
+
+// ===================== EPIC 5: TELEMETRY, PERIPHERALS, GAMES & COMBOS =====================
+
+export function getBatteryColor(percent: number): string {
+  if (percent > 30) return '#34D399';
+  if (percent > 15) return '#F59E0B';
+  return '#FB7185';
+}
+
+export function getTelemetryStatusPill(pct: number): {
+  cls: 'st-ok' | 'st-mid' | 'st-hot';
+  label: string;
+} {
+  if (pct < 45) return { cls: 'st-ok', label: 'Свободно' };
+  if (pct < 75) return { cls: 'st-mid', label: 'Норма' };
+  return { cls: 'st-hot', label: 'Высокая' };
+}
+
+export function getGpuTempStatusPill(tempC: number): {
+  cls: 'st-ok' | 'st-mid' | 'st-hot';
+  label: string;
+} {
+  if (tempC < 60) return { cls: 'st-ok', label: 'Холодная' };
+  if (tempC < 78) return { cls: 'st-mid', label: 'Рабочая' };
+  return { cls: 'st-hot', label: 'Горячая' };
+}
+
+export function formatGbValue(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/**
+ * Formats strictly single-line memory usage (e.g. `18.4 / 64 ГБ`) with zero raw RPM/MHz numbers.
+ */
+export function formatMemoryRatio(usedGb: number, totalGb: number): string {
+  return `${formatGbValue(usedGb)} / ${formatGbValue(totalGb)} ГБ`;
+}
+
+export interface ProcessMetricDisplay {
+  primary: string;
+  gpuBadge: string | null;
+}
+
+/**
+ * Formats strictly single-line process memory / GPU VRAM readouts for Work and Studio cards.
+ */
+export function formatProcessMetricLine(
+  proc: Pick<TopProcessInfo, 'memGb' | 'vramGb' | 'usesGpu'>,
+  mode: 'ram' | 'gpu',
+): ProcessMetricDisplay {
+  const ramLabel = `${formatGbValue(proc.memGb)} ГБ`;
+  if (mode === 'ram') {
+    return { primary: ramLabel, gpuBadge: null };
+  }
+  if (Number.isFinite(proc.vramGb) && proc.vramGb > 0) {
+    return {
+      primary: ramLabel,
+      gpuBadge: `VRAM ${formatGbValue(proc.vramGb)} ГБ`,
+    };
+  }
+  if (proc.usesGpu) {
+    return {
+      primary: ramLabel,
+      gpuBadge: 'GPU',
+    };
+  }
+  return { primary: ramLabel, gpuBadge: null };
+}
+
+export function resolveProcessKillPids(proc: Pick<TopProcessInfo, 'pid' | 'pids'>): number[] {
+  const source = Array.isArray(proc.pids) && proc.pids.length > 0 ? proc.pids : [proc.pid];
+  const unique: number[] = [];
+  const seen = new Set<number>();
+  for (const raw of source) {
+    if (Number.isInteger(raw) && raw > 0 && !seen.has(raw)) {
+      seen.add(raw);
+      unique.push(raw);
+    }
+  }
+  return unique;
+}
+
+export function formatKillProcessError(procName: string, err: unknown): string {
+  const raw =
+    typeof err === 'string'
+      ? err.trim()
+      : err instanceof Error
+        ? err.message.trim()
+        : String(err ?? '').trim();
+  const cleanName = procName.trim() || 'процесс';
+  if (!raw) {
+    return `Не удалось завершить ${cleanName}`;
+  }
+  const low = raw.toLowerCase();
+  if (low.includes('отказано в доступе') || low.includes('access is denied') || low.includes('access denied')) {
+    return `Отказано в доступе: ${cleanName} требует прав администратора`;
+  }
+  return raw;
+}
+
+export type GameLibraryFilter = 'recent' | 'all';
+export const RECENT_GAMES_LIMIT = 4;
+
+export function selectDisplayedGames<T>(games: readonly T[], filter: GameLibraryFilter): T[] {
+  if (filter === 'recent') {
+    return games.slice(0, RECENT_GAMES_LIMIT);
+  }
+  return [...games];
+}
+
+export const GAME_CARD_MAX_TILT_DEG = 8;
+
+export interface GameCardTilt {
+  gxPct: number;
+  gyPct: number;
+  rotateXDeg: number;
+  rotateYDeg: number;
+}
+
+function clampNum(v: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, v));
+}
+
+function round2(v: number): number {
+  const r = Math.round(v * 100) / 100;
+  return Object.is(r, -0) ? 0 : r;
+}
+
+/**
+ * Computes pointer-tracked 3D hover tilt angles (`perspective(700px) rotateX(...) rotateY(...)`)
+ * clamped strictly to `[-maxDeg, +maxDeg]` and zeroed cleanly under `prefers-reduced-motion`.
+ */
+export function computeGameCardTilt(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  reducedMotion = false,
+  maxDeg = GAME_CARD_MAX_TILT_DEG,
+): GameCardTilt {
+  if (
+    reducedMotion ||
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY) ||
+    !Number.isFinite(rect.width) ||
+    !Number.isFinite(rect.height) ||
+    rect.width <= 0 ||
+    rect.height <= 0
+  ) {
+    return { gxPct: 50, gyPct: 50, rotateXDeg: 0, rotateYDeg: 0 };
+  }
+
+  const clampedMax = Math.max(0, Math.min(20, Number.isFinite(maxDeg) ? maxDeg : GAME_CARD_MAX_TILT_DEG));
+  const nx = clampNum((clientX - rect.left) / rect.width, 0, 1);
+  const ny = clampNum((clientY - rect.top) / rect.height, 0, 1);
+
+  const rotateXDeg = round2(clampNum((0.5 - ny) * 2 * clampedMax, -clampedMax, clampedMax));
+  const rotateYDeg = round2(clampNum((nx - 0.5) * 2 * clampedMax, -clampedMax, clampedMax));
+
+  return {
+    gxPct: round2(nx * 100),
+    gyPct: round2(ny * 100),
+    rotateXDeg,
+    rotateYDeg,
+  };
+}
+
+export function buildGameComboLaunchPayload(
+  item: Pick<PinItem, 'kind' | 'target' | 'comboTargets'>,
+): { command: 'launch_combo'; args: { targets: string[] } } | null {
+  if (item.kind !== 'combo') return null;
+  const rawTargets =
+    Array.isArray(item.comboTargets) && item.comboTargets.length > 0
+      ? item.comboTargets
+      : item.target
+        ? [item.target]
+        : [];
+  const targets = rawTargets.map((t) => t.trim()).filter(Boolean);
+  if (targets.length === 0) return null;
+  return {
+    command: 'launch_combo',
+    args: { targets },
+  };
 }

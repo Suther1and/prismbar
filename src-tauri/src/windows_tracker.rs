@@ -20,7 +20,7 @@ use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, STGM,
+    COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, STGM,
 };
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
@@ -71,6 +71,11 @@ pub struct ComGuard {
 impl ComGuard {
     pub fn init_sta() -> Self {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        Self::from_hresult(hr)
+    }
+
+    pub fn init_mta() -> Self {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         Self::from_hresult(hr)
     }
 
@@ -1171,6 +1176,81 @@ pub fn launch_target_with_args(
 
 pub fn launch_target(target: &str, as_admin: bool) -> Result<(), String> {
     launch_target_with_args(target, None, as_admin)
+}
+
+/// Parses a Game Combo target string into an executable/URI target plus optional CLI arguments.
+/// Supports:
+/// - URI schemes (`steam://rungameid/570`, `https://...`)
+/// - Quoted paths with trailing args (`"C:\...\Update.exe" --processStart Discord.exe`)
+/// - Unquoted paths with `.exe` followed by CLI args (`C:\...\Update.exe --processStart Discord.exe`)
+/// - Bare Squirrel `Discord\Update.exe` (automatically injects `--processStart Discord.exe`)
+pub fn parse_combo_target(raw: &str) -> Result<NormalizedLaunchSpec, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Пустой путь запуска".to_string());
+    }
+
+    let mut spec = if trimmed.starts_with('"') || trimmed.contains("://") {
+        normalize_launch_spec(trimmed, None, false)?
+    } else {
+        let lower = trimmed.to_ascii_lowercase();
+        let mut split_at: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find(".exe") {
+            let end = search_from + rel + 4;
+            if let Some(next_ch) = trimmed[end..].chars().next() {
+                if next_ch.is_whitespace() {
+                    split_at = Some(end);
+                    break;
+                }
+            }
+            search_from = end;
+        }
+        if let Some(idx) = split_at {
+            let exe_part = trimmed[..idx].trim();
+            let args_part = trimmed[idx..].trim();
+            normalize_launch_spec(exe_part, (!args_part.is_empty()).then_some(args_part), false)?
+        } else {
+            normalize_launch_spec(trimmed, None, false)?
+        }
+    };
+
+    if spec.args.is_none() && crate::config::is_discord_update_target(&spec.target) {
+        spec.args = Some("--processStart Discord.exe".to_string());
+    }
+
+    Ok(spec)
+}
+
+/// Launches every non-empty target in a Game Combo, parsing CLI arguments cleanly and
+/// returning any aggregated launch error without aborting sibling targets.
+pub fn launch_combo_targets(targets: &[String]) -> Result<(), String> {
+    let specs: Vec<Result<NormalizedLaunchSpec, String>> = targets
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(parse_combo_target)
+        .collect();
+    if specs.is_empty() {
+        return Err("В связке нет целей для запуска".to_string());
+    }
+    let mut errors = Vec::new();
+    for spec_res in specs {
+        match spec_res {
+            Ok(spec) => {
+                if let Err(err) = launch_target_with_args(&spec.target, spec.args.as_deref(), false)
+                {
+                    errors.push(err);
+                }
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Formats an unescaped Windows command-line raw argument for `explorer.exe /select,"<path>"`

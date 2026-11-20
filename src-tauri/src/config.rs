@@ -191,10 +191,16 @@ fn detect_app_target(name_key: &str) -> String {
         "lightroom" => vec![pf.join(r"Adobe\Adobe Lightroom Classic\Lightroom.exe")],
         "figma" => vec![local.join(r"Figma\Figma.exe")],
         "unity" => vec![pf.join(r"Unity Hub\Unity Hub.exe")],
-        "steam" => vec![
-            PathBuf::from(r"D:\steam\steam.exe"),
-            pf86.join(r"Steam\steam.exe"),
-        ],
+        "steam" => {
+            if let Some(detected) = crate::apps_indexer::detect_steam_exe() {
+                return detected;
+            }
+            vec![
+                pf86.join(r"Steam\steam.exe"),
+                pf.join(r"Steam\steam.exe"),
+                PathBuf::from(r"D:\steam\steam.exe"),
+            ]
+        }
         "battlenet" => vec![pf86.join(r"Battle.net\Battle.net Launcher.exe")],
         "warp" => vec![local.join(r"Programs\Warp\warp.exe")],
         "wt" => vec![
@@ -649,10 +655,20 @@ impl Default for TestBarConfig {
                     "combo-dota2",
                     "Dota 2 + Discord",
                     "Steam + голосовой чат",
-                    vec![
-                        "steam://rungameid/570".to_string(),
-                        detect_app_target("discord"),
-                    ],
+                    {
+                        let mut targets = vec!["steam://rungameid/570".to_string()];
+                        let discord_target = detect_app_target("discord");
+                        if !discord_target.is_empty() {
+                            if is_discord_update_target(&discord_target) {
+                                targets.push(format!(
+                                    "\"{discord_target}\" --processStart Discord.exe"
+                                ));
+                            } else {
+                                targets.push(discord_target);
+                            }
+                        }
+                        targets
+                    },
                     "56,189,248",
                 ),
             ],

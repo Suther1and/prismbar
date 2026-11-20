@@ -8,6 +8,7 @@ import {
   isCacheIconKey,
   onEvent,
   type AppWindowGroup,
+  type AudioMasterState,
   type AudioState,
   type ClipboardEntry,
   type IndexedApp,
@@ -28,6 +29,7 @@ import {
   type SearchCorpusItem,
 } from '../lib/searchLogic';
 import {
+  buildGameComboLaunchPayload,
   INITIAL_START_ANIM_STATE,
   reducePowerClick,
   reduceStartState,
@@ -85,29 +87,26 @@ export const StartView: React.FC = () => {
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
     }
+    const durationMs = msg.length > 36 ? 2600 : 1500;
     toastTimerRef.current = window.setTimeout(() => {
       toastTimerRef.current = null;
       setToastMsg(null);
-    }, 1400);
+    }, durationMs);
   }, []);
 
-  const hydrateLiveData = useCallback(() => {
+  const hydrateInitialData = useCallback(() => {
     ipc<TestBarConfig>('get_config')
       .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
       .catch(() => {});
-    ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
-    ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
     ipc<ClipboardEntry[]>('get_clipboard_history').then(setClips).catch(() => {});
     ipc<MediaState>('get_media_state').then(setMedia).catch(() => {});
-    ipc<TelemetryState>('get_telemetry').then(setTelem).catch(() => {});
-    ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    hydrateLiveData();
     ipc<IndexedApp[]>('get_installed_apps').then(setApps).catch(() => {});
     ipc<IndexedFile[]>('get_indexed_files').then(setFiles).catch(() => {});
     ipc<SteamGame[]>('get_steam_games').then(setGames).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    hydrateInitialData();
 
     const subs = [
       onEvent<TestBarConfig>('config-updated', (next) =>
@@ -118,6 +117,19 @@ export const StartView: React.FC = () => {
       onEvent<IndexedFile[]>('files-indexed', setFiles),
       onEvent<SteamGame[]>('games-indexed', setGames),
       onEvent<AudioState>('audio-mixer-updated', setAudio),
+      onEvent<AudioMasterState>('audio-master-updated', (master) => {
+        setAudio((prev) =>
+          prev
+            ? {
+                ...prev,
+                available: master.available,
+                masterVolume: master.masterVolume,
+                masterMuted: master.masterMuted,
+                micMuted: master.micMuted,
+              }
+            : prev,
+        );
+      }),
       onEvent<MediaState>('media-updated', setMedia),
       onEvent<TelemetryState>('telemetry-updated', setTelem),
       onEvent<ClipboardEntry[]>('clipboard-updated', setClips),
@@ -130,7 +142,6 @@ export const StartView: React.FC = () => {
         setAnim((prev) => reduceStartState(prev, vis));
         if (vis) {
           setShiftHeld(false);
-          hydrateLiveData();
         } else {
           closeCleanupTimerRef.current = window.setTimeout(() => {
             closeCleanupTimerRef.current = null;
@@ -173,7 +184,7 @@ export const StartView: React.FC = () => {
       }
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [hydrateLiveData]);
+  }, [hydrateInitialData]);
 
   // Unified IconCache batch fetch for apps, window groups & cache-keyed pins (AD-6)
   useEffect(() => {
@@ -421,16 +432,25 @@ export const StartView: React.FC = () => {
   const launchPin = useCallback(
     (item: PinItem) => {
       if (editMode) return;
+      if (item.kind === 'combo') {
+        const comboPayload = buildGameComboLaunchPayload(item);
+        if (!comboPayload) {
+          showToast('В связке нет целей для запуска');
+          return;
+        }
+        ipc(comboPayload.command, comboPayload.args).catch((err) => {
+          showToast(typeof err === 'string' && err.trim() ? err : 'Не удалось запустить связку');
+        });
+        return;
+      }
       const action = resolvePinAction(item, shiftHeld);
-      if (action.type === 'combo') {
-        ipc('launch_combo', { targets: action.targets }).catch(() => {});
-      } else if (action.type === 'terminal') {
+      if (action.type === 'terminal') {
         ipc('open_terminal_at', { path: action.path }).catch(() => {});
       } else if (action.type === 'copy_path') {
         ipc('copy_to_clipboard', { text: action.text })
           .then(() => showToast(action.toast))
           .catch(() => {});
-      } else {
+      } else if (action.type === 'launch') {
         ipc('launch_item', {
           target: action.target,
           args: action.args,
@@ -608,7 +628,11 @@ export const StartView: React.FC = () => {
           onTogglePeriph={() => setPeriphOpen((v) => !v)}
           onClosePeriph={() => setPeriphOpen(false)}
           onSelectAudioDevice={(deviceId) => {
-            ipc<AudioState>('set_audio_device', { deviceId }).then(setAudio).catch(() => {});
+            ipc<AudioState>('set_audio_device', { deviceId })
+              .then(setAudio)
+              .catch((err) => {
+                showToast(typeof err === 'string' && err.trim() ? err : 'Не удалось переключить вывод звука');
+              });
           }}
           onOpenSearch={() => {
             setSearchOpen(true);

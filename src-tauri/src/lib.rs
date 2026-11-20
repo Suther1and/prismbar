@@ -240,6 +240,37 @@ fn emit_session_alerts_if_calendar_open(app: &AppHandle) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlowPollPlan {
+    poll_media: bool,
+    poll_telemetry: bool,
+    poll_peripherals: bool,
+    enforce_hide_native: bool,
+}
+
+/// Pure gating policy for hidden-window slow-poller suppression (AD-6, NFR-03):
+/// Start-only live widgets (`media`, `telemetry`, `peripherals`) are ONLY polled and emitted
+/// while the `start` window is actually visible.
+fn should_poll_start_widgets(coord: &WindowCoordinator) -> bool {
+    coord.is_start_visible()
+}
+
+/// Clipboard listener stays active continuously in Rust, but only emits `clipboard-updated`
+/// over IPC when `"start"` is currently visible (show-time hydration pushes the full vault).
+fn should_emit_start_clipboard_update(coord: &WindowCoordinator) -> bool {
+    coord.is_start_visible()
+}
+
+fn plan_slow_poll_tick(coord: &WindowCoordinator, tick: u64, hide_native: bool) -> SlowPollPlan {
+    let start_visible = should_poll_start_widgets(coord);
+    SlowPollPlan {
+        poll_media: start_visible,
+        poll_telemetry: start_visible && tick % 2 == 0,
+        poll_peripherals: start_visible && tick % 10 == 0,
+        enforce_hide_native: hide_native && tick % 10 == 0,
+    }
+}
+
 fn dispatch_coordinator<F>(
     app: &AppHandle,
     flyout_req: Option<&FlyoutRequest>,
@@ -737,21 +768,35 @@ fn apply_coordinator_actions(
         let cfg_snapshot = lock_unpoisoned(&st.config).clone();
         let win_snapshot = lock_unpoisoned(&st.last_window_groups).clone();
         let clips_snapshot = system_widgets::get_clipboard_history();
+        let media_snapshot = media::get_media_snapshot();
         let _ = app.emit_to("start", "config-updated", &cfg_snapshot);
         let _ = app.emit_to("start", "windows-updated", &win_snapshot);
         let _ = app.emit_to("start", "clipboard-updated", &clips_snapshot);
+        let _ = app.emit_to("start", "media-updated", &media_snapshot);
         let h_hyd = app.clone();
         std::thread::spawn(move || {
             let aud = audio::get_audio_state();
             if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "audio-mixer-updated", &aud);
                 let _ = h_hyd.emit_to("start", "audio-master-updated", &aud.to_master_state());
+            } else {
+                return;
             }
-            let med = media::get_media_state();
-            let tel = telemetry::get_telemetry();
+            let med = media::poll_media_state();
             if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "media-updated", &med);
+            } else {
+                return;
+            }
+            let tel = telemetry::get_telemetry_cached(&h_hyd.state::<AppState>().icon_cache);
+            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "telemetry-updated", &tel);
+            } else {
+                return;
+            }
+            let periphs = system_widgets::get_peripheral_batteries();
+            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+                let _ = h_hyd.emit_to("start", "peripherals-updated", &periphs);
             }
         });
     }
@@ -1189,6 +1234,11 @@ fn kill_process_pid(pid: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn kill_process_group(pids: Vec<u32>) -> Result<(), String> {
+    telemetry::kill_process_group(&pids)
+}
+
+#[tauri::command]
 fn launch_item(
     app: AppHandle,
     target: String,
@@ -1204,13 +1254,11 @@ fn launch_item(
 
 #[tauri::command]
 fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
-    close_start_and_flyout(&app, true, false);
-    for t in targets {
-        if !t.trim().is_empty() {
-            let _ = windows_tracker::launch_target(&t, false);
-        }
+    let has_target = targets.iter().any(|t| !t.trim().is_empty());
+    if has_target {
+        close_start_and_flyout(&app, true, false);
     }
-    Ok(())
+    windows_tracker::launch_combo_targets(&targets)
 }
 
 #[tauri::command]
@@ -1446,16 +1494,16 @@ fn get_media_state() -> MediaState {
 
 #[tauri::command]
 fn media_action(app: AppHandle, action: String) -> Result<MediaState, String> {
-    media::media_command(&action)?;
-    std::thread::sleep(std::time::Duration::from_millis(80));
-    let st = media::get_media_state();
-    let _ = app.emit("media-updated", &st);
+    let st = media::media_action(&action)?;
+    if should_poll_start_widgets(&lock_unpoisoned(&app.state::<AppState>().coordinator)) {
+        let _ = app.emit_to("start", "media-updated", &st);
+    }
     Ok(st)
 }
 
 #[tauri::command]
-fn get_telemetry() -> TelemetryState {
-    telemetry::get_telemetry()
+fn get_telemetry(state: State<AppState>) -> TelemetryState {
+    telemetry::get_telemetry_cached(&state.icon_cache)
 }
 
 #[tauri::command]
@@ -1482,14 +1530,18 @@ fn toggle_clip_pin(app: AppHandle, state: State<AppState>, id: String) -> Vec<Cl
             list = system_widgets::toggle_clipboard_pin(&id);
         }
     }
-    let _ = app.emit("clipboard-updated", &list);
+    if should_emit_start_clipboard_update(&lock_unpoisoned(&state.coordinator)) {
+        let _ = app.emit_to("start", "clipboard-updated", &list);
+    }
     list
 }
 
 #[tauri::command]
-fn clear_unpinned_clips(app: AppHandle) -> Vec<ClipboardEntry> {
+fn clear_unpinned_clips(app: AppHandle, state: State<AppState>) -> Vec<ClipboardEntry> {
     let list = system_widgets::clear_unpinned_clipboard();
-    let _ = app.emit("clipboard-updated", &list);
+    if should_emit_start_clipboard_update(&lock_unpoisoned(&state.coordinator)) {
+        let _ = app.emit_to("start", "clipboard-updated", &list);
+    }
     list
 }
 
@@ -1601,6 +1653,7 @@ pub fn run(hide_native: bool) {
     }
 
     let initial_cfg = config::load_config();
+    let initial_pinned_clipboard = initial_cfg.pinned_clipboard.clone();
     win_shell::set_keep_native_secondary_taskbar(
         win_shell::secondary_native_taskbar_should_stay_visible(&initial_cfg.secondary_taskbar_mode),
     );
@@ -1655,6 +1708,7 @@ pub fn run(hide_native: bool) {
             focus_window,
             close_window_hwnd,
             kill_process_pid,
+            kill_process_group,
             launch_item,
             launch_combo,
             open_location,
@@ -1831,10 +1885,19 @@ pub fn run(hide_native: bool) {
                 }
             });
 
-            // Live Clipboard History listener
+            // Dedicated MTA WinRT SMTC worker thread (AD-5)
+            media::start_media_worker();
+
+            // Live Clipboard History listener: hydrates persisted pins at startup, stays
+            // continuously active even while Start is hidden, and gates IPC emission to visible Start.
             let h_clip = handle.clone();
-            system_widgets::start_clipboard_listener(move |entries| {
-                let _ = h_clip.emit("clipboard-updated", &entries);
+            system_widgets::start_clipboard_listener(&initial_pinned_clipboard, move |entries| {
+                let emit = should_emit_start_clipboard_update(
+                    &lock_unpoisoned(&h_clip.state::<AppState>().coordinator),
+                );
+                if emit {
+                    let _ = h_clip.emit_to("start", "clipboard-updated", &entries);
+                }
             });
 
             // Async background app (Start .lnk + UWP), Steam library & user files indexer (non-blocking startup)
@@ -1921,16 +1984,23 @@ pub fn run(hide_native: bool) {
             });
 
             // Slower poller for split audio (diff-gated, visible-surface targeted),
-            // media, telemetry, and Bluetooth peripherals
+            // and hidden-window-gated Start live widgets (media, telemetry, Bluetooth peripherals)
             let h_slow = handle.clone();
             std::thread::spawn(move || {
                 let mut tick = 0u64;
                 let mut last_audio_master: Option<AudioMasterState> = None;
                 let mut last_audio_mixer: Option<AudioState> = None;
+                let mut last_media: Option<MediaState> = None;
+                let mut last_periphs: Option<Vec<PeripheralBattery>> = None;
                 loop {
-                    let mixer_needed = !lock_unpoisoned(&h_slow.state::<AppState>().coordinator)
-                        .audio_mixer_targets()
-                        .is_empty();
+                    let (mixer_needed, slow_plan) = {
+                        let st = h_slow.state::<AppState>();
+                        let coord = lock_unpoisoned(&st.coordinator);
+                        (
+                            !coord.audio_mixer_targets().is_empty(),
+                            plan_slow_poll_tick(&coord, tick, hide_native),
+                        )
+                    };
 
                     if mixer_needed {
                         let audio_st = audio::get_audio_state();
@@ -1980,20 +2050,47 @@ pub fn run(hide_native: bool) {
                         }
                     }
 
-                    let media_st = media::get_media_state();
-                    let _ = h_slow.emit("media-updated", &media_st);
-
-                    if tick % 2 == 0 {
-                        let telem = telemetry::get_telemetry();
-                        let _ = h_slow.emit("telemetry-updated", &telem);
+                    if slow_plan.poll_media {
+                        let media_st = media::poll_media_state();
+                        if last_media.as_ref() != Some(&media_st)
+                            && should_poll_start_widgets(
+                                &lock_unpoisoned(&h_slow.state::<AppState>().coordinator),
+                            )
+                        {
+                            last_media = Some(media_st.clone());
+                            let _ = h_slow.emit_to("start", "media-updated", &media_st);
+                        }
+                    } else {
+                        last_media = None;
+                        last_periphs = None;
                     }
 
-                    if tick % 10 == 0 {
-                        let periphs = system_widgets::get_peripheral_batteries();
-                        let _ = h_slow.emit("peripherals-updated", &periphs);
-                        if hide_native && !win_shell::is_restore_in_progress() {
-                            win_shell::hide_native_taskbar();
+                    if slow_plan.poll_telemetry {
+                        let telem = {
+                            let st = h_slow.state::<AppState>();
+                            telemetry::get_telemetry_cached(&st.icon_cache)
+                        };
+                        if should_poll_start_widgets(
+                            &lock_unpoisoned(&h_slow.state::<AppState>().coordinator),
+                        ) {
+                            let _ = h_slow.emit_to("start", "telemetry-updated", &telem);
                         }
+                    }
+
+                    if slow_plan.poll_peripherals {
+                        let periphs = system_widgets::get_peripheral_batteries();
+                        if last_periphs.as_ref() != Some(&periphs)
+                            && should_poll_start_widgets(
+                                &lock_unpoisoned(&h_slow.state::<AppState>().coordinator),
+                            )
+                        {
+                            last_periphs = Some(periphs.clone());
+                            let _ = h_slow.emit_to("start", "peripherals-updated", &periphs);
+                        }
+                    }
+
+                    if slow_plan.enforce_hide_native && !win_shell::is_restore_in_progress() {
+                        win_shell::hide_native_taskbar();
                     }
 
                     tick += 1;
@@ -2957,5 +3054,132 @@ mod integration_tests {
             sanitize_custom_space_accent(None, None),
             ("#A78BFA".to_string(), "167,139,250".to_string())
         );
+    }
+
+    #[test]
+    fn hidden_window_slow_poller_suppression_gates_media_telemetry_peripherals_and_clipboard() {
+        let mut coord = WindowCoordinator::new();
+
+        // 1. Start hidden (idle desktop): ZERO media/telemetry/peripherals/clipboard IPC
+        assert!(!should_poll_start_widgets(&coord));
+        assert!(!should_emit_start_clipboard_update(&coord));
+        assert_eq!(
+            plan_slow_poll_tick(&coord, 0, true),
+            SlowPollPlan {
+                poll_media: false,
+                poll_telemetry: false,
+                poll_peripherals: false,
+                enforce_hide_native: true,
+            }
+        );
+
+        // 2. Flyout open (e.g. Sound) while Start stays hidden: still suppresses Start widgets!
+        let _ = coord.request_open_flyout(FlyoutKind::Sound, 100);
+        assert!(!should_poll_start_widgets(&coord));
+        assert!(!should_emit_start_clipboard_update(&coord));
+        assert_eq!(
+            plan_slow_poll_tick(&coord, 0, false),
+            SlowPollPlan {
+                poll_media: false,
+                poll_telemetry: false,
+                poll_peripherals: false,
+                enforce_hide_native: false,
+            }
+        );
+
+        // 3. Start visible: tick 0 polls all three, tick 1 polls media only, tick 2 polls media + telemetry
+        let _ = coord.request_toggle_start(Some(true), 200);
+        assert!(should_poll_start_widgets(&coord));
+        assert!(should_emit_start_clipboard_update(&coord));
+        assert_eq!(
+            plan_slow_poll_tick(&coord, 0, true),
+            SlowPollPlan {
+                poll_media: true,
+                poll_telemetry: true,
+                poll_peripherals: true,
+                enforce_hide_native: true,
+            }
+        );
+        assert_eq!(
+            plan_slow_poll_tick(&coord, 1, true),
+            SlowPollPlan {
+                poll_media: true,
+                poll_telemetry: false,
+                poll_peripherals: false,
+                enforce_hide_native: false,
+            }
+        );
+        assert_eq!(
+            plan_slow_poll_tick(&coord, 2, true),
+            SlowPollPlan {
+                poll_media: true,
+                poll_telemetry: true,
+                poll_peripherals: false,
+                enforce_hide_native: false,
+            }
+        );
+
+        // 4. Closing Start immediately suppresses Start slow-poller widgets again
+        let _ = coord.request_toggle_start(Some(false), 300);
+        assert!(!should_poll_start_widgets(&coord));
+        assert!(!should_emit_start_clipboard_update(&coord));
+    }
+
+    #[test]
+    fn media_action_ipc_contains_zero_thread_sleep() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("fn media_action(")
+            .expect("media_action command must exist");
+        let tail = &src[start..];
+        let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+        let body = &tail[..end];
+        assert!(
+            !body.contains("sleep"),
+            "media_action IPC must never call thread::sleep: {body}"
+        );
+    }
+
+    #[test]
+    fn combo_target_parser_supports_uris_quoted_unquoted_args_and_discord_squirrel() {
+        let steam = windows_tracker::parse_combo_target("steam://rungameid/2694490").unwrap();
+        assert_eq!(steam.target, "steam://rungameid/2694490");
+        assert_eq!(steam.args, None);
+
+        let quoted = windows_tracker::parse_combo_target(
+            r#""C:\Users\Alex\AppData\Local\Discord\Update.exe" --processStart Discord.exe"#,
+        )
+        .unwrap();
+        assert_eq!(
+            quoted.target,
+            r"C:\Users\Alex\AppData\Local\Discord\Update.exe"
+        );
+        assert_eq!(quoted.args.as_deref(), Some("--processStart Discord.exe"));
+
+        let unquoted = windows_tracker::parse_combo_target(
+            r"C:\Users\Alex Doe\AppData\Local\Discord\Update.exe --processStart Discord.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            unquoted.target,
+            r"C:\Users\Alex Doe\AppData\Local\Discord\Update.exe"
+        );
+        assert_eq!(unquoted.args.as_deref(), Some("--processStart Discord.exe"));
+
+        // Legacy bare Discord\Update.exe auto-supplies --processStart Discord.exe
+        let bare_discord = windows_tracker::parse_combo_target(
+            r"C:\Users\Alex\AppData\Local\Discord\Update.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            bare_discord.target,
+            r"C:\Users\Alex\AppData\Local\Discord\Update.exe"
+        );
+        assert_eq!(
+            bare_discord.args.as_deref(),
+            Some("--processStart Discord.exe")
+        );
+
+        assert!(windows_tracker::parse_combo_target("   ").is_err());
     }
 }

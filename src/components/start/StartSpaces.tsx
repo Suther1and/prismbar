@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { getActiveDeviceIndex } from '../../lib/flyoutLogic';
 import {
   ipc,
@@ -10,8 +10,20 @@ import {
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
+  type TopProcessInfo,
 } from '../../lib/ipc';
-import { partitionHeroAndCompact } from '../../lib/startLogic';
+import {
+  computeGameCardTilt,
+  formatKillProcessError,
+  formatMemoryRatio,
+  formatProcessMetricLine,
+  getGpuTempStatusPill,
+  getTelemetryStatusPill,
+  partitionHeroAndCompact,
+  resolveProcessKillPids,
+  selectDisplayedGames,
+  type GameLibraryFilter,
+} from '../../lib/startLogic';
 import {
   ExternalArrowIcon,
   FallbackAppIcon,
@@ -29,16 +41,10 @@ function fmtSec(s: number): string {
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }
 
-function statusPill(pct: number): { cls: string; label: string } {
-  if (pct < 45) return { cls: 'st-ok', label: 'Свободно' };
-  if (pct < 75) return { cls: 'st-mid', label: 'Норма' };
-  return { cls: 'st-hot', label: 'Высокая' };
-}
-
-function tempStatus(temp: number): { cls: string; label: string } {
-  if (temp < 60) return { cls: 'st-ok', label: 'Холодная' };
-  if (temp < 78) return { cls: 'st-mid', label: 'Рабочая' };
-  return { cls: 'st-hot', label: 'Горячая' };
+function isReducedMotionPreferred(): boolean {
+  return typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
 interface DragOrigin {
@@ -91,9 +97,14 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   onSetClips,
   onShowToast,
 }) => {
-  const [gameFilter, setGameFilter] = useState<'recent' | 'all'>('recent');
+  const [gameFilter, setGameFilter] = useState<GameLibraryFilter>('recent');
   const [copiedClipId, setCopiedClipId] = useState<string | null>(null);
   const [dragOrigin, setDragOrigin] = useState<DragOrigin | null>(null);
+  const [killError, setKillError] = useState<{ space: 'work' | 'studio'; message: string } | null>(null);
+
+  useEffect(() => {
+    setKillError(null);
+  }, [space]);
 
   const audioDevs = (audio?.devices ?? []).slice(0, 3);
   const personalPartition = useMemo(
@@ -104,7 +115,29 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     () => partitionHeroAndCompact(config?.studioPins ?? []),
     [config?.studioPins],
   );
-  const displayedGames = gameFilter === 'recent' ? games.slice(0, 4) : games;
+  const displayedGames = useMemo(
+    () => selectDisplayedGames(games, gameFilter),
+    [games, gameFilter],
+  );
+  const studioProcesses = useMemo(
+    () => (telem?.gpuProcesses && telem.gpuProcesses.length > 0 ? telem.gpuProcesses : (telem?.topProcesses ?? [])),
+    [telem?.gpuProcesses, telem?.topProcesses],
+  );
+
+  const handleKillProcessGroup = (proc: TopProcessInfo, targetSpace: 'work' | 'studio') => {
+    const pids = resolveProcessKillPids(proc);
+    setKillError(null);
+    ipc('kill_process_group', { pids })
+      .then(() => {
+        onShowToast(`Завершено: ${proc.name}`);
+        return ipc<TelemetryState>('get_telemetry').then(onSetTelem);
+      })
+      .catch((err) => {
+        const message = formatKillProcessError(proc.name, err);
+        setKillError({ space: targetSpace, message });
+        onShowToast(message);
+      });
+  };
 
   const makeDragProps = (spaceKey: string, idx: number) => ({
     draggable: editMode,
@@ -241,7 +274,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             key={d.id}
             type="button"
             className={`seg-opt ${d.isDefault ? 'active' : ''}`}
-            onClick={() => ipc<AudioState>('set_audio_device', { deviceId: d.id }).then(onSetAudio).catch(() => {})}
+            onClick={() =>
+              ipc<AudioState>('set_audio_device', { deviceId: d.id })
+                .then(onSetAudio)
+                .catch((err) => {
+                  onShowToast(
+                    typeof err === 'string' && err.trim()
+                      ? err
+                      : 'Не удалось переключить вывод звука',
+                  );
+                })
+            }
           >
             {d.shortName}
           </button>
@@ -393,7 +436,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   type="button"
                   className="m-btn"
                   aria-label="Предыдущий трек"
-                  onClick={() => ipc<MediaState>('media_action', { action: 'prev' }).then(onSetMedia).catch(() => {})}
+                  onClick={() =>
+                    ipc<MediaState>('media_action', { action: 'prev' })
+                      .then(onSetMedia)
+                      .catch((err) => {
+                        if (typeof err === 'string' && err.trim()) onShowToast(err);
+                      })
+                  }
                 >
                   <svg className="ic14" viewBox="0 0 24 24" fill="currentColor">
                     <polygon points="19 4 9 12 19 20 19 4" />
@@ -404,7 +453,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   type="button"
                   className="m-btn play"
                   aria-label={media?.isPlaying ? 'Пауза' : 'Воспроизвести'}
-                  onClick={() => ipc<MediaState>('media_action', { action: 'toggle' }).then(onSetMedia).catch(() => {})}
+                  onClick={() =>
+                    ipc<MediaState>('media_action', { action: 'toggle' })
+                      .then(onSetMedia)
+                      .catch((err) => {
+                        if (typeof err === 'string' && err.trim()) onShowToast(err);
+                      })
+                  }
                 >
                   {media?.isPlaying ? (
                     <svg className="ic14" viewBox="0 0 24 24" fill="currentColor">
@@ -419,7 +474,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   type="button"
                   className="m-btn"
                   aria-label="Следующий трек"
-                  onClick={() => ipc<MediaState>('media_action', { action: 'next' }).then(onSetMedia).catch(() => {})}
+                  onClick={() =>
+                    ipc<MediaState>('media_action', { action: 'next' })
+                      .then(onSetMedia)
+                      .catch((err) => {
+                        if (typeof err === 'string' && err.trim()) onShowToast(err);
+                      })
+                  }
                 >
                   <svg className="ic14" viewBox="0 0 24 24" fill="currentColor">
                     <polygon points="5 4 15 12 5 20 5 4" />
@@ -616,7 +677,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <div className="sec-row" style={{ marginBottom: 9 }}>
               <span className="sec-title">Нагрузка ПК</span>
               <span className="health-hw-meta">
-                {telem ? `${telem.ramTotalGb} ГБ${telem.gpuAvailable ? ` · ${telem.gpuName}` : ''}` : 'Система'}
+                {telem ? `${Math.round(telem.ramTotalGb)} ГБ${telem.gpuAvailable ? ` · ${telem.gpuName}` : ''}` : 'Система'}
               </span>
             </div>
             <div className="health-list">
@@ -627,8 +688,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   </span>
                   <span className="health-val">
                     {telem?.cpuPct ?? 0}%{' '}
-                    <span className={`status-pill ${statusPill(telem?.cpuPct ?? 0).cls}`}>
-                      {statusPill(telem?.cpuPct ?? 0).label}
+                    <span className={`status-pill ${getTelemetryStatusPill(telem?.cpuPct ?? 0).cls}`}>
+                      {getTelemetryStatusPill(telem?.cpuPct ?? 0).label}
                     </span>
                   </span>
                 </div>
@@ -643,9 +704,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                     ОЗУ <span className="health-sub">· RAM</span>
                   </span>
                   <span className="health-val">
-                    {telem ? `${telem.ramUsedGb} / ${telem.ramTotalGb} ГБ` : '—'}{' '}
-                    <span className={`status-pill ${statusPill(telem?.ramPct ?? 0).cls}`}>
-                      {statusPill(telem?.ramPct ?? 0).label}
+                    {telem ? formatMemoryRatio(telem.ramUsedGb, telem.ramTotalGb) : '—'}{' '}
+                    <span className={`status-pill ${getTelemetryStatusPill(telem?.ramPct ?? 0).cls}`}>
+                      {getTelemetryStatusPill(telem?.ramPct ?? 0).label}
                     </span>
                   </span>
                 </div>
@@ -663,8 +724,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                       </span>
                       <span className="health-val">
                         {telem.gpuPct}%{' '}
-                        <span className={`status-pill ${tempStatus(telem.gpuTempC).cls}`}>
-                          {tempStatus(telem.gpuTempC).label}
+                        <span className={`status-pill ${getGpuTempStatusPill(telem.gpuTempC).cls}`}>
+                          {getGpuTempStatusPill(telem.gpuTempC).label}
                         </span>
                       </span>
                     </div>
@@ -679,9 +740,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                         Видеопамять <span className="health-sub">· VRAM</span>
                       </span>
                       <span className="health-val">
-                        {telem.vramUsedGb} / {telem.vramTotalGb} ГБ{' '}
-                        <span className={`status-pill ${statusPill(telem.vramPct).cls}`}>
-                          {statusPill(telem.vramPct).label}
+                        {formatMemoryRatio(telem.vramUsedGb, telem.vramTotalGb)}{' '}
+                        <span className={`status-pill ${getTelemetryStatusPill(telem.vramPct).cls}`}>
+                          {getTelemetryStatusPill(telem.vramPct).label}
                         </span>
                       </span>
                     </div>
@@ -712,34 +773,50 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 <ExternalArrowIcon />
               </button>
             </div>
+            {killError?.space === 'work' && (
+              <div className="consumer-err" role="alert">
+                <span>{killError.message}</span>
+                <button
+                  type="button"
+                  className="consumer-err-close"
+                  aria-label="Скрыть ошибку"
+                  onClick={() => setKillError(null)}
+                >
+                  <XIcon10 />
+                </button>
+              </div>
+            )}
             <div className="consumer-list">
-              {(telem?.topProcesses ?? []).map((pr) => (
-                <div key={pr.pid} className="consumer-row">
-                  {pr.iconData ? (
-                    <img src={pr.iconData} alt="" className="native-ic-sm" draggable={false} />
-                  ) : (
-                    <FallbackAppIcon iconKey={pr.name} size={18} />
-                  )}
-                  <div className="consumer-meta">
-                    <div className="consumer-name">{pr.name}</div>
-                    <div className="consumer-sub">{pr.cpuPct}% CPU</div>
+              {(telem?.topProcesses ?? []).map((pr) => {
+                const metrics = formatProcessMetricLine(pr, 'ram');
+                return (
+                  <div key={`${pr.name}-${pr.pid}`} className="consumer-row">
+                    {pr.iconData ? (
+                      <img src={pr.iconData} alt="" className="native-ic-sm" draggable={false} />
+                    ) : (
+                      <FallbackAppIcon iconKey={pr.name} size={18} />
+                    )}
+                    <div className="consumer-meta">
+                      <div className="consumer-name">{pr.name}</div>
+                      <div className="consumer-sub">
+                        {pr.cpuPct}% CPU{pr.pids.length > 1 ? ` · ${pr.pids.length} проц.` : ''}
+                      </div>
+                    </div>
+                    <div className="consumer-metrics">
+                      <span className="consumer-mem">{metrics.primary}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="consumer-kill"
+                      title={pr.pids.length > 1 ? `Завершить все (${pr.pids.length})` : 'Завершить процесс'}
+                      aria-label={`Завершить ${pr.name}`}
+                      onClick={() => handleKillProcessGroup(pr, 'work')}
+                    >
+                      <KillIcon />
+                    </button>
                   </div>
-                  <span className="consumer-mem">{pr.memGb} ГБ</span>
-                  <button
-                    type="button"
-                    className="consumer-kill"
-                    title="Завершить процесс"
-                    aria-label={`Завершить ${pr.name}`}
-                    onClick={() =>
-                      ipc('kill_process_pid', { pid: pr.pid })
-                        .then(() => ipc<TelemetryState>('get_telemetry').then(onSetTelem))
-                        .catch(() => {})
-                    }
-                  >
-                    <KillIcon />
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </SpotCard>
         </div>
@@ -790,8 +867,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           <SpotCard className="compact-card">
             <div className="sec-row" style={{ marginBottom: 9 }}>
               <span className="sec-title">Запас памяти</span>
-              <span className={`status-pill ${statusPill(telem?.ramPct ?? 0).cls}`}>
-                {statusPill(telem?.ramPct ?? 0).label}
+              <span className={`status-pill ${getTelemetryStatusPill(telem?.ramPct ?? 0).cls}`}>
+                {getTelemetryStatusPill(telem?.ramPct ?? 0).label}
               </span>
             </div>
             <div className="health-list">
@@ -802,8 +879,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                       VRAM <span className="health-sub">· {telem.gpuName} · {telem.gpuTempC}°C</span>
                     </span>
                     <span className="health-val">
-                      {telem.vramUsedGb} / {telem.vramTotalGb} ГБ{' '}
-                      <span className="status-pill st-mid">{telem.vramPct}%</span>
+                      {formatMemoryRatio(telem.vramUsedGb, telem.vramTotalGb)}{' '}
+                      <span className={`status-pill ${getTelemetryStatusPill(telem.vramPct).cls}`}>
+                        {telem.vramPct}%
+                      </span>
                     </span>
                   </div>
                   <div className="health-bar">
@@ -817,8 +896,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                     ОЗУ <span className="health-sub">· RAM</span>
                   </span>
                   <span className="health-val">
-                    {telem ? `${telem.ramUsedGb} / ${telem.ramTotalGb} ГБ` : '—'}{' '}
-                    <span className="status-pill st-ok">{telem?.ramPct ?? 0}%</span>
+                    {telem ? formatMemoryRatio(telem.ramUsedGb, telem.ramTotalGb) : '—'}{' '}
+                    <span className={`status-pill ${getTelemetryStatusPill(telem?.ramPct ?? 0).cls}`}>
+                      {telem?.ramPct ?? 0}%
+                    </span>
                   </span>
                 </div>
                 <div className="health-bar">
@@ -840,7 +921,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               onClick={() =>
                 ipc<AudioState>('set_mic_muted', { muted: !(audio?.micMuted ?? false) })
                   .then(onSetAudio)
-                  .catch(() => {})
+                  .catch((err) => {
+                    onShowToast(typeof err === 'string' && err.trim() ? err : 'Не удалось переключить микрофон');
+                  })
               }
             >
               <MicIcon className="ic16" muted={audio?.micMuted ?? false} />
@@ -856,21 +939,53 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <div className="sec-row" style={{ marginBottom: 8 }}>
               <span className="sec-title">Активные процессы GPU / ОЗУ</span>
             </div>
+            {killError?.space === 'studio' && (
+              <div className="consumer-err" role="alert">
+                <span>{killError.message}</span>
+                <button
+                  type="button"
+                  className="consumer-err-close"
+                  aria-label="Скрыть ошибку"
+                  onClick={() => setKillError(null)}
+                >
+                  <XIcon10 />
+                </button>
+              </div>
+            )}
             <div className="consumer-list">
-              {(telem?.topProcesses ?? []).map((pr) => (
-                <div key={pr.pid} className="consumer-row">
-                  {pr.iconData ? (
-                    <img src={pr.iconData} alt="" className="native-ic-sm" draggable={false} />
-                  ) : (
-                    <FallbackAppIcon iconKey={pr.name} size={18} />
-                  )}
-                  <div className="consumer-meta">
-                    <div className="consumer-name">{pr.name}</div>
-                    <div className="consumer-sub">{pr.cpuPct}% CPU</div>
+              {studioProcesses.map((pr) => {
+                const metrics = formatProcessMetricLine(pr, 'gpu');
+                return (
+                  <div key={`${pr.name}-${pr.pid}`} className="consumer-row">
+                    {pr.iconData ? (
+                      <img src={pr.iconData} alt="" className="native-ic-sm" draggable={false} />
+                    ) : (
+                      <FallbackAppIcon iconKey={pr.name} size={18} />
+                    )}
+                    <div className="consumer-meta">
+                      <div className="consumer-name">{pr.name}</div>
+                      <div className="consumer-sub">
+                        {pr.cpuPct}% CPU{pr.pids.length > 1 ? ` · ${pr.pids.length} проц.` : ''}
+                      </div>
+                    </div>
+                    <div className="consumer-metrics">
+                      {metrics.gpuBadge && (
+                        <span className="consumer-vram-pill">{metrics.gpuBadge}</span>
+                      )}
+                      <span className="consumer-mem">{metrics.primary}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="consumer-kill"
+                      title={pr.pids.length > 1 ? `Завершить все (${pr.pids.length})` : 'Завершить процесс'}
+                      aria-label={`Завершить ${pr.name}`}
+                      onClick={() => handleKillProcessGroup(pr, 'studio')}
+                    >
+                      <KillIcon />
+                    </button>
                   </div>
-                  <span className="consumer-mem">{pr.memGb} ГБ</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </SpotCard>
         </div>
@@ -920,13 +1035,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                       key={g.appId}
                       className="game-card"
                       onMouseMove={(e) => {
-                        const r = e.currentTarget.getBoundingClientRect();
-                        const x = (e.clientX - r.left) / r.width;
-                        const y = (e.clientY - r.top) / r.height;
-                        e.currentTarget.style.setProperty('--gx', `${(x * 100).toFixed(1)}%`);
-                        e.currentTarget.style.setProperty('--gy', `${(y * 100).toFixed(1)}%`);
-                        e.currentTarget.style.setProperty('--rx', `${((0.5 - y) * 6).toFixed(2)}deg`);
-                        e.currentTarget.style.setProperty('--ry', `${((x - 0.5) * 6).toFixed(2)}deg`);
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const tilt = computeGameCardTilt(
+                          e.clientX,
+                          e.clientY,
+                          rect,
+                          isReducedMotionPreferred(),
+                        );
+                        e.currentTarget.style.setProperty('--gx', `${tilt.gxPct}%`);
+                        e.currentTarget.style.setProperty('--gy', `${tilt.gyPct}%`);
+                        e.currentTarget.style.setProperty('--rx', `${tilt.rotateXDeg}deg`);
+                        e.currentTarget.style.setProperty('--ry', `${tilt.rotateYDeg}deg`);
                       }}
                       onMouseLeave={(e) => {
                         e.currentTarget.style.setProperty('--rx', '0deg');
@@ -985,7 +1104,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               onClick={() =>
                 ipc<AudioState>('set_mic_muted', { muted: !(audio?.micMuted ?? false) })
                   .then(onSetAudio)
-                  .catch(() => {})
+                  .catch((err) => {
+                    onShowToast(typeof err === 'string' && err.trim() ? err : 'Не удалось переключить микрофон');
+                  })
               }
             >
               <MicIcon className="ic16" muted={audio?.micMuted ?? false} />
@@ -995,7 +1116,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               </div>
               <span className="vu-bars"><i /><i /><i /></span>
             </button>
-            <div className="mixer-list mixer-scroll">{renderMixerRows(false)}</div>
+            <div className="mixer-list mixer-scroll">{renderMixerRows(true)}</div>
           </SpotCard>
 
           <SpotCard className="combos-card">
@@ -1057,9 +1178,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                     {telem.gpuName} <span className="health-sub">· {telem.gpuTempC}°C</span>
                   </span>
                   <span className="health-val">
-                    {telem.vramUsedGb} / {telem.vramTotalGb} ГБ{' '}
-                    <span className={`status-pill ${tempStatus(telem.gpuTempC).cls}`}>
-                      {tempStatus(telem.gpuTempC).label}
+                    {formatMemoryRatio(telem.vramUsedGb, telem.vramTotalGb)}{' '}
+                    <span className={`status-pill ${getGpuTempStatusPill(telem.gpuTempC).cls}`}>
+                      {getGpuTempStatusPill(telem.gpuTempC).label}
                     </span>
                   </span>
                 </div>

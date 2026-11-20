@@ -9,16 +9,28 @@ import startSpacesSrc from '../components/start/StartSpaces.tsx?raw';
 import startViewSrc from '../components/StartView.tsx?raw';
 import type { PinItem, TestBarConfig } from './ipc';
 import {
+  buildGameComboLaunchPayload,
+  computeGameCardTilt,
   computeSlidingPillRect,
   CUSTOM_SPACE_ACCENTS,
   findBannedStartArtifacts,
+  formatKillProcessError,
+  formatMemoryRatio,
+  formatProcessMetricLine,
+  GAME_CARD_MAX_TILT_DEG,
+  getBatteryColor,
+  getGpuTempStatusPill,
+  getTelemetryStatusPill,
   INITIAL_START_ANIM_STATE,
   isAppPinnedInSpace,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
+  RECENT_GAMES_LIMIT,
   reducePowerClick,
   reduceStartState,
   resolvePinAction,
+  resolveProcessKillPids,
+  selectDisplayedGames,
   validateCustomSpaceName,
 } from './startLogic';
 
@@ -327,6 +339,141 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       expect(content, `${relPath} must not render space-new-input`).not.toContain('space-new-input');
       expect(content, `${relPath} must not truncate compact pins with .slice(2, 11)`).not.toContain('.slice(2, 11)');
       expect(content, `${relPath} must not truncate work folders with .slice(0, 8)`).not.toContain('.slice(0, 8)');
+      expect(content, `${relPath} must never expose raw GPU RPM/MHz numbers`).not.toMatch(/\b(RPM|MHz)\b/i);
     }
+  });
+
+  it('formats single-line telemetry ratios, Studio GPU/RAM process badges, and multi-PID kill errors cleanly', () => {
+    expect(formatMemoryRatio(18.4, 64)).toBe('18.4 / 64 ГБ');
+    expect(formatMemoryRatio(6.0, 24.0)).toBe('6 / 24 ГБ');
+    expect(formatMemoryRatio(18.4, 64)).not.toContain('\n');
+
+    expect(getTelemetryStatusPill(22)).toEqual({ cls: 'st-ok', label: 'Свободно' });
+    expect(getTelemetryStatusPill(58)).toEqual({ cls: 'st-mid', label: 'Норма' });
+    expect(getTelemetryStatusPill(88)).toEqual({ cls: 'st-hot', label: 'Высокая' });
+
+    expect(getGpuTempStatusPill(45)).toEqual({ cls: 'st-ok', label: 'Холодная' });
+    expect(getGpuTempStatusPill(68)).toEqual({ cls: 'st-mid', label: 'Рабочая' });
+    expect(getGpuTempStatusPill(84)).toEqual({ cls: 'st-hot', label: 'Горячая' });
+
+    expect(getBatteryColor(85)).toBe('#34D399');
+    expect(getBatteryColor(24)).toBe('#F59E0B');
+    expect(getBatteryColor(10)).toBe('#FB7185');
+
+    // Work RAM readout stays single-line with no GPU pill
+    expect(formatProcessMetricLine({ memGb: 4.5, vramGb: 1.2, usesGpu: true }, 'ram')).toEqual({
+      primary: '4.5 ГБ',
+      gpuBadge: null,
+    });
+
+    // Studio readout surfaces real VRAM badge, WDDM GPU tag, or RAM-only fallback
+    expect(formatProcessMetricLine({ memGb: 2.0, vramGb: 8.5, usesGpu: true }, 'gpu')).toEqual({
+      primary: '2 ГБ',
+      gpuBadge: 'VRAM 8.5 ГБ',
+    });
+    expect(formatProcessMetricLine({ memGb: 3.1, vramGb: 0, usesGpu: true }, 'gpu')).toEqual({
+      primary: '3.1 ГБ',
+      gpuBadge: 'GPU',
+    });
+    expect(formatProcessMetricLine({ memGb: 1.4, vramGb: 0, usesGpu: false }, 'gpu')).toEqual({
+      primary: '1.4 ГБ',
+      gpuBadge: null,
+    });
+
+    // Multi-PID resolution deduplicates positive PIDs and falls back to primary pid
+    expect(resolveProcessKillPids({ pid: 102, pids: [101, 102, 101, 0, -5, 103] })).toEqual([101, 102, 103]);
+    expect(resolveProcessKillPids({ pid: 777, pids: [] })).toEqual([777]);
+
+    // OS permission error formatting produces readable Russian message
+    expect(
+      formatKillProcessError('Anticheat', 'Отказано в доступе при завершении процесса 444 (нужны права администратора)'),
+    ).toBe('Отказано в доступе: Anticheat требует прав администратора');
+    expect(formatKillProcessError('Docker', new Error('Access is denied'))).toBe(
+      'Отказано в доступе: Docker требует прав администратора',
+    );
+    expect(formatKillProcessError('Chrome', '')).toBe('Не удалось завершить Chrome');
+  });
+
+  it('toggles Recent(4)/All Games cleanly, clamps 3D hover tilt angles, and dispatches multi-target Game Combos', () => {
+    const library = Array.from({ length: 9 }, (_, i) => ({ appId: String(100 + i), name: `Game ${i + 1}` }));
+    const recent = selectDisplayedGames(library, 'recent');
+    const all = selectDisplayedGames(library, 'all');
+    expect(recent).toHaveLength(RECENT_GAMES_LIMIT);
+    expect(recent.map((g) => g.name)).toEqual(['Game 1', 'Game 2', 'Game 3', 'Game 4']);
+    expect(all).toHaveLength(9);
+
+    // 3D hover tilt: center -> 0deg, corners -> clamped to +/- GAME_CARD_MAX_TILT_DEG, out-of-bounds clamped
+    const rect = { left: 100, top: 200, width: 200, height: 100 };
+    expect(computeGameCardTilt(200, 250, rect, false)).toEqual({
+      gxPct: 50,
+      gyPct: 50,
+      rotateXDeg: 0,
+      rotateYDeg: 0,
+    });
+
+    const topRightExtreme = computeGameCardTilt(999, -500, rect, false);
+    expect(topRightExtreme.gxPct).toBe(100);
+    expect(topRightExtreme.gyPct).toBe(0);
+    expect(topRightExtreme.rotateXDeg).toBe(GAME_CARD_MAX_TILT_DEG);
+    expect(topRightExtreme.rotateYDeg).toBe(GAME_CARD_MAX_TILT_DEG);
+
+    const bottomLeftExtreme = computeGameCardTilt(-100, 999, rect, false);
+    expect(bottomLeftExtreme.gxPct).toBe(0);
+    expect(bottomLeftExtreme.gyPct).toBe(100);
+    expect(bottomLeftExtreme.rotateXDeg).toBe(-GAME_CARD_MAX_TILT_DEG);
+    expect(bottomLeftExtreme.rotateYDeg).toBe(-GAME_CARD_MAX_TILT_DEG);
+
+    // Reduced motion and invalid rect strictly zero out rotation
+    expect(computeGameCardTilt(300, 200, rect, true)).toEqual({
+      gxPct: 50,
+      gyPct: 50,
+      rotateXDeg: 0,
+      rotateYDeg: 0,
+    });
+    expect(computeGameCardTilt(200, 250, { left: 0, top: 0, width: 0, height: 100 }, false)).toEqual({
+      gxPct: 50,
+      gyPct: 50,
+      rotateXDeg: 0,
+      rotateYDeg: 0,
+    });
+
+    // Game Combo multi-target launch dispatch
+    const dotaCombo = makePin({
+      id: 'combo-dota2',
+      kind: 'combo',
+      title: 'Dota 2 + Discord',
+      target: '',
+      comboTargets: [
+        'steam://rungameid/570',
+        '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+        '   ',
+      ],
+    });
+    expect(buildGameComboLaunchPayload(dotaCombo)).toEqual({
+      command: 'launch_combo',
+      args: {
+        targets: [
+          'steam://rungameid/570',
+          '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+        ],
+      },
+    });
+    expect(resolvePinAction(dotaCombo, false)).toEqual({
+      type: 'combo',
+      targets: [
+        'steam://rungameid/570',
+        '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+      ],
+    });
+
+    // Empty combo returns null
+    const emptyCombo = makePin({
+      id: 'combo-empty',
+      kind: 'combo',
+      title: 'Empty',
+      target: '',
+      comboTargets: ['   '],
+    });
+    expect(buildGameComboLaunchPayload(emptyCombo)).toBeNull();
   });
 });

@@ -142,8 +142,11 @@ export interface MediaState {
 
 export interface TopProcessInfo {
   pid: number;
+  pids: number[];
   name: string;
   memGb: number;
+  vramGb: number;
+  usesGpu: boolean;
   cpuPct: number;
   iconData?: string | null;
 }
@@ -162,6 +165,7 @@ export interface TelemetryState {
   vramTotalGb: number;
   vramPct: number;
   topProcesses: TopProcessInfo[];
+  gpuProcesses: TopProcessInfo[];
 }
 
 export interface ClipboardEntry {
