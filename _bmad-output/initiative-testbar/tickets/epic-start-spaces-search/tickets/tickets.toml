@@ -4,9 +4,9 @@
 [[entry]]
 id = 1
 type = "story"
-title = "Start Menu shell, show-time hydration, 4 Spaces + custom & zero-clipping dynamic grids"
-description = "Wires StartView.tsx to show-time start-state hydration and unified IconCache, implements the spring sliding Space selector with hover ghost pill, cursor-tracking .spot-card radial spotlight, and prefers-reduced-motion support from DESIGN.md, removes hard .slice() truncation across Personal/Work/Studio/Games/Custom lists so unlimited user pins wrap/scroll cleanly, and replaces residual Unicode glyphs with inline SVGs."
-verify = "Vitest verifies unlimited pin rendering without clipping across all 4 Spaces + custom spaces and sliding indicator state; pnpm build, pnpm test, and cargo test pass."
+title = "Spacious Start Menu (1140x680, no footer hints), enter/exit animations, dark scrollbars, 4 Spaces & zero-clipping grids"
+description = "Upgrades Start Menu to a spacious 1140x680 logical canvas (respecting effective_scale), completely removes the bottom .start-footer tutorial hint bar (placing a subtle search icon button in the header while keeping type-anywhere search instant), adds global color-scheme:dark and custom slim dark scrollbars across the entire app, implements real CSS spring enter/exit open-close animations triggered on every start-state transition, wires show-time start-state hydration and unified IconCache, adds the spring sliding Space selector with hover ghost pill, cursor-tracking .spot-card radial spotlight, and prefers-reduced-motion support, removes hard .slice() truncation and clipped dividers across Personal/Work/Studio/Games/Custom lists so Clipboard/PC Health/Folders/Links all fit cleanly with zero clipping, and replaces residual Unicode glyphs with inline SVGs."
+verify = "Vitest verifies unlimited pin rendering without clipping across all 4 Spaces + custom spaces, zero footer hint text, enter/exit animation state transitions, and sliding indicator state; pnpm build, pnpm test, and cargo test pass."
 covers = ["R1"]
 after = ["3.4"]
 hitl = false
@@ -15,9 +15,9 @@ risk = "medium"
 [[entry]]
 id = 2
 type = "story"
-title = "Universal Edit Mode, modal-safe Pinning + UWP All Apps, TestBar Settings, Power overlay & Shift layer"
-description = "Enables drag-and-drop reorder across all Space lists (including Work hubs, Work apps, Personal links, Studio tools, and Games) with pixel-centered inline SVG x unpin badges, wraps rfd file/folder pickers in WindowCoordinator modal-guard so Start never closes while picking, extends apps_indexer.rs with UWP shell:AppsFolder discovery and RAII COM guard (removing the 180-app cap and fixing Discord default target args), verifies the TestBar Settings drawer (Dock/Edge, autostart, emergency restore, zero C2 exclusions; reachable from 2.4 empty-bar right-click) and 2-click armed Power overlay, and wires Shift alternate actions to match every shown badge."
-verify = "Rust unit tests verify UWP/Start indexer deduplication and RAII COM safety; Vitest verifies Shift action dispatch, Settings drawer actions, and 2-click Power arming; pnpm build, pnpm test, and cargo test pass."
+title = "Universal Edit Mode, floating + Space popover, redesigned Pinning + UWP All Apps, sleek Settings, Power & Shift layer"
+description = "Replaces the colliding inline + custom-space input with a clean floating glass popover anchored below + (name + accent color + Enter/Esc), redesigns the Universal Pinning & All Apps overlay with instant filter search, clear pinned/unpinned states, dark slim scrollbars (zero horizontal overflow), and crisp + Folder / + File / + URL cards wrapped in WindowCoordinator modal-guard, extends apps_indexer.rs with UWP shell:AppsFolder discovery and RAII COM guard (removing the 180-app cap and fixing Discord Update.exe --processStart Discord.exe args), enables drag-and-drop reorder across all Space lists with pixel-centered inline SVG x unpin badges, rebuilds the TestBar Settings overlay into a polished Obsidian Layered Glass control panel (visual Dock/Edge layout cards, multi-monitor secondary taskbar mode, autostart toggle, shortcuts overview, emergency restore, zero C2 exclusions), verifies 2-click armed Power overlay, and wires Shift alternate actions to match every shown badge."
+verify = "Rust unit tests verify UWP/Start indexer deduplication and RAII COM safety; Vitest verifies floating custom-space creation, Pinning filter/state, Shift action dispatch, redesigned Settings drawer actions, and 2-click Power arming; pnpm build, pnpm test, and cargo test pass."
 covers = ["R2"]
 after = [1]
 hitl = false

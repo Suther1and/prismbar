@@ -24,5 +24,8 @@
 - **Never use WinRT `UserNotificationListener` in an unpackaged `.exe`** — requires MSIX Package Identity and deterministically fails (`AD-7`).
 - **Never allow full-document `save_config` overwrites from frontend views** — use command-scoped atomic Rust mutations (`AD-4`).
 - **Always use an RAII COM guard checking `CoInitializeEx` result** — never call `CoUninitialize` when `RPC_E_CHANGED_MODE` was returned (`AD-5`).
+- **Always factor in Windows `HKCU\Software\Microsoft\Accessibility\TextScaleFactor` (`effective_scale = (dpi / 96.0) * (text_scale_factor / 100.0)`) when computing WebView2 window pixel dimensions** — WebView2 `RasterizationScale` scales by `dpi * TextScaleFactor` even when `LogPixels = 96`, causing severe clipping if Rust sizes windows at `1.0×`.
+- **Never inject `0xE8` and return `CallNextHookEx` on physical lone-Win `WM_KEYUP`** — `SendInput` queues after the current `KEYUP`; always inject `[0xE8 down, 0xE8 up, Win up]` and return `LRESULT(1)` to swallow the physical `KEYUP` so native Windows Start never pops over TestBar.
+- **Always style custom dark scrollbars (`color-scheme: dark` + `::-webkit-scrollbar`) globally** — never let white Chromium scrollbars appear.
 
 <!-- /bmad-project-context -->

@@ -2,7 +2,7 @@
 type: epic
 title: "Core Shell Host, Safe AppBar/Watchdog & 3-Window Lifecycle"
 parent: initiative-testbar
-status: in-progress
+status: done
 covers: [R1, R3, R5, R8]
 sources: [_bmad-output/initiative-testbar/initiative-testbar.md]
 companions: [_bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md]

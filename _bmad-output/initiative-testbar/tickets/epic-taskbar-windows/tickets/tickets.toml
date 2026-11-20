@@ -4,13 +4,13 @@
 [[entry]]
 id = 1
 type = "story"
-title = "Unified IconCache service & diff-only visible-window broadcasts"
-description = "Implements src-tauri/src/icon_cache.rs (256-entry LRU, namespaced exe:/aumid:/hwnd:/file: keys, batch get_icons IPC) plus frontend Map cache in src/lib/ipc.ts, and refactors the window tracker poller in lib.rs to emit windows-updated only on actual window/focus diffs targeting visible windows (taskbar + visible start/flyout) carrying icon_key instead of base64 PNG payloads."
-verify = "Cargo unit tests verify IconCache LRU eviction, namespaced key generation, and visible-window diff-only emission logic; Vitest verifies frontend icon batch fetch caching; pnpm build, pnpm test, and cargo test pass."
+title = "Unified IconCache, TextScaleFactor/Win-mask fix & diff-only visible-window broadcasts"
+description = "Implements src-tauri/src/icon_cache.rs (256-entry LRU, namespaced exe:/aumid:/hwnd:/file: keys, batch get_icons IPC) plus frontend Map cache in src/lib/ipc.ts, refactors the window tracker poller in lib.rs to emit windows-updated only on actual window/focus diffs targeting visible windows (taskbar + visible start/flyout), fixes effective_scale = dpi_scale * (TextScaleFactor / 100.0) across taskbar/start/flyout sizing with WebView2 bounds sync + unconstrained taskbar scrollWidth + 84px height (eliminating top/right clipping and black shadow rectangle), and fixes lone-Win KEYUP masking (SendInput [0xE8 down, 0xE8 up, Win up] + return LRESULT(1) + fast Shell_TrayWnd hide guard) so native Windows Start never pops over TestBar."
+verify = "Cargo unit tests verify IconCache LRU eviction, namespaced key generation, TextScaleFactor effective_scale math, lone-Win LRESULT(1) swallow logic, and visible-window diff-only emission; Vitest verifies frontend icon batch fetch caching; pnpm build, pnpm test, and cargo test pass."
 covers = ["R1"]
 after = ["1.5"]
 hitl = false
-risk = "medium"
+risk = "high"
 
 [[entry]]
 id = 2
@@ -26,9 +26,9 @@ risk = "high"
 [[entry]]
 id = 3
 type = "story"
-title = "Taskbar Dock/Edge layout, contained capsule hover & gapless live window previews"
-description = "Aligns TaskbarView.tsx and tokens.css to DESIGN.md (52px bar, 42x40px stationary hover slot with 6px margin, inner 24x24px lift, cursor radial glow, Dock/Edge-to-Edge toggle, active/running/multi-window pills) and wires gapless non-activating PrintWindow hover previews in FlyoutView.tsx with click-to-focus and per-window close."
-verify = "Frontend tests verify Dock/Edge layout class contracts and preview hover preemption; pnpm build, pnpm test, and cargo test pass."
+title = "Taskbar Dock/Edge layout, multi-monitor secondary taskbar, contained hover & gapless animated previews"
+description = "Aligns TaskbarView.tsx and tokens.css to DESIGN.md (52px bar inside 84px transparent host with zero black shadow rectangle, 42x40px stationary hover slot, inner 24x24px lift, cursor radial glow, unconstrained scrollWidth sizing, Dock/Edge-to-Edge toggle, active/running/multi-window pills), adds secondary-monitor taskbar window support (testbar taskbar rendered cleanly on DISPLAY2 or optional native secondary bar via config), and wires gapless non-activating animated PrintWindow hover previews in FlyoutView.tsx (fixing onMouseLeave to use close_preview_if_outside) with click-to-focus and per-window close."
+verify = "Frontend and Rust tests verify multi-monitor bounds calculation, Dock/Edge layout class contracts, unconstrained width sync, and preview hover preemption; pnpm build, pnpm test, and cargo test pass."
 covers = ["R3"]
 after = [2]
 hitl = false

@@ -3,7 +3,7 @@ title: 'Refactor sweep — Epic 1 shell foundation cleanup'
 type: 'refactor'
 ticket: '5'
 created: '2026-11-21'
-status: 'built'
+status: done
 baseline_revision: 'e0d39f84d25941fd6e2954683f471b30cf3bfede'
 route: 'full'
 route_source: 'auto'

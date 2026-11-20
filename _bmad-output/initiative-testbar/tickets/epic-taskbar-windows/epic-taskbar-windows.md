@@ -2,6 +2,7 @@
 type: epic
 title: "Bottom Taskbar, Real Window Tracking, UWP Icons, Previews & Context Menus"
 parent: initiative-testbar
+status: in-progress
 covers: [R2]
 sources: [_bmad-output/initiative-testbar/initiative-testbar.md]
 companions: [_bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md]
