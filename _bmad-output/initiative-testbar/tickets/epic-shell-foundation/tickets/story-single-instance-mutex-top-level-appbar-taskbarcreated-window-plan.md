@@ -3,7 +3,7 @@ title: 'Single-instance mutex, top-level AppBar/TaskbarCreated window & HiDPI wa
 type: 'feature'
 ticket: '2'
 created: '2026-11-20'
-status: 'built'
+status: done
 baseline_revision: '537eb082e434518f38207439ee8a29d2dd74055e'
 route: 'full'
 route_source: 'auto'
