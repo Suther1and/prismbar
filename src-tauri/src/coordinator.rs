@@ -264,6 +264,22 @@ impl WindowCoordinator {
             .unwrap_or(false)
     }
 
+    fn close_start(&mut self, actions: &mut CoordinatorActions) {
+        if self.start_open {
+            self.start_open = false;
+            self.last_start_opened_ms = None;
+            actions.start_visible = Some(false);
+            actions.emit_start_state = Some(false);
+        }
+    }
+
+    fn close_flyout(&mut self, actions: &mut CoordinatorActions) -> Option<FlyoutKind> {
+        let closed = self.active_flyout.take()?;
+        actions.flyout_visible = Some(false);
+        actions.emit_flyout_hide = true;
+        Some(closed)
+    }
+
     pub fn request_toggle_start(&mut self, force: Option<bool>, now_ms: u64) -> CoordinatorActions {
         let target = force.unwrap_or(!self.start_open);
         if target == self.start_open {
@@ -278,20 +294,13 @@ impl WindowCoordinator {
             if force.is_none() && self.is_debounced(TriggerId::Start, now_ms) {
                 return actions;
             }
-            if self.active_flyout.is_some() {
-                self.active_flyout = None;
-                actions.flyout_visible = Some(false);
-                actions.emit_flyout_hide = true;
-            }
+            let _ = self.close_flyout(&mut actions);
             self.start_open = true;
             self.last_start_opened_ms = Some(now_ms);
             actions.start_visible = Some(true);
             actions.emit_start_state = Some(true);
         } else {
-            self.start_open = false;
-            self.last_start_opened_ms = None;
-            actions.start_visible = Some(false);
-            actions.emit_start_state = Some(false);
+            self.close_start(&mut actions);
         }
         actions
     }
@@ -314,9 +323,7 @@ impl WindowCoordinator {
             }
         } else {
             if self.active_flyout == Some(kind) && kind.toggles_on_reclick() {
-                self.active_flyout = None;
-                actions.flyout_visible = Some(false);
-                actions.emit_flyout_hide = true;
+                let _ = self.close_flyout(&mut actions);
                 return actions;
             }
             if self.active_flyout.map_or(true, |a| a.is_non_activating())
@@ -324,12 +331,7 @@ impl WindowCoordinator {
             {
                 return actions;
             }
-            if self.start_open {
-                self.start_open = false;
-                self.last_start_opened_ms = None;
-                actions.start_visible = Some(false);
-                actions.emit_start_state = Some(false);
-            }
+            self.close_start(&mut actions);
         }
 
         self.active_flyout = Some(kind);
@@ -340,15 +342,9 @@ impl WindowCoordinator {
     }
 
     pub fn request_close_flyout(&mut self) -> CoordinatorActions {
-        if self.active_flyout.is_none() {
-            return CoordinatorActions::default();
-        }
-        self.active_flyout = None;
-        CoordinatorActions {
-            flyout_visible: Some(false),
-            emit_flyout_hide: true,
-            ..Default::default()
-        }
+        let mut actions = CoordinatorActions::default();
+        let _ = self.close_flyout(&mut actions);
+        actions
     }
 
     pub fn request_close_preview(&mut self) -> CoordinatorActions {
@@ -368,30 +364,22 @@ impl WindowCoordinator {
                 return CoordinatorActions::default();
             }
         }
-        self.start_open = false;
-        self.last_start_opened_ms = None;
+        let mut actions = CoordinatorActions::default();
+        self.close_start(&mut actions);
         self.last_dismissed_ms.insert(TriggerId::Start, now_ms);
-        CoordinatorActions {
-            start_visible: Some(false),
-            emit_start_state: Some(false),
-            ..Default::default()
-        }
+        actions
     }
 
     pub fn on_flyout_focus_lost(&mut self, now_ms: u64) -> CoordinatorActions {
-        match self.active_flyout {
-            Some(kind) if kind.is_interactive_click() => {
-                self.active_flyout = None;
-                self.last_dismissed_ms
-                    .insert(TriggerId::Flyout(kind), now_ms);
-                CoordinatorActions {
-                    flyout_visible: Some(false),
-                    emit_flyout_hide: true,
-                    ..Default::default()
-                }
-            }
-            _ => CoordinatorActions::default(),
+        if !self.active_flyout.is_some_and(FlyoutKind::is_interactive_click) {
+            return CoordinatorActions::default();
         }
+        let mut actions = CoordinatorActions::default();
+        if let Some(kind) = self.close_flyout(&mut actions) {
+            self.last_dismissed_ms
+                .insert(TriggerId::Flyout(kind), now_ms);
+        }
+        actions
     }
 
     pub fn on_global_mouse_down(
@@ -410,17 +398,12 @@ impl WindowCoordinator {
 
         let mut actions = CoordinatorActions::default();
         if self.start_open && !self.is_modal_picker_active() {
-            self.start_open = false;
-            self.last_start_opened_ms = None;
+            self.close_start(&mut actions);
             self.last_dismissed_ms.insert(TriggerId::Start, now_ms);
-            actions.start_visible = Some(false);
-            actions.emit_start_state = Some(false);
         }
-        if let Some(kind) = self.active_flyout.take() {
+        if let Some(kind) = self.close_flyout(&mut actions) {
             self.last_dismissed_ms
                 .insert(TriggerId::Flyout(kind), now_ms);
-            actions.flyout_visible = Some(false);
-            actions.emit_flyout_hide = true;
         }
         actions
     }
@@ -434,17 +417,8 @@ impl WindowCoordinator {
         let mut actions = CoordinatorActions::default();
         if is_fullscreen {
             actions.taskbar_visible = Some(false);
-            if self.start_open {
-                self.start_open = false;
-                self.last_start_opened_ms = None;
-                actions.start_visible = Some(false);
-                actions.emit_start_state = Some(false);
-            }
-            if self.active_flyout.is_some() {
-                self.active_flyout = None;
-                actions.flyout_visible = Some(false);
-                actions.emit_flyout_hide = true;
-            }
+            self.close_start(&mut actions);
+            let _ = self.close_flyout(&mut actions);
         } else {
             actions.taskbar_visible = Some(true);
         }

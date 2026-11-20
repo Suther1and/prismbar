@@ -80,10 +80,33 @@ fn win_hwnd(win: &WebviewWindow) -> Option<isize> {
     win.hwnd().ok().map(|h| h.0 as isize)
 }
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn scale_factor(app: &AppHandle) -> f64 {
     app.get_webview_window("taskbar")
         .and_then(|w| w.scale_factor().ok())
         .unwrap_or(1.0)
+}
+
+fn dispatch_coordinator<F>(
+    app: &AppHandle,
+    flyout_req: Option<&FlyoutRequest>,
+    transition: F,
+) -> CoordinatorActions
+where
+    F: FnOnce(&mut WindowCoordinator) -> CoordinatorActions,
+{
+    let actions = {
+        let state = app.state::<AppState>();
+        let mut coord = lock_unpoisoned(&state.coordinator);
+        let act = transition(&mut coord);
+        state.sync_overlay_flag(&coord);
+        act
+    };
+    apply_coordinator_actions(app, &actions, flyout_req);
+    actions
 }
 
 fn apply_fullscreen_snapshot(
@@ -91,7 +114,7 @@ fn apply_fullscreen_snapshot(
     hint_entering: Option<bool>,
     snap: &win_shell::FullscreenSnapshot,
 ) -> CoordinatorActions {
-    let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+    let mut coord = lock_unpoisoned(&state.coordinator);
     let act = match hint_entering {
         Some(entering) => coord.on_appbar_fullscreen_hint(
             entering,
@@ -109,16 +132,9 @@ fn apply_fullscreen_snapshot(
     act
 }
 
-fn reevaluate_fullscreen(app: &AppHandle) -> CoordinatorActions {
+fn reevaluate_fullscreen(app: &AppHandle, hint_entering: Option<bool>) -> CoordinatorActions {
     let snap = win_shell::query_fullscreen_snapshot();
-    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), None, &snap);
-    apply_coordinator_actions(app, &actions, None);
-    actions
-}
-
-fn reevaluate_fullscreen_with_hint(app: &AppHandle, hint_entering: bool) -> CoordinatorActions {
-    let snap = win_shell::query_fullscreen_snapshot();
-    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), Some(hint_entering), &snap);
+    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), hint_entering, &snap);
     apply_coordinator_actions(app, &actions, None);
     actions
 }
@@ -179,24 +195,11 @@ struct TaskbarLayoutInput {
 }
 
 fn read_taskbar_layout_if_allowed(state: &AppState) -> Option<TaskbarLayoutInput> {
-    let allow = state
-        .coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .should_apply_taskbar_bounds();
-    if !allow {
+    if !lock_unpoisoned(&state.coordinator).should_apply_taskbar_bounds() {
         return None;
     }
-    let bar_mode = state
-        .config
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .bar_mode
-        .clone();
-    let logical_content_w = *state
-        .taskbar_content_width
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let bar_mode = lock_unpoisoned(&state.config).bar_mode.clone();
+    let logical_content_w = *lock_unpoisoned(&state.taskbar_content_width);
     Some(TaskbarLayoutInput {
         bar_mode,
         logical_content_w,
@@ -272,12 +275,9 @@ fn position_flyout_window(app: &AppHandle, hwnd: isize, req: &FlyoutRequest) {
     let req_h = req.height.clamp(1, 2000);
     let w_px = ((req_w + 24) as f64 * sf).round() as i32;
     let h_px = ((req_h + 24) as f64 * sf).round() as i32;
-    let is_edge = app
-        .state::<AppState>()
-        .config
-        .lock()
-        .map(|c| BarMode::from_config_str(&c.bar_mode) == BarMode::Edge)
-        .unwrap_or(false);
+    let is_edge =
+        BarMode::from_config_str(&lock_unpoisoned(&app.state::<AppState>().config).bar_mode)
+            == BarMode::Edge;
     // Account for `.flyout-root`'s 12px bottom padding so Preview sits flush and click flyouts sit 10px above.
     let gap_logical = match (is_edge, req.kind) {
         (true, FlyoutKind::Preview) => 40.0,
@@ -392,7 +392,7 @@ fn close_start_and_flyout(app: &AppHandle, close_start: bool, close_flyout: bool
     let state = app.state::<AppState>();
     let now = monotonic_ms();
     let (start_act, flyout_act) = {
-        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
+        let mut coord = lock_unpoisoned(&state.coordinator);
         let s = if close_start {
             coord.request_toggle_start(Some(false), now)
         } else {
@@ -426,6 +426,18 @@ pub struct FlyoutRequest {
 
 // ======================= CONFIG TRANSACTION AUTHORITY =======================
 
+fn normalize_bump_and_save(
+    candidate: &mut TestBarConfig,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    config::normalize_and_migrate(candidate);
+    candidate.revision = candidate
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "config revision overflow".to_string())?;
+    config::save_config_to(path, candidate)
+}
+
 fn mutate_config_at<F>(
     config_mutex: &Mutex<TestBarConfig>,
     path: &std::path::Path,
@@ -434,17 +446,12 @@ fn mutate_config_at<F>(
 where
     F: FnOnce(&mut TestBarConfig) -> bool,
 {
-    let mut guard = config_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = lock_unpoisoned(config_mutex);
     let mut candidate = guard.clone();
     if !mutate(&mut candidate) {
         return Ok((guard.clone(), false));
     }
-    config::normalize_and_migrate(&mut candidate);
-    candidate.revision = candidate
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| "config revision overflow".to_string())?;
-    config::save_config_to(path, &candidate)?;
+    normalize_bump_and_save(&mut candidate, path)?;
     *guard = candidate.clone();
     Ok((candidate, true))
 }
@@ -489,7 +496,7 @@ fn apply_autostart_transaction<FReg>(
 where
     FReg: FnMut(bool) -> Result<(), String>,
 {
-    let mut guard = config_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = lock_unpoisoned(config_mutex);
     let prev_enabled = guard.autostart;
     apply_registry(enable)?;
     if prev_enabled == enable {
@@ -497,12 +504,7 @@ where
     }
     let mut candidate = guard.clone();
     candidate.autostart = enable;
-    config::normalize_and_migrate(&mut candidate);
-    candidate.revision = candidate
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| "config revision overflow".to_string())?;
-    if let Err(err) = config::save_config_to(path, &candidate) {
+    if let Err(err) = normalize_bump_and_save(&mut candidate, path) {
         let _ = apply_registry(prev_enabled);
         return Err(err);
     }
@@ -514,11 +516,7 @@ where
 
 #[tauri::command]
 fn get_config(state: State<AppState>) -> TestBarConfig {
-    state
-        .config
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    lock_unpoisoned(&state.config).clone()
 }
 
 #[tauri::command]
@@ -541,11 +539,7 @@ fn set_bar_mode(
             win_shell::update_appbar_mode(BarMode::from_config_str(&updated.bar_mode));
         }
         position_taskbar_window(&app);
-        let actions = state
-            .coordinator
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .on_taskbar_bounds_updated();
+        let actions = lock_unpoisoned(&state.coordinator).on_taskbar_bounds_updated();
         apply_coordinator_actions(&app, &actions, None);
         let _ = app.emit("config-updated", &updated);
     }
@@ -569,89 +563,45 @@ fn set_autostart(
 
 #[tauri::command]
 fn resize_taskbar_dock(app: AppHandle, state: State<AppState>, logical_width: i32) {
-    *state
-        .taskbar_content_width
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = logical_width;
+    *lock_unpoisoned(&state.taskbar_content_width) = logical_width;
     position_taskbar_window(&app);
-    let actions = state
-        .coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .on_taskbar_bounds_updated();
+    let actions = lock_unpoisoned(&state.coordinator).on_taskbar_bounds_updated();
     apply_coordinator_actions(&app, &actions, None);
 }
 
 #[tauri::command]
-fn toggle_start(app: AppHandle, state: State<AppState>, force: Option<bool>) {
-    let actions = {
-        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-        let act = coord.request_toggle_start(force, monotonic_ms());
-        state.sync_overlay_flag(&coord);
-        act
-    };
-    apply_coordinator_actions(&app, &actions, None);
+fn toggle_start(app: AppHandle, force: Option<bool>) {
+    dispatch_coordinator(&app, None, |coord| {
+        coord.request_toggle_start(force, monotonic_ms())
+    });
 }
 
 #[tauri::command]
-fn open_flyout(app: AppHandle, state: State<AppState>, mut req: FlyoutRequest) {
+fn open_flyout(app: AppHandle, mut req: FlyoutRequest) {
     req.no_activate = req.kind.is_non_activating();
-    let actions = {
-        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-        let act = coord.request_open_flyout(req.kind, monotonic_ms());
-        state.sync_overlay_flag(&coord);
-        act
-    };
-    apply_coordinator_actions(&app, &actions, Some(&req));
+    dispatch_coordinator(&app, Some(&req), |coord| {
+        coord.request_open_flyout(req.kind, monotonic_ms())
+    });
 }
 
 #[tauri::command]
-fn close_flyout(app: AppHandle, state: State<AppState>) {
-    let actions = {
-        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-        let act = coord.request_close_flyout();
-        state.sync_overlay_flag(&coord);
-        act
-    };
-    apply_coordinator_actions(&app, &actions, None);
+fn close_flyout(app: AppHandle) {
+    dispatch_coordinator(&app, None, |coord| coord.request_close_flyout());
 }
 
 #[tauri::command]
 fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
-    let is_preview = state
-        .coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .active_flyout()
-        == Some(FlyoutKind::Preview);
+    let is_preview =
+        lock_unpoisoned(&state.coordinator).active_flyout() == Some(FlyoutKind::Preview);
     if !is_preview {
         return;
     }
     let Some(fly) = app.get_webview_window("flyout") else { return };
     let Some(hwnd_raw) = win_hwnd(&fly) else { return };
-    unsafe {
-        let mut pt = windows::Win32::Foundation::POINT::default();
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
-        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_ok()
-            && windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok()
-        {
-            let inside = pt.x >= rect.left - 6
-                && pt.x <= rect.right + 6
-                && pt.y >= rect.top - 6
-                && pt.y <= rect.bottom + 18;
-            if inside {
-                return;
-            }
-        }
+    if win_shell::is_cursor_near_window(hwnd_raw, 6, 6, 18) {
+        return;
     }
-    let actions = {
-        let mut coord = state.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-        let act = coord.request_close_preview();
-        state.sync_overlay_flag(&coord);
-        act
-    };
-    apply_coordinator_actions(&app, &actions, None);
+    dispatch_coordinator(&app, None, |coord| coord.request_close_preview());
 }
 
 #[tauri::command]
@@ -711,12 +661,12 @@ fn open_terminal_at(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn get_installed_apps(state: State<AppState>) -> Vec<IndexedApp> {
-    state.installed_apps.lock().unwrap().clone()
+    lock_unpoisoned(&state.installed_apps).clone()
 }
 
 #[tauri::command]
 fn get_steam_games(state: State<AppState>) -> Vec<SteamGame> {
-    state.steam_games.lock().unwrap().clone()
+    lock_unpoisoned(&state.steam_games).clone()
 }
 
 #[tauri::command]
@@ -726,8 +676,7 @@ fn add_pin(
     space: String,
     mut item: PinItem,
 ) -> Result<TestBarConfig, String> {
-    let force_combo =
-        space == "game_combos" || (space == "games" && item.kind.trim().eq_ignore_ascii_case("combo"));
+    let force_combo = config::should_force_combo(&space, &item.kind);
     config::normalize_pin(&mut item, force_combo);
     if item.icon_data.is_none() && (item.kind == "app" || item.kind == "file") {
         item.icon_data = windows_tracker::extract_icon_for_path(&item.target);
@@ -790,12 +739,7 @@ fn add_custom_space(
 }
 
 fn refocus_start_if_open(app: &AppHandle, state: &AppState) {
-    let start_open = state
-        .coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_start_open();
-    if start_open {
+    if lock_unpoisoned(&state.coordinator).is_start_open() {
         if let Some(win) = app.get_webview_window("start") {
             if let Some(hwnd) = win_hwnd(&win) {
                 win_shell::force_focus_window(hwnd);
@@ -948,7 +892,6 @@ fn power_action(action: String) -> Result<(), String> {
 fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
     win_shell::stop_shell_hook_thread();
     if state.hide_native {
-        win_shell::stop_appbar_message_window();
         win_shell::restore_native_taskbar();
     }
     app.exit(0);
@@ -1052,13 +995,7 @@ pub fn run(hide_native: bool) {
             if let Some(tb) = app.get_webview_window("taskbar") {
                 if let Some(hwnd) = win_hwnd(&tb) {
                     win_shell::style_overlay_window(hwnd, true);
-                    let mode = app
-                        .state::<AppState>()
-                        .config
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .bar_mode
-                        .clone();
+                    let mode = lock_unpoisoned(&app.state::<AppState>().config).bar_mode.clone();
                     if hide_native {
                         win_shell::hide_native_taskbar();
                         let h_appbar = handle.clone();
@@ -1068,7 +1005,7 @@ pub fn run(hide_native: bool) {
                                 let h = h_appbar.clone();
                                 let _ = h_appbar.run_on_main_thread(move || match ev {
                                     ShellAppBarEvent::FullscreenHint(entering) => {
-                                        let _ = reevaluate_fullscreen_with_hint(&h, entering);
+                                        let _ = reevaluate_fullscreen(&h, Some(entering));
                                     }
                                     ShellAppBarEvent::PositionChanged
                                     | ShellAppBarEvent::TaskbarCreated
@@ -1083,7 +1020,7 @@ pub fn run(hide_native: bool) {
                                             }
                                             _ => {}
                                         }
-                                        let actions = reevaluate_fullscreen(&h);
+                                        let actions = reevaluate_fullscreen(&h, None);
                                         // If fullscreen just exited, apply_coordinator_actions already
                                         // repositioned the taskbar with the latest DPI/mode/width before showing it.
                                         if actions.taskbar_visible != Some(true) {
@@ -1097,15 +1034,9 @@ pub fn run(hide_native: bool) {
                             return Err(err.into());
                         }
                     }
-                    let _ = reevaluate_fullscreen(&handle);
+                    let _ = reevaluate_fullscreen(&handle, None);
                     position_taskbar_window(&handle);
-                    let show_tb = app
-                        .state::<AppState>()
-                        .coordinator
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .should_show_taskbar();
-                    if show_tb {
+                    if lock_unpoisoned(&app.state::<AppState>().coordinator).should_show_taskbar() {
                         win_shell::set_window_visible(hwnd, true, true);
                     }
                 }
@@ -1118,14 +1049,9 @@ pub fn run(hide_native: bool) {
                 let h_blur = handle.clone();
                 start_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
-                        let actions = {
-                            let st = h_blur.state::<AppState>();
-                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-                            let act = coord.on_start_focus_lost(monotonic_ms());
-                            st.sync_overlay_flag(&coord);
-                            act
-                        };
-                        apply_coordinator_actions(&h_blur, &actions, None);
+                        dispatch_coordinator(&h_blur, None, |coord| {
+                            coord.on_start_focus_lost(monotonic_ms())
+                        });
                     }
                 });
             }
@@ -1138,14 +1064,9 @@ pub fn run(hide_native: bool) {
                 let h_blur = handle.clone();
                 fly_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
-                        let actions = {
-                            let st = h_blur.state::<AppState>();
-                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-                            let act = coord.on_flyout_focus_lost(monotonic_ms());
-                            st.sync_overlay_flag(&coord);
-                            act
-                        };
-                        apply_coordinator_actions(&h_blur, &actions, None);
+                        dispatch_coordinator(&h_blur, None, |coord| {
+                            coord.on_flyout_focus_lost(monotonic_ms())
+                        });
                     }
                 });
             }
@@ -1158,14 +1079,9 @@ pub fn run(hide_native: bool) {
                 ShellHookEvent::ToggleStart => {
                     let h = h_hook.clone();
                     let _ = h_hook.run_on_main_thread(move || {
-                        let actions = {
-                            let st = h.state::<AppState>();
-                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-                            let act = coord.request_toggle_start(None, monotonic_ms());
-                            st.sync_overlay_flag(&coord);
-                            act
-                        };
-                        apply_coordinator_actions(&h, &actions, None);
+                        dispatch_coordinator(&h, None, |coord| {
+                            coord.request_toggle_start(None, monotonic_ms())
+                        });
                     });
                 }
                 ShellHookEvent::GlobalMouseDown(x, y) => {
@@ -1175,21 +1091,15 @@ pub fn run(hide_native: bool) {
                     let h = h_hook.clone();
                     let _ = h_hook.run_on_main_thread(move || {
                         let rects = active_shell_window_rects(&h);
-                        let actions = {
-                            let st = h.state::<AppState>();
-                            let mut coord = st.coordinator.lock().unwrap_or_else(|e| e.into_inner());
-                            let act = coord.on_global_mouse_down(x, y, &rects, monotonic_ms());
-                            st.sync_overlay_flag(&coord);
-                            act
-                        };
-                        apply_coordinator_actions(&h, &actions, None);
+                        dispatch_coordinator(&h, None, |coord| {
+                            coord.on_global_mouse_down(x, y, &rects, monotonic_ms())
+                        });
                     });
                 }
                 ShellHookEvent::EmergencyRestore => {
                     let h = h_hook.clone();
                     let _ = h_hook.run_on_main_thread(move || {
                         if h.state::<AppState>().hide_native {
-                            win_shell::stop_appbar_message_window();
                             win_shell::restore_native_taskbar();
                         }
                         h.exit(0);
@@ -1210,8 +1120,8 @@ pub fn run(hide_native: bool) {
                 let games = apps_indexer::scan_steam_games();
                 {
                     let st = h_idx.state::<AppState>();
-                    *st.installed_apps.lock().unwrap() = apps.clone();
-                    *st.steam_games.lock().unwrap() = games.clone();
+                    *lock_unpoisoned(&st.installed_apps) = apps.clone();
+                    *lock_unpoisoned(&st.steam_games) = games.clone();
                 }
                 let _ = h_idx.emit("apps-indexed", &apps);
                 let _ = h_idx.emit("games-indexed", &games);
@@ -1236,7 +1146,7 @@ pub fn run(hide_native: bool) {
                     if fs != fast_fs_suppressed.load(Ordering::Acquire) {
                         let h = h_fast.clone();
                         let _ = h_fast.run_on_main_thread(move || {
-                            reevaluate_fullscreen(&h);
+                            let _ = reevaluate_fullscreen(&h, None);
                         });
                     }
 
@@ -1282,7 +1192,6 @@ pub fn run(hide_native: bool) {
         if let tauri::RunEvent::Exit = event {
             win_shell::stop_shell_hook_thread();
             if hide_native {
-                win_shell::stop_appbar_message_window();
                 win_shell::restore_native_taskbar();
             }
         }

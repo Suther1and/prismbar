@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, WaitForSingleObject,
-    INFINITE, PROCESS_SYNCHRONIZE,
+    AttachThreadInput, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+    WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -40,17 +40,17 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW,
-    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     CREATESTRUCTW, GWLP_USERDATA, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN,
-    SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE, WM_QUIT,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SHOW_WINDOW_CMD,
+    SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE, WM_QUIT,
     WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDPROC, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
 };
@@ -342,10 +342,9 @@ pub fn query_current_workarea_snapshot() -> Option<WorkAreaSnapshot> {
         {
             return None;
         }
-        let mon = primary_monitor_rect();
         let snap = WorkAreaSnapshot {
             work_area: PixelRect::new(wa.left, wa.top, wa.right, wa.bottom),
-            primary_monitor: PixelRect::new(mon.left, mon.top, mon.right, mon.bottom),
+            primary_monitor: primary_monitor_rect().to_pixel_rect(),
             dpi: primary_monitor_dpi(),
         };
         if snap.is_valid() {
@@ -479,8 +478,7 @@ fn resolve_recovery_workarea(
 
 fn get_recovery_workarea(explicit: Option<PixelRect>) -> Option<PixelRect> {
     let in_memory = *ORIGINAL_WORKAREA.lock().unwrap_or_else(|e| e.into_inner());
-    let mon = primary_monitor_rect();
-    let mon_px = PixelRect::new(mon.left, mon.top, mon.right, mon.bottom);
+    let mon_px = primary_monitor_rect().to_pixel_rect();
     let dpi = primary_monitor_dpi();
     resolve_recovery_workarea(explicit, in_memory, &recovery_workarea_path(), mon_px, dpi)
 }
@@ -514,6 +512,12 @@ pub struct MonitorRect {
     pub bottom: i32,
     pub width: i32,
     pub height: i32,
+}
+
+impl MonitorRect {
+    pub fn to_pixel_rect(self) -> PixelRect {
+        PixelRect::new(self.left, self.top, self.right, self.bottom)
+    }
 }
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -590,34 +594,35 @@ pub fn force_focus_window(hwnd_raw: isize) {
         let hwnd = HWND(hwnd_raw as *mut _);
         let fg = GetForegroundWindow();
         let fg_tid = GetWindowThreadProcessId(fg, None);
-        let cur_tid = windows::Win32::System::Threading::GetCurrentThreadId();
+        let cur_tid = GetCurrentThreadId();
         let target_tid = GetWindowThreadProcessId(hwnd, None);
         if fg_tid != cur_tid {
-            let _ = windows::Win32::System::Threading::AttachThreadInput(cur_tid, fg_tid, true);
+            let _ = AttachThreadInput(cur_tid, fg_tid, true);
         }
         if target_tid != cur_tid {
-            let _ = windows::Win32::System::Threading::AttachThreadInput(cur_tid, target_tid, true);
+            let _ = AttachThreadInput(cur_tid, target_tid, true);
         }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         if target_tid != cur_tid {
-            let _ = windows::Win32::System::Threading::AttachThreadInput(cur_tid, target_tid, false);
+            let _ = AttachThreadInput(cur_tid, target_tid, false);
         }
         if fg_tid != cur_tid {
-            let _ = windows::Win32::System::Threading::AttachThreadInput(cur_tid, fg_tid, false);
+            let _ = AttachThreadInput(cur_tid, fg_tid, false);
         }
     }
 }
 
-pub fn point_inside_hwnd(hwnd_raw: isize, x: i32, y: i32) -> bool {
+pub fn is_cursor_near_window(hwnd_raw: isize, pad_x: i32, pad_top: i32, pad_bottom: i32) -> bool {
     unsafe {
+        let mut pt = POINT::default();
+        let mut rect = RECT::default();
         let hwnd = HWND(hwnd_raw as *mut _);
-        if !IsWindowVisible(hwnd).as_bool() {
-            return false;
-        }
-        let mut r = RECT::default();
-        if GetWindowRect(hwnd, &mut r).is_ok() {
-            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        if GetCursorPos(&mut pt).is_ok() && GetWindowRect(hwnd, &mut rect).is_ok() {
+            return pt.x >= rect.left.saturating_sub(pad_x)
+                && pt.x <= rect.right.saturating_add(pad_x)
+                && pt.y >= rect.top.saturating_sub(pad_top)
+                && pt.y <= rect.bottom.saturating_add(pad_bottom);
         }
         false
     }
@@ -726,35 +731,38 @@ pub fn set_window_visible(hwnd_raw: isize, visible: bool, no_activate: bool) {
     }
 }
 
-/// Safely hides Windows 11 native taskbar(s) without injecting or terminating explorer.exe.
-pub fn hide_native_taskbar() {
-    if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
-        return;
-    }
+fn set_native_taskbars_visibility(cmd: SHOW_WINDOW_CMD) {
     unsafe {
         let cls = wide("Shell_TrayWnd");
         if let Ok(hwnd) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
             if !hwnd.0.is_null() {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = ShowWindow(hwnd, cmd);
             }
         }
-        // Also hide secondary monitor taskbars
-        extern "system" fn hide_secondary(hwnd: HWND, _: LPARAM) -> BOOL {
+        extern "system" fn set_secondary(hwnd: HWND, lparam: LPARAM) -> BOOL {
             unsafe {
                 let mut buf = [0u16; 64];
                 let len = GetClassNameW(hwnd, &mut buf);
                 if len > 0 {
                     let name = String::from_utf16_lossy(&buf[..len as usize]);
                     if name == "Shell_SecondaryTrayWnd" {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        let _ = ShowWindow(hwnd, SHOW_WINDOW_CMD(lparam.0 as i32));
                     }
                 }
             }
             BOOL(1)
         }
-        let _ = EnumWindows(Some(hide_secondary), LPARAM(0));
-        NATIVE_HIDDEN.store(true, Ordering::SeqCst);
+        let _ = EnumWindows(Some(set_secondary), LPARAM(cmd.0 as isize));
     }
+}
+
+/// Safely hides Windows 11 native taskbar(s) without injecting or terminating explorer.exe.
+pub fn hide_native_taskbar() {
+    if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
+        return;
+    }
+    set_native_taskbars_visibility(SW_HIDE);
+    NATIVE_HIDDEN.store(true, Ordering::SeqCst);
 }
 
 trait AppBarShellOps: Send {
@@ -773,8 +781,7 @@ struct Win32AppBarShellOps;
 
 impl AppBarShellOps for Win32AppBarShellOps {
     fn primary_monitor_rect(&self) -> PixelRect {
-        let mon = primary_monitor_rect();
-        PixelRect::new(mon.left, mon.top, mon.right, mon.bottom)
+        primary_monitor_rect().to_pixel_rect()
     }
 
     fn primary_monitor_dpi(&self) -> u32 {
@@ -1268,35 +1275,15 @@ pub fn flush_orphaned_appbars() {
 }
 
 fn show_native_taskbars_and_restore_workarea(explicit_workarea: Option<PixelRect>) {
-    unsafe {
-        let cls = wide("Shell_TrayWnd");
-        if let Ok(hwnd) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
-            if !hwnd.0.is_null() {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-            }
-        }
-        extern "system" fn show_secondary(hwnd: HWND, _: LPARAM) -> BOOL {
-            unsafe {
-                let mut buf = [0u16; 64];
-                let len = GetClassNameW(hwnd, &mut buf);
-                if len > 0 {
-                    let name = String::from_utf16_lossy(&buf[..len as usize]);
-                    if name == "Shell_SecondaryTrayWnd" {
-                        let _ = ShowWindow(hwnd, SW_SHOW);
-                    }
-                }
-            }
-            BOOL(1)
-        }
-        let _ = EnumWindows(Some(show_secondary), LPARAM(0));
-
-        if let Some(wa_rect) = get_recovery_workarea(explicit_workarea) {
-            let mut wa = RECT {
-                left: wa_rect.left,
-                top: wa_rect.top,
-                right: wa_rect.right,
-                bottom: wa_rect.bottom,
-            };
+    set_native_taskbars_visibility(SW_SHOW);
+    if let Some(wa_rect) = get_recovery_workarea(explicit_workarea) {
+        let mut wa = RECT {
+            left: wa_rect.left,
+            top: wa_rect.top,
+            right: wa_rect.right,
+            bottom: wa_rect.bottom,
+        };
+        unsafe {
             let _ = SystemParametersInfoW(
                 SPI_SETWORKAREA,
                 0,
@@ -1408,8 +1395,7 @@ pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
             _ => NotificationState::Unknown,
         };
 
-        let mon = primary_monitor_rect();
-        let primary_monitor = PixelRect::new(mon.left, mon.top, mon.right, mon.bottom);
+        let primary_monitor = primary_monitor_rect().to_pixel_rect();
 
         let fg = GetForegroundWindow();
         let foreground = if fg.0.is_null() {
@@ -1958,35 +1944,6 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
         }));
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
-}
-
-#[allow(dead_code)]
-pub fn create_hidden_message_window(class_name: &str) -> Option<HWND> {
-    unsafe {
-        let cls = wide(class_name);
-        CreateWindowExW(
-            Default::default(),
-            PCWSTR(cls.as_ptr()),
-            PCWSTR::null(),
-            Default::default(),
-            0,
-            0,
-            0,
-            0,
-            HWND::default(),
-            None,
-            None,
-            None,
-        )
-        .ok()
-    }
-}
-
-#[allow(dead_code)]
-pub fn post_close_to_hwnd(hwnd_raw: isize) {
-    unsafe {
-        let _ = PostMessageW(HWND(hwnd_raw as *mut _), windows::Win32::UI::WindowsAndMessaging::WM_CLOSE, WPARAM(0), LPARAM(0));
-    }
 }
 
 #[cfg(test)]

@@ -662,10 +662,6 @@ pub fn save_config_to(path: &Path, cfg: &TestBarConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub fn save_config(cfg: &TestBarConfig) -> Result<(), String> {
-    save_config_to(&config_path(), cfg)
-}
-
 pub fn set_pinned_clipboard(cfg: &mut TestBarConfig, text: &str, pinned: bool) -> bool {
     let value = text.trim();
     if value.is_empty() {
@@ -684,9 +680,12 @@ pub fn set_pinned_clipboard(cfg: &mut TestBarConfig, text: &str, pinned: bool) -
     }
 }
 
+pub fn should_force_combo(space: &str, kind: &str) -> bool {
+    space == "game_combos" || (space == "games" && kind.trim().eq_ignore_ascii_case("combo"))
+}
+
 pub fn add_pin_to_space(cfg: &mut TestBarConfig, space: &str, mut item: PinItem) -> bool {
-    let force_combo =
-        space == "game_combos" || (space == "games" && item.kind.trim().eq_ignore_ascii_case("combo"));
+    let force_combo = should_force_combo(space, &item.kind);
     normalize_pin(&mut item, force_combo);
 
     match space {
@@ -971,7 +970,7 @@ pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
     set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, enable)
 }
 
-pub fn ensure_parent_dir(p: &Path) -> Result<(), String> {
+fn ensure_parent_dir(p: &Path) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
