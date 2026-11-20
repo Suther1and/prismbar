@@ -28,6 +28,21 @@
         "focus": false
       },
       {
+        "label": "taskbar-secondary",
+        "title": "TestBar Secondary",
+        "url": "index.html?view=taskbar&monitor=secondary",
+        "width": 640,
+        "height": 84,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "visible": false,
+        "focus": false
+      },
+      {
         "label": "start",
         "title": "TestBar Start",
         "url": "index.html?view=start",

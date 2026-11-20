@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -48,7 +49,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     CREATESTRUCTW, GWLP_USERDATA, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, SHOW_WINDOW_CMD,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
+    SHOW_WINDOW_CMD,
     SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
@@ -82,6 +84,7 @@ const HOTKEY_EMERGENCY_ID: i32 = 0x7B01;
 
 static APPBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 static NATIVE_HIDDEN: AtomicBool = AtomicBool::new(false);
+static KEEP_NATIVE_SECONDARY_TASKBAR: AtomicBool = AtomicBool::new(false);
 static RESTORE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -544,7 +547,7 @@ pub fn install_panic_restore_hook() {
     }));
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorRect {
     pub left: i32,
     pub top: i32,
@@ -552,6 +555,7 @@ pub struct MonitorRect {
     pub bottom: i32,
     pub width: i32,
     pub height: i32,
+    pub dpi: u32,
 }
 
 impl MonitorRect {
@@ -562,6 +566,16 @@ impl MonitorRect {
 
 pub fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn monitor_dpi(hmon: HMONITOR) -> u32 {
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x > 0 {
+        dpi_x
+    } else {
+        96
+    }
 }
 
 pub fn primary_monitor_rect() -> MonitorRect {
@@ -580,6 +594,7 @@ pub fn primary_monitor_rect() -> MonitorRect {
                 bottom: r.bottom,
                 width: r.right - r.left,
                 height: r.bottom - r.top,
+                dpi: monitor_dpi(hmon),
             };
         }
         let w = GetSystemMetrics(SM_CXSCREEN);
@@ -591,8 +606,55 @@ pub fn primary_monitor_rect() -> MonitorRect {
             bottom: h,
             width: w,
             height: h,
+            dpi: 96,
         }
     }
+}
+
+/// Enumerates all non-primary display monitors via `EnumDisplayMonitors` with exact
+/// physical bounds and per-monitor effective DPI, sorted deterministically by `(left, top)`.
+pub fn secondary_monitor_rects() -> Vec<MonitorRect> {
+    extern "system" fn enum_proc(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        unsafe {
+            let out = &mut *(lparam.0 as *mut Vec<MonitorRect>);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut info).as_bool()
+                && (info.dwFlags & MONITORINFOF_PRIMARY) == 0
+            {
+                let r = info.rcMonitor;
+                out.push(MonitorRect {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                    width: r.right - r.left,
+                    height: r.bottom - r.top,
+                    dpi: monitor_dpi(hmon),
+                });
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut monitors: Vec<MonitorRect> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(enum_proc),
+            LPARAM(&mut monitors as *mut _ as isize),
+        );
+    }
+    monitors.sort_by_key(|m| (m.left, m.top));
+    monitors
 }
 
 /// Apply borderless tool-window topmost styling so windows never show in Alt+Tab
@@ -771,12 +833,52 @@ pub fn set_window_visible(hwnd_raw: isize, visible: bool, no_activate: bool) {
     }
 }
 
-fn set_native_taskbars_visibility(cmd: SHOW_WINDOW_CMD) {
+pub fn secondary_native_taskbar_should_stay_visible(mode: &str) -> bool {
+    mode.trim().eq_ignore_ascii_case("native")
+}
+
+pub fn set_keep_native_secondary_taskbar(keep_native: bool) {
+    KEEP_NATIVE_SECONDARY_TASKBAR.store(keep_native, Ordering::SeqCst);
+}
+
+pub fn apply_secondary_taskbar_mode_to_native(mode: &str, hide_native: bool) {
+    set_keep_native_secondary_taskbar(secondary_native_taskbar_should_stay_visible(mode));
+    if hide_native && !RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
+        hide_native_taskbar();
+    }
+}
+
+fn is_any_secondary_native_taskbar_visible() -> bool {
+    unsafe {
+        let mut any_visible = false;
+        extern "system" fn check_secondary(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                let mut buf = [0u16; 64];
+                let len = GetClassNameW(hwnd, &mut buf);
+                if len > 0 {
+                    let name = String::from_utf16_lossy(&buf[..len as usize]);
+                    if name == "Shell_SecondaryTrayWnd" && IsWindowVisible(hwnd).as_bool() {
+                        *(lparam.0 as *mut bool) = true;
+                        return BOOL(0);
+                    }
+                }
+            }
+            BOOL(1)
+        }
+        let _ = EnumWindows(
+            Some(check_secondary),
+            LPARAM(&mut any_visible as *mut bool as isize),
+        );
+        any_visible
+    }
+}
+
+fn set_native_taskbars_visibility(primary_cmd: SHOW_WINDOW_CMD, secondary_cmd: SHOW_WINDOW_CMD) {
     unsafe {
         let cls = wide("Shell_TrayWnd");
         if let Ok(hwnd) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
             if !hwnd.0.is_null() {
-                let _ = ShowWindow(hwnd, cmd);
+                let _ = ShowWindow(hwnd, primary_cmd);
             }
         }
         extern "system" fn set_secondary(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -792,26 +894,35 @@ fn set_native_taskbars_visibility(cmd: SHOW_WINDOW_CMD) {
             }
             BOOL(1)
         }
-        let _ = EnumWindows(Some(set_secondary), LPARAM(cmd.0 as isize));
+        let _ = EnumWindows(Some(set_secondary), LPARAM(secondary_cmd.0 as isize));
     }
 }
 
 /// Safely hides Windows 11 native taskbar(s) without injecting or terminating explorer.exe.
+/// Keeps `Shell_SecondaryTrayWnd` visible when `secondary_taskbar_mode == "native"`.
 pub fn hide_native_taskbar() {
     if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
         return;
     }
-    set_native_taskbars_visibility(SW_HIDE);
+    let secondary_cmd = if KEEP_NATIVE_SECONDARY_TASKBAR.load(Ordering::SeqCst) {
+        SW_SHOW
+    } else {
+        SW_HIDE
+    };
+    set_native_taskbars_visibility(SW_HIDE, secondary_cmd);
     NATIVE_HIDDEN.store(true, Ordering::SeqCst);
 }
 
 /// Lightweight check for the 650ms poller: only re-hides native taskbars if Explorer
-/// snuck `Shell_TrayWnd` back visible while TestBar owns the shell.
+/// snuck `Shell_TrayWnd` (or `Shell_SecondaryTrayWnd` when hidden) back visible while TestBar owns the shell.
 pub fn ensure_native_taskbar_hidden_if_needed() {
     if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
         return;
     }
-    if is_native_taskbar_visible() {
+    let keep_secondary = KEEP_NATIVE_SECONDARY_TASKBAR.load(Ordering::SeqCst);
+    if is_native_taskbar_visible()
+        || (!keep_secondary && is_any_secondary_native_taskbar_visible())
+    {
         hide_native_taskbar();
     }
 }
@@ -1332,7 +1443,7 @@ pub fn flush_orphaned_appbars() {
 }
 
 fn show_native_taskbars_and_restore_workarea(explicit_workarea: Option<PixelRect>) {
-    set_native_taskbars_visibility(SW_SHOW);
+    set_native_taskbars_visibility(SW_SHOW, SW_SHOW);
     if let Some(wa_rect) = get_recovery_workarea(explicit_workarea) {
         let mut wa = RECT {
             left: wa_rect.left,

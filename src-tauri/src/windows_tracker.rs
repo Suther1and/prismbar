@@ -1,12 +1,13 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use windows::core::{HRESULT, PCWSTR, PWSTR};
+use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, RECT,
-    RPC_E_CHANGED_MODE, SIZE, S_FALSE, S_OK, WPARAM,
+    CloseHandle, BOOL, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM,
+    RECT, RPC_E_CHANGED_MODE, SIZE, S_FALSE, S_OK, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
@@ -16,15 +17,19 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED, STGM,
+};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
     QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::Shell::{
-    IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, ShellExecuteW,
-    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHGetFileInfoW,
+    ShellExecuteW, ShellLink, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK,
+    SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DrawIconEx, EnumChildWindows, EnumWindows, GetClassLongPtrW, GetClassNameW,
@@ -869,47 +874,174 @@ pub fn close_window(hwnd_raw: isize) {
     }
 }
 
-pub fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
-            .map_err(|e| format!("Не удалось открыть процесс {pid}: {e}"))?;
-        let res = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-        res.map_err(|e| format!("Не удалось завершить процесс {pid}: {e}"))
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JumpListItem {
+    pub title: String,
+    pub target: String,
+    pub args: Option<String>,
+    /// `"task"` | `"recent"`
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedLaunchSpec {
+    pub target: String,
+    pub args: Option<String>,
+    pub verb: &'static str,
+}
+
+fn format_terminate_error(pid: u32, err: windows::core::Error, stage: &str) -> String {
+    if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+        format!("Отказано в доступе при завершении процесса {pid} (нужны права администратора)")
+    } else {
+        format!("Не удалось {stage} процесс {pid}: {err}")
     }
 }
 
-pub fn launch_target(target: &str, as_admin: bool) -> Result<(), String> {
-    if target.trim().is_empty() {
-        return Err("Пустой путь запуска".to_string());
+pub fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("Некорректный PID процесса".to_string());
     }
     unsafe {
-        let verb = wide(if as_admin { "runas" } else { "open" });
-        let file = wide(target);
+        let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
+            .map_err(|e| format_terminate_error(pid, e, "открыть"))?;
+        let res = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+        res.map_err(|e| format_terminate_error(pid, e, "завершить"))
+    }
+}
+
+/// Validates and normalizes target + optional CLI args for direct Win32 `ShellExecuteW`
+/// launch (`"runas"` or `"open"`), avoiding any shell/PowerShell string interpolation.
+pub fn normalize_launch_spec(
+    target: &str,
+    args: Option<&str>,
+    as_admin: bool,
+) -> Result<NormalizedLaunchSpec, String> {
+    let raw_target = target.trim();
+    if raw_target.is_empty() {
+        return Err("Пустой путь запуска".to_string());
+    }
+    if raw_target.contains('\0') || raw_target.contains('\r') || raw_target.contains('\n') {
+        return Err("Недопустимые символы в пути запуска".to_string());
+    }
+
+    let (clean_target, inline_args) = if let Some(after_open) = raw_target.strip_prefix('"') {
+        let Some(close_idx) = after_open.find('"') else {
+            return Err("Незакрытая кавычка в пути запуска".to_string());
+        };
+        let t = after_open[..close_idx].trim();
+        let rest = after_open[close_idx + 1..].trim();
+        (t, (!rest.is_empty()).then_some(rest))
+    } else {
+        (raw_target, None)
+    };
+
+    if clean_target.is_empty() {
+        return Err("Пустой путь запуска".to_string());
+    }
+
+    let extra_args = args.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(a) = extra_args {
+        if a.contains('\0') || a.contains('\r') || a.contains('\n') {
+            return Err("Недопустимые символы в аргументах запуска".to_string());
+        }
+    }
+
+    let merged_args = match (inline_args, extra_args) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    };
+
+    Ok(NormalizedLaunchSpec {
+        target: clean_target.to_string(),
+        args: merged_args,
+        verb: if as_admin { "runas" } else { "open" },
+    })
+}
+
+pub fn format_shell_execute_error(code: isize, target: &str) -> String {
+    match code {
+        2 | 3 => format!("Файл или путь не найден: {target}"),
+        5 => format!("Отказано в доступе или запуск отменён: {target}"),
+        31 => format!("Нет связанного приложения для: {target}"),
+        _ => format!("Не удалось открыть {target} (код {code})"),
+    }
+}
+
+pub fn launch_target_with_args(
+    target: &str,
+    args: Option<&str>,
+    as_admin: bool,
+) -> Result<(), String> {
+    let spec = normalize_launch_spec(target, args, as_admin)?;
+    unsafe {
+        let verb = wide(spec.verb);
+        let file = wide(&spec.target);
+        let params_wide = spec.args.as_deref().map(wide);
+        let params_ptr = params_wide
+            .as_ref()
+            .map(|w| PCWSTR(w.as_ptr()))
+            .unwrap_or_else(PCWSTR::null);
         let res = ShellExecuteW(
             HWND::default(),
             PCWSTR(verb.as_ptr()),
             PCWSTR(file.as_ptr()),
-            PCWSTR::null(),
+            params_ptr,
             PCWSTR::null(),
             SW_SHOW,
         );
-        if (res.0 as isize) <= 32 {
-            return Err(format!("Не удалось открыть: {target}"));
+        let code = res.0 as isize;
+        if code <= 32 {
+            return Err(format_shell_execute_error(code, &spec.target));
         }
     }
     Ok(())
 }
 
-pub fn open_file_location(path: &str) -> Result<(), String> {
-    if path.is_empty() {
+pub fn launch_target(target: &str, as_admin: bool) -> Result<(), String> {
+    launch_target_with_args(target, None, as_admin)
+}
+
+/// Formats an unescaped Windows command-line raw argument for `explorer.exe /select,"<path>"`
+/// so paths containing spaces never get broken by Rust's default `.arg()` quote escaping (AD-7).
+pub fn format_explorer_select_raw_arg(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
         return Err("Пустой путь".to_string());
     }
+    if trimmed.contains('\0') || trimmed.contains('\r') || trimmed.contains('\n') {
+        return Err("Недопустимый путь".to_string());
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim();
+    if unquoted.is_empty() {
+        return Err("Пустой путь".to_string());
+    }
+    if unquoted.contains('"') {
+        return Err("Путь содержит недопустимые кавычки".to_string());
+    }
+    let lower = unquoted.to_ascii_lowercase();
+    if lower.contains("://") || lower.starts_with("shell:") || lower.starts_with("ms-") {
+        return Err("Расположение файла недоступно для системных URI".to_string());
+    }
+    let normalized = unquoted.replace('/', "\\");
+    Ok(format!("/select,\"{normalized}\""))
+}
+
+pub fn open_file_location(path: &str) -> Result<(), String> {
+    let raw = format_explorer_select_raw_arg(path)?;
     std::process::Command::new("explorer.exe")
-        .arg(format!("/select,\"{path}\""))
+        .raw_arg(raw)
         .spawn()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("Не удалось открыть Проводник: {e}"))
 }
 
 pub fn open_in_terminal(dir_path: &str) -> Result<(), String> {
@@ -928,15 +1060,312 @@ pub fn open_in_terminal(dir_path: &str) -> Result<(), String> {
     {
         return Ok(());
     }
+    let ps_escaped = target.replace('\'', "''");
     std::process::Command::new("powershell.exe")
         .args([
             "-NoExit",
             "-Command",
-            &format!("Set-Location -LiteralPath '{target}'"),
+            &format!("Set-Location -LiteralPath '{ps_escaped}'"),
         ])
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+fn normalized_exe_basename(exe_path: &str) -> String {
+    exe_path
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Returns built-in app-specific quick Jump List tasks for common browsers, editors,
+/// terminals, Explorer, Notepad, OBS, and Steam.
+pub fn known_app_quick_tasks(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
+    let exe_clean = exe_path.trim().trim_matches('"');
+    let base = normalized_exe_basename(exe_clean);
+    let aumid_low = aumid.unwrap_or("").trim().to_ascii_lowercase();
+    let mut tasks = Vec::new();
+
+    let task = |title: &str, target: &str, args: Option<&str>| JumpListItem {
+        title: title.to_string(),
+        target: target.to_string(),
+        args: args.map(str::to_string),
+        kind: "task".to_string(),
+    };
+
+    if matches!(base.as_str(), "zen.exe" | "firefox.exe") && !exe_clean.is_empty() {
+        tasks.push(task("Приватное окно", exe_clean, Some("-private-window")));
+    } else if matches!(
+        base.as_str(),
+        "chrome.exe" | "brave.exe" | "browser.exe" | "vivaldi.exe" | "opera.exe"
+    ) && !exe_clean.is_empty()
+    {
+        tasks.push(task("Окно инкогнито", exe_clean, Some("--incognito")));
+    } else if base == "msedge.exe" && !exe_clean.is_empty() {
+        tasks.push(task("Окно InPrivate", exe_clean, Some("--inprivate")));
+    } else if matches!(base.as_str(), "code.exe" | "cursor.exe" | "antigravity.exe")
+        && !exe_clean.is_empty()
+    {
+        tasks.push(task("Новое пустое окно", exe_clean, Some("--new-window")));
+    } else if matches!(base.as_str(), "wt.exe" | "windowsterminal.exe")
+        || aumid_low.contains("windowsterminal")
+    {
+        tasks.push(task("Новая вкладка PowerShell", "wt.exe", Some("new-tab powershell")));
+        tasks.push(task("Новая вкладка CMD", "wt.exe", Some("new-tab cmd")));
+    } else if base == "notepad.exe" || aumid_low.contains("windowsnotepad") {
+        let target = if !exe_clean.is_empty() && !is_application_frame_host(exe_clean) {
+            exe_clean
+        } else {
+            "notepad.exe"
+        };
+        tasks.push(task("Новый документ", target, None));
+    } else if base == "explorer.exe" {
+        if let Some(dl) = dirs::download_dir().filter(|p| p.exists()) {
+            tasks.push(task("Загрузки", &dl.to_string_lossy(), None));
+        }
+        if let Some(docs) = dirs::document_dir().filter(|p| p.exists()) {
+            tasks.push(task("Документы", &docs.to_string_lossy(), None));
+        }
+        if let Some(desk) = dirs::desktop_dir().filter(|p| p.exists()) {
+            tasks.push(task("Рабочий стол", &desk.to_string_lossy(), None));
+        }
+    } else if base == "obs64.exe" && !exe_clean.is_empty() {
+        tasks.push(task("Запустить в трее", exe_clean, Some("--minimize-to-tray")));
+    } else if base == "steam.exe" {
+        tasks.push(task("Библиотека игр", "steam://open/games", None));
+        tasks.push(task("Список друзей", "steam://open/friends", None));
+    }
+
+    tasks
+}
+
+fn recent_extensions_for_app(base: &str, aumid_low: &str) -> (&'static [&'static str], bool) {
+    match base {
+        "explorer.exe" => (&[], true),
+        "code.exe" | "cursor.exe" | "antigravity.exe" => (
+            &[
+                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "md", "py", "cs", "cpp", "h",
+                "html", "css", "yaml", "yml", "code-workspace", "sql",
+            ],
+            true,
+        ),
+        "notepad.exe" | "notepad++.exe" => (
+            &["txt", "md", "log", "json", "ini", "cfg", "xml", "csv", "toml", "env"],
+            false,
+        ),
+        "obsidian.exe" => (&["md"], false),
+        "photoshop.exe" | "lightroom.exe" | "mspaint.exe" | "photos.exe" | "photosapp.exe" => (
+            &[
+                "psd", "psb", "png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "svg", "dng",
+                "raw",
+            ],
+            false,
+        ),
+        "zen.exe" | "firefox.exe" | "chrome.exe" | "msedge.exe" | "browser.exe" | "brave.exe" => {
+            (&["html", "htm", "pdf", "svg", "mhtml"], false)
+        }
+        "winword.exe" => (&["doc", "docx", "rtf", "odt", "pdf"], false),
+        "excel.exe" => (&["xls", "xlsx", "csv", "ods"], false),
+        "powerpnt.exe" => (&["ppt", "pptx"], false),
+        "vlc.exe" | "mpv.exe" | "obs64.exe" => {
+            (&["mp4", "mkv", "webm", "mov", "avi", "mp3", "flac", "wav"], false)
+        }
+        _ if aumid_low.contains("windowsnotepad") => {
+            (&["txt", "md", "log", "json", "ini", "csv"], false)
+        }
+        _ if aumid_low.contains("photos") || aumid_low.contains("paint") => {
+            (&["png", "jpg", "jpeg", "webp", "bmp", "svg"], false)
+        }
+        _ => (&[], false),
+    }
+}
+
+fn looks_like_directory_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.ends_with('\\') || trimmed.ends_with('/') {
+        return true;
+    }
+    let p = Path::new(trimmed);
+    if p.is_dir() {
+        return true;
+    }
+    p.extension().is_none()
+}
+
+/// Pure matcher selecting up to `limit` recent Windows `.lnk` entries relevant to the
+/// target app (`exe_path` / `aumid`), deduplicating targets case-insensitively.
+pub fn match_recent_entries_for_app(
+    exe_path: &str,
+    aumid: Option<&str>,
+    recent_entries: &[(String, String)],
+    limit: usize,
+) -> Vec<JumpListItem> {
+    if limit == 0 || recent_entries.is_empty() {
+        return Vec::new();
+    }
+    let base = normalized_exe_basename(exe_path);
+    let aumid_low = aumid.unwrap_or("").trim().to_ascii_lowercase();
+    let (exts, allow_dirs) = recent_extensions_for_app(&base, &aumid_low);
+    if exts.is_empty() && !allow_dirs {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen_targets = HashSet::new();
+    let self_norm = exe_path.trim().replace('/', "\\").to_ascii_lowercase();
+
+    for (raw_title, raw_target) in recent_entries {
+        let target = raw_target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let target_norm = target.replace('/', "\\").to_ascii_lowercase();
+        if target_norm == self_norm || target_norm.ends_with(".exe") {
+            continue;
+        }
+
+        let ext = Path::new(target)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase());
+        let matches = match ext.as_deref() {
+            Some(e) => exts.contains(&e),
+            None => allow_dirs && looks_like_directory_path(target),
+        };
+        if !matches || !seen_targets.insert(target_norm) {
+            continue;
+        }
+
+        let clean_title = raw_title
+            .trim()
+            .strip_suffix(".lnk")
+            .or_else(|| raw_title.trim().strip_suffix(".LNK"))
+            .unwrap_or(raw_title.trim());
+        let title = if clean_title.is_empty() {
+            Path::new(target)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| target.to_string())
+        } else {
+            clean_title.to_string()
+        };
+
+        out.push(JumpListItem {
+            title,
+            target: target.to_string(),
+            args: None,
+            kind: "recent".to_string(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+
+    out
+}
+
+fn resolve_recent_lnk_target(lnk_path: &Path) -> Option<String> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pf: IPersistFile = link.cast().ok()?;
+        let w = wide(&lnk_path.to_string_lossy());
+        pf.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut fd = std::mem::zeroed();
+        link.GetPath(&mut buf, &mut fd, 0).ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let resolved = String::from_utf16_lossy(&buf[..len]).trim().to_string();
+        if resolved.is_empty() {
+            None
+        } else {
+            Some(resolved)
+        }
+    }
+}
+
+fn collect_windows_recent_targets(max_scan: usize) -> Vec<(String, String)> {
+    let Some(recent_dir) = dirs::config_dir().map(|d| d.join(r"Microsoft\Windows\Recent")) else {
+        return Vec::new();
+    };
+    let Ok(read_dir) = std::fs::read_dir(&recent_dir) else {
+        return Vec::new();
+    };
+
+    let mut lnk_files: Vec<(std::time::SystemTime, PathBuf)> = read_dir
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_lnk = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            if !is_lnk {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+
+    // Newest first
+    lnk_files.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let com = ComGuard::init_sta();
+    if !com.is_usable() {
+        return Vec::new();
+    }
+
+    let mut resolved = Vec::new();
+    for (_, lnk_path) in lnk_files.into_iter().take(max_scan) {
+        let Some(target) = resolve_recent_lnk_target(&lnk_path) else {
+            continue;
+        };
+        if !Path::new(&target).exists() {
+            continue;
+        }
+        let title = lnk_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| target.clone());
+        resolved.push((title, target));
+    }
+    resolved
+}
+
+/// Returns structured Jump List actions (app-specific quick tasks + matching Windows Recent
+/// items from `%APPDATA%\Microsoft\Windows\Recent` resolved behind RAII `ComGuard`).
+pub fn get_jump_list(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
+    let mut items = known_app_quick_tasks(exe_path, aumid);
+    let base = normalized_exe_basename(exe_path);
+    let aumid_low = aumid.unwrap_or("").trim().to_ascii_lowercase();
+    let (exts, allow_dirs) = recent_extensions_for_app(&base, &aumid_low);
+    if !exts.is_empty() || allow_dirs {
+        let recent_raw = collect_windows_recent_targets(48);
+        let recent_matched = match_recent_entries_for_app(exe_path, aumid, &recent_raw, 4);
+        let mut seen: HashSet<String> = items
+            .iter()
+            .map(|i| format!("{}|{}", i.target.to_ascii_lowercase(), i.args.as_deref().unwrap_or("")))
+            .collect();
+        for r in recent_matched {
+            let key = format!("{}|", r.target.to_ascii_lowercase());
+            if seen.insert(key) {
+                items.push(r);
+            }
+        }
+    }
+    items.truncate(6);
+    items
 }
 
 /// Captures a live visual thumbnail of an open window (using PrintWindow PW_RENDERFULLCONTENT)
@@ -1245,5 +1674,130 @@ mod tests {
         cache.lock().unwrap().put(uwp_key.clone(), uwp_uri.clone());
         let batch_uwp = cache.lock().unwrap().get_batch(&[uwp_key.clone()]);
         assert_eq!(batch_uwp.get(&uwp_key), Some(&uwp_uri));
+    }
+
+    #[test]
+    fn format_explorer_select_raw_arg_handles_spaces_quotes_and_rejects_invalid() {
+        // Spaces preserved inside exact unescaped /select,"..." raw arg
+        assert_eq!(
+            format_explorer_select_raw_arg(r"C:\Program Files\VS Code\Code.exe").unwrap(),
+            r#"/select,"C:\Program Files\VS Code\Code.exe""#
+        );
+        // Forward slashes normalized to backslashes
+        assert_eq!(
+            format_explorer_select_raw_arg("C:/Users/Test User/Docs/file.txt").unwrap(),
+            r#"/select,"C:\Users\Test User\Docs\file.txt""#
+        );
+        // Matching surrounding quotes stripped cleanly without double-quoting
+        assert_eq!(
+            format_explorer_select_raw_arg(r#"  "C:\Program Files\Zen\zen.exe"  "#).unwrap(),
+            r#"/select,"C:\Program Files\Zen\zen.exe""#
+        );
+
+        // Rejects empty, whitespace, embedded quotes, control chars, and URI schemes
+        assert!(format_explorer_select_raw_arg("").is_err());
+        assert!(format_explorer_select_raw_arg("   ").is_err());
+        assert!(format_explorer_select_raw_arg(r#""""#).is_err());
+        assert!(format_explorer_select_raw_arg(r#"C:\Bad"Quote\app.exe"#).is_err());
+        assert!(format_explorer_select_raw_arg("C:\\Bad\nPath\\app.exe").is_err());
+        assert!(format_explorer_select_raw_arg("C:\\Bad\0Path\\app.exe").is_err());
+        assert!(format_explorer_select_raw_arg("https://example.com").is_err());
+        assert!(format_explorer_select_raw_arg("shell:AppsFolder\\Microsoft.Store!App").is_err());
+        assert!(format_explorer_select_raw_arg("ms-settings:display").is_err());
+    }
+
+    #[test]
+    fn normalize_launch_spec_uses_direct_shellexecute_verb_and_normalizes_args() {
+        // Plain exe with as_admin = true uses native "runas" verb (never PowerShell quoting)
+        let admin = normalize_launch_spec(r"C:\Program Files\App\O'Brien's App.exe", None, true)
+            .expect("apostrophe path must normalize cleanly");
+        assert_eq!(admin.verb, "runas");
+        assert_eq!(admin.target, r"C:\Program Files\App\O'Brien's App.exe");
+        assert_eq!(admin.args, None);
+
+        // Quoted exe with inline args + explicit PinItem args merged cleanly
+        let quoted = normalize_launch_spec(
+            r#""C:\Program Files\VS Code\Code.exe" --new-window"#,
+            Some("--disable-gpu"),
+            false,
+        )
+        .expect("quoted exe with args must parse");
+        assert_eq!(quoted.verb, "open");
+        assert_eq!(quoted.target, r"C:\Program Files\VS Code\Code.exe");
+        assert_eq!(quoted.args.as_deref(), Some("--new-window --disable-gpu"));
+
+        // Blank args collapse to None
+        let clean = normalize_launch_spec(r"C:\Windows\notepad.exe", Some("   "), false).unwrap();
+        assert_eq!(clean.args, None);
+
+        // Invalid inputs rejected
+        assert!(normalize_launch_spec("", None, false).is_err());
+        assert!(normalize_launch_spec("   ", None, true).is_err());
+        assert!(normalize_launch_spec(r#""C:\Unclosed\app.exe"#, None, false).is_err());
+        assert!(normalize_launch_spec("C:\\App\nEvil.exe", None, false).is_err());
+        assert!(normalize_launch_spec(r"C:\App.exe", Some("--bad\0arg"), false).is_err());
+
+        // Error messages are readable Russian strings
+        assert!(format_shell_execute_error(2, "missing.exe").contains("не найден"));
+        assert!(format_shell_execute_error(5, "admin.exe").contains("доступе"));
+    }
+
+    #[test]
+    fn jump_list_quick_tasks_and_recent_matching_cover_browsers_editors_terminals_and_dedup() {
+        // Browser private/incognito tasks
+        let zen_tasks = known_app_quick_tasks(r"C:\Program Files\Zen Browser\zen.exe", None);
+        assert_eq!(zen_tasks.len(), 1);
+        assert_eq!(zen_tasks[0].kind, "task");
+        assert_eq!(zen_tasks[0].args.as_deref(), Some("-private-window"));
+
+        let chrome_tasks = known_app_quick_tasks(r"C:\Program Files\Google\Chrome\chrome.exe", None);
+        assert_eq!(chrome_tasks[0].args.as_deref(), Some("--incognito"));
+
+        let edge_tasks = known_app_quick_tasks(r"C:\Program Files\Edge\msedge.exe", None);
+        assert_eq!(edge_tasks[0].args.as_deref(), Some("--inprivate"));
+
+        // Windows Terminal via AUMID
+        let wt_tasks = known_app_quick_tasks(
+            r"C:\Windows\System32\ApplicationFrameHost.exe",
+            Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"),
+        );
+        assert_eq!(wt_tasks.len(), 2);
+        assert_eq!(wt_tasks[0].target, "wt.exe");
+
+        // Recent matching for VS Code: keeps code files & folders, skips images/exe, deduplicates, respects limit
+        let recent = vec![
+            ("Cargo.toml.lnk".to_string(), r"C:\Projects\testbar\Cargo.toml".to_string()),
+            ("duplicate.lnk".to_string(), r"c:/projects/testbar/cargo.toml".to_string()),
+            ("photo.png.lnk".to_string(), r"C:\Users\loki2\Pictures\photo.png".to_string()),
+            ("Code.exe.lnk".to_string(), r"C:\Program Files\VS Code\Code.exe".to_string()),
+            ("testbar".to_string(), r"C:\Users\loki2\Documents\testbar".to_string()),
+            ("lib.rs".to_string(), r"C:\Projects\testbar\src\lib.rs".to_string()),
+            ("index.ts".to_string(), r"C:\Projects\testbar\src\index.ts".to_string()),
+        ];
+
+        let code_recent = match_recent_entries_for_app(
+            r"C:\Program Files\VS Code\Code.exe",
+            None,
+            &recent,
+            3,
+        );
+        assert_eq!(code_recent.len(), 3);
+        assert_eq!(code_recent[0].title, "Cargo.toml");
+        assert_eq!(code_recent[0].kind, "recent");
+        assert_eq!(code_recent[0].target, r"C:\Projects\testbar\Cargo.toml");
+        assert_eq!(code_recent[1].title, "testbar");
+        assert_eq!(code_recent[2].title, "lib.rs");
+
+        // Notepad matches text/toml, ignores folders and png
+        let note_recent =
+            match_recent_entries_for_app(r"C:\Windows\System32\notepad.exe", None, &recent, 4);
+        assert_eq!(note_recent.len(), 1);
+        assert_eq!(note_recent[0].title, "Cargo.toml");
+
+        // Explorer matches directories only
+        let exp_recent =
+            match_recent_entries_for_app(r"C:\Windows\explorer.exe", None, &recent, 4);
+        assert_eq!(exp_recent.len(), 1);
+        assert_eq!(exp_recent[0].title, "testbar");
     }
 }

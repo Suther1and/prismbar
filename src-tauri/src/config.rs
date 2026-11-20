@@ -13,6 +13,32 @@ use windows::Win32::System::Registry::{
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const SECONDARY_TASKBAR_MODE_TESTBAR: &str = "testbar";
+pub const SECONDARY_TASKBAR_MODE_NATIVE: &str = "native";
+pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
+
+pub fn default_secondary_taskbar_mode() -> String {
+    SECONDARY_TASKBAR_MODE_TESTBAR.to_string()
+}
+
+pub fn normalize_secondary_taskbar_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "native" => SECONDARY_TASKBAR_MODE_NATIVE,
+        "hidden" => SECONDARY_TASKBAR_MODE_HIDDEN,
+        _ => SECONDARY_TASKBAR_MODE_TESTBAR,
+    }
+}
+
+pub fn validate_secondary_taskbar_mode(mode: &str) -> Result<&'static str, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "testbar" => Ok(SECONDARY_TASKBAR_MODE_TESTBAR),
+        "native" => Ok(SECONDARY_TASKBAR_MODE_NATIVE),
+        "hidden" => Ok(SECONDARY_TASKBAR_MODE_HIDDEN),
+        other => Err(format!(
+            "Недопустимый режим второго монитора: '{other}' (допустимы: testbar, native, hidden)"
+        )),
+    }
+}
 
 const AUTOSTART_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE_NAME: &str = "TestBar";
@@ -70,6 +96,8 @@ pub struct TestBarConfig {
     pub revision: u64,
     #[serde(default)]
     pub bar_mode: String, // "dock" | "edge"
+    #[serde(default = "default_secondary_taskbar_mode")]
+    pub secondary_taskbar_mode: String, // "testbar" | "native" | "hidden"
     #[serde(default)]
     pub autostart: bool,
     #[serde(default)]
@@ -430,6 +458,12 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         changed = true;
     }
 
+    let desired_secondary = normalize_secondary_taskbar_mode(&cfg.secondary_taskbar_mode);
+    if cfg.secondary_taskbar_mode != desired_secondary {
+        cfg.secondary_taskbar_mode = desired_secondary.to_string();
+        changed = true;
+    }
+
     for list in [
         &mut cfg.taskbar_pins,
         &mut cfg.personal_pins,
@@ -506,6 +540,7 @@ impl Default for TestBarConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             revision: 0,
             bar_mode: "dock".to_string(),
+            secondary_taskbar_mode: default_secondary_taskbar_mode(),
             autostart: false,
             taskbar_pins: vec![
                 pin("explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
@@ -1793,5 +1828,46 @@ mod tests {
         // 5. Repeat disable is idempotent Ok(())
         set_windows_autostart_at(&subkey, val_name, exe_path, false)
             .expect("repeat disable must succeed");
+    }
+
+    #[test]
+    fn secondary_taskbar_mode_defaults_validation_and_persistence() {
+        let dir = make_temp_dir("secondary-mode");
+        let cfg_path = dir.join("config.json");
+
+        // Default config uses "testbar"
+        let def = TestBarConfig::default();
+        assert_eq!(def.secondary_taskbar_mode, "testbar");
+
+        // Validation accepts canonical values case-insensitively and rejects invalid ones
+        assert_eq!(validate_secondary_taskbar_mode("testbar"), Ok("testbar"));
+        assert_eq!(validate_secondary_taskbar_mode("  NATIVE "), Ok("native"));
+        assert_eq!(validate_secondary_taskbar_mode("Hidden"), Ok("hidden"));
+        assert!(validate_secondary_taskbar_mode("mirror").is_err());
+        assert!(validate_secondary_taskbar_mode("").is_err());
+
+        // Legacy JSON missing secondaryTaskbarMode defaults to "testbar"
+        let legacy_json = r#"{"schemaVersion":1,"revision":2,"barMode":"dock"}"#;
+        fs::write(&cfg_path, legacy_json).expect("write legacy");
+        let loaded = load_config_from(&cfg_path);
+        assert_eq!(loaded.secondary_taskbar_mode, "testbar");
+
+        // Unknown value normalizes back to "testbar" on load/migration
+        let invalid_json =
+            r#"{"schemaVersion":1,"revision":3,"barMode":"dock","secondaryTaskbarMode":"bogus"}"#;
+        fs::write(&cfg_path, invalid_json).expect("write invalid");
+        let normalized = load_config_from(&cfg_path);
+        assert_eq!(normalized.secondary_taskbar_mode, "testbar");
+
+        // Valid modes ("native", "hidden") persist cleanly through save/load roundtrip
+        for mode in ["native", "hidden", "testbar"] {
+            let mut cfg = TestBarConfig::default();
+            cfg.secondary_taskbar_mode = mode.to_string();
+            save_config_to(&cfg_path, &cfg).expect("save mode");
+            let back = load_config_from(&cfg_path);
+            assert_eq!(back.secondary_taskbar_mode, mode);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

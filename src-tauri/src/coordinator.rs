@@ -219,8 +219,21 @@ pub fn compute_appbar_rect(primary_monitor: PixelRect, dpi: u32, bar_mode: BarMo
 /// Returns the WebView window labels that should receive `windows-updated` broadcasts (AD-6):
 /// always `"taskbar"`, plus `"start"` only when visible and `"flyout"` only when visible.
 pub fn windows_update_targets(start_visible: bool, flyout_visible: bool) -> Vec<&'static str> {
-    let mut targets = Vec::with_capacity(3);
+    windows_update_targets_with_secondary(start_visible, flyout_visible, false)
+}
+
+/// Returns the WebView window labels that should receive `windows-updated` broadcasts (AD-6),
+/// including `"taskbar-secondary"` only when the secondary monitor taskbar is currently visible.
+pub fn windows_update_targets_with_secondary(
+    start_visible: bool,
+    flyout_visible: bool,
+    secondary_taskbar_visible: bool,
+) -> Vec<&'static str> {
+    let mut targets = Vec::with_capacity(4);
     targets.push("taskbar");
+    if secondary_taskbar_visible {
+        targets.push("taskbar-secondary");
+    }
     if start_visible {
         targets.push("start");
     }
@@ -273,6 +286,17 @@ impl WindowCoordinator {
 
     pub fn windows_update_targets(&self) -> Vec<&'static str> {
         windows_update_targets(self.is_start_visible(), self.is_flyout_visible())
+    }
+
+    pub fn windows_update_targets_with_secondary(
+        &self,
+        secondary_taskbar_visible: bool,
+    ) -> Vec<&'static str> {
+        windows_update_targets_with_secondary(
+            self.is_start_visible(),
+            self.is_flyout_visible(),
+            secondary_taskbar_visible,
+        )
     }
 
     pub fn active_flyout(&self) -> Option<FlyoutKind> {
@@ -930,9 +954,9 @@ mod tests {
         let windows = conf["app"]["windows"]
             .as_array()
             .expect("app.windows must be an array");
-        assert_eq!(windows.len(), 3, "expected exactly 3 pre-warmed windows");
+        assert_eq!(windows.len(), 4, "expected exactly 4 pre-warmed windows");
 
-        for expected_label in ["taskbar", "start", "flyout"] {
+        for expected_label in ["taskbar", "taskbar-secondary", "start", "flyout"] {
             let win = windows
                 .iter()
                 .find(|w| w["label"].as_str() == Some(expected_label))
@@ -942,6 +966,12 @@ mod tests {
             assert_eq!(win["transparent"].as_bool(), Some(true), "{expected_label} must have transparent: true");
             assert_eq!(win["shadow"].as_bool(), Some(false), "{expected_label} must have shadow: false");
             assert_eq!(win["skipTaskbar"].as_bool(), Some(true), "{expected_label} must have skipTaskbar: true");
+            if expected_label == "taskbar-secondary" {
+                assert_eq!(
+                    win["url"].as_str(),
+                    Some("index.html?view=taskbar&monitor=secondary")
+                );
+            }
         }
 
         assert_eq!(

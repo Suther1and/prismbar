@@ -17,6 +17,7 @@ function makeConfig(revision: number, barMode: 'dock' | 'edge' = 'dock'): TestBa
     schemaVersion: 1,
     revision,
     barMode,
+    secondaryTaskbarMode: 'testbar',
     autostart: false,
     taskbarPins: [],
     personalPins: [],

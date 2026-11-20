@@ -104,7 +104,18 @@ export const StartView: React.FC = () => {
           setPowerOpen(false);
           setArmedPower(null);
           setPeriphOpen(false);
+          setSettingsOpen(false);
+          setDrawerOpen(false);
         }
+      }),
+      onEvent<void>('open-start-settings', () => {
+        setSearchOpen(false);
+        setQuery('');
+        setDrawerOpen(false);
+        setPowerOpen(false);
+        setArmedPower(null);
+        setPeriphOpen(false);
+        setSettingsOpen(true);
       }),
     ];
     return () => {
@@ -257,7 +268,12 @@ export const StartView: React.FC = () => {
       ipc('open_terminal_at', { path: item.target });
       return;
     }
-    ipc('launch_item', { target: item.target, asAdmin: shiftHeld && item.kind === 'app', closeStart: true });
+    ipc('launch_item', {
+      target: item.target,
+      args: item.args ?? null,
+      asAdmin: shiftHeld && item.kind === 'app',
+      closeStart: true,
+    });
   };
 
   const handleUniversalPin = async (kind: 'folder' | 'file' | 'url') => {
@@ -1403,6 +1419,35 @@ export const StartView: React.FC = () => {
                 >
                   На всю ширину
                 </button>
+              </div>
+            </div>
+
+            <div className="set-row">
+              <div>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>Второй монитор</div>
+                <div style={{ fontSize: 11.5, color: 'var(--t2)' }}>Показывать панель TestBar, стандартную панель Windows или скрывать</div>
+              </div>
+              <div className="mini-tabs">
+                {(
+                  [
+                    ['testbar', 'TestBar'],
+                    ['native', 'Windows'],
+                    ['hidden', 'Скрыть'],
+                  ] as const
+                ).map(([modeKey, label]) => (
+                  <button
+                    key={modeKey}
+                    className={`mini-tab ${(config?.secondaryTaskbarMode ?? 'testbar') === modeKey ? 'active' : ''}`}
+                    style={{ padding: '6px 11px', fontSize: 12 }}
+                    onClick={() =>
+                      ipc<TestBarConfig>('set_secondary_taskbar_mode', { mode: modeKey })
+                        .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+                        .catch(() => {})
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 

@@ -13,9 +13,24 @@ import {
   type MergedBarItem,
   type TestBarConfig,
 } from '../lib/ipc';
+import {
+  buildAppContextMenuRequest,
+  buildBarContextMenuRequest,
+  buildPreviewFlyoutRequest,
+  computeDockLogicalWidth,
+  getTaskbarItemStateClass,
+  getTaskbarRootClassName,
+  resolveTaskbarMonitor,
+  shouldTriggerPreviewHover,
+} from '../lib/taskbarLogic';
 import { FallbackAppIcon, StartLogoIcon, VolIcon } from './Icons';
 
 export const TaskbarView: React.FC = () => {
+  const monitor = useMemo(
+    () => (typeof window !== 'undefined' ? resolveTaskbarMonitor(window.location.search) : 'primary'),
+    [],
+  );
+
   const [config, setConfig] = useState<TestBarConfig | null>(null);
   const [groups, setGroups] = useState<AppWindowGroup[]>([]);
   const [audio, setAudio] = useState<AudioState | null>(null);
@@ -33,7 +48,12 @@ export const TaskbarView: React.FC = () => {
 
   useEffect(() => {
     const t = window.setInterval(() => setNow(new Date()), 1000);
-    return () => window.clearInterval(t);
+    return () => {
+      window.clearInterval(t);
+      if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+      if (leaveTimer.current) window.clearTimeout(leaveTimer.current);
+      if (volToastTimer.current) window.clearTimeout(volToastTimer.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -60,14 +80,17 @@ export const TaskbarView: React.FC = () => {
     };
   }, []);
 
-  // Load real native .exe icons for pinned taskbar apps
+  // Load real native .exe and shell:AppsFolder\ UWP icons for pinned taskbar apps
   useEffect(() => {
     if (!config) return;
     config.taskbarPins.forEach((p) => {
-      if (p.target && !p.iconData && !iconMap[p.target] && p.target.includes(':\\')) {
-        ipc<string | null>('get_icon_for_path', { path: p.target })
+      const target = p.target?.trim() ?? '';
+      const canResolve =
+        target.includes(':\\') || target.toLowerCase().startsWith('shell:appsfolder\\');
+      if (target && !p.iconData && !iconMap[target] && canResolve) {
+        ipc<string | null>('get_icon_for_path', { path: target })
           .then((data) => {
-            if (data) setIconMap((prev) => ({ ...prev, [p.target]: data }));
+            if (data) setIconMap((prev) => (prev[target] ? prev : { ...prev, [target]: data }));
           })
           .catch(() => {});
       }
@@ -133,16 +156,16 @@ export const TaskbarView: React.FC = () => {
     const el = barRef.current;
     if (!el || config?.barMode === 'edge') return;
     const syncSize = () => {
-      const w = Math.ceil(Math.max(el.scrollWidth, el.getBoundingClientRect().width));
-      if (w > 200) {
-        ipc('resize_taskbar_dock', { logicalWidth: w }).catch(() => {});
+      const w = computeDockLogicalWidth(el.scrollWidth, el.getBoundingClientRect().width);
+      if (w !== null) {
+        ipc('resize_taskbar_dock', { logicalWidth: w, monitor }).catch(() => {});
       }
     };
     syncSize();
     const ro = new ResizeObserver(syncSize);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [barItems.length, config?.barMode]);
+  }, [barItems.length, config?.barMode, layout, monitor]);
 
   const anchorX = (el: HTMLElement) => {
     const r = el.getBoundingClientRect();
@@ -165,6 +188,7 @@ export const TaskbarView: React.FC = () => {
         width,
         height,
         noActivate,
+        monitor,
         payload,
       },
     }).catch(() => {});
@@ -176,18 +200,22 @@ export const TaskbarView: React.FC = () => {
       const activeWin = item.group.windows.find((w) => w.isActive) || item.group.windows[0];
       ipc('focus_window', { hwnd: activeWin.hwnd, toggleMinimize: true }).catch(() => {});
     } else if (item.target) {
-      ipc('launch_item', { target: item.target, asAdmin: false, closeStart: false }).catch(() => {});
+      ipc('launch_item', {
+        target: item.target,
+        args: item.args ?? null,
+        asAdmin: false,
+        closeStart: false,
+      }).catch(() => {});
     }
   };
 
   const handleAppHover = (item: MergedBarItem, el: HTMLElement) => {
     if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
     if (leaveTimer.current) window.clearTimeout(leaveTimer.current);
-    if (!item.group || item.group.windows.length === 0 || startOpen) return;
+    if (!shouldTriggerPreviewHover(item, startOpen, activeFlyout)) return;
     hoverTimer.current = window.setTimeout(() => {
-      const count = Math.min(item.group!.windows.length, 4);
-      const w = count * 214 + 20;
-      openFlyoutAt('preview', el, w, 166, true, { group: item.group });
+      const req = buildPreviewFlyoutRequest(item, anchorX(el), monitor);
+      ipc('open_flyout', { req }).catch(() => {});
     }, 220);
   };
 
@@ -203,32 +231,17 @@ export const TaskbarView: React.FC = () => {
     e.preventDefault();
     e.stopPropagation();
     if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
-    const hasWins = Boolean(item.group && item.group.windows.length > 0);
-    openFlyoutAt('context_app', e.currentTarget as HTMLElement, 248, hasWins ? 270 : 196, false, {
-      id: item.id,
-      pinId: item.pinId,
-      name: item.name,
-      target: item.target,
-      aumid: item.group?.aumid ?? null,
-      pinned: item.pinned,
-      windows: item.group?.windows ?? [],
-    });
+    if (leaveTimer.current) window.clearTimeout(leaveTimer.current);
+    const req = buildAppContextMenuRequest(item, anchorX(e.currentTarget as HTMLElement), monitor);
+    ipc('open_flyout', { req }).catch(() => {});
   };
 
   const handleBarCtx = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('.tb-btn')) return;
     e.preventDefault();
-    ipc('open_flyout', {
-      req: {
-        kind: 'context_bar',
-        anchorXLogical: e.clientX,
-        anchorInTaskbar: true,
-        width: 244,
-        height: 190,
-        noActivate: false,
-        payload: { barMode: config?.barMode ?? 'dock' },
-      },
-    }).catch(() => {});
+    if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+    const req = buildBarContextMenuRequest(config?.barMode, e.clientX, monitor);
+    ipc('open_flyout', { req }).catch(() => {});
   };
 
   const flashVol = (text: string) => {
@@ -264,10 +277,13 @@ export const TaskbarView: React.FC = () => {
   const pad2 = (n: number) => String(n).padStart(2, '0');
   const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
   const dateStr = `${pad2(now.getDate())}.${pad2(now.getMonth() + 1)}.${now.getFullYear()}`;
-  const isEdge = config?.barMode === 'edge';
 
   return (
-    <div className={`tb-root ${isEdge ? 'edge' : ''}`} data-space="personal">
+    <div
+      className={getTaskbarRootClassName(config?.barMode)}
+      data-space="personal"
+      data-monitor={monitor}
+    >
       <nav
         ref={barRef}
         className="taskbar"
@@ -290,7 +306,7 @@ export const TaskbarView: React.FC = () => {
 
           {barItems.map((item) => {
             const winCount = item.group?.windows.length ?? 0;
-            const cls = item.group?.isActive ? 'active' : winCount > 0 ? 'running' : 'idle';
+            const cls = getTaskbarItemStateClass(item);
             return (
               <button
                 key={item.id}

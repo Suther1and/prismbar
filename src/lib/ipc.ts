@@ -25,10 +25,13 @@ export interface CustomSpace {
   items: PinItem[];
 }
 
+export type SecondaryTaskbarMode = 'testbar' | 'native' | 'hidden';
+
 export interface TestBarConfig {
   schemaVersion: number;
   revision: number;
   barMode: 'dock' | 'edge';
+  secondaryTaskbarMode: SecondaryTaskbarMode;
   autostart: boolean;
   taskbarPins: PinItem[];
   personalPins: PinItem[];
@@ -177,6 +180,13 @@ export type FlyoutKind =
   | 'ctx_app'
   | 'ctx_taskbar';
 
+export interface JumpListItem {
+  title: string;
+  target: string;
+  args?: string | null;
+  kind: 'task' | 'recent';
+}
+
 export interface FlyoutRequest {
   kind: FlyoutKind;
   anchorXLogical: number;
@@ -184,6 +194,7 @@ export interface FlyoutRequest {
   width: number;
   height: number;
   noActivate: boolean;
+  monitor?: 'primary' | 'secondary';
   payload: unknown;
 }
 
@@ -191,6 +202,9 @@ export interface MergedBarItem {
   id: string;
   name: string;
   target: string;
+  args?: string | null;
+  matchExe?: string | null;
+  matchAumid?: string | null;
   iconKey: string;
   cacheIconKey?: string | null;
   iconData?: string | null;
@@ -452,6 +466,9 @@ export function mergeTaskbarItems(
         p.target ||
         matchedGroup?.exePath ||
         (matchedGroup?.aumid ? `shell:AppsFolder\\${matchedGroup.aumid}` : ''),
+      args: p.args ?? null,
+      matchExe: p.matchExe ?? (matchedGroup?.exePath ? extractBasename(matchedGroup.exePath) || null : null),
+      matchAumid: p.matchAumid ?? matchedGroup?.aumid ?? null,
       iconKey: p.iconKey,
       cacheIconKey: cacheKey,
       iconData: resolvedIconData,
@@ -464,10 +481,14 @@ export function mergeTaskbarItems(
   for (const g of groups) {
     if (!usedGroupKeys.has(g.key)) {
       const resolvedIconData = resolveCachedIcon(iconMap, g.iconKey) || g.iconData || null;
+      const baseExe = extractBasename(g.exePath);
       merged.push({
         id: 'run-' + g.key,
         name: g.name,
         target: g.exePath || (g.aumid ? `shell:AppsFolder\\${g.aumid}` : ''),
+        args: null,
+        matchExe: baseExe && baseExe.endsWith('.exe') ? baseExe : null,
+        matchAumid: g.aumid ?? null,
         iconKey: g.iconKey || g.name.toLowerCase(),
         cacheIconKey: g.iconKey ?? null,
         iconData: resolvedIconData,
