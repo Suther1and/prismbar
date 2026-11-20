@@ -2,6 +2,7 @@
 type: epic
 title: "Compact Tray Overflow, WASAPI Audio/Mixer, OSD, Layout & Calendar"
 parent: initiative-testbar
+status: in-progress
 covers: [R4]
 sources: [_bmad-output/initiative-testbar/initiative-testbar.md]
 companions: [_bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md]
