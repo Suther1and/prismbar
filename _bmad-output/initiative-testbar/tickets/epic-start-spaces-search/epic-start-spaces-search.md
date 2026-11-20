@@ -2,7 +2,7 @@
 type: epic
 title: "Start Menu 4 Adaptive Spaces, Universal Pinning, Edit Mode & Type-Anywhere Search"
 parent: initiative-testbar
-status: in-progress
+status: done
 covers: [R5, R6]
 sources: [_bmad-output/initiative-testbar/initiative-testbar.md]
 companions: [_bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md]

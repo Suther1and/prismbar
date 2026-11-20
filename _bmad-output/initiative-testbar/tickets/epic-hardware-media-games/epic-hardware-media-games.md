@@ -2,6 +2,7 @@
 type: epic
 title: "Live Media, Clipboard, Telemetry, Peripherals, Steam Games & Standalone .exe Delivery"
 parent: initiative-testbar
+status: in-progress
 covers: [R7, R8]
 sources: [_bmad-output/initiative-testbar/initiative-testbar.md]
 companions: [_bmad-output/initiative-testbar/architecture-testbar/architecture-testbar.md, _bmad-output/initiative-testbar/ux-testbar/DESIGN.md, _bmad-output/initiative-testbar/ux-testbar/EXPERIENCE.md]
