@@ -98,6 +98,10 @@ export const StartView: React.FC = () => {
     ipc<TestBarConfig>('get_config')
       .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
       .catch(() => {});
+    ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
+    ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
+    ipc<TelemetryState>('get_telemetry').then(setTelem).catch(() => {});
+    ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
     ipc<ClipboardEntry[]>('get_clipboard_history').then(setClips).catch(() => {});
     ipc<MediaState>('get_media_state').then(setMedia).catch(() => {});
     ipc<IndexedApp[]>('get_installed_apps').then(setApps).catch(() => {});
