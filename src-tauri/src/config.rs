@@ -738,11 +738,18 @@ pub fn add_pin_to_space(cfg: &mut TestBarConfig, space: &str, mut item: PinItem)
             true
         }
         "taskbar" | "taskbar_pins" => {
-            let duplicate = !item.target.is_empty()
+            let duplicate = (!item.target.is_empty()
                 && cfg
                     .taskbar_pins
                     .iter()
-                    .any(|p| p.target.eq_ignore_ascii_case(&item.target));
+                    .any(|p| p.target.eq_ignore_ascii_case(&item.target)))
+                || item.match_aumid.as_deref().is_some_and(|aumid| {
+                    cfg.taskbar_pins.iter().any(|p| {
+                        p.match_aumid
+                            .as_deref()
+                            .is_some_and(|pa| pa.eq_ignore_ascii_case(aumid))
+                    })
+                });
             if duplicate {
                 false
             } else {

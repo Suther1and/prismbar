@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   applyConfigUpdate,
+  fetchIconsBatch,
+  iconCache,
   ipc,
+  isCacheIconKey,
   mergeTaskbarItems,
   onEvent,
   type AppWindowGroup,
@@ -71,18 +74,66 @@ export const TaskbarView: React.FC = () => {
     });
   }, [config]);
 
+  // Batch-fetch missing cached icon keys from Rust IconCache for running windows & cache-keyed pins
+  useEffect(() => {
+    const missing = new Set<string>();
+    for (const g of groups) {
+      if (g.iconKey && !iconMap[g.iconKey]) {
+        const cached = iconCache.get(g.iconKey);
+        if (cached) {
+          setIconMap((prev) => (prev[g.iconKey!] ? prev : { ...prev, [g.iconKey!]: cached }));
+        } else {
+          missing.add(g.iconKey);
+        }
+      }
+    }
+    for (const p of config?.taskbarPins ?? []) {
+      if (isCacheIconKey(p.iconKey) && !iconMap[p.iconKey]) {
+        const cached = iconCache.get(p.iconKey);
+        if (cached) {
+          setIconMap((prev) => (prev[p.iconKey] ? prev : { ...prev, [p.iconKey]: cached }));
+        } else {
+          missing.add(p.iconKey);
+        }
+      }
+    }
+    if (missing.size === 0) return;
+
+    let cancelled = false;
+    fetchIconsBatch(Array.from(missing))
+      .then((fetched) => {
+        if (cancelled) return;
+        const keys = Object.keys(fetched);
+        if (keys.length === 0) return;
+        setIconMap((prev) => {
+          let changed = false;
+          for (const k of keys) {
+            if (prev[k] !== fetched[k]) {
+              changed = true;
+              break;
+            }
+          }
+          return changed ? { ...prev, ...fetched } : prev;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [groups, config]);
+
   // Merge pinned apps + running window groups cleanly without duplicates
   const barItems = useMemo<MergedBarItem[]>(
     () => mergeTaskbarItems(config?.taskbarPins ?? [], groups, iconMap),
     [config, groups, iconMap],
   );
 
-  // Auto-size floating dock window to exact capsule width so desktop left/right stays clickable
+  // Auto-size floating dock window to exact unconstrained capsule width so desktop left/right stays clickable
   useEffect(() => {
     const el = barRef.current;
     if (!el || config?.barMode === 'edge') return;
     const syncSize = () => {
-      const w = Math.ceil(el.getBoundingClientRect().width);
+      const w = Math.ceil(Math.max(el.scrollWidth, el.getBoundingClientRect().width));
       if (w > 200) {
         ipc('resize_taskbar_dock', { logicalWidth: w }).catch(() => {});
       }
@@ -158,6 +209,7 @@ export const TaskbarView: React.FC = () => {
       pinId: item.pinId,
       name: item.name,
       target: item.target,
+      aumid: item.group?.aumid ?? null,
       pinned: item.pinned,
       windows: item.group?.windows ?? [],
     });

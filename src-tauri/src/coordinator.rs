@@ -172,14 +172,35 @@ pub fn classify_fullscreen(
     fg.rect.covers(primary_monitor)
 }
 
-/// Computes the DPI-scaled bottom AppBar reservation rect in physical pixels (AD-2).
-pub fn compute_appbar_rect(primary_monitor: PixelRect, dpi: u32, bar_mode: BarMode) -> PixelRect {
-    let effective_dpi = if dpi == 0 { 96 } else { dpi };
+/// Computes effective WebView2 / UI scale factor combining monitor DPI scale and
+/// Windows Accessibility `TextScaleFactor` (`effective_scale = (dpi / 96.0) * text_scale`).
+pub fn compute_effective_scale(dpi: u32, text_scale: f64) -> f64 {
+    let dpi_scale = if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 };
+    let ts = if text_scale.is_finite() && text_scale > 0.0 {
+        text_scale.clamp(1.0, 2.25)
+    } else {
+        1.0
+    };
+    dpi_scale * ts
+}
+
+/// Computes the scaled bottom AppBar reservation rect in physical pixels (AD-2)
+/// using `effective_scale = (dpi / 96.0) * (text_scale_factor / 100.0)`.
+pub fn compute_appbar_rect_scaled(
+    primary_monitor: PixelRect,
+    effective_scale: f64,
+    bar_mode: BarMode,
+) -> PixelRect {
+    let sf = if effective_scale.is_finite() && effective_scale > 0.0 {
+        effective_scale
+    } else {
+        1.0
+    };
     let logical_height = match bar_mode {
         BarMode::Dock => DOCK_APPBAR_LOGICAL_HEIGHT,
         BarMode::Edge => EDGE_APPBAR_LOGICAL_HEIGHT,
     };
-    let reserve_px = (((logical_height as f64) * (effective_dpi as f64) / 96.0).round() as i32)
+    let reserve_px = (((logical_height as f64) * sf).round() as i32)
         .clamp(0, primary_monitor.height());
     PixelRect {
         left: primary_monitor.left,
@@ -187,6 +208,26 @@ pub fn compute_appbar_rect(primary_monitor: PixelRect, dpi: u32, bar_mode: BarMo
         right: primary_monitor.right,
         bottom: primary_monitor.bottom,
     }
+}
+
+/// Computes the DPI-scaled bottom AppBar reservation rect in physical pixels (AD-2)
+/// assuming default 100% `TextScaleFactor`.
+pub fn compute_appbar_rect(primary_monitor: PixelRect, dpi: u32, bar_mode: BarMode) -> PixelRect {
+    compute_appbar_rect_scaled(primary_monitor, compute_effective_scale(dpi, 1.0), bar_mode)
+}
+
+/// Returns the WebView window labels that should receive `windows-updated` broadcasts (AD-6):
+/// always `"taskbar"`, plus `"start"` only when visible and `"flyout"` only when visible.
+pub fn windows_update_targets(start_visible: bool, flyout_visible: bool) -> Vec<&'static str> {
+    let mut targets = Vec::with_capacity(3);
+    targets.push("taskbar");
+    if start_visible {
+        targets.push("start");
+    }
+    if flyout_visible {
+        targets.push("flyout");
+    }
+    targets
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -220,6 +261,18 @@ impl WindowCoordinator {
 
     pub fn is_start_open(&self) -> bool {
         self.start_open
+    }
+
+    pub fn is_start_visible(&self) -> bool {
+        self.start_open
+    }
+
+    pub fn is_flyout_visible(&self) -> bool {
+        self.active_flyout.is_some()
+    }
+
+    pub fn windows_update_targets(&self) -> Vec<&'static str> {
+        windows_update_targets(self.is_start_visible(), self.is_flyout_visible())
     }
 
     pub fn active_flyout(&self) -> Option<FlyoutKind> {
@@ -1248,5 +1301,62 @@ mod tests {
         assert!(!coord.is_fullscreen_suppressed());
         assert!(coord.should_show_taskbar());
         assert!(coord.should_apply_taskbar_bounds());
+    }
+
+    #[test]
+    fn compute_effective_scale_and_scaled_appbar_respect_text_scale_factor() {
+        let mon = mon_1080p();
+
+        assert!((compute_effective_scale(96, 1.0) - 1.0).abs() < 1e-9);
+        assert!((compute_effective_scale(96, 1.4) - 1.4).abs() < 1e-9);
+        assert!((compute_effective_scale(144, 1.4) - 2.1).abs() < 1e-9);
+        assert!((compute_effective_scale(0, 1.4) - 1.4).abs() < 1e-9);
+        assert!((compute_effective_scale(96, 0.5) - 1.0).abs() < 1e-9);
+        assert!((compute_effective_scale(96, 3.0) - 2.25).abs() < 1e-9);
+        assert!((compute_effective_scale(96, f64::NAN) - 1.0).abs() < 1e-9);
+
+        // 96 DPI + 140% TextScaleFactor -> Dock 64 * 1.4 = 89.6 -> 90px, Edge 52 * 1.4 = 72.8 -> 73px
+        let dock_140 = compute_appbar_rect_scaled(mon, compute_effective_scale(96, 1.4), BarMode::Dock);
+        assert_eq!(dock_140.height(), 90);
+        assert_eq!(dock_140.top, 1080 - 90);
+        assert_eq!(dock_140.bottom, 1080);
+
+        let edge_140 = compute_appbar_rect_scaled(mon, compute_effective_scale(96, 1.4), BarMode::Edge);
+        assert_eq!(edge_140.height(), 73);
+        assert_eq!(edge_140.top, 1080 - 73);
+        assert_eq!(edge_140.bottom, 1080);
+
+        // Invalid effective scale falls back safely to 1.0x
+        assert_eq!(compute_appbar_rect_scaled(mon, f64::NAN, BarMode::Dock).height(), 64);
+        assert_eq!(compute_appbar_rect_scaled(mon, -1.0, BarMode::Edge).height(), 52);
+    }
+
+    #[test]
+    fn windows_update_targets_tracks_visible_surfaces_only() {
+        let mut coord = WindowCoordinator::new();
+        assert!(!coord.is_start_visible());
+        assert!(!coord.is_flyout_visible());
+        assert_eq!(coord.windows_update_targets(), vec!["taskbar"]);
+
+        let _ = coord.request_toggle_start(Some(true), 100);
+        assert!(coord.is_start_visible());
+        assert!(!coord.is_flyout_visible());
+        assert_eq!(coord.windows_update_targets(), vec!["taskbar", "start"]);
+
+        let _ = coord.request_open_flyout(FlyoutKind::Osd, 150);
+        assert!(coord.is_start_visible());
+        assert!(coord.is_flyout_visible());
+        assert_eq!(
+            coord.windows_update_targets(),
+            vec!["taskbar", "start", "flyout"]
+        );
+
+        let _ = coord.request_open_flyout(FlyoutKind::Sound, 200);
+        assert!(!coord.is_start_visible());
+        assert!(coord.is_flyout_visible());
+        assert_eq!(coord.windows_update_targets(), vec!["taskbar", "flyout"]);
+
+        let _ = coord.request_close_flyout();
+        assert_eq!(coord.windows_update_targets(), vec!["taskbar"]);
     }
 }

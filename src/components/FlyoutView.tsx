@@ -367,6 +367,7 @@ export const FlyoutView: React.FC = () => {
       pinId?: string;
       name: string;
       target: string;
+      aumid?: string | null;
       pinned: boolean;
       windows: OpenWindowInfo[];
     };
@@ -429,11 +430,12 @@ export const FlyoutView: React.FC = () => {
                       kind: 'app',
                       title: p.name,
                       subtitle: 'Приложение',
-                      target: p.target,
+                      target: p.target || (p.aumid ? `shell:AppsFolder\\${p.aumid}` : ''),
                       altAction: 'Новое окно',
                       accentRgb: '129,140,248',
                       iconKey: p.name.toLowerCase(),
                       iconData: null,
+                      matchAumid: p.aumid ?? null,
                     },
                   }).catch(() => {});
                   close();

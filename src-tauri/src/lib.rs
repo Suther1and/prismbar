@@ -2,6 +2,7 @@ pub mod apps_indexer;
 pub mod audio;
 pub mod config;
 pub mod coordinator;
+pub mod icon_cache;
 pub mod media;
 pub mod system_widgets;
 pub mod telemetry;
@@ -9,6 +10,7 @@ pub mod win_shell;
 pub mod windows_tracker;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -19,16 +21,23 @@ use config::{CustomSpace, PinItem, TestBarConfig};
 use coordinator::{
     BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect, WindowCoordinator,
 };
+use icon_cache::IconCache;
 use media::MediaState;
 use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, TrayAppItem};
 use telemetry::TelemetryState;
 use win_shell::{ShellAppBarEvent, ShellHookEvent, WatchdogArgs};
 use windows_tracker::AppWindowGroup;
 
+const DOCK_WINDOW_LOGICAL_HEIGHT: f64 = 84.0;
+const START_DEFAULT_LOGICAL_WIDTH: f64 = 1172.0;
+const START_DEFAULT_LOGICAL_HEIGHT: f64 = 712.0;
+
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 
 pub struct AppState {
     pub config: Mutex<TestBarConfig>,
+    pub icon_cache: Mutex<IconCache>,
+    pub last_window_groups: Mutex<Vec<AppWindowGroup>>,
     pub installed_apps: Mutex<Vec<IndexedApp>>,
     pub steam_games: Mutex<Vec<SteamGame>>,
     pub hide_native: bool,
@@ -85,9 +94,69 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn scale_factor(app: &AppHandle) -> f64 {
-    app.get_webview_window("taskbar")
+    let dpi_override = app.state::<AppState>().current_dpi_override();
+    let fallback_sf = app
+        .get_webview_window("taskbar")
         .and_then(|w| w.scale_factor().ok())
-        .unwrap_or(1.0)
+        .unwrap_or_else(|| win_shell::primary_monitor_dpi() as f64 / 96.0);
+    let text_scale = win_shell::windows_text_scale_factor();
+    effective_taskbar_scale_factor(dpi_override, fallback_sf, text_scale)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowItemDigest {
+    hwnd: isize,
+    title: String,
+    is_active: bool,
+    is_minimized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowGroupDigest {
+    key: String,
+    name: String,
+    aumid: Option<String>,
+    icon_key: Option<String>,
+    is_active: bool,
+    windows: Vec<WindowItemDigest>,
+}
+
+type WindowsFingerprint = Vec<WindowGroupDigest>;
+
+fn compute_windows_fingerprint(groups: &[AppWindowGroup]) -> WindowsFingerprint {
+    groups
+        .iter()
+        .map(|g| WindowGroupDigest {
+            key: g.key.clone(),
+            name: g.name.clone(),
+            aumid: g.aumid.clone(),
+            icon_key: g.icon_key.clone(),
+            is_active: g.is_active,
+            windows: g
+                .windows
+                .iter()
+                .map(|w| WindowItemDigest {
+                    hwnd: w.hwnd,
+                    title: w.title.clone(),
+                    is_active: w.is_active,
+                    is_minimized: w.is_minimized,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn diff_window_update_targets(
+    last_fp: &mut Option<WindowsFingerprint>,
+    groups: &[AppWindowGroup],
+    coord: &WindowCoordinator,
+) -> Option<Vec<&'static str>> {
+    let fp = compute_windows_fingerprint(groups);
+    if last_fp.as_ref() == Some(&fp) {
+        return None;
+    }
+    *last_fp = Some(fp);
+    Some(coord.windows_update_targets())
 }
 
 fn dispatch_coordinator<F>(
@@ -153,14 +222,24 @@ fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
     rects
 }
 
-fn effective_taskbar_scale_factor(dpi_override: Option<u32>, fallback_sf: f64) -> f64 {
-    if let Some(dpi) = dpi_override.filter(|&d| d > 0) {
+fn effective_taskbar_scale_factor(
+    dpi_override: Option<u32>,
+    fallback_sf: f64,
+    text_scale: f64,
+) -> f64 {
+    let base_dpi_sf = if let Some(dpi) = dpi_override.filter(|&d| d > 0) {
         dpi as f64 / 96.0
     } else if fallback_sf.is_finite() && fallback_sf > 0.0 {
         fallback_sf
     } else {
         1.0
-    }
+    };
+    let ts = if text_scale.is_finite() && text_scale > 0.0 {
+        text_scale.clamp(1.0, 2.25)
+    } else {
+        1.0
+    };
+    base_dpi_sf * ts
 }
 
 fn compute_taskbar_bounds(
@@ -176,15 +255,43 @@ fn compute_taskbar_bounds(
         let h = ((52.0 * sf).round() as i32).clamp(0, mon_h);
         PixelRect::new(mon.left, mon.bottom - h, mon.left + mon_w, mon.bottom)
     } else {
-        // Dock mode: exact capsule width + subtle shadow margin so desktop left/right stays natively clickable
-        let desired_w = ((logical_content_w.clamp(380, 1600) + 28) as f64 * sf).round() as i32;
+        // Dock mode: exact capsule width + shadow margin; 84px logical height = 52px bar + 12px bottom + 20px top shadow buffer
+        let desired_w = ((logical_content_w.clamp(380, 2400) + 28) as f64 * sf).round() as i32;
         let max_w = (mon_w - 16).max(0);
         let w = desired_w.clamp(0, max_w);
-        let h = ((68.0 * sf).round() as i32).clamp(0, mon_h);
+        let h = ((DOCK_WINDOW_LOGICAL_HEIGHT * sf).round() as i32).clamp(0, mon_h);
         let x = mon.left + (mon_w - w) / 2;
         let y = mon.bottom - h;
         PixelRect::new(x, y, x + w, y + h)
     }
+}
+
+fn compute_start_bounds(mon: win_shell::MonitorRect, sf: f64) -> PixelRect {
+    let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
+    let mon_w = mon.width.max(0);
+    let mon_h = mon.height.max(0);
+    let avail_w = ((mon_w as f64 / sf) - 24.0).max(320.0);
+    let avail_h = ((mon_h as f64 / sf) - 88.0).max(320.0);
+    let logical_w = avail_w.min(START_DEFAULT_LOGICAL_WIDTH);
+    let logical_h = avail_h.min(START_DEFAULT_LOGICAL_HEIGHT);
+    let max_w_px = (mon_w - 16).max(0);
+    let max_h_px = (mon_h - 16).max(0);
+    let w_px = ((logical_w * sf).round() as i32).clamp(0, max_w_px);
+    let h_px = ((logical_h * sf).round() as i32).clamp(0, max_h_px);
+    let bar_gap = (76.0 * sf).round() as i32;
+    let x_px = mon.left + (mon_w - w_px) / 2;
+    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
+    PixelRect::new(x_px, y_px, x_px + w_px, y_px + h_px)
+}
+
+/// Synchronizes both Tauri/WebView2 inner controller bounds and synchronous Win32 HWND bounds
+/// without activating or forcing hidden windows visible (AD-1).
+fn apply_webview_bounds(win: &WebviewWindow, hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
+    let w_clamped = w.max(1);
+    let h_clamped = h.max(1);
+    let _ = win.set_size(tauri::PhysicalSize::new(w_clamped as u32, h_clamped as u32));
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    win_shell::position_window(hwnd, x, y, w_clamped, h_clamped);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,9 +319,10 @@ fn plan_taskbar_bounds_update(
     state: &AppState,
     mon: win_shell::MonitorRect,
     fallback_sf: f64,
+    text_scale: f64,
 ) -> Option<PixelRect> {
     let input = read_taskbar_layout_if_allowed(state)?;
-    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf);
+    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf, text_scale);
     Some(compute_taskbar_bounds(
         mon,
         sf,
@@ -231,30 +339,29 @@ fn position_taskbar_window(app: &AppHandle) {
     let Some(tb) = app.get_webview_window("taskbar") else { return };
     let Some(hwnd) = win_hwnd(&tb) else { return };
     let fallback_sf = tb.scale_factor().unwrap_or(1.0);
-    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf);
+    let text_scale = win_shell::windows_text_scale_factor();
+    let sf = effective_taskbar_scale_factor(input.dpi_override, fallback_sf, text_scale);
     let mon = win_shell::primary_monitor_rect();
 
     let rect = compute_taskbar_bounds(mon, sf, &input.bar_mode, input.logical_content_w);
 
     // Never force visibility here so fullscreen suppression cannot leak on bounds updates.
-    win_shell::position_window(hwnd, rect.left, rect.top, rect.width(), rect.height());
+    apply_webview_bounds(&tb, hwnd, rect.left, rect.top, rect.width(), rect.height());
 }
 
-fn position_start_window(app: &AppHandle, hwnd: isize) {
+fn position_start_window(app: &AppHandle, win: &WebviewWindow, hwnd: isize) {
     let sf = scale_factor(app);
     let mon = win_shell::primary_monitor_rect();
-    let max_w = ((mon.width as f64 / sf) - 32.0).min(1084.0).max(860.0);
-    let max_h = ((mon.height as f64 / sf) - 96.0).min(660.0).max(560.0);
-    let w_px = (max_w * sf).round() as i32;
-    let h_px = (max_h * sf).round() as i32;
-    let bar_gap = (78.0 * sf).round() as i32;
-    let x_px = mon.left + (mon.width - w_px) / 2;
-    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 16);
-
-    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
+    let rect = compute_start_bounds(mon, sf);
+    apply_webview_bounds(win, hwnd, rect.left, rect.top, rect.width(), rect.height());
 }
 
-fn position_flyout_window(app: &AppHandle, hwnd: isize, req: &FlyoutRequest) {
+fn position_flyout_window(
+    app: &AppHandle,
+    win: &WebviewWindow,
+    hwnd: isize,
+    req: &FlyoutRequest,
+) {
     let sf = scale_factor(app);
     let mon = win_shell::primary_monitor_rect();
 
@@ -291,7 +398,7 @@ fn position_flyout_window(app: &AppHandle, hwnd: isize, req: &FlyoutRequest) {
     x_px = x_px.clamp(mon.left + 8, (mon.right - w_px - 8).max(mon.left + 8));
     let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
 
-    win_shell::position_window(hwnd, x_px, y_px, w_px, h_px);
+    apply_webview_bounds(win, hwnd, x_px, y_px, w_px, h_px);
 }
 
 fn apply_taskbar_visibility_action<FPos, FVis>(
@@ -349,11 +456,14 @@ fn apply_coordinator_actions(
     if actions.start_visible == Some(true) {
         if let Some(win) = app.get_webview_window("start") {
             if let Some(hwnd) = win_hwnd(&win) {
-                position_start_window(app, hwnd);
+                position_start_window(app, &win, hwnd);
                 win_shell::set_window_visible(hwnd, true, false);
                 let _ = win.set_focus();
             }
         }
+        // Hydrate Start immediately on hidden -> visible transition (AD-6)
+        let snapshot = lock_unpoisoned(&app.state::<AppState>().last_window_groups).clone();
+        let _ = app.emit_to("start", "windows-updated", &snapshot);
     }
 
     if actions.flyout_visible == Some(true) {
@@ -362,7 +472,7 @@ fn apply_coordinator_actions(
                 let non_activating = actions.flyout_non_activating.unwrap_or(false);
                 win_shell::set_flyout_non_activating(non_activating);
                 if let Some(req) = flyout_req {
-                    position_flyout_window(app, hwnd, req);
+                    position_flyout_window(app, &fly, hwnd, req);
                 }
                 win_shell::set_window_visible(hwnd, true, non_activating);
                 if !non_activating {
@@ -370,6 +480,9 @@ fn apply_coordinator_actions(
                 }
             }
         }
+        // Hydrate Flyout immediately on hidden -> visible transition (AD-6)
+        let snapshot = lock_unpoisoned(&app.state::<AppState>().last_window_groups).clone();
+        let _ = app.emit_to("flyout", "windows-updated", &snapshot);
     }
 
     // 4. Emit canonical + legacy events
@@ -605,8 +718,15 @@ fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
 }
 
 #[tauri::command]
-fn get_open_windows() -> Vec<AppWindowGroup> {
-    windows_tracker::list_open_window_groups()
+fn get_open_windows(state: State<AppState>) -> Vec<AppWindowGroup> {
+    let groups = windows_tracker::list_open_window_groups_cached(&state.icon_cache);
+    *lock_unpoisoned(&state.last_window_groups) = groups.clone();
+    groups
+}
+
+#[tauri::command]
+fn get_icons(state: State<AppState>, keys: Vec<String>) -> HashMap<String, String> {
+    lock_unpoisoned(&state.icon_cache).get_batch(&keys)
 }
 
 #[tauri::command]
@@ -679,7 +799,8 @@ fn add_pin(
     let force_combo = config::should_force_combo(&space, &item.kind);
     config::normalize_pin(&mut item, force_combo);
     if item.icon_data.is_none() && (item.kind == "app" || item.kind == "file") {
-        item.icon_data = windows_tracker::extract_icon_for_path(&item.target);
+        item.icon_data =
+            windows_tracker::extract_icon_for_path_cached(&item.target, &state.icon_cache);
     }
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         config::add_pin_to_space(cfg, &space, item)
@@ -898,8 +1019,8 @@ fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
 }
 
 #[tauri::command]
-fn get_icon_for_path(path: String) -> Option<String> {
-    windows_tracker::extract_icon_for_path(&path)
+fn get_icon_for_path(state: State<AppState>, path: String) -> Option<String> {
+    windows_tracker::extract_icon_for_path_cached(&path, &state.icon_cache)
 }
 
 pub fn run_watchdog_mode(args: WatchdogArgs) {
@@ -929,6 +1050,8 @@ pub fn run(hide_native: bool) {
     win_shell::set_overlay_open_hint(false);
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
+        icon_cache: Mutex::new(IconCache::default()),
+        last_window_groups: Mutex::new(Vec::new()),
         installed_apps: Mutex::new(Vec::new()),
         steam_games: Mutex::new(Vec::new()),
         hide_native,
@@ -951,6 +1074,7 @@ pub fn run(hide_native: bool) {
             close_flyout,
             close_preview_if_outside,
             get_open_windows,
+            get_icons,
             get_window_thumbnail,
             focus_window,
             close_window_hwnd,
@@ -1127,19 +1251,42 @@ pub fn run(hide_native: bool) {
                 let _ = h_idx.emit("games-indexed", &games);
             });
 
-            // Fast lightweight poller for open windows, keyboard layout, and fullscreen auto-hide
+            // Fast lightweight poller for open windows (diff-only visible-window broadcast),
+            // keyboard layout, native taskbar hide guard, and fullscreen auto-hide.
             let h_fast = handle.clone();
             let fast_fs_suppressed = Arc::clone(&fullscreen_suppressed);
             std::thread::spawn(move || {
                 let mut last_layout = String::new();
+                let mut last_windows_fp: Option<WindowsFingerprint> = None;
                 loop {
-                    let groups = windows_tracker::list_open_window_groups();
-                    let _ = h_fast.emit("windows-updated", &groups);
+                    let groups = {
+                        let st = h_fast.state::<AppState>();
+                        windows_tracker::list_open_window_groups_cached(&st.icon_cache)
+                    };
+                    let targets = {
+                        let st = h_fast.state::<AppState>();
+                        let coord = lock_unpoisoned(&st.coordinator);
+                        let maybe_targets =
+                            diff_window_update_targets(&mut last_windows_fp, &groups, &coord);
+                        if maybe_targets.is_some() {
+                            *lock_unpoisoned(&st.last_window_groups) = groups.clone();
+                        }
+                        maybe_targets
+                    };
+                    if let Some(targets) = targets {
+                        for target in targets {
+                            let _ = h_fast.emit_to(target, "windows-updated", &groups);
+                        }
+                    }
 
                     let layout = system_widgets::get_keyboard_layout_code();
                     if layout != last_layout {
                         last_layout = layout.clone();
                         let _ = h_fast.emit("layout-updated", &layout);
+                    }
+
+                    if hide_native && !win_shell::is_restore_in_progress() {
+                        win_shell::ensure_native_taskbar_hidden_if_needed();
                     }
 
                     let fs = win_shell::is_fullscreen_active();
@@ -1233,6 +1380,8 @@ mod integration_tests {
         cfg.bar_mode = bar_mode.to_string();
         AppState {
             config: Mutex::new(cfg),
+            icon_cache: Mutex::new(IconCache::default()),
+            last_window_groups: Mutex::new(Vec::new()),
             installed_apps: Mutex::new(Vec::new()),
             steam_games: Mutex::new(Vec::new()),
             hide_native: false,
@@ -1264,11 +1413,11 @@ mod integration_tests {
         };
         let state = make_test_app_state("dock", 620);
 
-        // Normal desktop: bounds update allowed with initial Dock width 620
-        let initial_bounds = plan_taskbar_bounds_update(&state, mon, 1.0)
+        // Normal desktop: bounds update allowed with initial Dock width 620 (84px logical height)
+        let initial_bounds = plan_taskbar_bounds_update(&state, mon, 1.0, 1.0)
             .expect("bounds should be allowed on normal desktop");
         assert_eq!(initial_bounds.width(), 648);
-        assert_eq!(initial_bounds.height(), 68);
+        assert_eq!(initial_bounds.height(), 84);
         assert_eq!(initial_bounds.bottom, 1080);
 
         // Enter fullscreen -> bounds updates must be suppressed (None)
@@ -1280,13 +1429,13 @@ mod integration_tests {
         let enter_act = apply_fullscreen_snapshot(&state, None, &fs_snap);
         assert_eq!(enter_act.taskbar_visible, Some(false));
         assert!(state.fullscreen_suppressed.load(Ordering::Acquire));
-        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0), None);
 
         // Simulate resize_taskbar_dock and set_bar_mode mutations while suppressed
         *state.taskbar_content_width.lock().unwrap() = 840;
-        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0), None);
         state.config.lock().unwrap().bar_mode = "edge".to_string();
-        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0), None);
 
         // Exit fullscreen -> taskbar_visible == Some(true) and bounds reflect latest Edge mode
         let desktop_snap = win_shell::FullscreenSnapshot {
@@ -1298,16 +1447,16 @@ mod integration_tests {
         assert_eq!(exit_act.taskbar_visible, Some(true));
         assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
 
-        let restored_edge = plan_taskbar_bounds_update(&state, mon, 1.0)
+        let restored_edge = plan_taskbar_bounds_update(&state, mon, 1.0, 1.0)
             .expect("bounds should apply on fullscreen exit");
         assert_eq!(restored_edge, PixelRect::new(0, 1080 - 52, 1920, 1080));
 
         // Switch back to dock -> reflects recorded logical width 840 (+ 28 shadow margin = 868)
         state.config.lock().unwrap().bar_mode = "dock".to_string();
-        let restored_dock = plan_taskbar_bounds_update(&state, mon, 1.0)
+        let restored_dock = plan_taskbar_bounds_update(&state, mon, 1.0, 1.0)
             .expect("bounds should apply in dock mode");
         assert_eq!(restored_dock.width(), 868);
-        assert_eq!(restored_dock.height(), 68);
+        assert_eq!(restored_dock.height(), 84);
     }
 
     #[test]
@@ -1339,7 +1488,7 @@ mod integration_tests {
         let act_max = apply_fullscreen_snapshot(&state, Some(true), &max_snap);
         assert_eq!(act_max, CoordinatorActions::default());
         assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
-        assert!(plan_taskbar_bounds_update(&state, mon, 1.0).is_some());
+        assert!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0).is_some());
 
         // ABN_FULLSCREENAPP(false) while D3D fullscreen is active still suppresses taskbar
         let d3d_snap = win_shell::FullscreenSnapshot {
@@ -1350,13 +1499,13 @@ mod integration_tests {
         let act_d3d = apply_fullscreen_snapshot(&state, Some(false), &d3d_snap);
         assert_eq!(act_d3d.taskbar_visible, Some(false));
         assert!(state.fullscreen_suppressed.load(Ordering::Acquire));
-        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0), None);
 
         // ABN_FULLSCREENAPP(true) once D3D exits back to maximized app restores taskbar
         let act_restore = apply_fullscreen_snapshot(&state, Some(true), &max_snap);
         assert_eq!(act_restore.taskbar_visible, Some(true));
         assert!(!state.fullscreen_suppressed.load(Ordering::Acquire));
-        assert!(plan_taskbar_bounds_update(&state, mon, 1.0).is_some());
+        assert!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0).is_some());
     }
 
     #[test]
@@ -1412,7 +1561,7 @@ mod integration_tests {
         // DpiChanged(144 = 150%) arrives while fullscreen-suppressed: persisted but bounds stay suppressed
         state.set_dpi_override(144);
         assert_eq!(state.current_dpi_override(), Some(144));
-        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0), None);
+        assert_eq!(plan_taskbar_bounds_update(&state, mon, 1.0, 1.0), None);
 
         // Exit fullscreen: bounds immediately use persisted 144 DPI (1.5x), not stale fallback 1.0x
         let desktop_snap = win_shell::FullscreenSnapshot {
@@ -1424,19 +1573,19 @@ mod integration_tests {
             apply_fullscreen_snapshot(&state, None, &desktop_snap).taskbar_visible,
             Some(true)
         );
-        let restored = plan_taskbar_bounds_update(&state, mon, 1.0)
+        let restored = plan_taskbar_bounds_update(&state, mon, 1.0, 1.0)
             .expect("bounds should apply on fullscreen exit");
-        // (620 + 28) * 1.5 = 972, height = 68 * 1.5 = 102
+        // (620 + 28) * 1.5 = 972, height = 84 * 1.5 = 126
         assert_eq!(restored.width(), 972);
-        assert_eq!(restored.height(), 102);
+        assert_eq!(restored.height(), 126);
 
         // DisplayChanged clears dpi_override so fallback scale_factor applies again
         state.clear_dpi_override();
         assert_eq!(state.current_dpi_override(), None);
-        let after_display_change = plan_taskbar_bounds_update(&state, mon, 1.25).unwrap();
-        // (620 + 28) * 1.25 = 810, height = 68 * 1.25 = 85
+        let after_display_change = plan_taskbar_bounds_update(&state, mon, 1.25, 1.0).unwrap();
+        // (620 + 28) * 1.25 = 810, height = 84 * 1.25 = 105
         assert_eq!(after_display_change.width(), 810);
-        assert_eq!(after_display_change.height(), 85);
+        assert_eq!(after_display_change.height(), 105);
 
         // Narrow monitors (< 16px) and non-finite/non-positive scale factors never invert bounds
         let narrow = win_shell::MonitorRect {
@@ -1462,6 +1611,123 @@ mod integration_tests {
         // Valid HiDPI 200% (sf = 2.0) on normal monitor
         let hidpi_edge = compute_taskbar_bounds(mon, 2.0, "edge", 620);
         assert_eq!(hidpi_edge, PixelRect::new(0, 1440 - 104, 2560, 1440));
+    }
+
+    #[test]
+    fn effective_scale_with_text_scale_factor_and_start_dock_bounds() {
+        // 96 DPI (1.0) * 140% TextScaleFactor (1.4) = 1.4
+        let eff_140 = effective_taskbar_scale_factor(Some(96), 1.0, 1.4);
+        assert!((eff_140 - 1.4).abs() < 1e-9);
+        assert!((effective_taskbar_scale_factor(None, 1.0, 1.4) - 1.4).abs() < 1e-9);
+        assert!((effective_taskbar_scale_factor(Some(144), 1.0, 1.4) - 2.1).abs() < 1e-9);
+        // Clamping out-of-range text scale factors
+        assert!((effective_taskbar_scale_factor(Some(96), 1.0, 0.5) - 1.0).abs() < 1e-9);
+        assert!((effective_taskbar_scale_factor(Some(96), 1.0, 4.0) - 2.25).abs() < 1e-9);
+        assert!((effective_taskbar_scale_factor(Some(96), 1.0, f64::NAN) - 1.0).abs() < 1e-9);
+
+        let mon_1440 = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+            width: 2560,
+            height: 1440,
+        };
+        let state = make_test_app_state("dock", 620);
+        let dock_140 = plan_taskbar_bounds_update(&state, mon_1440, 1.0, 1.4).unwrap();
+        // (620 + 28) * 1.4 = 907.2 -> 907; 84 * 1.4 = 117.6 -> 118
+        assert_eq!(dock_140.width(), 907);
+        assert_eq!(dock_140.height(), 118);
+
+        // Start bounds at 1.0x on 1920x1080 -> full 1172x712 logical
+        let mon_1080 = win_shell::MonitorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+            width: 1920,
+            height: 1080,
+        };
+        let start_100 = compute_start_bounds(mon_1080, 1.0);
+        assert_eq!(start_100.width(), 1172);
+        assert_eq!(start_100.height(), 712);
+        assert!(start_100.left >= mon_1080.left && start_100.right <= mon_1080.right);
+        assert!(start_100.top >= mon_1080.top && start_100.bottom <= mon_1080.bottom);
+
+        // Start bounds at 1.4x on 2560x1440 -> full 1172x712 scaled to 1641x997
+        let start_1440_140 = compute_start_bounds(mon_1440, 1.4);
+        assert_eq!(start_1440_140.width(), (1172.0_f64 * 1.4).round() as i32);
+        assert_eq!(start_1440_140.height(), (712.0_f64 * 1.4).round() as i32);
+        assert!(start_1440_140.top >= mon_1440.top + 8);
+
+        // Start bounds at 1.4x on 1920x1080 -> clamped cleanly inside monitor bounds
+        let start_1080_140 = compute_start_bounds(mon_1080, 1.4);
+        assert!(start_1080_140.left >= mon_1080.left + 8);
+        assert!(start_1080_140.right <= mon_1080.right - 8);
+        assert!(start_1080_140.top >= mon_1080.top + 8);
+        assert!(start_1080_140.bottom <= mon_1080.bottom);
+    }
+
+    #[test]
+    fn windows_diff_fingerprint_skips_identical_and_targets_only_visible_windows() {
+        let make_sample = |title: &str, active: bool, minimized: bool, icon_key: Option<&str>| {
+            vec![AppWindowGroup {
+                key: "c:\\apps\\zen.exe".to_string(),
+                name: "Zen Browser".to_string(),
+                exe_path: r"C:\Apps\zen.exe".to_string(),
+                aumid: None,
+                icon_key: icon_key.map(str::to_string),
+                icon_data: None,
+                is_active: active,
+                windows: vec![windows_tracker::OpenWindowInfo {
+                    hwnd: 1001,
+                    pid: 42,
+                    title: title.to_string(),
+                    exe_path: r"C:\Apps\zen.exe".to_string(),
+                    exe_name: "Zen Browser".to_string(),
+                    aumid: None,
+                    is_active: active,
+                    is_minimized: minimized,
+                }],
+            }]
+        };
+
+        let mut coord = WindowCoordinator::new();
+        let mut last_fp: Option<WindowsFingerprint> = None;
+
+        // First poll always emits -> only taskbar is visible
+        let g1 = make_sample("Tab 1", true, false, Some("exe:aaa"));
+        assert_eq!(
+            diff_window_update_targets(&mut last_fp, &g1, &coord),
+            Some(vec!["taskbar"])
+        );
+
+        // Identical poll -> NO emit (None)
+        assert_eq!(diff_window_update_targets(&mut last_fp, &g1, &coord), None);
+
+        // Open Start -> title change emits to taskbar + start (not flyout)
+        let _ = coord.request_toggle_start(Some(true), 100);
+        let g2 = make_sample("Tab 2", true, false, Some("exe:aaa"));
+        assert_eq!(
+            diff_window_update_targets(&mut last_fp, &g2, &coord),
+            Some(vec!["taskbar", "start"])
+        );
+        assert_eq!(diff_window_update_targets(&mut last_fp, &g2, &coord), None);
+
+        // Open Sound flyout (closes Start) -> minimize change emits to taskbar + flyout
+        let _ = coord.request_open_flyout(FlyoutKind::Sound, 200);
+        let g3 = make_sample("Tab 2", false, true, Some("exe:aaa"));
+        assert_eq!(
+            diff_window_update_targets(&mut last_fp, &g3, &coord),
+            Some(vec!["taskbar", "flyout"])
+        );
+
+        // Icon key change also triggers diff
+        let g4 = make_sample("Tab 2", false, true, Some("exe:bbb"));
+        assert_eq!(
+            diff_window_update_targets(&mut last_fp, &g4, &coord),
+            Some(vec!["taskbar", "flyout"])
+        );
     }
 
     fn make_lib_temp_dir(tag: &str) -> std::path::PathBuf {

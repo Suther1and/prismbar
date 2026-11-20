@@ -49,6 +49,7 @@ export interface OpenWindowInfo {
   title: string;
   exePath: string;
   exeName: string;
+  aumid?: string | null;
   isActive: boolean;
   isMinimized: boolean;
 }
@@ -57,6 +58,8 @@ export interface AppWindowGroup {
   key: string;
   name: string;
   exePath: string;
+  aumid?: string | null;
+  iconKey?: string | null;
   iconData?: string | null;
   isActive: boolean;
   windows: OpenWindowInfo[];
@@ -189,6 +192,7 @@ export interface MergedBarItem {
   name: string;
   target: string;
   iconKey: string;
+  cacheIconKey?: string | null;
   iconData?: string | null;
   pinned: boolean;
   pinId?: string;
@@ -196,6 +200,117 @@ export interface MergedBarItem {
 }
 
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+export const iconCache = new Map<string, string>();
+const inFlightIconRequests = new Map<string, Promise<string | undefined>>();
+
+export function isCacheIconKey(key: string | null | undefined): key is string {
+  if (!key) return false;
+  return (
+    key.startsWith('exe:') ||
+    key.startsWith('aumid:') ||
+    key.startsWith('hwnd:') ||
+    key.startsWith('file:')
+  );
+}
+
+export function clearIconCache(): void {
+  iconCache.clear();
+  inFlightIconRequests.clear();
+}
+
+export type IconBatchFetcher = (keys: string[]) => Promise<Record<string, string>>;
+
+const defaultIconFetcher: IconBatchFetcher = (keys) => {
+  if (!isTauri() || keys.length === 0) {
+    return Promise.resolve({});
+  }
+  return ipc<Record<string, string>>('get_icons', { keys });
+};
+
+/**
+ * Fetches icon PNG data URIs in batches via `get_icons`, deduplicating both already-cached
+ * entries in `iconCache` and concurrent in-flight requests across overlapping calls.
+ */
+export async function fetchIconsBatch(
+  keys: string[],
+  fetcher: IconBatchFetcher = defaultIconFetcher,
+): Promise<Record<string, string>> {
+  const uniqueKeys: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of keys) {
+    const trimmed = raw.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    uniqueKeys.push(trimmed);
+  }
+
+  const result: Record<string, string> = {};
+  if (uniqueKeys.length === 0) {
+    return result;
+  }
+
+  const toFetch: string[] = [];
+  const pendingWaiters: Array<[string, Promise<string | undefined>]> = [];
+
+  for (const key of uniqueKeys) {
+    const cached = iconCache.get(key);
+    if (cached !== undefined) {
+      result[key] = cached;
+      continue;
+    }
+    const inflight = inFlightIconRequests.get(key);
+    if (inflight) {
+      pendingWaiters.push([key, inflight]);
+    } else {
+      toFetch.push(key);
+    }
+  }
+
+  if (toFetch.length > 0) {
+    let rawPromise: Promise<Record<string, string>>;
+    try {
+      rawPromise = Promise.resolve(fetcher(toFetch));
+    } catch {
+      rawPromise = Promise.resolve({});
+    }
+    const batchPromise = rawPromise
+      .then((fetched) => fetched ?? {})
+      .catch(() => ({} as Record<string, string>));
+
+    for (const key of toFetch) {
+      const keyPromise = batchPromise
+        .then((map) => {
+          const uri = map[key];
+          if (typeof uri === 'string' && uri.length > 0) {
+            iconCache.set(key, uri);
+            return uri;
+          }
+          return undefined;
+        })
+        .finally(() => {
+          if (inFlightIconRequests.get(key) === keyPromise) {
+            inFlightIconRequests.delete(key);
+          }
+        });
+      inFlightIconRequests.set(key, keyPromise);
+      pendingWaiters.push([key, keyPromise]);
+    }
+  }
+
+  if (pendingWaiters.length > 0) {
+    const settled = await Promise.all(
+      pendingWaiters.map(async ([key, promise]) => [key, await promise] as const),
+    );
+    for (const [key, uri] of settled) {
+      if (uri) {
+        result[key] = uri;
+      }
+    }
+  }
+
+  return result;
+}
 
 function isValidRevision(rev: unknown): rev is number {
   return typeof rev === 'number' && Number.isSafeInteger(rev) && rev >= 0;
@@ -236,6 +351,34 @@ function extractBasename(p: string | null | undefined): string {
   return idx >= 0 ? norm.slice(idx + 1) : norm;
 }
 
+function normalizeAumid(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const trimmed = raw.trim().toLowerCase();
+  const prefix = 'shell:appsfolder\\';
+  return trimmed.startsWith(prefix) ? trimmed.slice(prefix.length).trim() : trimmed;
+}
+
+function extractAumidFromTarget(target: string | null | undefined): string {
+  if (!target) return '';
+  const trimmed = target.trim().toLowerCase();
+  const prefix = 'shell:appsfolder\\';
+  return trimmed.startsWith(prefix) ? trimmed.slice(prefix.length).trim() : '';
+}
+
+function resolveCachedIcon(
+  iconMap: Record<string, string>,
+  ...keys: Array<string | null | undefined>
+): string | null {
+  for (const key of keys) {
+    if (!key) continue;
+    const fromMap = iconMap[key];
+    if (fromMap) return fromMap;
+    const fromCache = iconCache.get(key);
+    if (fromCache) return fromCache;
+  }
+  return null;
+}
+
 export function mergeTaskbarItems(
   pins: PinItem[],
   groups: AppWindowGroup[],
@@ -245,35 +388,73 @@ export function mergeTaskbarItems(
   const merged: MergedBarItem[] = [];
 
   for (const p of pins) {
+    const pinAumid = normalizeAumid(p.matchAumid) || extractAumidFromTarget(p.target);
+    const matchExeBase = extractBasename(p.matchExe);
     const targetNorm = normalizePath(p.target);
     const targetBase = extractBasename(p.target);
-    const matchExeBase = extractBasename(p.matchExe);
     const titleLow = p.title.trim().toLowerCase();
 
-    const matchedGroup = groups.find((g) => {
-      if (usedGroupKeys.has(g.key)) return false;
-      const groupKeyNorm = normalizePath(g.key);
-      const groupBase = extractBasename(g.exePath);
-      const groupNameLow = g.name.trim().toLowerCase();
+    const available = groups.filter((g) => !usedGroupKeys.has(g.key));
 
-      return (
-        (Boolean(targetNorm) && groupKeyNorm === targetNorm) ||
-        (Boolean(matchExeBase) && Boolean(groupBase) && groupBase === matchExeBase) ||
-        (Boolean(targetBase) && Boolean(groupBase) && groupBase === targetBase) ||
-        (Boolean(titleLow) && Boolean(groupNameLow) && groupNameLow === titleLow)
-      );
-    });
+    // Priority 1: Exact case-insensitive UWP AUMID match
+    let matchedGroup = pinAumid
+      ? available.find((g) => {
+          const groupAumid = normalizeAumid(g.aumid);
+          return Boolean(groupAumid) && groupAumid === pinAumid;
+        })
+      : undefined;
+
+    // Priority 2: Exact case-insensitive Win32 matchExe === basename(group.exePath)
+    if (!matchedGroup && matchExeBase) {
+      matchedGroup = available.find((g) => {
+        const groupBase = extractBasename(g.exePath);
+        return Boolean(groupBase) && groupBase === matchExeBase;
+      });
+    }
+
+    // Priority 3: Normalized target path / basename fallback
+    if (!matchedGroup && (targetNorm || targetBase)) {
+      matchedGroup = available.find((g) => {
+        const groupKeyNorm = normalizePath(g.key);
+        const groupExeNorm = normalizePath(g.exePath);
+        const groupBase = extractBasename(g.exePath);
+        return (
+          (Boolean(targetNorm) && (groupKeyNorm === targetNorm || groupExeNorm === targetNorm)) ||
+          (Boolean(targetBase) && Boolean(groupBase) && groupBase === targetBase)
+        );
+      });
+    }
+
+    // Priority 4: Exact case-insensitive display title fallback
+    if (!matchedGroup && titleLow) {
+      matchedGroup = available.find((g) => {
+        const groupNameLow = g.name.trim().toLowerCase();
+        return Boolean(groupNameLow) && groupNameLow === titleLow;
+      });
+    }
 
     if (matchedGroup) {
       usedGroupKeys.add(matchedGroup.key);
     }
 
+    const cacheKey = matchedGroup?.iconKey ?? (isCacheIconKey(p.iconKey) ? p.iconKey : null);
+    const resolvedIconData =
+      resolveCachedIcon(iconMap, matchedGroup?.iconKey, isCacheIconKey(p.iconKey) ? p.iconKey : null) ||
+      matchedGroup?.iconData ||
+      p.iconData ||
+      iconMap[p.target] ||
+      null;
+
     merged.push({
       id: p.id,
       name: p.title,
-      target: p.target || matchedGroup?.exePath || '',
+      target:
+        p.target ||
+        matchedGroup?.exePath ||
+        (matchedGroup?.aumid ? `shell:AppsFolder\\${matchedGroup.aumid}` : ''),
       iconKey: p.iconKey,
-      iconData: matchedGroup?.iconData || p.iconData || iconMap[p.target],
+      cacheIconKey: cacheKey,
+      iconData: resolvedIconData,
       pinned: true,
       pinId: p.id,
       group: matchedGroup,
@@ -282,12 +463,14 @@ export function mergeTaskbarItems(
 
   for (const g of groups) {
     if (!usedGroupKeys.has(g.key)) {
+      const resolvedIconData = resolveCachedIcon(iconMap, g.iconKey) || g.iconData || null;
       merged.push({
         id: 'run-' + g.key,
         name: g.name,
-        target: g.exePath,
-        iconKey: g.name.toLowerCase(),
-        iconData: g.iconData,
+        target: g.exePath || (g.aumid ? `shell:AppsFolder\\${g.aumid}` : ''),
+        iconKey: g.iconKey || g.name.toLowerCase(),
+        cacheIconKey: g.iconKey ?? null,
+        iconData: resolvedIconData,
         pinned: false,
         group: g,
       });

@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyConfigUpdate,
+  clearIconCache,
+  fetchIconsBatch,
+  iconCache,
+  isCacheIconKey,
   mergeTaskbarItems,
   shouldApplyConfigUpdate,
   type AppWindowGroup,
@@ -186,5 +190,202 @@ describe('mergeTaskbarItems', () => {
     expect(merged[0].group?.key).toBe('grp-spot');
     expect(merged[1].group).toBeUndefined();
     expect(merged.some((m) => m.id === 'run-grp-blank')).toBe(true);
+  });
+
+  it('deduplicates pinned UWP apps via case-insensitive matchAumid and resolves icons via iconKey', () => {
+    clearIconCache();
+    iconCache.set('aumid:settings', 'data:image/png;base64,SETTINGS');
+
+    const pins = [
+      makePin({
+        id: 'pin-calc',
+        title: 'Калькулятор',
+        target: 'shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+        matchAumid: 'Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+        iconKey: 'calc',
+      }),
+      makePin({
+        id: 'pin-term',
+        title: 'Терминал',
+        target: 'shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+        iconKey: 'warp',
+      }),
+    ];
+    const groups = [
+      makeGroup({
+        key: 'aumid:microsoft.windowscalculator_8wekyb3d8bbwe!app',
+        name: 'Calculator',
+        exePath: 'C:\\Program Files\\WindowsApps\\Calc\\CalculatorApp.exe',
+        aumid: 'microsoft.windowscalculator_8wekyb3d8bbwe!app',
+        iconKey: 'aumid:calc',
+        isActive: true,
+      }),
+      makeGroup({
+        key: 'aumid:microsoft.windowsterminal_8wekyb3d8bbwe!app',
+        name: 'Windows Terminal',
+        exePath: 'C:\\Program Files\\WindowsApps\\WT\\WindowsTerminal.exe',
+        aumid: 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+        iconKey: 'aumid:wt',
+      }),
+      makeGroup({
+        key: 'aumid:windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+        name: 'Параметры',
+        exePath: 'C:\\Windows\\ImmersiveControlPanel\\SystemSettings.exe',
+        aumid: 'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+        iconKey: 'aumid:settings',
+      }),
+    ];
+
+    const merged = mergeTaskbarItems(pins, groups, {
+      'aumid:calc': 'data:image/png;base64,CALC',
+      'aumid:wt': 'data:image/png;base64,WT',
+    });
+
+    // 2 pinned UWP apps merged + 1 unpinned UWP Settings app = 3 total slots, zero duplicates
+    expect(merged).toHaveLength(3);
+    expect(merged[0].id).toBe('pin-calc');
+    expect(merged[0].pinned).toBe(true);
+    expect(merged[0].group?.aumid).toBe('microsoft.windowscalculator_8wekyb3d8bbwe!app');
+    expect(merged[0].iconData).toBe('data:image/png;base64,CALC');
+    expect(merged[0].cacheIconKey).toBe('aumid:calc');
+
+    expect(merged[1].id).toBe('pin-term');
+    expect(merged[1].pinned).toBe(true);
+    expect(merged[1].group?.aumid).toBe('Microsoft.WindowsTerminal_8wekyb3d8bbwe!App');
+    expect(merged[1].iconData).toBe('data:image/png;base64,WT');
+
+    // Unpinned UWP Settings resolves icon straight from iconCache via iconKey
+    expect(merged[2].pinned).toBe(false);
+    expect(merged[2].name).toBe('Параметры');
+    expect(merged[2].iconData).toBe('data:image/png;base64,SETTINGS');
+    expect(merged[2].cacheIconKey).toBe('aumid:settings');
+  });
+
+  it('prioritizes exact matchAumid over matchExe and title fallback', () => {
+    const pins = [
+      makePin({
+        id: 'pin-uwp',
+        title: 'Store',
+        target: 'C:\\Tools\\store.exe',
+        matchExe: 'store.exe',
+        matchAumid: 'Microsoft.WindowsStore_8wekyb3d8bbwe!App',
+      }),
+    ];
+    const groups = [
+      makeGroup({
+        key: 'c:\\tools\\store.exe',
+        name: 'Store',
+        exePath: 'C:\\Tools\\store.exe',
+        aumid: null,
+      }),
+      makeGroup({
+        key: 'aumid:microsoft.windowsstore_8wekyb3d8bbwe!app',
+        name: 'Microsoft Store',
+        exePath: 'C:\\Program Files\\WindowsApps\\Store\\WinStore.App.exe',
+        aumid: 'Microsoft.WindowsStore_8wekyb3d8bbwe!App',
+      }),
+    ];
+
+    const merged = mergeTaskbarItems(pins, groups, {});
+    expect(merged).toHaveLength(2);
+    expect(merged[0].group?.key).toBe('aumid:microsoft.windowsstore_8wekyb3d8bbwe!app');
+    expect(merged[1].id).toBe('run-c:\\tools\\store.exe');
+  });
+});
+
+describe('fetchIconsBatch and iconCache', () => {
+  beforeEach(() => {
+    clearIconCache();
+  });
+
+  it('identifies namespaced cache icon keys accurately', () => {
+    expect(isCacheIconKey('exe:0123456789abcdef')).toBe(true);
+    expect(isCacheIconKey('aumid:fedcba9876543210')).toBe(true);
+    expect(isCacheIconKey('hwnd:1234:0')).toBe(true);
+    expect(isCacheIconKey('file:abcdef0123456789')).toBe(true);
+    expect(isCacheIconKey('explorer')).toBe(false);
+    expect(isCacheIconKey('')).toBe(false);
+    expect(isCacheIconKey(null)).toBe(false);
+  });
+
+  it('batches missing keys, caches results, and skips IPC on subsequent hits', async () => {
+    const fetcher = vi.fn(async (keys: string[]) => {
+      const out: Record<string, string> = {};
+      for (const k of keys) {
+        if (k !== 'exe:missing') {
+          out[k] = `data:image/png;base64,${k}`;
+        }
+      }
+      return out;
+    });
+
+    const first = await fetchIconsBatch(['exe:a', 'exe:b', 'exe:a', '  ', 'exe:missing'], fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledWith(['exe:a', 'exe:b', 'exe:missing']);
+    expect(first).toEqual({
+      'exe:a': 'data:image/png;base64,exe:a',
+      'exe:b': 'data:image/png;base64,exe:b',
+    });
+    expect(iconCache.get('exe:a')).toBe('data:image/png;base64,exe:a');
+    expect(iconCache.has('exe:missing')).toBe(false);
+
+    // Subsequent request for cached keys makes ZERO fetcher calls
+    const second = await fetchIconsBatch(['exe:a', 'exe:b'], fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(second).toEqual(first);
+  });
+
+  it('deduplicates concurrent in-flight keys across overlapping calls', async () => {
+    let resolveFirst!: (val: Record<string, string>) => void;
+    const firstDeferred = new Promise<Record<string, string>>((res) => {
+      resolveFirst = res;
+    });
+
+    const calls: string[][] = [];
+    const fetcher = vi.fn((keys: string[]) => {
+      calls.push(keys);
+      if (calls.length === 1) {
+        return firstDeferred;
+      }
+      return Promise.resolve({ 'exe:c': 'data:image/png;base64,C' });
+    });
+
+    const p1 = fetchIconsBatch(['exe:a', 'exe:b'], fetcher);
+    const p2 = fetchIconsBatch(['exe:b', 'exe:c'], fetcher);
+
+    // Second call must NOT re-request in-flight exe:b — only exe:c
+    expect(calls).toEqual([
+      ['exe:a', 'exe:b'],
+      ['exe:c'],
+    ]);
+
+    resolveFirst({
+      'exe:a': 'data:image/png;base64,A',
+      'exe:b': 'data:image/png;base64,B',
+    });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toEqual({
+      'exe:a': 'data:image/png;base64,A',
+      'exe:b': 'data:image/png;base64,B',
+    });
+    expect(r2).toEqual({
+      'exe:b': 'data:image/png;base64,B',
+      'exe:c': 'data:image/png;base64,C',
+    });
+  });
+
+  it('recovers cleanly on fetch failure so later retries succeed', async () => {
+    const failFetcher = vi.fn(async () => {
+      throw new Error('ipc down');
+    });
+    const failed = await fetchIconsBatch(['aumid:retry'], failFetcher);
+    expect(failed).toEqual({});
+    expect(iconCache.has('aumid:retry')).toBe(false);
+
+    const okFetcher = vi.fn(async () => ({ 'aumid:retry': 'data:image/png;base64,OK' }));
+    const retried = await fetchIconsBatch(['aumid:retry'], okFetcher);
+    expect(retried).toEqual({ 'aumid:retry': 'data:image/png;base64,OK' });
+    expect(iconCache.get('aumid:retry')).toBe('data:image/png;base64,OK');
   });
 });

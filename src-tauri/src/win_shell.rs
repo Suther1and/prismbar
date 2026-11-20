@@ -10,7 +10,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS,
-    ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WIN32_ERROR, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -19,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::{
     AttachThreadInput, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
     WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
@@ -29,8 +31,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VIRTUAL_KEY, VK_CONTROL,
-    VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
@@ -56,8 +58,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::coordinator::{
-    classify_fullscreen, compute_appbar_rect, BarMode, ForegroundWindowInfo, NotificationState,
-    PixelRect,
+    classify_fullscreen, compute_appbar_rect_scaled, compute_effective_scale, BarMode,
+    ForegroundWindowInfo, NotificationState, PixelRect,
 };
 
 pub const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\TestBar_SingleInstance_v1";
@@ -68,6 +70,11 @@ pub const VK_DUMMY_MASK: u16 = 0xE8;
 pub const LLKHF_INJECTED_FLAG: u32 = 0x0000_0010;
 pub const LLKHF_LOWER_IL_INJECTED_FLAG: u32 = 0x0000_0002;
 pub const LLKHF_ALTDOWN_FLAG: u32 = 0x0000_0020;
+pub const MIN_TEXT_SCALE_PERCENT: u32 = 100;
+pub const MAX_TEXT_SCALE_PERCENT: u32 = 225;
+
+const ACCESSIBILITY_SUBKEY: &str = r"Software\Microsoft\Accessibility";
+const TEXT_SCALE_FACTOR_VALUE: &str = "TextScaleFactor";
 
 const APPBAR_MSG_WND_CLASS: &str = "TestBarAppBarMsgWnd";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -327,6 +334,39 @@ pub fn primary_monitor_dpi() -> u32 {
         }
         96
     }
+}
+
+/// Pure parser for Windows Accessibility `TextScaleFactor` (DWORD percent, default 100, clamped 100..=225).
+pub fn parse_text_scale_factor(raw: Option<u32>) -> f64 {
+    let pct = raw.unwrap_or(MIN_TEXT_SCALE_PERCENT);
+    let clamped = pct.clamp(MIN_TEXT_SCALE_PERCENT, MAX_TEXT_SCALE_PERCENT);
+    clamped as f64 / 100.0
+}
+
+/// Reads `HKCU\Software\Microsoft\Accessibility\TextScaleFactor` (DWORD) and returns
+/// the WebView2 rasterization text-scale multiplier (`1.0..=2.25`).
+pub fn windows_text_scale_factor() -> f64 {
+    let raw = unsafe {
+        let subkey = wide(ACCESSIBILITY_SUBKEY);
+        let value_name = wide(TEXT_SCALE_FACTOR_VALUE);
+        let mut value: u32 = 0;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut c_void),
+            Some(&mut size),
+        );
+        if status == ERROR_SUCCESS {
+            Some(value)
+        } else {
+            None
+        }
+    };
+    parse_text_scale_factor(raw)
 }
 
 pub fn query_current_workarea_snapshot() -> Option<WorkAreaSnapshot> {
@@ -765,9 +805,21 @@ pub fn hide_native_taskbar() {
     NATIVE_HIDDEN.store(true, Ordering::SeqCst);
 }
 
+/// Lightweight check for the 650ms poller: only re-hides native taskbars if Explorer
+/// snuck `Shell_TrayWnd` back visible while TestBar owns the shell.
+pub fn ensure_native_taskbar_hidden_if_needed() {
+    if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
+        return;
+    }
+    if is_native_taskbar_visible() {
+        hide_native_taskbar();
+    }
+}
+
 trait AppBarShellOps: Send {
     fn primary_monitor_rect(&self) -> PixelRect;
     fn primary_monitor_dpi(&self) -> u32;
+    fn text_scale_factor(&self) -> f64;
     fn hide_native_taskbar(&self);
     fn abm_new(&self, hwnd: HWND, abd: &mut APPBARDATA) -> bool;
     fn abm_querypos(&self, hwnd: HWND, abd: &mut APPBARDATA);
@@ -786,6 +838,10 @@ impl AppBarShellOps for Win32AppBarShellOps {
 
     fn primary_monitor_dpi(&self) -> u32 {
         primary_monitor_dpi()
+    }
+
+    fn text_scale_factor(&self) -> f64 {
+        windows_text_scale_factor()
     }
 
     fn hide_native_taskbar(&self) {
@@ -887,7 +943,8 @@ fn apply_appbar_on_hwnd(
     let dpi = dpi_override
         .filter(|&d| d > 0)
         .unwrap_or_else(|| ctx.shell_ops.primary_monitor_dpi());
-    let target = compute_appbar_rect(mon_px, dpi, ctx.bar_mode.get());
+    let effective_scale = compute_effective_scale(dpi, ctx.shell_ops.text_scale_factor());
+    let target = compute_appbar_rect_scaled(mon_px, effective_scale, ctx.bar_mode.get());
     let reserve_h = target.height();
 
     let mut abd = APPBARDATA {
@@ -1836,10 +1893,12 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-fn send_dummy_mask_key() {
+fn send_masked_win_keyup(vk: u16) {
     unsafe {
-        // Masking key (0xE8 unassigned) prevents Windows shell from opening native Start
-        // when releasing a lone Win key, without affecting any other application.
+        // Inject [0xE8 DOWN, 0xE8 UP, vk KEYUP] in one atomic batch while swallowing the
+        // physical Win KEYUP via LRESULT(1). This guarantees the mask key strictly precedes
+        // the Win release seen by Explorer so native Windows Start never pops over TestBar.
+        // All 3 events carry LLKHF_INJECTED so our WH_KEYBOARD_LL hook ignores them.
         let inputs = [
             INPUT {
                 r#type: INPUT_KEYBOARD,
@@ -1860,28 +1919,43 @@ fn send_dummy_mask_key() {
                     },
                 },
             },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        dwFlags: KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY,
+                        ..Default::default()
+                    },
+                },
+            },
         ];
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
+/// Processes a single low-level keyboard event. Returns `true` ONLY when a lone physical
+/// Win `KEYUP` triggered `ToggleStart` and was successfully enqueued + replaced with a
+/// masked `[0xE8 down, 0xE8 up, Win up]` sequence, telling `ll_keyboard_proc` to return
+/// `LRESULT(1)` and swallow the physical `KEYUP`.
 fn dispatch_ll_keyboard_event<FQuery, FMask>(
     msg: u32,
     vk_code: u32,
     flags: u32,
     query_physical: FQuery,
     send_mask: FMask,
-) where
+) -> bool
+where
     FQuery: FnOnce() -> PhysicalKeySnapshot,
-    FMask: FnOnce(),
+    FMask: FnOnce(u16),
 {
     let transition = match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN => KeyTransition::Down,
         WM_KEYUP | WM_SYSKEYUP => KeyTransition::Up,
-        _ => return,
+        _ => return false,
     };
     let Ok(vk) = u16::try_from(vk_code) else {
-        return;
+        return false;
     };
     let is_injected_or_mask = (flags & (LLKHF_INJECTED_FLAG | LLKHF_LOWER_IL_INJECTED_FLAG)) != 0
         || vk == VK_DUMMY_MASK;
@@ -1911,7 +1985,7 @@ fn dispatch_ll_keyboard_event<FQuery, FMask>(
         .unwrap_or(WinKeyAction::None);
 
     if action == WinKeyAction::ToggleStart {
-        // Enqueue ToggleStart first; only suppress native Start via mask key if enqueued.
+        // Enqueue ToggleStart first; only mask and swallow physical Win KEYUP if enqueued.
         let result = HOOK_EVENT_SENDER
             .try_with(|slot| {
                 slot.try_borrow()
@@ -1925,23 +1999,29 @@ fn dispatch_ll_keyboard_event<FQuery, FMask>(
             })
             .unwrap_or(HookEnqueueResult::Disconnected);
         if result == HookEnqueueResult::Sent {
-            send_mask();
+            send_mask(vk);
+            return true;
         }
     }
+    false
 }
 
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && lparam.0 != 0 {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let suppress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             dispatch_ll_keyboard_event(
                 wparam.0 as u32,
                 kb.vkCode,
                 kb.flags.0,
                 query_physical_keys,
-                send_dummy_mask_key,
-            );
-        }));
+                send_masked_win_keyup,
+            )
+        }))
+        .unwrap_or(false);
+        if suppress {
+            return LRESULT(1);
+        }
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
@@ -1990,6 +2070,7 @@ mod tests {
     struct FakeShellState {
         monitor: PixelRect,
         dpi: u32,
+        text_scale: f64,
         abm_new_results: VecDeque<bool>,
         querypos_bottom_offset: i32,
         ops: Vec<FakeOp>,
@@ -2006,6 +2087,10 @@ mod tests {
 
         fn primary_monitor_dpi(&self) -> u32 {
             self.state.lock().unwrap().dpi
+        }
+
+        fn text_scale_factor(&self) -> f64 {
+            self.state.lock().unwrap().text_scale
         }
 
         fn hide_native_taskbar(&self) {
@@ -2457,6 +2542,7 @@ mod tests {
         let fake_state = Arc::new(Mutex::new(FakeShellState {
             monitor: mon,
             dpi: 144, // 150% DPI -> Dock 64*1.5=96px, Edge 52*1.5=78px
+            text_scale: 1.0,
             abm_new_results: VecDeque::from([false, true, true]), // 1st ABM_NEW fails -> must retry!
             querypos_bottom_offset: 0,
             ops: Vec::new(),
@@ -3035,24 +3121,52 @@ mod tests {
         HOOK_EVENT_SENDER.with(|slot| *slot.borrow_mut() = Some(sender.clone()));
 
         let idle_phys = || PhysicalKeySnapshot::default();
-        let mask_calls = Cell::new(0u32);
-        let inc_mask = || mask_calls.set(mask_calls.get() + 1);
+        let masked_vks: RefCell<Vec<u16>> = RefCell::new(Vec::new());
+        let record_mask = |vk: u16| masked_vks.borrow_mut().push(vk);
 
-        // 1. Thread-local persistence across WM_KEYDOWN/WM_KEYUP & try_send-before-mask
-        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 0);
-        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 1);
+        // 1. Lone LWin tap: Down passes through (false), Up enqueues ToggleStart, injects mask+keyup, and swallows physical KEYUP (true)
+        assert!(
+            !dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask),
+            "Win KEYDOWN must pass through via CallNextHookEx"
+        );
+        assert!(masked_vks.borrow().is_empty());
+        assert!(
+            dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
+            "lone LWin KEYUP must return suppress=true (LRESULT(1)) after sending masked sequence"
+        );
+        assert_eq!(*masked_vks.borrow(), vec![VK_LWIN.0]);
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
 
-        // 2. WM_SYSKEYDOWN / WM_SYSKEYUP with LLKHF_ALTDOWN never triggers ToggleStart or mask
-        dispatch_ll_keyboard_event(WM_SYSKEYDOWN, lwin, ext | alt, idle_phys, inc_mask);
-        dispatch_ll_keyboard_event(WM_SYSKEYUP, lwin, ext | up | alt, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 1);
+        // 1b. Win+E chord passes completely untouched (suppress=false on every event, no mask key)
+        let key_e = 0x45u32;
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask));
+        assert!(!dispatch_ll_keyboard_event(
+            WM_KEYDOWN,
+            key_e,
+            0,
+            || PhysicalKeySnapshot {
+                lwin_down: true,
+                rwin_down: false,
+                modifier_down: false,
+            },
+            record_mask,
+        ));
+        assert!(!dispatch_ll_keyboard_event(WM_KEYUP, key_e, up, idle_phys, record_mask));
+        assert!(
+            !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
+            "Win+E chord KEYUP must NOT be swallowed"
+        );
+        assert_eq!(*masked_vks.borrow(), vec![VK_LWIN.0]);
+        assert!(rx.try_recv().is_err());
+
+        // 2. WM_SYSKEYDOWN / WM_SYSKEYUP with LLKHF_ALTDOWN never triggers ToggleStart, mask, or swallow
+        assert!(!dispatch_ll_keyboard_event(WM_SYSKEYDOWN, lwin, ext | alt, idle_phys, record_mask));
+        assert!(!dispatch_ll_keyboard_event(WM_SYSKEYUP, lwin, ext | up | alt, idle_phys, record_mask));
+        assert_eq!(masked_vks.borrow().len(), 1);
         assert!(rx.try_recv().is_err());
 
         // 3. Pre-held Ctrl/Shift/Alt detected via physical key snapshot suppresses lone Win
-        dispatch_ll_keyboard_event(
+        assert!(!dispatch_ll_keyboard_event(
             WM_KEYDOWN,
             lwin,
             ext,
@@ -3061,15 +3175,15 @@ mod tests {
                 rwin_down: false,
                 modifier_down: true,
             },
-            inc_mask,
-        );
-        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 1);
+            record_mask,
+        ));
+        assert!(!dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask));
+        assert_eq!(masked_vks.borrow().len(), 1);
         assert!(rx.try_recv().is_err());
 
-        // 4. Win+L Secure Desktop lost LWin Up: next LWin tap reconciles physical state and succeeds
-        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
-        dispatch_ll_keyboard_event(
+        // 4. Win+L Secure Desktop lost LWin Up: next RWin tap reconciles physical state and swallows RWin KEYUP
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask));
+        assert!(!dispatch_ll_keyboard_event(
             WM_KEYDOWN,
             key_l,
             0,
@@ -3078,21 +3192,24 @@ mod tests {
                 rwin_down: false,
                 modifier_down: false,
             },
-            inc_mask,
+            record_mask,
+        ));
+        // LWin Up is lost; user unlocks desktop and taps RWin -> physical LWin is up -> succeeds with VK_RWIN!
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, rwin, ext, idle_phys, record_mask));
+        assert!(
+            dispatch_ll_keyboard_event(WM_KEYUP, rwin, ext | up, idle_phys, record_mask),
+            "lone RWin KEYUP must return suppress=true (LRESULT(1))"
         );
-        // LWin Up is lost; user unlocks desktop and taps RWin -> physical LWin is up -> succeeds!
-        dispatch_ll_keyboard_event(WM_KEYDOWN, rwin, ext, idle_phys, inc_mask);
-        dispatch_ll_keyboard_event(WM_KEYUP, rwin, ext | up, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 2);
+        assert_eq!(*masked_vks.borrow(), vec![VK_LWIN.0, VK_RWIN.0]);
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
 
         // 5. Out-of-range vkCode (> u16::MAX) is ignored safely without truncation
-        dispatch_ll_keyboard_event(WM_KEYDOWN, (1u32 << 16) | lwin, ext, idle_phys, inc_mask);
-        dispatch_ll_keyboard_event(WM_KEYUP, (1u32 << 16) | lwin, ext | up, idle_phys, inc_mask);
-        assert_eq!(mask_calls.get(), 2);
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, (1u32 << 16) | lwin, ext, idle_phys, record_mask));
+        assert!(!dispatch_ll_keyboard_event(WM_KEYUP, (1u32 << 16) | lwin, ext | up, idle_phys, record_mask));
+        assert_eq!(masked_vks.borrow().len(), 2);
         assert!(rx.try_recv().is_err());
 
-        // 6. When channel is full, try_send returns DroppedFull and mask key is NOT invoked
+        // 6. When channel is full, try_send returns DroppedFull -> mask key NOT invoked and KEYUP NOT swallowed
         assert_eq!(
             sender.try_send(ShellHookEvent::GlobalMouseDown(1, 1)),
             HookEnqueueResult::Sent
@@ -3101,12 +3218,15 @@ mod tests {
             sender.try_send(ShellHookEvent::GlobalMouseDown(2, 2)),
             HookEnqueueResult::Sent
         );
-        dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, inc_mask);
-        dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, inc_mask);
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask));
+        assert!(
+            !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
+            "physical Win KEYUP must NOT be swallowed when ToggleStart was dropped on full channel"
+        );
         assert_eq!(
-            mask_calls.get(),
+            masked_vks.borrow().len(),
             2,
-            "send_dummy_mask_key must NOT run when ToggleStart was dropped on full channel"
+            "send_masked_win_keyup must NOT run when ToggleStart was dropped on full channel"
         );
         assert_eq!(sender.dropped_count(), 1);
         let _ = rx.try_recv().unwrap();
@@ -3125,5 +3245,71 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(30, 40));
         dispatch_ll_mouse_event(WM_MBUTTONDOWN, 50, 60, true);
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(50, 60));
+    }
+
+    #[test]
+    fn parse_text_scale_factor_clamping_and_live_registry_probe() {
+        assert!((parse_text_scale_factor(None) - 1.0).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(0)) - 1.0).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(50)) - 1.0).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(100)) - 1.0).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(140)) - 1.4).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(175)) - 1.75).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(225)) - 2.25).abs() < 1e-9);
+        assert!((parse_text_scale_factor(Some(400)) - 2.25).abs() < 1e-9);
+
+        let live = windows_text_scale_factor();
+        assert!(
+            (1.0..=2.25).contains(&live),
+            "expected TextScaleFactor in 1.0..=2.25, got {live}"
+        );
+    }
+
+    #[test]
+    fn appbar_message_window_reserves_effective_scale_with_text_scale_factor() {
+        let (ev_tx, ev_rx) = mpsc::channel::<ShellAppBarEvent>();
+        let mon = PixelRect::new(0, 0, 2560, 1440);
+        let fake_state = Arc::new(Mutex::new(FakeShellState {
+            monitor: mon,
+            dpi: 96,         // 100% DPI
+            text_scale: 1.4, // 140% TextScaleFactor -> effective_scale = 1.4
+            abm_new_results: VecDeque::from([true]),
+            querypos_bottom_offset: 0,
+            ops: Vec::new(),
+        }));
+        let fake_ops = Box::new(FakeAppBarShellOps {
+            state: Arc::clone(&fake_state),
+        });
+
+        let mut wnd = AppBarMessageWindow::spawn_with_ops(BarMode::Dock, fake_ops, move |ev| {
+            let _ = ev_tx.send(ev);
+        })
+        .expect("spawn_with_ops failed");
+
+        // Dock 64 * 1.4 = 89.6 -> 90px
+        let expected_dock = PixelRect::new(0, 1440 - 90, 2560, 1440);
+        assert_eq!(
+            fake_state.lock().unwrap().ops,
+            vec![
+                FakeOp::AbmNew(true),
+                FakeOp::AbmQueryPos(expected_dock),
+                FakeOp::AbmSetPos(expected_dock),
+            ]
+        );
+        fake_state.lock().unwrap().ops.clear();
+
+        // Edge 52 * 1.4 = 72.8 -> 73px
+        wnd.update_mode(BarMode::Edge);
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ShellAppBarEvent::PositionChanged
+        );
+        let expected_edge = PixelRect::new(0, 1440 - 73, 2560, 1440);
+        assert_eq!(
+            fake_state.lock().unwrap().ops,
+            vec![FakeOp::AbmQueryPos(expected_edge), FakeOp::AbmSetPos(expected_edge)]
+        );
+
+        wnd.stop();
     }
 }
