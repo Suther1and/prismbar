@@ -411,7 +411,7 @@ export const FlyoutView: React.FC = () => {
             <button
               className="ctx-item"
               onClick={() => {
-                ipc('remove_pin', { space: 'taskbar', itemId: p.pinId });
+                ipc('remove_pin', { space: 'taskbar', itemId: p.pinId }).catch(() => {});
                 close();
               }}
             >
@@ -427,7 +427,7 @@ export const FlyoutView: React.FC = () => {
                     item: {
                       id: `tb-${Date.now()}`,
                       kind: 'app',
-                      name: p.name,
+                      title: p.name,
                       subtitle: 'Приложение',
                       target: p.target,
                       altAction: 'Новое окно',
@@ -435,7 +435,7 @@ export const FlyoutView: React.FC = () => {
                       iconKey: p.name.toLowerCase(),
                       iconData: null,
                     },
-                  });
+                  }).catch(() => {});
                   close();
                 }}
               >
@@ -494,7 +494,7 @@ export const FlyoutView: React.FC = () => {
           <button
             className="ctx-item"
             onClick={() => {
-              ipc('set_bar_mode', { mode: nextMode });
+              ipc('set_bar_mode', { mode: nextMode }).catch(() => {});
               close();
             }}
           >

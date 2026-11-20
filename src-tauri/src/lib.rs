@@ -424,45 +424,146 @@ pub struct FlyoutRequest {
     pub payload: serde_json::Value,
 }
 
+// ======================= CONFIG TRANSACTION AUTHORITY =======================
+
+fn mutate_config_at<F>(
+    config_mutex: &Mutex<TestBarConfig>,
+    path: &std::path::Path,
+    mutate: F,
+) -> Result<(TestBarConfig, bool), String>
+where
+    F: FnOnce(&mut TestBarConfig) -> bool,
+{
+    let mut guard = config_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let mut candidate = guard.clone();
+    if !mutate(&mut candidate) {
+        return Ok((guard.clone(), false));
+    }
+    config::normalize_and_migrate(&mut candidate);
+    candidate.revision = candidate
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "config revision overflow".to_string())?;
+    config::save_config_to(path, &candidate)?;
+    *guard = candidate.clone();
+    Ok((candidate, true))
+}
+
+fn mutate_config_with_emitter<F, FEmit>(
+    config_mutex: &Mutex<TestBarConfig>,
+    path: &std::path::Path,
+    mutate: F,
+    emit: FEmit,
+) -> Result<(TestBarConfig, bool), String>
+where
+    F: FnOnce(&mut TestBarConfig) -> bool,
+    FEmit: FnOnce(&TestBarConfig),
+{
+    let (updated, changed) = mutate_config_at(config_mutex, path, mutate)?;
+    if changed {
+        emit(&updated);
+    }
+    Ok((updated, changed))
+}
+
+fn mutate_config_and_emit<F>(
+    app: &AppHandle,
+    state: &AppState,
+    mutate: F,
+) -> Result<(TestBarConfig, bool), String>
+where
+    F: FnOnce(&mut TestBarConfig) -> bool,
+{
+    let path = config::config_path();
+    mutate_config_with_emitter(&state.config, &path, mutate, |updated| {
+        let _ = app.emit("config-updated", updated);
+    })
+}
+
+fn apply_autostart_transaction<FReg>(
+    config_mutex: &Mutex<TestBarConfig>,
+    path: &std::path::Path,
+    enable: bool,
+    mut apply_registry: FReg,
+) -> Result<(TestBarConfig, bool), String>
+where
+    FReg: FnMut(bool) -> Result<(), String>,
+{
+    let mut guard = config_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_enabled = guard.autostart;
+    apply_registry(enable)?;
+    if prev_enabled == enable {
+        return Ok((guard.clone(), false));
+    }
+    let mut candidate = guard.clone();
+    candidate.autostart = enable;
+    config::normalize_and_migrate(&mut candidate);
+    candidate.revision = candidate
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "config revision overflow".to_string())?;
+    if let Err(err) = config::save_config_to(path, &candidate) {
+        let _ = apply_registry(prev_enabled);
+        return Err(err);
+    }
+    *guard = candidate.clone();
+    Ok((candidate, true))
+}
+
 // ======================= TAURI IPC COMMANDS =======================
 
 #[tauri::command]
 fn get_config(state: State<AppState>) -> TestBarConfig {
-    state.config.lock().unwrap().clone()
+    state
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 #[tauri::command]
-fn set_bar_mode(app: AppHandle, state: State<AppState>, mode: String) -> Result<TestBarConfig, String> {
-    let updated = {
-        let mut cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
-        cfg.bar_mode = if mode == "edge" { "edge".to_string() } else { "dock".to_string() };
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    if state.hide_native {
-        win_shell::update_appbar_mode(BarMode::from_config_str(&updated.bar_mode));
+fn set_bar_mode(
+    app: AppHandle,
+    state: State<AppState>,
+    mode: String,
+) -> Result<TestBarConfig, String> {
+    let target_mode = if mode == "edge" { "edge" } else { "dock" };
+    let path = config::config_path();
+    let (updated, changed) = mutate_config_at(&state.config, &path, |cfg| {
+        if cfg.bar_mode == target_mode {
+            return false;
+        }
+        cfg.bar_mode = target_mode.to_string();
+        true
+    })?;
+    if changed {
+        if state.hide_native {
+            win_shell::update_appbar_mode(BarMode::from_config_str(&updated.bar_mode));
+        }
+        position_taskbar_window(&app);
+        let actions = state
+            .coordinator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_taskbar_bounds_updated();
+        apply_coordinator_actions(&app, &actions, None);
+        let _ = app.emit("config-updated", &updated);
     }
-    position_taskbar_window(&app);
-    let actions = state
-        .coordinator
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .on_taskbar_bounds_updated();
-    apply_coordinator_actions(&app, &actions, None);
-    let _ = app.emit("config-updated", &updated);
     Ok(updated)
 }
 
 #[tauri::command]
-fn set_autostart(app: AppHandle, state: State<AppState>, enable: bool) -> Result<TestBarConfig, String> {
-    config::set_windows_autostart(enable)?;
-    let updated = {
-        let mut cfg = state.config.lock().unwrap();
-        cfg.autostart = enable;
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    let _ = app.emit("config-updated", &updated);
+fn set_autostart(
+    app: AppHandle,
+    state: State<AppState>,
+    enable: bool,
+) -> Result<TestBarConfig, String> {
+    let path = config::config_path();
+    let (updated, changed) =
+        apply_autostart_transaction(&state.config, &path, enable, config::set_windows_autostart)?;
+    if changed {
+        let _ = app.emit("config-updated", &updated);
+    }
     Ok(updated)
 }
 
@@ -619,53 +720,63 @@ fn get_steam_games(state: State<AppState>) -> Vec<SteamGame> {
 }
 
 #[tauri::command]
-fn add_pin(app: AppHandle, state: State<AppState>, space: String, mut item: PinItem) -> Result<TestBarConfig, String> {
+fn add_pin(
+    app: AppHandle,
+    state: State<AppState>,
+    space: String,
+    mut item: PinItem,
+) -> Result<TestBarConfig, String> {
+    let force_combo =
+        space == "game_combos" || (space == "games" && item.kind.trim().eq_ignore_ascii_case("combo"));
+    config::normalize_pin(&mut item, force_combo);
     if item.icon_data.is_none() && (item.kind == "app" || item.kind == "file") {
         item.icon_data = windows_tracker::extract_icon_for_path(&item.target);
     }
-    let updated = {
-        let mut cfg = state.config.lock().unwrap();
-        config::add_pin_to_space(&mut cfg, &space, item);
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    let _ = app.emit("config-updated", &updated);
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::add_pin_to_space(cfg, &space, item)
+    })?;
     Ok(updated)
 }
 
 #[tauri::command]
-fn remove_pin(app: AppHandle, state: State<AppState>, space: String, item_id: String) -> Result<TestBarConfig, String> {
-    let updated = {
-        let mut cfg = state.config.lock().unwrap();
-        config::remove_pin_from_space(&mut cfg, &space, &item_id);
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    let _ = app.emit("config-updated", &updated);
+fn remove_pin(
+    app: AppHandle,
+    state: State<AppState>,
+    space: String,
+    item_id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::remove_pin_from_space(cfg, &space, &item_id)
+    })?;
     Ok(updated)
 }
 
 #[tauri::command]
-fn reorder_pins(app: AppHandle, state: State<AppState>, space: String, from_idx: usize, to_idx: usize) -> Result<TestBarConfig, String> {
-    let updated = {
-        let mut cfg = state.config.lock().unwrap();
-        config::reorder_pins_in_space(&mut cfg, &space, from_idx, to_idx);
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    let _ = app.emit("config-updated", &updated);
+fn reorder_pins(
+    app: AppHandle,
+    state: State<AppState>,
+    space: String,
+    from_idx: usize,
+    to_idx: usize,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::reorder_pins_in_space(cfg, &space, from_idx, to_idx)
+    })?;
     Ok(updated)
 }
 
 #[tauri::command]
-fn add_custom_space(app: AppHandle, state: State<AppState>, name: String) -> Result<TestBarConfig, String> {
+fn add_custom_space(
+    app: AppHandle,
+    state: State<AppState>,
+    name: String,
+) -> Result<TestBarConfig, String> {
     let clean = name.trim().to_string();
     if clean.is_empty() {
         return Err("Пустое название".to_string());
     }
     let id = format!("custom-{}", now_ms());
-    let updated = {
-        let mut cfg = state.config.lock().unwrap();
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         cfg.custom_spaces.push(CustomSpace {
             id,
             name: clean,
@@ -673,10 +784,8 @@ fn add_custom_space(app: AppHandle, state: State<AppState>, name: String) -> Res
             accent_rgb: "167,139,250".to_string(),
             items: vec![],
         });
-        config::save_config(&cfg)?;
-        cfg.clone()
-    };
-    let _ = app.emit("config-updated", &updated);
+        true
+    })?;
     Ok(updated)
 }
 
@@ -779,8 +888,19 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn toggle_clip_pin(app: AppHandle, id: String) -> Vec<ClipboardEntry> {
-    let list = system_widgets::toggle_clipboard_pin(&id);
+fn toggle_clip_pin(app: AppHandle, state: State<AppState>, id: String) -> Vec<ClipboardEntry> {
+    let mut list = system_widgets::toggle_clipboard_pin(&id);
+    if let Some(entry) = list.iter().find(|c| c.id == id) {
+        let text = entry.text.clone();
+        let pinned = entry.pinned;
+        if mutate_config_and_emit(&app, &state, |cfg| {
+            config::set_pinned_clipboard(cfg, &text, pinned)
+        })
+        .is_err()
+        {
+            list = system_widgets::toggle_clipboard_pin(&id);
+        }
+    }
     let _ = app.emit("clipboard-updated", &list);
     list
 }
@@ -932,7 +1052,13 @@ pub fn run(hide_native: bool) {
             if let Some(tb) = app.get_webview_window("taskbar") {
                 if let Some(hwnd) = win_hwnd(&tb) {
                     win_shell::style_overlay_window(hwnd, true);
-                    let mode = app.state::<AppState>().config.lock().unwrap().bar_mode.clone();
+                    let mode = app
+                        .state::<AppState>()
+                        .config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .bar_mode
+                        .clone();
                     if hide_native {
                         win_shell::hide_native_taskbar();
                         let h_appbar = handle.clone();
@@ -1427,5 +1553,382 @@ mod integration_tests {
         // Valid HiDPI 200% (sf = 2.0) on normal monitor
         let hidpi_edge = compute_taskbar_bounds(mon, 2.0, "edge", 620);
         assert_eq!(hidpi_edge, PixelRect::new(0, 1440 - 104, 2560, 1440));
+    }
+
+    fn make_lib_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "testbar-lib-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn transactional_config_mutation_bumps_revision_skips_noops_and_rolls_back_on_save_error() {
+        let dir = make_lib_temp_dir("tx-mutate");
+        let cfg_path = dir.join("config.json");
+        let state = make_test_app_state("dock", 620);
+
+        // 1. Valid mutation bumps revision 0 -> 1 and writes atomically
+        let (updated, changed) = mutate_config_at(&state.config, &cfg_path, |cfg| {
+            if cfg.bar_mode == "edge" {
+                return false;
+            }
+            cfg.bar_mode = "edge".to_string();
+            true
+        })
+        .expect("valid mutation must succeed");
+        assert!(changed);
+        assert_eq!(updated.revision, 1);
+        assert_eq!(updated.bar_mode, "edge");
+        assert!(cfg_path.exists());
+        assert_eq!(config::load_config_from(&cfg_path).revision, 1);
+
+        // 2. No-op mutation returns changed = false, keeps revision = 1, and skips disk write
+        std::fs::remove_file(&cfg_path).expect("remove file to prove no-op skips write");
+        let (same, changed_noop) = mutate_config_at(&state.config, &cfg_path, |cfg| {
+            if cfg.bar_mode == "edge" {
+                return false;
+            }
+            cfg.bar_mode = "edge".to_string();
+            true
+        })
+        .expect("no-op mutation must succeed");
+        assert!(!changed_noop);
+        assert_eq!(same.revision, 1);
+        assert!(!cfg_path.exists(), "no-op mutation must skip disk write");
+
+        // 3. Failed disk write (target is a directory) rolls back in-memory state and revision
+        let dir_target = dir.join("existing-dir");
+        std::fs::create_dir_all(&dir_target).expect("create dir target");
+        let err = mutate_config_at(&state.config, &dir_target, |cfg| {
+            cfg.bar_mode = "dock".to_string();
+            cfg.autostart = true;
+            true
+        });
+        assert!(err.is_err(), "writing over a directory must return Err");
+
+        let in_mem = state.config.lock().unwrap().clone();
+        assert_eq!(in_mem.revision, 1, "revision must not advance on failed save");
+        assert_eq!(in_mem.bar_mode, "edge", "bar_mode must roll back on failed save");
+        assert!(!in_mem.autostart, "autostart must roll back on failed save");
+
+        let tmp_count = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_count, 0, "no .tmp files may remain after failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_v0_migration_and_command_mutations_persist_monotonically() {
+        let dir = make_lib_temp_dir("v0-e2e");
+        let cfg_path = dir.join("config.json");
+        let v0_json = r#"{
+          "barMode": "dock",
+          "autostart": false,
+          "taskbarPins": [
+            {
+              "id": "p-term",
+              "kind": "app",
+              "name": "Terminal",
+              "subtitle": "Shell",
+              "target": "C:\\Windows\\System32\\cmd.exe",
+              "altAction": "",
+              "accentRgb": "52,211,153",
+              "iconKey": "warp"
+            }
+          ],
+          "personalPins": [],
+          "personalLinks": [],
+          "workFolders": [],
+          "workApps": [],
+          "studioPins": [],
+          "studioTools": [],
+          "gameLaunchers": [],
+          "gameCombos": [
+            {
+              "id": "g-1",
+              "name": "PoE2",
+              "subtitle": "Steam",
+              "targets": ["steam://rungameid/2694490"],
+              "accentRgb": "251,113,133"
+            }
+          ],
+          "customSpaces": []
+        }"#;
+        std::fs::write(&cfg_path, v0_json).expect("write v0");
+
+        let loaded = config::load_config_from(&cfg_path);
+        assert_eq!(loaded.schema_version, config::CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.revision, 0);
+        assert_eq!(loaded.taskbar_pins[0].title, "Terminal");
+        assert_eq!(loaded.taskbar_pins[0].match_exe.as_deref(), Some("cmd.exe"));
+        assert_eq!(loaded.game_combos[0].kind, "combo");
+
+        let cfg_mutex = Mutex::new(loaded);
+
+        // Add clipboard pin -> revision 1
+        let (c1, ch1) = mutate_config_at(&cfg_mutex, &cfg_path, |cfg| {
+            config::set_pinned_clipboard(cfg, "pinned-snippet", true)
+        })
+        .expect("pin clip");
+        assert!(ch1);
+        assert_eq!(c1.revision, 1);
+        assert_eq!(c1.pinned_clipboard, vec!["pinned-snippet"]);
+
+        // Duplicate clipboard pin -> no-op, revision stays 1
+        let (c2, ch2) = mutate_config_at(&cfg_mutex, &cfg_path, |cfg| {
+            config::set_pinned_clipboard(cfg, "pinned-snippet", true)
+        })
+        .expect("dup clip");
+        assert!(!ch2);
+        assert_eq!(c2.revision, 1);
+
+        // Add pin to studio_tools -> revision 2
+        let (c3, ch3) = mutate_config_at(&cfg_mutex, &cfg_path, |cfg| {
+            config::add_pin_to_space(
+                cfg,
+                "studio_tools",
+                PinItem {
+                    id: "tool-1".to_string(),
+                    kind: "app".to_string(),
+                    title: "WizTree".to_string(),
+                    subtitle: "Disk".to_string(),
+                    target: r"C:\Program Files\WizTree\WizTree64.exe".to_string(),
+                    args: None,
+                    alt_action: String::new(),
+                    accent_rgb: "56,189,248".to_string(),
+                    icon_key: "disk".to_string(),
+                    icon_data: None,
+                    match_exe: None,
+                    match_aumid: None,
+                    combo_targets: None,
+                },
+            )
+        })
+        .expect("add studio tool");
+        assert!(ch3);
+        assert_eq!(c3.revision, 2);
+        assert_eq!(
+            c3.studio_tools[0].match_exe.as_deref(),
+            Some("wiztree64.exe")
+        );
+
+        let disk_cfg = config::load_config_from(&cfg_path);
+        assert_eq!(disk_cfg.revision, 2);
+        assert_eq!(disk_cfg.pinned_clipboard, vec!["pinned-snippet"]);
+        assert_eq!(disk_cfg.studio_tools.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutate_config_with_emitter_emits_only_on_real_change_and_rejects_revision_overflow() {
+        let dir = make_lib_temp_dir("tx-emitter");
+        let cfg_path = dir.join("config.json");
+        let state = make_test_app_state("dock", 620);
+
+        // 1. Real change emits exactly once with updated revision
+        let mut emitted = Vec::new();
+        let (c1, ch1) = mutate_config_with_emitter(
+            &state.config,
+            &cfg_path,
+            |cfg| {
+                cfg.bar_mode = "edge".to_string();
+                true
+            },
+            |updated| emitted.push(updated.revision),
+        )
+        .expect("real change");
+        assert!(ch1);
+        assert_eq!(c1.revision, 1);
+        assert_eq!(emitted, vec![1]);
+
+        // 2. No-op emits zero times
+        emitted.clear();
+        let (_, ch2) = mutate_config_with_emitter(
+            &state.config,
+            &cfg_path,
+            |_| false,
+            |updated| emitted.push(updated.revision),
+        )
+        .expect("no-op");
+        assert!(!ch2);
+        assert!(emitted.is_empty());
+
+        // 3. Save error emits zero times and rolls back
+        emitted.clear();
+        let dir_target = dir.join("bad-dir");
+        std::fs::create_dir_all(&dir_target).expect("create dir");
+        let err = mutate_config_with_emitter(
+            &state.config,
+            &dir_target,
+            |cfg| {
+                cfg.bar_mode = "dock".to_string();
+                true
+            },
+            |updated| emitted.push(updated.revision),
+        );
+        assert!(err.is_err());
+        assert!(emitted.is_empty());
+        assert_eq!(state.config.lock().unwrap().bar_mode, "edge");
+
+        // 4. u64::MAX revision overflow returns Err and emits zero times
+        state.config.lock().unwrap().revision = u64::MAX;
+        emitted.clear();
+        let overflow = mutate_config_with_emitter(
+            &state.config,
+            &cfg_path,
+            |cfg| {
+                cfg.bar_mode = "dock".to_string();
+                true
+            },
+            |updated| emitted.push(updated.revision),
+        );
+        assert!(overflow.is_err());
+        assert!(emitted.is_empty());
+        assert_eq!(state.config.lock().unwrap().revision, u64::MAX);
+        assert_eq!(state.config.lock().unwrap().bar_mode, "edge");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_autostart_transaction_rolls_back_registry_on_save_failure() {
+        let dir = make_lib_temp_dir("autostart-tx");
+        let cfg_path = dir.join("config.json");
+        let state = make_test_app_state("dock", 620);
+
+        // 1. Successful enable calls registry(true), bumps revision, persists config
+        let mut reg_calls = Vec::new();
+        let (c1, ch1) = apply_autostart_transaction(&state.config, &cfg_path, true, |en| {
+            reg_calls.push(en);
+            Ok(())
+        })
+        .expect("enable autostart");
+        assert!(ch1);
+        assert!(c1.autostart);
+        assert_eq!(c1.revision, 1);
+        assert_eq!(reg_calls, vec![true]);
+
+        // 2. No-op enable syncs registry but skips revision bump
+        reg_calls.clear();
+        let (c2, ch2) = apply_autostart_transaction(&state.config, &cfg_path, true, |en| {
+            reg_calls.push(en);
+            Ok(())
+        })
+        .expect("noop autostart");
+        assert!(!ch2);
+        assert_eq!(c2.revision, 1);
+        assert_eq!(reg_calls, vec![true]);
+
+        // 3. Disk failure triggers compensating registry(prev_enabled = true) rollback
+        let dir_target = dir.join("dir-fail");
+        std::fs::create_dir_all(&dir_target).expect("create dir");
+        reg_calls.clear();
+        let err = apply_autostart_transaction(&state.config, &dir_target, false, |en| {
+            reg_calls.push(en);
+            Ok(())
+        });
+        assert!(err.is_err(), "save over dir must fail");
+        assert_eq!(
+            reg_calls,
+            vec![false, true],
+            "failed save must issue compensating rollback call with previous state"
+        );
+        let in_mem = state.config.lock().unwrap().clone();
+        assert!(in_mem.autostart, "in-memory autostart must remain unchanged");
+        assert_eq!(in_mem.revision, 1, "revision must remain unchanged");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_full_document_save_config_ipc_command_is_exposed() {
+        let src = include_str!("lib.rs");
+
+        // 1. Parse all handler identifiers registered in tauri::generate_handler![...]
+        let marker = "tauri::generate_handler![";
+        let handler_start = src.find(marker).expect("generate_handler! must exist") + marker.len();
+        let handler_tail = &src[handler_start..];
+        let handler_end = handler_tail.find("])").expect("end of generate_handler!");
+        let handler_block = &handler_tail[..handler_end];
+
+        let handlers: Vec<String> = handler_block
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(|line| line.split(','))
+            .map(|tok| tok.trim())
+            .filter(|tok| !tok.is_empty())
+            .map(|tok| tok.rsplit("::").next().unwrap_or(tok).trim().to_string())
+            .collect();
+
+        assert!(!handlers.is_empty(), "generate_handler! must list commands");
+        assert!(
+            !handlers.iter().any(|h| h == "save_config"),
+            "generate_handler! must not register a save_config command: {handlers:?}"
+        );
+
+        // 2. Inspect every #[tauri::command] parameter list to ensure none accepts TestBarConfig
+        let mut cursor = 0usize;
+        let mut checked_commands = 0usize;
+        while let Some(rel) = src[cursor..].find("#[tauri::command]") {
+            let attr_pos = cursor + rel;
+            let line_start = src[..attr_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_end = src[attr_pos..]
+                .find('\n')
+                .map(|i| attr_pos + i)
+                .unwrap_or(src.len());
+            cursor = line_end;
+            if src[line_start..line_end].trim() != "#[tauri::command]" {
+                continue;
+            }
+            let after_attr = &src[line_end..];
+            let Some(fn_rel) = after_attr.find("fn ") else {
+                continue;
+            };
+            let fn_slice = &after_attr[fn_rel..];
+            let Some(open_paren) = fn_slice.find('(') else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut close_paren = None;
+            for (idx, ch) in fn_slice[open_paren..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_paren = Some(open_paren + idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close_paren = close_paren.expect("command signature closing paren");
+            let fn_name = fn_slice[3..open_paren].trim();
+            let params = &fn_slice[open_paren + 1..close_paren];
+            assert!(
+                !params.contains("TestBarConfig"),
+                "#[tauri::command] `{fn_name}` must not accept a full TestBarConfig parameter"
+            );
+            checked_commands += 1;
+        }
+        assert!(
+            checked_commands >= 10,
+            "expected to inspect all tauri commands, found {checked_commands}"
+        );
     }
 }

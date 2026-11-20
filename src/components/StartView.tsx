@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  applyConfigUpdate,
   ipc,
   onEvent,
   type AppWindowGroup,
@@ -72,7 +73,9 @@ export const StartView: React.FC = () => {
   const cmdInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    ipc<TestBarConfig>('get_config').then(setConfig).catch(() => {});
+    ipc<TestBarConfig>('get_config')
+      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+      .catch(() => {});
     ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
     ipc<IndexedApp[]>('get_installed_apps').then(setApps).catch(() => {});
     ipc<SteamGame[]>('get_steam_games').then(setGames).catch(() => {});
@@ -83,7 +86,9 @@ export const StartView: React.FC = () => {
     ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
 
     const subs = [
-      onEvent<TestBarConfig>('config-updated', setConfig),
+      onEvent<TestBarConfig>('config-updated', (next) =>
+        setConfig((prev) => applyConfigUpdate(prev, next)),
+      ),
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
       onEvent<IndexedApp[]>('apps-indexed', setApps),
       onEvent<SteamGame[]>('games-indexed', setGames),
@@ -153,9 +158,9 @@ export const StartView: React.FC = () => {
       pool.push({ name, cat, target, iconData, iconKey, kind });
     };
 
-    (config?.personalPins ?? []).forEach((p) => addItem(p.name, 'Личное', p.target, p.iconData || iconMap[p.target], p.iconKey, p.kind));
-    (config?.workFolders ?? []).forEach((p) => addItem(p.name, 'Папка', p.target, null, p.iconKey, 'folder'));
-    (config?.studioPins ?? []).forEach((p) => addItem(p.name, 'Студия', p.target, p.iconData || iconMap[p.target], p.iconKey, p.kind));
+    (config?.personalPins ?? []).forEach((p) => addItem(p.title, 'Личное', p.target, p.iconData || iconMap[p.target], p.iconKey, p.kind));
+    (config?.workFolders ?? []).forEach((p) => addItem(p.title, 'Папка', p.target, null, p.iconKey, 'folder'));
+    (config?.studioPins ?? []).forEach((p) => addItem(p.title, 'Студия', p.target, p.iconData || iconMap[p.target], p.iconKey, p.kind));
     games.forEach((g) => addItem(g.name, 'Игра · Steam', g.target, null, 'steam', 'app'));
     apps.forEach((a) => addItem(a.name, a.category, a.target, a.iconData, a.name, 'app'));
 
@@ -267,7 +272,7 @@ export const StartView: React.FC = () => {
     const item: PinItem = {
       id: `pin-${Date.now()}`,
       kind,
-      name: baseName,
+      title: baseName,
       subtitle: kind === 'folder' ? 'Папка' : 'Файл',
       target: picked,
       altAction: kind === 'folder' ? 'Открыть в терминале' : 'Открыть',
@@ -275,7 +280,7 @@ export const StartView: React.FC = () => {
       iconKey: kind,
       iconData: null,
     };
-    await ipc('add_pin', { space: targetSpace, item });
+    await ipc('add_pin', { space: targetSpace, item }).catch(() => {});
     setDrawerOpen(false);
   };
 
@@ -293,7 +298,7 @@ export const StartView: React.FC = () => {
       item: {
         id: `url-${Date.now()}`,
         kind: 'url',
-        name: label,
+        title: label,
         subtitle: 'Ссылка',
         target: raw,
         altAction: 'Открыть',
@@ -301,7 +306,7 @@ export const StartView: React.FC = () => {
         iconKey: 'url',
         iconData: null,
       },
-    });
+    }).catch(() => {});
     setUrlValue('');
     setUrlPromptOpen(false);
     setDrawerOpen(false);
@@ -340,7 +345,7 @@ export const StartView: React.FC = () => {
           e.preventDefault();
           e.currentTarget.classList.remove('drag-over');
           if (editMode && dragIdx !== null && dragIdx !== idx) {
-            ipc('reorder_pins', { space: spaceKey, fromIdx: dragIdx, toIdx: idx });
+            ipc('reorder_pins', { space: spaceKey, fromIdx: dragIdx, toIdx: idx }).catch(() => {});
           }
           setDragIdx(null);
         }}
@@ -362,7 +367,7 @@ export const StartView: React.FC = () => {
             title="Открепить"
             onClick={(e) => {
               e.stopPropagation();
-              ipc('remove_pin', { space: spaceKey, itemId: item.id });
+              ipc('remove_pin', { space: spaceKey, itemId: item.id }).catch(() => {});
             }}
           >
             <XIcon10 />
@@ -377,7 +382,7 @@ export const StartView: React.FC = () => {
           {running && <span className="run-led" />}
         </div>
         <div className="tile-meta">
-          <div className="tile-name">{item.name}</div>
+          <div className="tile-name">{item.title}</div>
           <div className={`tile-sub ${item.altAction ? 'has-alt' : ''}`}>
             {shiftHeld && item.altAction ? item.altAction : item.subtitle}
           </div>
@@ -490,9 +495,14 @@ export const StartView: React.FC = () => {
                 }}
                 onKeyDown={async (e) => {
                   if (e.key === 'Enter' && newSpaceName.trim()) {
-                    const updated = await ipc<TestBarConfig>('add_custom_space', { name: newSpaceName.trim() });
-                    const newest = updated.customSpaces[updated.customSpaces.length - 1];
-                    if (newest) setSpace(newest.id);
+                    try {
+                      const updated = await ipc<TestBarConfig>('add_custom_space', { name: newSpaceName.trim() });
+                      setConfig((prev) => applyConfigUpdate(prev, updated));
+                      const newest = updated.customSpaces[updated.customSpaces.length - 1];
+                      if (newest) setSpace(newest.id);
+                    } catch {
+                      // Ignore failed space creation so UI stays responsive
+                    }
                     setAddingSpace(false);
                     setNewSpaceName('');
                   } else if (e.key === 'Escape') {
@@ -661,7 +671,7 @@ export const StartView: React.FC = () => {
                         <button key={l.id} className="qlink" onClick={() => launchPin(l)}>
                           <FallbackAppIcon iconKey={l.iconKey} kind={l.kind} size={16} />
                           <div style={{ minWidth: 0 }}>
-                            <div className="qlink-name">{l.name}</div>
+                            <div className="qlink-name">{l.title}</div>
                             <div className="qlink-sub">{l.subtitle}</div>
                           </div>
                         </button>
@@ -837,7 +847,7 @@ export const StartView: React.FC = () => {
                               className="tile-del"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                ipc('remove_pin', { space: 'work', itemId: f.id });
+                                ipc('remove_pin', { space: 'work', itemId: f.id }).catch(() => {});
                               }}
                             >
                               <XIcon10 />
@@ -845,7 +855,7 @@ export const StartView: React.FC = () => {
                           )}
                           <div className="folder-ic-box"><FolderSvg className="ic18" /></div>
                           <div className="tile-meta">
-                            <div className="tile-name">{f.name}</div>
+                            <div className="tile-name">{f.title}</div>
                             <div className="tile-sub">{f.subtitle}</div>
                           </div>
                           {!editMode && (
@@ -890,7 +900,7 @@ export const StartView: React.FC = () => {
                             <FallbackAppIcon iconKey={a.iconKey} size={18} />
                           )}
                           <div style={{ minWidth: 0 }}>
-                            <div className="qlink-name">{a.name}</div>
+                            <div className="qlink-name">{a.title}</div>
                             <div className="qlink-sub">{a.subtitle}</div>
                           </div>
                         </button>
@@ -1010,7 +1020,7 @@ export const StartView: React.FC = () => {
                         <button key={t.id} className="qlink" onClick={() => launchPin(t)}>
                           <FallbackAppIcon iconKey={t.iconKey} size={16} />
                           <div style={{ minWidth: 0 }}>
-                            <div className="qlink-name">{t.name}</div>
+                            <div className="qlink-name">{t.title}</div>
                             <div className="qlink-sub">{t.subtitle}</div>
                           </div>
                         </button>
@@ -1166,7 +1176,7 @@ export const StartView: React.FC = () => {
                             <FallbackAppIcon iconKey={l.iconKey} size={18} />
                           )}
                           <div style={{ minWidth: 0 }}>
-                            <div className="qlink-name">{l.name}</div>
+                            <div className="qlink-name">{l.title}</div>
                             <div className="qlink-sub">{l.subtitle}</div>
                           </div>
                         </button>
@@ -1228,13 +1238,13 @@ export const StartView: React.FC = () => {
                           key={cb.id}
                           className="consumer-row"
                           style={{ width: '100%', cursor: 'pointer', textAlign: 'left', color: 'var(--t1)', fontFamily: 'inherit' }}
-                          onClick={() => ipc('launch_combo', { targets: cb.targets })}
+                          onClick={() => ipc('launch_combo', { targets: cb.comboTargets ?? [] })}
                         >
                           <span style={{ width: 28, height: 28, borderRadius: 8, background: `rgba(${cb.accentRgb}, 0.16)`, color: `rgb(${cb.accentRgb})`, display: 'grid', placeItems: 'center', flexShrink: 0 }}>
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3" /></svg>
                           </span>
                           <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 12, fontWeight: 600 }}>{cb.name}</div>
+                            <div style={{ fontSize: 12, fontWeight: 600 }}>{cb.title}</div>
                             <div style={{ fontSize: 10.5, color: 'var(--t3)' }}>{cb.subtitle}</div>
                           </div>
                         </button>
@@ -1335,7 +1345,7 @@ export const StartView: React.FC = () => {
                       item: {
                         id: `app-${Date.now()}`,
                         kind: 'app',
-                        name: a.name,
+                        title: a.name,
                         subtitle: a.category,
                         target: a.target,
                         altAction: 'От админа',
@@ -1343,7 +1353,7 @@ export const StartView: React.FC = () => {
                         iconKey: a.name.toLowerCase(),
                         iconData: a.iconData ?? null,
                       },
-                    });
+                    }).catch(() => {});
                     setDrawerOpen(false);
                   }}
                 >
@@ -1374,14 +1384,22 @@ export const StartView: React.FC = () => {
                 <button
                   className={`mini-tab ${config?.barMode !== 'edge' ? 'active' : ''}`}
                   style={{ padding: '6px 12px', fontSize: 12 }}
-                  onClick={() => ipc<TestBarConfig>('set_bar_mode', { mode: 'dock' }).then(setConfig)}
+                  onClick={() =>
+                    ipc<TestBarConfig>('set_bar_mode', { mode: 'dock' })
+                      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+                      .catch(() => {})
+                  }
                 >
                   Плавающий док
                 </button>
                 <button
                   className={`mini-tab ${config?.barMode === 'edge' ? 'active' : ''}`}
                   style={{ padding: '6px 12px', fontSize: 12 }}
-                  onClick={() => ipc<TestBarConfig>('set_bar_mode', { mode: 'edge' }).then(setConfig)}
+                  onClick={() =>
+                    ipc<TestBarConfig>('set_bar_mode', { mode: 'edge' })
+                      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+                      .catch(() => {})
+                  }
                 >
                   На всю ширину
                 </button>
@@ -1395,7 +1413,11 @@ export const StartView: React.FC = () => {
               </div>
               <button
                 className="pin-any-btn"
-                onClick={() => ipc<TestBarConfig>('set_autostart', { enable: !(config?.autostart ?? false) }).then(setConfig)}
+                onClick={() =>
+                  ipc<TestBarConfig>('set_autostart', { enable: !(config?.autostart ?? false) })
+                    .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+                    .catch(() => {})
+                }
               >
                 {config?.autostart ? 'Включён' : 'Выключен'}
               </button>
@@ -1479,7 +1501,7 @@ export const StartView: React.FC = () => {
             style={{ position: 'fixed', left: tileCtx.x, top: tileCtx.y, width: 236, zIndex: 120 }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="ctx-sec">{tileCtx.item.name}</div>
+            <div className="ctx-sec">{tileCtx.item.title}</div>
             <button
               className="ctx-item"
               onClick={() => {
@@ -1515,7 +1537,7 @@ export const StartView: React.FC = () => {
               <button
                 className="ctx-item"
                 onClick={() => {
-                  ipc('add_pin', { space: 'taskbar', item: { ...tileCtx.item, id: `tb-${Date.now()}` } });
+                  ipc('add_pin', { space: 'taskbar', item: { ...tileCtx.item, id: `tb-${Date.now()}` } }).catch(() => {});
                   setTileCtx(null);
                 }}
               >
@@ -1526,7 +1548,7 @@ export const StartView: React.FC = () => {
             <button
               className="ctx-item danger"
               onClick={() => {
-                ipc('remove_pin', { space: tileCtx.spaceKey, itemId: tileCtx.item.id });
+                ipc('remove_pin', { space: tileCtx.spaceKey, itemId: tileCtx.item.id }).catch(() => {});
                 setTileCtx(null);
               }}
             >

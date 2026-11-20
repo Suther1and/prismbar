@@ -1,25 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  applyConfigUpdate,
   ipc,
+  mergeTaskbarItems,
   onEvent,
   type AppWindowGroup,
   type AudioState,
   type FlyoutKind,
-  type PinItem,
+  type MergedBarItem,
   type TestBarConfig,
 } from '../lib/ipc';
 import { FallbackAppIcon, StartLogoIcon, VolIcon } from './Icons';
-
-interface MergedBarItem {
-  id: string;
-  name: string;
-  target: string;
-  iconKey: string;
-  iconData?: string | null;
-  pinned: boolean;
-  pinId?: string;
-  group?: AppWindowGroup;
-}
 
 export const TaskbarView: React.FC = () => {
   const [config, setConfig] = useState<TestBarConfig | null>(null);
@@ -43,13 +34,17 @@ export const TaskbarView: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    ipc<TestBarConfig>('get_config').then(setConfig).catch(() => {});
+    ipc<TestBarConfig>('get_config')
+      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+      .catch(() => {});
     ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
     ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
     ipc<string>('get_keyboard_layout').then(setLayout).catch(() => {});
 
     const subs = [
-      onEvent<TestBarConfig>('config-updated', setConfig),
+      onEvent<TestBarConfig>('config-updated', (next) =>
+        setConfig((prev) => applyConfigUpdate(prev, next)),
+      ),
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
       onEvent<AudioState>('audio-updated', setAudio),
       onEvent<string>('layout-updated', setLayout),
@@ -77,47 +72,10 @@ export const TaskbarView: React.FC = () => {
   }, [config]);
 
   // Merge pinned apps + running window groups cleanly without duplicates
-  const barItems = useMemo<MergedBarItem[]>(() => {
-    const pins: PinItem[] = config?.taskbarPins ?? [];
-    const usedGroupKeys = new Set<string>();
-    const merged: MergedBarItem[] = [];
-
-    for (const p of pins) {
-      const targetLow = p.target.toLowerCase();
-      const matchedGroup = groups.find(
-        (g) =>
-          (targetLow && g.key === targetLow) ||
-          (targetLow && g.exePath.toLowerCase().endsWith('\\' + targetLow.split('\\').pop())) ||
-          g.name.toLowerCase() === p.name.toLowerCase(),
-      );
-      if (matchedGroup) usedGroupKeys.add(matchedGroup.key);
-      merged.push({
-        id: p.id,
-        name: p.name,
-        target: p.target || matchedGroup?.exePath || '',
-        iconKey: p.iconKey,
-        iconData: matchedGroup?.iconData || p.iconData || iconMap[p.target],
-        pinned: true,
-        pinId: p.id,
-        group: matchedGroup,
-      });
-    }
-
-    for (const g of groups) {
-      if (!usedGroupKeys.has(g.key)) {
-        merged.push({
-          id: 'run-' + g.key,
-          name: g.name,
-          target: g.exePath,
-          iconKey: g.name.toLowerCase(),
-          iconData: g.iconData,
-          pinned: false,
-          group: g,
-        });
-      }
-    }
-    return merged;
-  }, [config, groups, iconMap]);
+  const barItems = useMemo<MergedBarItem[]>(
+    () => mergeTaskbarItems(config?.taskbarPins ?? [], groups, iconMap),
+    [config, groups, iconMap],
+  );
 
   // Auto-size floating dock window to exact capsule width so desktop left/right stays clickable
   useEffect(() => {

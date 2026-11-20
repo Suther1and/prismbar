@@ -3,22 +3,18 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export interface PinItem {
   id: string;
-  kind: 'app' | 'folder' | 'file' | 'url';
-  name: string;
+  kind: 'app' | 'folder' | 'file' | 'url' | 'combo';
+  title: string;
   subtitle: string;
   target: string;
+  args?: string | null;
   altAction: string;
   accentRgb: string;
   iconKey: string;
   iconData?: string | null;
-}
-
-export interface GameCombo {
-  id: string;
-  name: string;
-  subtitle: string;
-  targets: string[];
-  accentRgb: string;
+  matchExe?: string | null;
+  matchAumid?: string | null;
+  comboTargets?: string[] | null;
 }
 
 export interface CustomSpace {
@@ -30,6 +26,8 @@ export interface CustomSpace {
 }
 
 export interface TestBarConfig {
+  schemaVersion: number;
+  revision: number;
   barMode: 'dock' | 'edge';
   autostart: boolean;
   taskbarPins: PinItem[];
@@ -40,8 +38,9 @@ export interface TestBarConfig {
   studioPins: PinItem[];
   studioTools: PinItem[];
   gameLaunchers: PinItem[];
-  gameCombos: GameCombo[];
+  gameCombos: PinItem[];
   customSpaces: CustomSpace[];
+  pinnedClipboard: string[];
 }
 
 export interface OpenWindowInfo {
@@ -185,7 +184,118 @@ export interface FlyoutRequest {
   payload: unknown;
 }
 
+export interface MergedBarItem {
+  id: string;
+  name: string;
+  target: string;
+  iconKey: string;
+  iconData?: string | null;
+  pinned: boolean;
+  pinId?: string;
+  group?: AppWindowGroup;
+}
+
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+function isValidRevision(rev: unknown): rev is number {
+  return typeof rev === 'number' && Number.isSafeInteger(rev) && rev >= 0;
+}
+
+export function shouldApplyConfigUpdate(
+  prev: Pick<TestBarConfig, 'revision'> | null | undefined,
+  next: Pick<TestBarConfig, 'revision'> | null | undefined,
+): boolean {
+  if (!next || !isValidRevision(next.revision)) {
+    return false;
+  }
+  if (!prev || !isValidRevision(prev.revision)) {
+    return true;
+  }
+  return next.revision > prev.revision;
+}
+
+export function applyConfigUpdate(
+  prev: TestBarConfig | null,
+  next: TestBarConfig | null | undefined,
+): TestBarConfig | null {
+  if (!next || !shouldApplyConfigUpdate(prev, next)) {
+    return prev;
+  }
+  return next;
+}
+
+function normalizePath(p: string | null | undefined): string {
+  if (!p) return '';
+  return p.trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function extractBasename(p: string | null | undefined): string {
+  const norm = normalizePath(p);
+  if (!norm || norm.endsWith('\\')) return '';
+  const idx = norm.lastIndexOf('\\');
+  return idx >= 0 ? norm.slice(idx + 1) : norm;
+}
+
+export function mergeTaskbarItems(
+  pins: PinItem[],
+  groups: AppWindowGroup[],
+  iconMap: Record<string, string>,
+): MergedBarItem[] {
+  const usedGroupKeys = new Set<string>();
+  const merged: MergedBarItem[] = [];
+
+  for (const p of pins) {
+    const targetNorm = normalizePath(p.target);
+    const targetBase = extractBasename(p.target);
+    const matchExeBase = extractBasename(p.matchExe);
+    const titleLow = p.title.trim().toLowerCase();
+
+    const matchedGroup = groups.find((g) => {
+      if (usedGroupKeys.has(g.key)) return false;
+      const groupKeyNorm = normalizePath(g.key);
+      const groupBase = extractBasename(g.exePath);
+      const groupNameLow = g.name.trim().toLowerCase();
+
+      return (
+        (Boolean(targetNorm) && groupKeyNorm === targetNorm) ||
+        (Boolean(matchExeBase) && Boolean(groupBase) && groupBase === matchExeBase) ||
+        (Boolean(targetBase) && Boolean(groupBase) && groupBase === targetBase) ||
+        (Boolean(titleLow) && Boolean(groupNameLow) && groupNameLow === titleLow)
+      );
+    });
+
+    if (matchedGroup) {
+      usedGroupKeys.add(matchedGroup.key);
+    }
+
+    merged.push({
+      id: p.id,
+      name: p.title,
+      target: p.target || matchedGroup?.exePath || '',
+      iconKey: p.iconKey,
+      iconData: matchedGroup?.iconData || p.iconData || iconMap[p.target],
+      pinned: true,
+      pinId: p.id,
+      group: matchedGroup,
+    });
+  }
+
+  for (const g of groups) {
+    if (!usedGroupKeys.has(g.key)) {
+      merged.push({
+        id: 'run-' + g.key,
+        name: g.name,
+        target: g.exePath,
+        iconKey: g.name.toLowerCase(),
+        iconData: g.iconData,
+        pinned: false,
+        group: g,
+      });
+    }
+  }
+
+  return merged;
+}
 
 export async function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(cmd, args);
