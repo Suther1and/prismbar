@@ -47,6 +47,7 @@ covers = ["R5"]
 after = [3]
 hitl = false
 risk = "medium"
+refine = true
 
 [[entry]]
 id = 5

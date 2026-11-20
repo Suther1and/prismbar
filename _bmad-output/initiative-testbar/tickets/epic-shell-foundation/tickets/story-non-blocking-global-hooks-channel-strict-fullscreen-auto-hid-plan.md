@@ -3,7 +3,7 @@ title: 'Non-blocking global hooks channel & strict fullscreen auto-hide integrat
 type: 'feature'
 ticket: '3'
 created: '2026-11-20'
-status: 'built'
+status: done
 baseline_revision: '98f50d76e5d072d4130a1158ec067de171daabac'
 route: 'full'
 route_source: 'auto'
