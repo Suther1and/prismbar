@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
-use apps_indexer::{IndexedApp, SteamGame};
+use apps_indexer::{IndexedApp, IndexedFile, SteamGame};
 use audio::{AudioMasterState, AudioState};
 use config::{CustomSpace, PinItem, TestBarConfig};
 use coordinator::{
@@ -33,14 +33,17 @@ const DOCK_HORIZONTAL_PADDING_LOGICAL: i32 = 36; // 18px left + 18px right trans
 const START_DEFAULT_LOGICAL_WIDTH: f64 = 1172.0;
 const START_DEFAULT_LOGICAL_HEIGHT: f64 = 712.0;
 const FLYOUT_EXIT_ANIM_MS: u64 = 130;
+const START_EXIT_ANIM_MS: u64 = 135;
 
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 
 pub struct AppState {
     pub config: Mutex<TestBarConfig>,
     pub icon_cache: Mutex<IconCache>,
+    pub icon_sources: Mutex<HashMap<String, String>>,
     pub last_window_groups: Mutex<Vec<AppWindowGroup>>,
     pub installed_apps: Mutex<Vec<IndexedApp>>,
+    pub indexed_files: Mutex<Vec<IndexedFile>>,
     pub steam_games: Mutex<Vec<SteamGame>>,
     pub hide_native: bool,
     pub coordinator: Mutex<WindowCoordinator>,
@@ -51,6 +54,7 @@ pub struct AppState {
     pub secondary_taskbar_visible: Arc<AtomicBool>,
     pub last_flyout_req: Mutex<Option<FlyoutRequest>>,
     pub flyout_anim_gen: Arc<AtomicU64>,
+    pub start_anim_gen: Arc<AtomicU64>,
     pub dpi_override: AtomicU32,
 }
 
@@ -287,13 +291,16 @@ fn reevaluate_fullscreen(app: &AppHandle, hint_entering: Option<bool>) -> Coordi
 
 fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
     let st = app.state::<AppState>();
-    let flyout_active = lock_unpoisoned(&st.coordinator).is_flyout_visible();
+    let (start_active, flyout_active) = {
+        let coord = lock_unpoisoned(&st.coordinator);
+        (coord.is_start_visible(), coord.is_flyout_visible())
+    };
     let secondary_visible = st.secondary_taskbar_visible.load(Ordering::Acquire);
     let mut rects = Vec::with_capacity(4);
     for (label, include) in [
         ("taskbar", true),
         ("taskbar-secondary", secondary_visible),
-        ("start", true),
+        ("start", start_active),
         ("flyout", flyout_active),
     ] {
         if !include {
@@ -658,11 +665,47 @@ fn apply_coordinator_actions(
             });
         }
     }
+    let mut start_state_emitted_early = false;
     if actions.start_visible == Some(false) {
-        if let Some(win) = app.get_webview_window("start") {
-            if let Some(hwnd) = win_hwnd(&win) {
-                win_shell::set_window_visible(hwnd, false, true);
+        let hide_gen = st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let hide_immediately =
+            actions.flyout_visible == Some(true) || actions.taskbar_visible == Some(false);
+
+        if actions.emit_start_state == Some(false) {
+            let _ = app.emit("start-state", false);
+            start_state_emitted_early = true;
+        }
+
+        if hide_immediately {
+            if let Some(win) = app.get_webview_window("start") {
+                if let Some(hwnd) = win_hwnd(&win) {
+                    win_shell::set_window_visible(hwnd, false, true);
+                }
             }
+        } else {
+            let h_hide = app.clone();
+            let anim_gen = Arc::clone(&st.start_anim_gen);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(START_EXIT_ANIM_MS));
+                if anim_gen.load(Ordering::SeqCst) != hide_gen {
+                    return;
+                }
+                let h = h_hide.clone();
+                let _ = h_hide.run_on_main_thread(move || {
+                    if anim_gen.load(Ordering::SeqCst) != hide_gen {
+                        return;
+                    }
+                    let still_hidden =
+                        !lock_unpoisoned(&h.state::<AppState>().coordinator).is_start_visible();
+                    if still_hidden {
+                        if let Some(win) = h.get_webview_window("start") {
+                            if let Some(hwnd) = win_hwnd(&win) {
+                                win_shell::set_window_visible(hwnd, false, true);
+                            }
+                        }
+                    }
+                });
+            });
         }
     }
 
@@ -681,6 +724,8 @@ fn apply_coordinator_actions(
 
     // 3. Show incoming surfaces via visibility only (never 1x1 shrink or per-open GWL_EXSTYLE flip)
     if actions.start_visible == Some(true) {
+        // Cancel any pending delayed hide from a prior Start exit animation
+        st.start_anim_gen.fetch_add(1, Ordering::SeqCst);
         if let Some(win) = app.get_webview_window("start") {
             if let Some(hwnd) = win_hwnd(&win) {
                 position_start_window(app, &win, hwnd);
@@ -689,14 +734,24 @@ fn apply_coordinator_actions(
             }
         }
         // Hydrate Start immediately on hidden -> visible transition (AD-6)
-        let snapshot = lock_unpoisoned(&st.last_window_groups).clone();
-        let _ = app.emit_to("start", "windows-updated", &snapshot);
-        let h_aud = app.clone();
+        let cfg_snapshot = lock_unpoisoned(&st.config).clone();
+        let win_snapshot = lock_unpoisoned(&st.last_window_groups).clone();
+        let clips_snapshot = system_widgets::get_clipboard_history();
+        let _ = app.emit_to("start", "config-updated", &cfg_snapshot);
+        let _ = app.emit_to("start", "windows-updated", &win_snapshot);
+        let _ = app.emit_to("start", "clipboard-updated", &clips_snapshot);
+        let h_hyd = app.clone();
         std::thread::spawn(move || {
             let aud = audio::get_audio_state();
-            if lock_unpoisoned(&h_aud.state::<AppState>().coordinator).is_start_visible() {
-                let _ = h_aud.emit_to("start", "audio-mixer-updated", &aud);
-                let _ = h_aud.emit_to("start", "audio-master-updated", &aud.to_master_state());
+            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+                let _ = h_hyd.emit_to("start", "audio-mixer-updated", &aud);
+                let _ = h_hyd.emit_to("start", "audio-master-updated", &aud.to_master_state());
+            }
+            let med = media::get_media_state();
+            let tel = telemetry::get_telemetry();
+            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+                let _ = h_hyd.emit_to("start", "media-updated", &med);
+                let _ = h_hyd.emit_to("start", "telemetry-updated", &tel);
             }
         });
     }
@@ -752,7 +807,9 @@ fn apply_coordinator_actions(
 
     // 4. Emit canonical state events
     if let Some(vis) = actions.emit_start_state {
-        let _ = app.emit("start-state", vis);
+        if !(start_state_emitted_early && !vis) {
+            let _ = app.emit("start-state", vis);
+        }
     }
     if actions.emit_flyout_hide && actions.flyout_visible != Some(false) {
         let _ = app.emit("flyout-hide", ());
@@ -1061,7 +1118,48 @@ fn get_open_windows(state: State<AppState>) -> Vec<AppWindowGroup> {
 
 #[tauri::command]
 fn get_icons(state: State<AppState>, keys: Vec<String>) -> HashMap<String, String> {
-    lock_unpoisoned(&state.icon_cache).get_batch(&keys)
+    let mut resolved = lock_unpoisoned(&state.icon_cache).get_batch(&keys);
+    let missing: Vec<(String, String)> = {
+        let sources = lock_unpoisoned(&state.icon_sources);
+        keys.iter()
+            .filter(|k| !k.is_empty() && !resolved.contains_key(*k))
+            .filter_map(|k| sources.get(k).map(|src| (k.clone(), src.clone())))
+            .collect()
+    };
+    for (key, src) in missing {
+        if let Some(uri) = windows_tracker::extract_icon_for_path_cached(&src, &state.icon_cache) {
+            resolved.insert(key, uri);
+        }
+    }
+    resolved
+}
+
+#[tauri::command]
+fn resolve_pin_icons(state: State<AppState>, targets: Vec<String>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in targets {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        let low = trimmed.to_ascii_lowercase();
+        let is_local_or_uwp =
+            trimmed.contains(":\\") || trimmed.starts_with("\\\\") || low.starts_with("shell:appsfolder\\");
+        if !is_local_or_uwp {
+            continue;
+        }
+        if let Some(uri) = windows_tracker::extract_icon_for_path_cached(trimmed, &state.icon_cache) {
+            let key = if low.starts_with("shell:appsfolder\\") {
+                icon_cache::aumid_key(trimmed)
+            } else {
+                icon_cache::path_icon_key(trimmed)
+            };
+            lock_unpoisoned(&state.icon_sources).insert(key, trimmed.to_string());
+            out.insert(trimmed.to_string(), uri);
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1131,6 +1229,11 @@ fn get_installed_apps(state: State<AppState>) -> Vec<IndexedApp> {
 }
 
 #[tauri::command]
+fn get_indexed_files(state: State<AppState>) -> Vec<IndexedFile> {
+    lock_unpoisoned(&state.indexed_files).clone()
+}
+
+#[tauri::command]
 fn get_steam_games(state: State<AppState>) -> Vec<SteamGame> {
     lock_unpoisoned(&state.steam_games).clone()
 }
@@ -1181,23 +1284,60 @@ fn reorder_pins(
     Ok(updated)
 }
 
+fn sanitize_custom_space_accent(
+    accent_hex: Option<&str>,
+    accent_rgb: Option<&str>,
+) -> (String, String) {
+    let hex = accent_hex
+        .map(str::trim)
+        .filter(|h| h.len() == 7 && h.starts_with('#') && h[1..].chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or("#A78BFA");
+    let rgb = accent_rgb
+        .map(str::trim)
+        .filter(|r| {
+            let parts: Vec<&str> = r.split(',').collect();
+            parts.len() == 3 && parts.iter().all(|p| p.trim().parse::<u8>().is_ok())
+        })
+        .map(|r| {
+            r.split(',')
+                .map(|p| p.trim())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[1..3], 16),
+                u8::from_str_radix(&hex[3..5], 16),
+                u8::from_str_radix(&hex[5..7], 16),
+            ) {
+                format!("{r},{g},{b}")
+            } else {
+                "167,139,250".to_string()
+            }
+        });
+    (hex.to_uppercase(), rgb)
+}
+
 #[tauri::command]
 fn add_custom_space(
     app: AppHandle,
     state: State<AppState>,
     name: String,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
 ) -> Result<TestBarConfig, String> {
     let clean = name.trim().to_string();
     if clean.is_empty() {
         return Err("Пустое название".to_string());
     }
+    let (hex, rgb) = sanitize_custom_space_accent(accent_hex.as_deref(), accent_rgb.as_deref());
     let id = format!("custom-{}", now_ms());
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         cfg.custom_spaces.push(CustomSpace {
             id,
             name: clean,
-            accent_hex: "#A78BFA".to_string(),
-            accent_rgb: "167,139,250".to_string(),
+            accent_hex: hex,
+            accent_rgb: rgb,
             items: vec![],
         });
         true
@@ -1469,12 +1609,15 @@ pub fn run(hide_native: bool) {
     let fullscreen_suppressed = Arc::new(AtomicBool::new(false));
     let secondary_taskbar_visible = Arc::new(AtomicBool::new(false));
     let flyout_anim_gen = Arc::new(AtomicU64::new(0));
+    let start_anim_gen = Arc::new(AtomicU64::new(0));
     win_shell::set_overlay_open_hint(false);
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
         icon_cache: Mutex::new(IconCache::default()),
+        icon_sources: Mutex::new(HashMap::new()),
         last_window_groups: Mutex::new(Vec::new()),
         installed_apps: Mutex::new(Vec::new()),
+        indexed_files: Mutex::new(Vec::new()),
         steam_games: Mutex::new(Vec::new()),
         hide_native,
         coordinator: Mutex::new(WindowCoordinator::new()),
@@ -1485,6 +1628,7 @@ pub fn run(hide_native: bool) {
         secondary_taskbar_visible: Arc::clone(&secondary_taskbar_visible),
         last_flyout_req: Mutex::new(None),
         flyout_anim_gen: Arc::clone(&flyout_anim_gen),
+        start_anim_gen: Arc::clone(&start_anim_gen),
         dpi_override: AtomicU32::new(0),
     };
 
@@ -1505,6 +1649,7 @@ pub fn run(hide_native: bool) {
             close_preview_if_outside,
             get_open_windows,
             get_icons,
+            resolve_pin_icons,
             get_jump_list,
             get_window_thumbnail,
             focus_window,
@@ -1515,6 +1660,7 @@ pub fn run(hide_native: bool) {
             open_location,
             open_terminal_at,
             get_installed_apps,
+            get_indexed_files,
             get_steam_games,
             add_pin,
             remove_pin,
@@ -1691,18 +1837,32 @@ pub fn run(hide_native: bool) {
                 let _ = h_clip.emit("clipboard-updated", &entries);
             });
 
-            // Async background app & Steam library indexer (non-blocking startup)
+            // Async background app (Start .lnk + UWP), Steam library & user files indexer (non-blocking startup)
             let h_idx = handle.clone();
             std::thread::spawn(move || {
-                let apps = apps_indexer::scan_installed_apps();
-                let games = apps_indexer::scan_steam_games();
+                let apps = {
+                    let st = h_idx.state::<AppState>();
+                    apps_indexer::scan_installed_apps_cached(&st.icon_cache, Some(&st.icon_sources))
+                };
                 {
                     let st = h_idx.state::<AppState>();
                     *lock_unpoisoned(&st.installed_apps) = apps.clone();
-                    *lock_unpoisoned(&st.steam_games) = games.clone();
                 }
                 let _ = h_idx.emit("apps-indexed", &apps);
+
+                let games = apps_indexer::scan_steam_games();
+                {
+                    let st = h_idx.state::<AppState>();
+                    *lock_unpoisoned(&st.steam_games) = games.clone();
+                }
                 let _ = h_idx.emit("games-indexed", &games);
+
+                let files = apps_indexer::scan_user_files();
+                {
+                    let st = h_idx.state::<AppState>();
+                    *lock_unpoisoned(&st.indexed_files) = files.clone();
+                }
+                let _ = h_idx.emit("files-indexed", &files);
             });
 
             // Fast lightweight poller for open windows (diff-only visible-window broadcast),
@@ -1899,8 +2059,10 @@ mod integration_tests {
         AppState {
             config: Mutex::new(cfg),
             icon_cache: Mutex::new(IconCache::default()),
+            icon_sources: Mutex::new(HashMap::new()),
             last_window_groups: Mutex::new(Vec::new()),
             installed_apps: Mutex::new(Vec::new()),
+            indexed_files: Mutex::new(Vec::new()),
             steam_games: Mutex::new(Vec::new()),
             hide_native: false,
             coordinator: Mutex::new(WindowCoordinator::new()),
@@ -1911,6 +2073,7 @@ mod integration_tests {
             secondary_taskbar_visible: Arc::new(AtomicBool::new(false)),
             last_flyout_req: Mutex::new(None),
             flyout_anim_gen: Arc::new(AtomicU64::new(0)),
+            start_anim_gen: Arc::new(AtomicU64::new(0)),
             dpi_override: AtomicU32::new(0),
         }
     }
@@ -2773,6 +2936,26 @@ mod integration_tests {
         assert_eq!(
             diff_audio_mixer_targets(&mut last_mixer, &full, &coord),
             None
+        );
+    }
+
+    #[test]
+    fn custom_space_accent_sanitization_validates_hex_and_derives_rgb() {
+        assert_eq!(
+            sanitize_custom_space_accent(Some("#38bdf8"), Some("56, 189, 248")),
+            ("#38BDF8".to_string(), "56,189,248".to_string())
+        );
+        assert_eq!(
+            sanitize_custom_space_accent(Some("#34d399"), None),
+            ("#34D399".to_string(), "52,211,153".to_string())
+        );
+        assert_eq!(
+            sanitize_custom_space_accent(Some("not-a-color"), Some("999,0,0")),
+            ("#A78BFA".to_string(), "167,139,250".to_string())
+        );
+        assert_eq!(
+            sanitize_custom_space_accent(None, None),
+            ("#A78BFA".to_string(), "167,139,250".to_string())
         );
     }
 }

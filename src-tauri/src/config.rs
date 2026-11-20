@@ -303,6 +303,15 @@ pub fn derive_match_exe(target: &str) -> Option<String> {
     }
 }
 
+pub fn is_discord_update_target(target: &str) -> bool {
+    let norm = target
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    norm.ends_with(r"\discord\update.exe")
+}
+
 fn pin(
     id: &str,
     kind: &str,
@@ -313,7 +322,15 @@ fn pin(
     accent_rgb: &str,
     icon_key: &str,
 ) -> PinItem {
-    let match_exe = if kind == "app" {
+    let is_discord_squirrel = kind == "app" && is_discord_update_target(&target);
+    let args = if is_discord_squirrel {
+        Some("--processStart Discord.exe".to_string())
+    } else {
+        None
+    };
+    let match_exe = if is_discord_squirrel {
+        Some("discord.exe".to_string())
+    } else if kind == "app" {
         derive_match_exe(&target)
     } else {
         None
@@ -324,7 +341,7 @@ fn pin(
         title: title.to_string(),
         subtitle: subtitle.to_string(),
         target,
-        args: None,
+        args,
         alt_action: alt_action.to_string(),
         accent_rgb: accent_rgb.to_string(),
         icon_key: icon_key.to_string(),
@@ -414,6 +431,12 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         }
     }
 
+    let is_discord_squirrel = item.kind == "app" && is_discord_update_target(&item.target);
+    if is_discord_squirrel && item.args.is_none() {
+        item.args = Some("--processStart Discord.exe".to_string());
+        changed = true;
+    }
+
     if let Some(ref aumid) = item.match_aumid {
         let trimmed = aumid.trim();
         if trimmed.is_empty() {
@@ -430,7 +453,12 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         .as_deref()
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
-    let desired_exe = if item.kind == "app" {
+    let desired_exe = if is_discord_squirrel {
+        match normalized_existing_exe.as_deref() {
+            None | Some("update.exe") => Some("discord.exe".to_string()),
+            Some(_) => normalized_existing_exe,
+        }
+    } else if item.kind == "app" {
         normalized_existing_exe.or_else(|| derive_match_exe(&item.target))
     } else {
         normalized_existing_exe
@@ -1206,15 +1234,15 @@ mod tests {
             PinItem {
                 id: "override-app".to_string(),
                 kind: "  APP ".to_string(),
-                title: "Discord".to_string(),
+                title: "Slack".to_string(),
                 subtitle: "Chat".to_string(),
-                target: r"C:\Discord\Update.exe".to_string(),
+                target: r"C:\Slack\Update.exe".to_string(),
                 args: Some("   ".to_string()),
                 alt_action: String::new(),
                 accent_rgb: String::new(),
                 icon_key: String::new(),
                 icon_data: None,
-                match_exe: Some("  Discord.EXE ".to_string()),
+                match_exe: Some("  Slack.EXE ".to_string()),
                 match_aumid: Some("   ".to_string()),
                 combo_targets: None,
             },
@@ -1281,7 +1309,7 @@ mod tests {
         assert_eq!(cfg.personal_pins[0].kind, "app");
         assert_eq!(
             cfg.personal_pins[0].match_exe.as_deref(),
-            Some("discord.exe"),
+            Some("slack.exe"),
             "explicit match_exe override must be preserved instead of replaced by update.exe"
         );
         assert_eq!(cfg.personal_pins[0].args, None);
@@ -1869,5 +1897,55 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discord_squirrel_update_exe_normalizes_args_and_match_exe() {
+        let target = r"C:\Users\alice\AppData\Local\Discord\Update.exe".to_string();
+        let created = pin(
+            "discord",
+            "app",
+            "Discord",
+            "Голос и чаты",
+            target.clone(),
+            "Каналы",
+            "99,102,241",
+            "discord",
+        );
+        assert_eq!(created.args.as_deref(), Some("--processStart Discord.exe"));
+        assert_eq!(created.match_exe.as_deref(), Some("discord.exe"));
+
+        // Legacy persisted Discord pin with Update.exe and no args / wrong match_exe migrates cleanly
+        let mut legacy = PinItem {
+            id: "discord".to_string(),
+            kind: "app".to_string(),
+            title: "Discord".to_string(),
+            subtitle: "Голос".to_string(),
+            target,
+            args: None,
+            alt_action: "Каналы".to_string(),
+            accent_rgb: "99,102,241".to_string(),
+            icon_key: "discord".to_string(),
+            icon_data: None,
+            match_exe: Some("update.exe".to_string()),
+            match_aumid: None,
+            combo_targets: None,
+        };
+        assert!(normalize_pin(&mut legacy, false));
+        assert_eq!(legacy.args.as_deref(), Some("--processStart Discord.exe"));
+        assert_eq!(legacy.match_exe.as_deref(), Some("discord.exe"));
+        // Idempotent second pass
+        assert!(!normalize_pin(&mut legacy, false));
+
+        // Non-Discord Update.exe is untouched
+        let mut other = PinItem {
+            target: r"C:\Users\alice\AppData\Local\OtherApp\Update.exe".to_string(),
+            args: None,
+            match_exe: None,
+            ..legacy.clone()
+        };
+        assert!(normalize_pin(&mut other, false));
+        assert_eq!(other.args, None);
+        assert_eq!(other.match_exe.as_deref(), Some("update.exe"));
     }
 }

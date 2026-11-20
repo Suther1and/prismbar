@@ -73,7 +73,18 @@ export interface IndexedApp {
   name: string;
   category: string;
   target: string;
+  aumid?: string | null;
+  iconKey?: string | null;
   iconData?: string | null;
+}
+
+export interface IndexedFile {
+  id: string;
+  name: string;
+  kind: 'file' | 'folder';
+  location: string;
+  target: string;
+  modifiedTs: number;
 }
 
 export interface SteamGame {

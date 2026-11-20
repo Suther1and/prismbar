@@ -150,6 +150,109 @@ export const GlobeSvg: React.FC<{ className?: string; color?: string }> = ({ cla
   </svg>
 );
 
+export const SearchIcon: React.FC<{ className?: string; color?: string }> = ({
+  className = 'ic14',
+  color = 'currentColor',
+}) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.9" strokeLinecap="round">
+    <circle cx="11" cy="11" r="7" />
+    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+  </svg>
+);
+
+export const PlayTriangleIcon: React.FC<{ className?: string; size?: number }> = ({ className, size = 11 }) => (
+  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+    <polygon points="6 4 20 12 6 20 6 4" />
+  </svg>
+);
+
+export const ExternalArrowIcon: React.FC<{ className?: string }> = ({ className = 'ic12' }) => (
+  <svg className={className} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="7" y1="17" x2="17" y2="7" />
+    <polyline points="8 7 17 7 17 16" />
+  </svg>
+);
+
+export const CheckIcon: React.FC<{ className?: string; size?: number }> = ({ className, size = 12 }) => (
+  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+);
+
+export const PlusIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <line x1="12" y1="5" x2="12" y2="19" />
+    <line x1="5" y1="12" x2="19" y2="12" />
+  </svg>
+);
+
+export const EditPencilIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+  </svg>
+);
+
+export const AppsGridIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+    <rect x="3" y="3" width="7" height="7" rx="1.5" />
+    <rect x="14" y="3" width="7" height="7" rx="1.5" />
+    <rect x="3" y="14" width="7" height="7" rx="1.5" />
+    <rect x="14" y="14" width="7" height="7" rx="1.5" />
+  </svg>
+);
+
+export const PowerIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+    <line x1="12" y1="2" x2="12" y2="12" />
+  </svg>
+);
+
+export const MouseIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+    <rect x="6" y="3" width="12" height="18" rx="6" />
+    <line x1="12" y1="7" x2="12" y2="10" />
+  </svg>
+);
+
+export const HeadphonesIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+    <path d="M3 18v-6a9 9 0 0 1 18 0v6" />
+    <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z" />
+  </svg>
+);
+
+export const MicIcon: React.FC<{ className?: string; muted?: boolean }> = ({ className = 'ic16', muted = false }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+    <line x1="12" y1="19" x2="12" y2="23" />
+    {muted && <line x1="3" y1="3" x2="21" y2="21" stroke="#FB7185" strokeWidth="2" />}
+  </svg>
+);
+
+export const RestoreWindowsIcon: React.FC<{ className?: string }> = ({ className = 'ic16' }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+    <polyline points="3 3 3 8 8 8" />
+  </svg>
+);
+
+export const ArrowUpIcon: React.FC<{ size?: number }> = ({ size = 10 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="12" y1="19" x2="12" y2="5" />
+    <polyline points="5 12 12 5 19 12" />
+  </svg>
+);
+
+export const ArrowDownIcon: React.FC<{ size?: number }> = ({ size = 10 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="12" y1="5" x2="12" y2="19" />
+    <polyline points="19 12 12 19 5 12" />
+  </svg>
+);
+
 export const FallbackAppIcon: React.FC<{ iconKey?: string; kind?: string; size?: number }> = ({
   iconKey = '',
   kind = 'app',

@@ -1,26 +1,57 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use windows::core::{Interface, PCWSTR};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
+use windows::core::{Interface, GUID, PCWSTR, PWSTR};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, STGM,
+    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM,
 };
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+use windows::Win32::UI::Shell::{
+    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItem2, IShellLinkW,
+    SHGetKnownFolderItem, ShellLink, KF_FLAG_DEFAULT, SIGDN_DESKTOPABSOLUTEPARSING,
+    SIGDN_NORMALDISPLAY,
+};
 
+use crate::icon_cache::{self, IconCache};
 use crate::win_shell::wide;
-use crate::windows_tracker::extract_icon_for_path;
+use crate::windows_tracker::{extract_icon_for_path_cached, ComGuard};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PKEY_AppUserModel_ID` (`{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}`, pid 5).
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x9F4C_2855_9F79_4B39_A8D0_E1D4_2DE1_D5F3),
+    pid: 5,
+};
+
+pub const DEFAULT_USER_FILE_MAX_DEPTH: usize = 2;
+pub const DEFAULT_USER_FILE_CAP: usize = 400;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexedApp {
     pub id: String,
     pub name: String,
     pub category: String,
     pub target: String,
+    pub aumid: Option<String>,
+    pub icon_key: Option<String>,
     pub icon_data: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedFile {
+    pub id: String,
+    pub name: String,
+    /// `"file"` | `"folder"`
+    pub kind: String,
+    /// `"Рабочий стол"` | `"Документы"` | `"Загрузки"`
+    pub location: String,
+    pub target: String,
+    pub modified_ts: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,41 +65,202 @@ pub struct SteamGame {
     pub last_updated: u64,
 }
 
-fn resolve_lnk_target(lnk_path: &Path) -> Option<String> {
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn pwstr_to_string_and_free(raw: PWSTR) -> Option<String> {
+    if raw.0.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let s = raw.to_string().ok();
+        CoTaskMemFree(Some(raw.0 as *const std::ffi::c_void));
+        s
+    }?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn resolve_lnk_target_and_args(lnk_path: &Path) -> Option<(String, String)> {
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         let pf: IPersistFile = link.cast().ok()?;
         let w = wide(&lnk_path.to_string_lossy());
         pf.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
-        let mut buf = [0u16; 1024];
+
+        let mut path_buf = [0u16; 1024];
         let mut fd = std::mem::zeroed();
-        link.GetPath(&mut buf, &mut fd, 0).ok()?;
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let resolved = String::from_utf16_lossy(&buf[..len]);
+        link.GetPath(&mut path_buf, &mut fd, 0).ok()?;
+        let path_len = path_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(path_buf.len());
+        let resolved = String::from_utf16_lossy(&path_buf[..path_len])
+            .trim()
+            .to_string();
         if resolved.is_empty() {
-            None
-        } else {
-            Some(resolved)
+            return None;
         }
+
+        let mut args_buf = [0u16; 512];
+        let args = if link.GetArguments(&mut args_buf).is_ok() {
+            let args_len = args_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(args_buf.len());
+            String::from_utf16_lossy(&args_buf[..args_len])
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        Some((resolved, args))
     }
 }
 
-fn categorize_app(name: &str, path: &str) -> String {
-    let low = format!("{} {}", name.to_ascii_lowercase(), path.to_ascii_lowercase());
-    if low.contains("browser") || low.contains("chrome") || low.contains("edge") || low.contains("firefox") || low.contains("zen") || low.contains("yandex") {
+pub fn is_ignored_app_name(name: &str) -> bool {
+    let low = name.trim().to_lowercase();
+    if low.is_empty() {
+        return true;
+    }
+    low.contains("uninstall")
+        || low.contains("удалить")
+        || low.contains("деинсталл")
+        || low.contains("readme")
+        || low.contains("release notes")
+        || low.contains("license")
+        || low.contains("лиценз")
+        || low.contains("website")
+        || low.contains("web site")
+        || low.contains("documentation")
+        || low.contains("manual")
+        || low.contains("справка")
+        || low == "help"
+        || low.ends_with(" help")
+}
+
+pub fn is_packaged_uwp_aumid(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let candidate = lower.strip_prefix("shell:appsfolder\\").unwrap_or(&lower);
+    if candidate.is_empty()
+        || candidate.contains(":\\")
+        || candidate.contains(":/")
+        || candidate.starts_with('{')
+        || candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+    {
+        return false;
+    }
+    if let Some((pkg, app_id)) = candidate.split_once('!') {
+        !pkg.trim().is_empty() && !app_id.trim().is_empty()
+    } else {
+        false
+    }
+}
+
+pub fn categorize_app(name: &str, path: &str) -> String {
+    let low = format!("{} {}", name.to_lowercase(), path.to_lowercase());
+    if low.contains("browser")
+        || low.contains("chrome")
+        || low.contains("edge")
+        || low.contains("firefox")
+        || low.contains("zen")
+        || low.contains("yandex")
+        || low.contains("brave")
+        || low.contains("opera")
+    {
         "Интернет".to_string()
-    } else if low.contains("telegram") || low.contains("discord") || low.contains("spark") || low.contains("slack") || low.contains("zoom") || low.contains("whatsapp") {
+    } else if low.contains("telegram")
+        || low.contains("discord")
+        || low.contains("spark")
+        || low.contains("slack")
+        || low.contains("zoom")
+        || low.contains("whatsapp")
+        || low.contains("teams")
+        || low.contains("mail")
+        || low.contains("почта")
+    {
         "Общение".to_string()
-    } else if low.contains("code") || low.contains("cursor") || low.contains("antigravity") || low.contains("studio") || low.contains("unity") || low.contains("git") || low.contains("terminal") || low.contains("warp") || low.contains("python") {
+    } else if low.contains("code")
+        || low.contains("cursor")
+        || low.contains("antigravity")
+        || low.contains("studio")
+        || low.contains("unity")
+        || low.contains("git")
+        || low.contains("terminal")
+        || low.contains("терминал")
+        || low.contains("warp")
+        || low.contains("python")
+        || low.contains("powershell")
+        || low.contains("docker")
+    {
         "Разработка".to_string()
-    } else if low.contains("photoshop") || low.contains("lightroom") || low.contains("figma") || low.contains("blender") || low.contains("adobe") {
+    } else if low.contains("photoshop")
+        || low.contains("lightroom")
+        || low.contains("figma")
+        || low.contains("blender")
+        || low.contains("adobe")
+        || low.contains("paint")
+        || low.contains("illustrator")
+    {
         "Дизайн".to_string()
-    } else if low.contains("claude") || low.contains("comfy") || low.contains("ollama") || low.contains("gpt") {
+    } else if low.contains("claude")
+        || low.contains("comfy")
+        || low.contains("ollama")
+        || low.contains("gpt")
+        || low.contains("copilot")
+    {
         "AI".to_string()
-    } else if low.contains("steam") || low.contains("battle.net") || low.contains("epic") || low.contains("riot") || low.contains("game") || low.contains("play") {
+    } else if low.contains("steam")
+        || low.contains("battle.net")
+        || low.contains("epic")
+        || low.contains("riot")
+        || low.contains("xbox")
+        || low.contains("game")
+        || low.contains("play")
+    {
         "Игры".to_string()
-    } else if low.contains("music") || low.contains("музыка") || low.contains("obs") || low.contains("vlc") || low.contains("spotify") {
+    } else if low.contains("music")
+        || low.contains("музыка")
+        || low.contains("obs")
+        || low.contains("vlc")
+        || low.contains("spotify")
+        || low.contains("photos")
+        || low.contains("фотограф")
+        || low.contains("media player")
+        || low.contains("медиапроигр")
+    {
         "Медиа".to_string()
+    } else if low.contains("immersivecontrolpanel")
+        || low.contains("параметры")
+        || low.contains("settings")
+        || low.contains("calculator")
+        || low.contains("калькулятор")
+        || low.contains("windowsstore")
+        || low.contains("microsoft store")
+        || low.contains("notepad")
+        || low.contains("блокнот")
+        || low.contains("snipping")
+        || low.contains("ножницы")
+        || low.contains("clock")
+        || low.contains("часы")
+        || low.contains("sechealthui")
+        || low.contains("безопасност")
+        || low.contains("taskmgr")
+        || low.contains("explorer")
+        || low.contains("проводник")
+    {
+        "Система".to_string()
     } else {
         "Программы".to_string()
     }
@@ -83,14 +275,203 @@ fn walk_start_menu(dir: &Path, out: &mut Vec<PathBuf>, depth: u8) {
             let p = entry.path();
             if p.is_dir() {
                 walk_start_menu(&p, out, depth + 1);
-            } else if p.extension().map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false) {
+            } else if p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false)
+            {
                 out.push(p);
             }
         }
     }
 }
 
-pub fn scan_installed_apps() -> Vec<IndexedApp> {
+/// Discovers packaged UWP/MSIX apps from `FOLDERID_AppsFolder` via `SHGetKnownFolderItem`
+/// + `IEnumShellItems` using an RAII `ComGuard` (AD-5).
+fn enumerate_uwp_apps_folder() -> Vec<IndexedApp> {
+    let com = ComGuard::init_sta();
+    if !com.is_usable() {
+        return Vec::new();
+    }
+
+    let folder: IShellItem = match unsafe {
+        SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
+    } {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let enumerator: IEnumShellItems = match unsafe { folder.BindToHandler(None, &BHID_EnumItems) } {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    let mut batch: [Option<IShellItem>; 32] = Default::default();
+
+    loop {
+        let mut fetched = 0u32;
+        let res = unsafe { enumerator.Next(&mut batch, Some(&mut fetched)) };
+        let count = (fetched as usize).min(batch.len());
+        if count == 0 {
+            break;
+        }
+        for slot in batch.iter_mut().take(count) {
+            let Some(item) = slot.take() else {
+                continue;
+            };
+            let Some(name) = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY).ok() }
+                .and_then(pwstr_to_string_and_free)
+            else {
+                continue;
+            };
+            if is_ignored_app_name(&name) {
+                continue;
+            }
+
+            let raw_aumid = item
+                .cast::<IShellItem2>()
+                .ok()
+                .and_then(|item2| unsafe { item2.GetString(&PKEY_APP_USER_MODEL_ID).ok() })
+                .and_then(pwstr_to_string_and_free)
+                .or_else(|| {
+                    unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING).ok() }
+                        .and_then(pwstr_to_string_and_free)
+                });
+
+            let Some(aumid) = raw_aumid.filter(|val| is_packaged_uwp_aumid(val)) else {
+                continue;
+            };
+
+            let target = format!("shell:AppsFolder\\{aumid}");
+            let icon_key = icon_cache::aumid_key(&aumid);
+            let category = categorize_app(&name, &aumid);
+            out.push(IndexedApp {
+                id: String::new(),
+                name,
+                category,
+                target,
+                aumid: Some(aumid),
+                icon_key: Some(icon_key),
+                icon_data: None,
+            });
+        }
+        if res.is_err() || count < batch.len() {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Pure, testable merger/deduplicator combining Start Menu `.lnk` apps and packaged UWP
+/// `shell:AppsFolder` apps with NO artificial 180-item truncation cap.
+pub fn merge_and_deduplicate_apps(
+    lnk_apps: Vec<IndexedApp>,
+    uwp_apps: Vec<IndexedApp>,
+) -> Vec<IndexedApp> {
+    let mut merged: Vec<IndexedApp> = Vec::with_capacity(lnk_apps.len() + uwp_apps.len());
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut seen_targets: HashSet<String> = HashSet::new();
+    let mut seen_aumids: HashSet<String> = HashSet::new();
+
+    for app in lnk_apps {
+        let name_trimmed = app.name.trim();
+        let target_trimmed = app.target.trim();
+        if is_ignored_app_name(name_trimmed) || target_trimmed.is_empty() {
+            continue;
+        }
+        let name_key = name_trimmed.to_lowercase();
+        let target_key = target_trimmed.replace('/', "\\").to_lowercase();
+        if by_name.contains_key(&name_key) || !seen_targets.insert(target_key) {
+            continue;
+        }
+        if let Some(ref aumid) = app.aumid {
+            let aumid_key = aumid.trim().to_lowercase();
+            if !aumid_key.is_empty() && !seen_aumids.insert(aumid_key) {
+                continue;
+            }
+        }
+        let idx = merged.len();
+        by_name.insert(name_key, idx);
+        merged.push(app);
+    }
+
+    for uwp in uwp_apps {
+        let name_trimmed = uwp.name.trim();
+        let target_trimmed = uwp.target.trim();
+        if is_ignored_app_name(name_trimmed) || target_trimmed.is_empty() {
+            continue;
+        }
+        let name_key = name_trimmed.to_lowercase();
+        let target_key = target_trimmed.replace('/', "\\").to_lowercase();
+        let aumid_key = uwp
+            .aumid
+            .as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
+
+        if let Some(ref ak) = aumid_key {
+            if seen_aumids.contains(ak) {
+                continue;
+            }
+        }
+        if seen_targets.contains(&target_key) {
+            continue;
+        }
+
+        if let Some(&existing_idx) = by_name.get(&name_key) {
+            let existing = &mut merged[existing_idx];
+            // If the Start Menu entry didn't resolve to a real .exe (e.g. a bare .lnk wrapper
+            // for a Store/UWP app), upgrade it to the packaged UWP entry; otherwise attach AUMID
+            // metadata so Win32 + UWP icon/matching stays unified without creating a duplicate row.
+            let existing_is_exe = existing.target.to_ascii_lowercase().ends_with(".exe");
+            if !existing_is_exe {
+                *existing = uwp;
+            } else if existing.aumid.is_none() && uwp.aumid.is_some() {
+                existing.aumid = uwp.aumid;
+            }
+            if let Some(ak) = aumid_key {
+                seen_aumids.insert(ak);
+            }
+            seen_targets.insert(target_key);
+            continue;
+        }
+
+        if let Some(ak) = aumid_key {
+            seen_aumids.insert(ak);
+        }
+        seen_targets.insert(target_key);
+        let idx = merged.len();
+        by_name.insert(name_key, idx);
+        merged.push(uwp);
+    }
+
+    merged.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.target.to_lowercase().cmp(&b.target.to_lowercase()))
+    });
+
+    for (idx, app) in merged.iter_mut().enumerate() {
+        app.id = if app.aumid.is_some() {
+            format!("uwp-{idx}")
+        } else {
+            format!("app-{idx}")
+        };
+    }
+
+    merged
+}
+
+/// Scans all installed Start Menu `.lnk` apps and packaged UWP `shell:AppsFolder` apps with no
+/// 180-app truncation cap, populating unified `IconCache` and registering `icon_sources` so
+/// `get_icons` can hydrate any evicted icon on demand (AD-5, AD-6).
+pub fn scan_installed_apps_cached(
+    cache: &Mutex<IconCache>,
+    icon_sources: Option<&Mutex<HashMap<String, String>>>,
+) -> Vec<IndexedApp> {
     let mut roots = vec![PathBuf::from(
         r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs",
     )];
@@ -103,58 +484,263 @@ pub fn scan_installed_apps() -> Vec<IndexedApp> {
         walk_start_menu(r, &mut lnks, 0);
     }
 
-    let mut apps = Vec::new();
-    let mut seen = HashSet::new();
+    let mut lnk_apps = Vec::new();
+    let mut icon_paths: HashMap<String, String> = HashMap::new();
 
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    {
+        let com = ComGuard::init_sta();
+        for lnk in lnks {
+            let name = match lnk.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+                _ => continue,
+            };
+            if is_ignored_app_name(&name) {
+                continue;
+            }
+
+            let lnk_str = lnk.to_string_lossy().to_string();
+            let resolved = if com.is_usable() {
+                resolve_lnk_target_and_args(&lnk)
+            } else {
+                None
+            };
+
+            let (target, icon_source) = match resolved {
+                Some((exe, args))
+                    if exe.to_ascii_lowercase().ends_with(".exe") && Path::new(&exe).exists() =>
+                {
+                    // Keep the .lnk when shortcut carries required CLI arguments (e.g. Discord Update.exe),
+                    // while extracting the icon cleanly from the .lnk or resolved .exe.
+                    if args.is_empty() {
+                        (exe.clone(), exe)
+                    } else {
+                        (lnk_str.clone(), lnk_str)
+                    }
+                }
+                _ => (lnk_str.clone(), lnk_str),
+            };
+
+            let icon_key = icon_cache::path_icon_key(&icon_source);
+            icon_paths.insert(icon_key.clone(), icon_source);
+            let category = categorize_app(&name, &target);
+
+            lnk_apps.push(IndexedApp {
+                id: String::new(),
+                name,
+                category,
+                target,
+                aumid: None,
+                icon_key: Some(icon_key),
+                icon_data: None,
+            });
+        }
     }
 
-    for lnk in lnks {
-        let name = match lnk.file_stem().map(|s| s.to_string_lossy().to_string()) {
-            Some(n) if !n.trim().is_empty() => n,
-            _ => continue,
-        };
-        let low_name = name.to_ascii_lowercase();
-        if low_name.contains("uninstall")
-            || low_name.contains("удалить")
-            || low_name.contains("readme")
-            || low_name.contains("help")
-            || low_name.contains("справка")
-            || low_name.contains("license")
-            || low_name.contains("website")
-        {
-            continue;
+    let uwp_apps = enumerate_uwp_apps_folder();
+    for uwp in &uwp_apps {
+        if let Some(ref key) = uwp.icon_key {
+            icon_paths.insert(key.clone(), uwp.target.clone());
         }
-        let target = resolve_lnk_target(&lnk)
-            .filter(|t| t.to_ascii_lowercase().ends_with(".exe") && Path::new(t).exists())
-            .unwrap_or_else(|| lnk.to_string_lossy().to_string());
+    }
 
-        let dedup_key = low_name.clone();
-        if !seen.insert(dedup_key) {
-            continue;
+    let apps = merge_and_deduplicate_apps(lnk_apps, uwp_apps);
+
+    // Register every discovered icon source so `get_icons` can re-hydrate any LRU-evicted key
+    if let Some(sources) = icon_sources {
+        let mut map = lock_unpoisoned(sources);
+        for app in &apps {
+            if let Some(ref key) = app.icon_key {
+                let src = icon_paths
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| app.target.clone());
+                map.insert(key.clone(), src);
+            }
         }
+    }
 
-        let category = categorize_app(&name, &target);
-        let icon_data = extract_icon_for_path(&target).or_else(|| extract_icon_for_path(&lnk.to_string_lossy()));
-        apps.push(IndexedApp {
-            id: format!("app-{}", apps.len()),
-            name,
-            category,
-            target,
-            icon_data,
-        });
-        if apps.len() >= 180 {
+    // Pre-warm UWP icons and leading Win32 app icons into unified IconCache without thrashing
+    // the 256-entry LRU budget (remaining keys hydrate lazily on demand via `get_icons`).
+    let mut prewarmed = 0usize;
+    let prewarm_limit = 140usize;
+    for app in &apps {
+        if prewarmed >= prewarm_limit {
             break;
         }
+        let Some(ref key) = app.icon_key else {
+            continue;
+        };
+        let src = icon_paths
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or(&app.target);
+        if app.aumid.is_some() || prewarmed < 80 {
+            if extract_icon_for_path_cached(src, cache).is_some() {
+                prewarmed += 1;
+            }
+        }
     }
 
-    unsafe {
-        CoUninitialize();
-    }
-
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
+}
+
+pub fn scan_installed_apps() -> Vec<IndexedApp> {
+    let cache = Mutex::new(IconCache::default());
+    scan_installed_apps_cached(&cache, None)
+}
+
+/// Returns true if a directory name should be excluded from user file indexing.
+pub fn is_excluded_user_dir_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.starts_with('$') {
+        return true;
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "node_modules"
+            | "target"
+            | "venv"
+            | "__pycache__"
+            | "dist"
+            | "build"
+            | "out"
+            | "appdata"
+            | "system volume information"
+            | "windowsapps"
+    )
+}
+
+/// Returns true if a file name should be excluded from user file indexing (hidden/temp/system).
+pub fn is_excluded_user_file_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.starts_with('~')
+        || trimmed.starts_with("~$")
+    {
+        return true;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if matches!(low.as_str(), "desktop.ini" | "thumbs.db" | "ntuser.dat") {
+        return true;
+    }
+    low.ends_with(".tmp")
+        || low.ends_with(".crdownload")
+        || low.ends_with(".part")
+        || low.ends_with(".bak")
+}
+
+fn file_modified_ts(meta: &fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn walk_user_files(
+    dir: &Path,
+    location: &str,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<IndexedFile>,
+    seen_targets: &mut HashSet<String>,
+) {
+    if depth > max_depth || !dir.exists() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name_os) = path.file_name() else {
+            continue;
+        };
+        let name = name_os.to_string_lossy().trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let is_dir = meta.is_dir();
+        if is_dir {
+            if is_excluded_user_dir_name(&name) {
+                continue;
+            }
+        } else if is_excluded_user_file_name(&name) {
+            continue;
+        }
+
+        let target = path.to_string_lossy().to_string();
+        let target_key = target.replace('/', "\\").to_lowercase();
+        if seen_targets.insert(target_key) {
+            out.push(IndexedFile {
+                id: String::new(),
+                name,
+                kind: if is_dir {
+                    "folder".to_string()
+                } else {
+                    "file".to_string()
+                },
+                location: location.to_string(),
+                target,
+                modified_ts: file_modified_ts(&meta),
+            });
+        }
+
+        if is_dir && depth < max_depth {
+            walk_user_files(&path, location, depth + 1, max_depth, out, seen_targets);
+        }
+    }
+}
+
+/// Pure, testable user-files scanner across caller-specified root folders.
+/// Respects `max_depth`, excludes `node_modules`/`.git`/`target`/hidden/temp entries,
+/// sorts newest-modified first, and caps at `max_items`.
+pub fn scan_user_files_in_roots(
+    roots: &[(&str, PathBuf)],
+    max_depth: usize,
+    max_items: usize,
+) -> Vec<IndexedFile> {
+    let mut out = Vec::new();
+    let mut seen_targets = HashSet::new();
+
+    for (location, root) in roots {
+        if root.is_dir() {
+            walk_user_files(root, location, 0, max_depth, &mut out, &mut seen_targets);
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.modified_ts
+            .cmp(&a.modified_ts)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    if out.len() > max_items {
+        out.truncate(max_items);
+    }
+    for (idx, item) in out.iter_mut().enumerate() {
+        item.id = format!("ufile-{idx}");
+    }
+    out
+}
+
+/// Scans `Desktop`, `Documents`, and `Downloads` (depth <= 2, capped at 400 recent items)
+/// for instant type-anywhere search in TestBar Start Menu.
+pub fn scan_user_files() -> Vec<IndexedFile> {
+    let mut roots: Vec<(&str, PathBuf)> = Vec::with_capacity(3);
+    if let Some(desktop) = dirs::desktop_dir() {
+        roots.push(("Рабочий стол", desktop));
+    }
+    if let Some(docs) = dirs::document_dir() {
+        roots.push(("Документы", docs));
+    }
+    if let Some(downloads) = dirs::download_dir() {
+        roots.push(("Загрузки", downloads));
+    }
+    scan_user_files_in_roots(&roots, DEFAULT_USER_FILE_MAX_DEPTH, DEFAULT_USER_FILE_CAP)
 }
 
 fn parse_acf_field(content: &str, key: &str) -> Option<String> {
@@ -203,7 +789,8 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
                         if cand.exists() {
                             if let Ok(bytes) = fs::read(&cand) {
                                 if bytes.len() <= 1_800_000 {
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(bytes);
                                     return Some(format!("data:image/jpeg;base64,{b64}"));
                                 }
                             }
@@ -258,7 +845,10 @@ pub fn scan_steam_games() -> Vec<SteamGame> {
         if let Ok(entries) = fs::read_dir(&steamapps) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let fname = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 if !(fname.starts_with("appmanifest_") && fname.ends_with(".acf")) {
                     continue;
                 }
@@ -311,4 +901,256 @@ pub fn pick_file_dialog() -> Option<String> {
         .set_title("Выбери файл или программу для закрепления в TestBar")
         .pick_file()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::Win32::Foundation::{E_FAIL, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "testbar-apps-indexer-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn com_guard_honors_rpc_e_changed_mode_without_mismatched_uninit() {
+        let ok = ComGuard::from_hresult(S_OK);
+        assert!(ok.is_usable());
+        assert!(ok.will_uninitialize());
+        // Avoid calling CoUninitialize in synthetic test by forgetting after inspecting flags
+        std::mem::forget(ok);
+
+        let already_same = ComGuard::from_hresult(S_FALSE);
+        assert!(already_same.is_usable());
+        assert!(already_same.will_uninitialize());
+        std::mem::forget(already_same);
+
+        let changed = ComGuard::from_hresult(RPC_E_CHANGED_MODE);
+        assert!(changed.is_usable());
+        assert!(!changed.will_uninitialize());
+        drop(changed);
+
+        let failed = ComGuard::from_hresult(E_FAIL);
+        assert!(!failed.is_usable());
+        assert!(!failed.will_uninitialize());
+        drop(failed);
+    }
+
+    #[test]
+    fn uwp_aumid_classifier_accepts_packaged_and_rejects_paths_and_guids() {
+        assert!(is_packaged_uwp_aumid(
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        ));
+        assert!(is_packaged_uwp_aumid(
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        ));
+        assert!(is_packaged_uwp_aumid(
+            "shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+        ));
+        assert!(!is_packaged_uwp_aumid(r"C:\Windows\notepad.exe"));
+        assert!(!is_packaged_uwp_aumid(
+            "{6D809377-6AF0-444B-8957-A3773F02200E}\\foo.exe"
+        ));
+        assert!(!is_packaged_uwp_aumid("https://example.com"));
+        assert!(!is_packaged_uwp_aumid("no_bang_identifier"));
+        assert!(!is_packaged_uwp_aumid(""));
+    }
+
+    #[test]
+    fn merge_and_deduplicate_apps_handles_uwp_lnk_overlap_and_removes_180_cap() {
+        let mut lnk_apps = Vec::new();
+        for i in 0..210 {
+            lnk_apps.push(IndexedApp {
+                id: String::new(),
+                name: format!("Tool {i:03}"),
+                category: "Программы".to_string(),
+                target: format!(r"C:\Tools\tool{i:03}.exe"),
+                aumid: None,
+                icon_key: Some(icon_cache::exe_key(&format!(r"C:\Tools\tool{i:03}.exe"))),
+                icon_data: None,
+            });
+        }
+        // Duplicate .lnk name + junk uninstall shortcut + bare .lnk wrapper for Calculator
+        lnk_apps.push(IndexedApp {
+            id: String::new(),
+            name: "Tool 001".to_string(),
+            category: "Программы".to_string(),
+            target: r"C:\Other\tool001.exe".to_string(),
+            aumid: None,
+            icon_key: None,
+            icon_data: None,
+        });
+        lnk_apps.push(IndexedApp {
+            id: String::new(),
+            name: "Uninstall Tool 001".to_string(),
+            category: "Программы".to_string(),
+            target: r"C:\Tools\unins000.exe".to_string(),
+            aumid: None,
+            icon_key: None,
+            icon_data: None,
+        });
+        lnk_apps.push(IndexedApp {
+            id: String::new(),
+            name: "Calculator".to_string(),
+            category: "Система".to_string(),
+            target: r"C:\ProgramData\Start Menu\Calculator.lnk".to_string(),
+            aumid: None,
+            icon_key: None,
+            icon_data: None,
+        });
+
+        let uwp_apps = vec![
+            IndexedApp {
+                id: String::new(),
+                name: "Calculator".to_string(),
+                category: "Система".to_string(),
+                target: "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+                    .to_string(),
+                aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string()),
+                icon_key: Some(icon_cache::aumid_key(
+                    "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+                )),
+                icon_data: None,
+            },
+            // Duplicate AUMID under localized name must not produce a second entry
+            IndexedApp {
+                id: String::new(),
+                name: "Калькулятор".to_string(),
+                category: "Система".to_string(),
+                target: "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+                    .to_string(),
+                aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string()),
+                icon_key: Some(icon_cache::aumid_key(
+                    "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+                )),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: String::new(),
+                name: "Параметры".to_string(),
+                category: "Система".to_string(),
+                target: "shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".to_string(),
+                aumid: Some("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".to_string()),
+                icon_key: Some(icon_cache::aumid_key("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel")),
+                icon_data: None,
+            },
+        ];
+
+        let merged = merge_and_deduplicate_apps(lnk_apps, uwp_apps);
+
+        // 210 unique Win32 tools + 2 unique UWP apps = 212 (> 180 proves no cap!)
+        assert_eq!(merged.len(), 212);
+        assert!(!merged.iter().any(|a| a.name.contains("Uninstall")));
+
+        // Bare .lnk Calculator was upgraded to the real UWP AUMID entry without duplicating
+        let calc_entries: Vec<_> = merged
+            .iter()
+            .filter(|a| a.aumid.as_deref() == Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"))
+            .collect();
+        assert_eq!(calc_entries.len(), 1);
+        assert!(calc_entries[0]
+            .target
+            .starts_with("shell:AppsFolder\\Microsoft.WindowsCalculator"));
+        assert!(calc_entries[0]
+            .icon_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("aumid:")));
+    }
+
+    #[test]
+    fn user_files_scanner_filters_excluded_dirs_hidden_temp_and_enforces_depth_and_cap() {
+        let root = make_temp_dir("user-files");
+        let docs = root.join("Documents");
+        fs::create_dir_all(docs.join("Projects").join("Nested")).unwrap();
+        fs::create_dir_all(docs.join("Projects").join("Nested").join("TooDeep")).unwrap();
+        fs::create_dir_all(docs.join("node_modules").join("react")).unwrap();
+        fs::create_dir_all(docs.join(".git").join("objects")).unwrap();
+        fs::create_dir_all(docs.join("target").join("debug")).unwrap();
+
+        // Included files at depth 0, 1, 2
+        fs::write(docs.join("Report.pdf"), b"pdf").unwrap();
+        fs::write(docs.join("Projects").join("Roadmap.md"), b"md").unwrap();
+        fs::write(
+            docs.join("Projects").join("Nested").join("Design.fig"),
+            b"fig",
+        )
+        .unwrap();
+
+        // Depth 3 file should be excluded when max_depth = 2
+        fs::write(
+            docs.join("Projects")
+                .join("Nested")
+                .join("TooDeep")
+                .join("Deep.txt"),
+            b"deep",
+        )
+        .unwrap();
+
+        // Excluded directories and temp/hidden files
+        fs::write(
+            docs.join("node_modules").join("react").join("index.js"),
+            b"js",
+        )
+        .unwrap();
+        fs::write(docs.join(".git").join("HEAD"), b"ref").unwrap();
+        fs::write(docs.join("target").join("debug").join("bin.exe"), b"exe").unwrap();
+        fs::write(docs.join("desktop.ini"), b"ini").unwrap();
+        fs::write(docs.join("Thumbs.db"), b"db").unwrap();
+        fs::write(docs.join("~$Report.docx"), b"lock").unwrap();
+        fs::write(docs.join(".hidden"), b"secret").unwrap();
+        fs::write(docs.join("download.crdownload"), b"partial").unwrap();
+
+        let files = scan_user_files_in_roots(&[("Документы", docs.clone())], 2, 400);
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+
+        assert!(names.contains(&"Report.pdf"));
+        assert!(names.contains(&"Projects"));
+        assert!(names.contains(&"Roadmap.md"));
+        assert!(names.contains(&"Nested"));
+        assert!(names.contains(&"Design.fig"));
+
+        assert!(!names.contains(&"Deep.txt"));
+        assert!(!names.contains(&"node_modules"));
+        assert!(!names.contains(&"index.js"));
+        assert!(!names.contains(&".git"));
+        assert!(!names.contains(&"HEAD"));
+        assert!(!names.contains(&"target"));
+        assert!(!names.contains(&"bin.exe"));
+        assert!(!names.contains(&"desktop.ini"));
+        assert!(!names.contains(&"Thumbs.db"));
+        assert!(!names.contains(&"~$Report.docx"));
+        assert!(!names.contains(&".hidden"));
+        assert!(!names.contains(&"download.crdownload"));
+
+        // Verify cap enforcement
+        let capped = scan_user_files_in_roots(&[("Документы", docs)], 2, 2);
+        assert_eq!(capped.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn real_uwp_apps_folder_enumeration_discovers_packaged_apps_with_icon_keys() {
+        let uwp = enumerate_uwp_apps_folder();
+        assert!(
+            !uwp.is_empty(),
+            "Windows 11 FOLDERID_AppsFolder should discover packaged UWP apps"
+        );
+        assert!(uwp.iter().all(|a| {
+            a.aumid.is_some()
+                && a.target.starts_with("shell:AppsFolder\\")
+                && a.icon_key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("aumid:"))
+        }));
+    }
 }
