@@ -3,7 +3,7 @@ title: 'Command-scoped atomic config authority, PinItem matching schema & autost
 type: 'feature'
 ticket: '4'
 created: '2026-11-20'
-status: 'built'
+status: done
 baseline_revision: '865e8b6649ca9f59ee4e2fa01ff09e75dcafccf0'
 route: 'full'
 route_source: 'auto'
