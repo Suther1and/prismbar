@@ -161,7 +161,7 @@ impl<'de, T: serde::de::DeserializeOwned, R: tauri::Runtime> tauri::ipc::Command
             tauri::ipc::InvokeBody::Raw(_) => Err(tauri::Error::InvalidArgs(
                 name,
                 arg,
-                serde_json::de::Error::custom("expected json body"),
+                serde::de::Error::custom("expected json body"),
             )
             .into()),
         }
@@ -2525,8 +2525,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn mac_app_never_exposes_save_config_or_accepts_full_config() {
         let src = include_str!("app.rs");
