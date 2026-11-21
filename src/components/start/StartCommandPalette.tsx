@@ -10,11 +10,15 @@ import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  BluetoothIcon,
   BroomIcon,
+  DiskIcon,
   FallbackAppIcon,
+  GamepadIcon,
   GlobeSvg,
   LockIcon,
   MicIcon,
+  NetIcon,
   PasteIcon,
   PowerIcon,
   RebootIcon,
@@ -22,6 +26,7 @@ import {
   ScissorsIcon,
   SearchIcon,
   SettingsGearIcon,
+  ShieldIcon,
   SleepIcon,
   TaskmgrIcon,
   VolIcon,
@@ -37,6 +42,7 @@ export interface StartCommandPaletteProps {
   onQueryChange: (next: string) => void;
   onSelectIdx: (idx: number) => void;
   onLaunch: (item: SearchCorpusItem, ctrlKey: boolean, altKey?: boolean) => void;
+  onItemContextMenu?: (e: React.MouseEvent, item: SearchCorpusItem) => void;
   onClose: () => void;
 }
 
@@ -94,6 +100,37 @@ function renderCommandIcon(item: SearchCorpusItem): React.ReactNode {
   if (item.source === 'audio_device') {
     return <VolIcon className="ic16" />;
   }
+  if (item.source === 'win_settings') {
+    const idOrTarget = `${item.id} ${item.target}`.toLowerCase();
+    if (idOrTarget.includes('wifi')) {
+      return <NetIcon kind="wifi" className="ic16" />;
+    }
+    if (
+      idOrTarget.includes('network') ||
+      idOrTarget.includes('ethernet') ||
+      idOrTarget.includes('vpn') ||
+      idOrTarget.includes('proxy') ||
+      idOrTarget.includes('ncpa')
+    ) {
+      return <NetIcon className="ic16" />;
+    }
+    if (idOrTarget.includes('bluetooth')) {
+      return <BluetoothIcon className="ic16" />;
+    }
+    if (idOrTarget.includes('sound') || idOrTarget.includes('mmsys')) {
+      return <VolIcon className="ic16" />;
+    }
+    if (idOrTarget.includes('storage') || idOrTarget.includes('diskmgmt')) {
+      return <DiskIcon className="ic16" />;
+    }
+    if (idOrTarget.includes('defender')) {
+      return <ShieldIcon className="ic16" />;
+    }
+    if (idOrTarget.includes('gaming')) {
+      return <GamepadIcon className="ic16" />;
+    }
+    return <SettingsGearIcon className="ic16" />;
+  }
   if (item.source === 'command') {
     switch (item.commandId) {
       case 'mic_toggle':
@@ -136,6 +173,7 @@ export const StartCommandPalette: React.FC<StartCommandPaletteProps> = ({
   onQueryChange,
   onSelectIdx,
   onLaunch,
+  onItemContextMenu,
   onClose,
 }) => {
   const { mounted, phase } = useAnimatedPresence(open, 90);
@@ -172,6 +210,7 @@ export const StartCommandPalette: React.FC<StartCommandPaletteProps> = ({
   const showAdminHint =
     selectedItem &&
     selectedItem.source !== 'window' &&
+    selectedItem.source !== 'win_settings' &&
     selectedItem.source !== 'clipboard' &&
     selectedItem.source !== 'audio_device' &&
     selectedItem.source !== 'web' &&
@@ -213,6 +252,7 @@ export const StartCommandPalette: React.FC<StartCommandPaletteProps> = ({
             results.items.map((it, i) => {
               const showSubline =
                 it.source === 'window' ||
+                it.source === 'win_settings' ||
                 it.source === 'file' ||
                 it.source === 'folder' ||
                 it.source === 'clipboard' ||
@@ -228,6 +268,12 @@ export const StartCommandPalette: React.FC<StartCommandPaletteProps> = ({
                   className={`cmd-row ${i === safeSelectedIdx ? 'selected' : ''}`}
                   onMouseEnter={() => onSelectIdx(i)}
                   onClick={(e) => onLaunch(it, e.ctrlKey, e.altKey)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onSelectIdx(i);
+                    onItemContextMenu?.(e, it);
+                  }}
                 >
                   <span className="cmd-ic-slot">{renderCommandIcon(it)}</span>
                   <div className="cmd-row-text">

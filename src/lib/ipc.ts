@@ -692,6 +692,27 @@ function normalizePath(p: string | null | undefined): string {
   return p.trim().replace(/\//g, '\\').toLowerCase();
 }
 
+export function isNonLaunchableUwpHostExe(path: string | null | undefined): boolean {
+  const norm = normalizePath(path).replace(/^"+|"+$/g, '').trim();
+  if (!norm) return false;
+  return (
+    norm.endsWith('\\systemsettings.exe') ||
+    norm === 'systemsettings.exe' ||
+    norm.endsWith('\\applicationframehost.exe') ||
+    norm === 'applicationframehost.exe' ||
+    norm.includes('\\windowsapps\\')
+  );
+}
+
+export function formatAppsFolderTarget(aumid: string): string {
+  const trimmed = aumid.trim();
+  const prefix = 'shell:appsfolder\\';
+  const clean = trimmed.toLowerCase().startsWith(prefix)
+    ? trimmed.slice(prefix.length).trim()
+    : trimmed;
+  return clean ? `shell:AppsFolder\\${clean}` : '';
+}
+
 function extractBasename(p: string | null | undefined): string {
   const norm = normalizePath(p);
   if (!norm || norm.endsWith('\\')) return '';
@@ -842,17 +863,22 @@ export function mergeTaskbarItems(
       (p.target ? iconMap[p.target.toLowerCase()] : undefined) ||
       null;
 
+    const pinnedAumid = effectiveGroup?.aumid?.trim() || p.matchAumid?.trim() || '';
+    const pinnedRawTarget = p.target?.trim() || effectiveGroup?.exePath?.trim() || '';
+    const resolvedPinnedTarget =
+      pinnedAumid && (!pinnedRawTarget || isNonLaunchableUwpHostExe(pinnedRawTarget))
+        ? formatAppsFolderTarget(pinnedAumid)
+        : pinnedRawTarget || (pinnedAumid ? formatAppsFolderTarget(pinnedAumid) : '');
+    const pinnedExeBase = effectiveGroup?.exePath ? extractBasename(effectiveGroup.exePath) || null : null;
+
     merged.push({
       id: p.id,
       name: p.title,
-      target:
-        p.target ||
-        effectiveGroup?.exePath ||
-        (effectiveGroup?.aumid ? `shell:AppsFolder\\${effectiveGroup.aumid}` : ''),
+      target: resolvedPinnedTarget,
       args: p.args ?? null,
       matchExe:
         p.matchExe ??
-        (effectiveGroup?.exePath ? extractBasename(effectiveGroup.exePath) || null : null),
+        (pinnedExeBase && pinnedExeBase !== 'applicationframehost.exe' ? pinnedExeBase : null),
       matchAumid: p.matchAumid ?? effectiveGroup?.aumid ?? null,
       iconKey: p.iconKey,
       cacheIconKey: cacheKey,
@@ -868,12 +894,21 @@ export function mergeTaskbarItems(
     if (!usedGroupKeys.has(g.key)) {
       const resolvedIconData = resolveCachedIcon(iconMap, g.iconKey) || g.iconData || null;
       const baseExe = extractBasename(g.exePath);
+      const groupAumid = g.aumid?.trim() || '';
+      const rawExePath = g.exePath?.trim() || '';
+      const resolvedGroupTarget =
+        groupAumid && (!rawExePath || isNonLaunchableUwpHostExe(rawExePath))
+          ? formatAppsFolderTarget(groupAumid)
+          : rawExePath || (groupAumid ? formatAppsFolderTarget(groupAumid) : '');
       merged.push({
         id: 'run-' + g.key,
         name: g.name,
-        target: g.exePath || (g.aumid ? `shell:AppsFolder\\${g.aumid}` : ''),
+        target: resolvedGroupTarget,
         args: null,
-        matchExe: baseExe && baseExe.endsWith('.exe') ? baseExe : null,
+        matchExe:
+          baseExe && baseExe.endsWith('.exe') && baseExe !== 'applicationframehost.exe'
+            ? baseExe
+            : null,
         matchAumid: g.aumid ?? null,
         iconKey: g.iconKey || g.name.toLowerCase(),
         cacheIconKey: g.iconKey ?? null,

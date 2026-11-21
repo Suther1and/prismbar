@@ -452,9 +452,50 @@ describe('Warm preview scrubbing, hover preemption & flyout payload builders', (
     expect(pin.id).toBe('tb-fixed');
     expect(pin.kind).toBe('app');
     expect(pin.title).toBe('Терминал');
+    expect(pin.target).toBe('shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App');
     expect(pin.matchExe).toBe('windowsterminal.exe');
     expect(pin.matchAumid).toBe('Microsoft.WindowsTerminal_8wekyb3d8bbwe!App');
     expect(pin.iconKey).toBe('aumid:abcd1234');
+
+    // Non-launchable UWP host executables (SystemSettings.exe / ApplicationFrameHost.exe / \WindowsApps\)
+    // must ALWAYS resolve to shell:AppsFolder\<aumid> when aumid is present
+    const settingsPin = buildPinFromAppContext(
+      {
+        id: 'run-settings',
+        name: 'Параметры',
+        target: 'C:\\Windows\\ImmersiveControlPanel\\SystemSettings.exe',
+        args: null,
+        matchExe: 'systemsettings.exe',
+        aumid: 'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+        iconKey: 'aumid:settings',
+        pinned: false,
+        windows: [],
+      },
+      'tb-settings',
+    );
+    expect(settingsPin.target).toBe(
+      'shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+    );
+    expect(settingsPin.matchAumid).toBe(
+      'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+    );
+
+    const afhPin = buildPinFromAppContext(
+      {
+        id: 'run-calc',
+        name: 'Калькулятор',
+        target: 'C:\\Windows\\System32\\ApplicationFrameHost.exe',
+        args: null,
+        matchExe: 'applicationframehost.exe',
+        aumid: 'Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+        iconKey: 'aumid:calc',
+        pinned: false,
+        windows: [],
+      },
+      'tb-calc',
+    );
+    expect(afhPin.target).toBe('shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App');
+    expect(afhPin.matchExe).toBeNull();
   });
 
   it('builds empty-bar context menu payload for both dock and edge modes', () => {

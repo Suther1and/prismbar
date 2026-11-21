@@ -1064,6 +1064,58 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         }
     }
 
+    // Auto-heal broken non-launchable UWP host pins (`SystemSettings.exe`, `ApplicationFrameHost.exe`, `\WindowsApps\`)
+    let mut healed_uwp_host = false;
+    if item.kind != "combo" {
+        let target_norm = item
+            .target
+            .trim()
+            .trim_matches('"')
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        if target_norm.ends_with(r"\systemsettings.exe") || target_norm == "systemsettings.exe" {
+            const SETTINGS_AUMID: &str =
+                "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+            let healed_target = format!(r"shell:AppsFolder\{SETTINGS_AUMID}");
+            if item.target != healed_target {
+                item.target = healed_target;
+                changed = true;
+            }
+            if item.match_aumid.as_deref() != Some(SETTINGS_AUMID) {
+                item.match_aumid = Some(SETTINGS_AUMID.to_string());
+                changed = true;
+            }
+            healed_uwp_host = true;
+        } else if target_norm.ends_with(r"\applicationframehost.exe")
+            || target_norm == "applicationframehost.exe"
+            || target_norm.contains(r"\windowsapps\")
+        {
+            if let Some(ref aumid) = item.match_aumid {
+                let trimmed_aumid = aumid.trim();
+                let clean_aumid = if trimmed_aumid
+                    .get(..17)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("shell:appsfolder\\"))
+                {
+                    trimmed_aumid[17..].trim()
+                } else {
+                    trimmed_aumid
+                };
+                if !clean_aumid.is_empty() {
+                    let healed_target = format!(r"shell:AppsFolder\{clean_aumid}");
+                    if item.target != healed_target {
+                        item.target = healed_target;
+                        changed = true;
+                    }
+                    if item.match_aumid.as_deref() != Some(clean_aumid) {
+                        item.match_aumid = Some(clean_aumid.to_string());
+                        changed = true;
+                    }
+                    healed_uwp_host = true;
+                }
+            }
+        }
+    }
+
     let normalized_existing_exe = item
         .match_exe
         .as_deref()
@@ -1075,7 +1127,16 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
             Some(_) => normalized_existing_exe,
         }
     } else if item.kind == "app" {
-        normalized_existing_exe.or_else(|| derive_match_exe(&item.target))
+        let filtered = if healed_uwp_host
+            && matches!(
+                normalized_existing_exe.as_deref(),
+                Some("applicationframehost.exe")
+            ) {
+            None
+        } else {
+            normalized_existing_exe
+        };
+        filtered.or_else(|| derive_match_exe(&item.target))
     } else {
         normalized_existing_exe
     };
@@ -5224,5 +5285,61 @@ mod tests {
                 "TestBarConfig::default() pin metadata must not contain personal hardcode '{needle}', got: {lower_labels}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_pin_auto_heals_system_settings_and_uwp_host_targets() {
+        // 1. SystemSettings.exe -> shell:AppsFolder\windows.immersivecontrolpanel_... + match_aumid
+        let mut settings_pin = PinItem {
+            id: "set-1".into(),
+            kind: "app".into(),
+            title: "Параметры".into(),
+            target: r"C:\Windows\ImmersiveControlPanel\SystemSettings.exe".into(),
+            ..Default::default()
+        };
+        assert!(normalize_pin(&mut settings_pin, false));
+        assert_eq!(
+            settings_pin.target,
+            r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        );
+        assert_eq!(
+            settings_pin.match_aumid.as_deref(),
+            Some("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel")
+        );
+        assert!(!normalize_pin(&mut settings_pin, false));
+
+        // 2. ApplicationFrameHost.exe with match_aumid -> shell:AppsFolder\<aumid>
+        let mut afh_pin = PinItem {
+            id: "calc-1".into(),
+            kind: "app".into(),
+            title: "Калькулятор".into(),
+            target: r"C:/Windows/System32/ApplicationFrameHost.exe".into(),
+            match_exe: Some("ApplicationFrameHost.exe".into()),
+            match_aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+            ..Default::default()
+        };
+        assert!(normalize_pin(&mut afh_pin, false));
+        assert_eq!(
+            afh_pin.target,
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(afh_pin.match_exe, None);
+        assert!(!normalize_pin(&mut afh_pin, false));
+
+        // 3. \WindowsApps\ exe with match_aumid -> shell:AppsFolder\<aumid>
+        let mut winapps_pin = PinItem {
+            id: "wt-1".into(),
+            kind: "app".into(),
+            title: "Terminal".into(),
+            target: r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe".into(),
+            match_aumid: Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".into()),
+            ..Default::default()
+        };
+        assert!(normalize_pin(&mut winapps_pin, false));
+        assert_eq!(
+            winapps_pin.target,
+            r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+        );
+        assert!(!normalize_pin(&mut winapps_pin, false));
     }
 }

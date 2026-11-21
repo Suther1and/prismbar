@@ -1007,6 +1007,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     expect(startSpacesSrc).toContain("import '../../styles/spaces-v3.css'");
     expect(startViewSrc).toContain('v3-explorer-slot');
     expect(startViewSrc).toContain('data-explorer-path');
+    expect(startViewSrc).toContain('<StartFileExplorer');
     for (const [relPath, content] of [
       ['StartView.tsx', startViewSrc],
       ['StartHeader.tsx', startHeaderSrc],

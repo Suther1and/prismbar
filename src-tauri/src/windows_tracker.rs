@@ -1061,16 +1061,20 @@ pub fn resolve_icon_source_path(raw: &str) -> Option<String> {
 /// Extracts a crystal-clear 96x96 High-DPI native icon via `IShellItemImageFactory::GetImage`
 /// (wrapped in RAII `ComGuard::init_sta()`), falling back to `SHGetFileInfoW` + 64x64 HALFTONE
 /// `hicon_to_data_url` ONLY when `IShellItemImageFactory` fails.
+pub const WINDOWS_SETTINGS_AUMID: &str =
+    "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+
 pub fn extract_path_icon_raw(path: &str) -> Option<String> {
     let trimmed = path.trim().trim_matches('"').trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed
-        .to_ascii_lowercase()
-        .starts_with("shell:appsfolder\\")
-    {
+    let low_scheme = trimmed.to_ascii_lowercase();
+    if low_scheme.starts_with("shell:appsfolder\\") {
         return extract_uwp_icon_by_aumid(trimmed);
+    }
+    if low_scheme.starts_with("ms-settings:") {
+        return extract_uwp_icon_by_aumid(WINDOWS_SETTINGS_AUMID);
     }
 
     // Windows Terminal App Execution Alias stub (`...\WindowsApps\wt.exe` or bare `wt.exe`) has
@@ -1192,11 +1196,14 @@ pub fn extract_icon_for_path_cached(path: &str, cache: &Mutex<IconCache>) -> Opt
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed
-        .to_ascii_lowercase()
-        .starts_with("shell:appsfolder\\")
-    {
-        let key = icon_cache::aumid_key(trimmed);
+    let low_scheme = trimmed.to_ascii_lowercase();
+    if low_scheme.starts_with("shell:appsfolder\\") || low_scheme.starts_with("ms-settings:") {
+        let uwp_source = if low_scheme.starts_with("ms-settings:") {
+            WINDOWS_SETTINGS_AUMID
+        } else {
+            trimmed
+        };
+        let key = icon_cache::aumid_key(uwp_source);
         {
             let mut guard = lock_unpoisoned(cache);
             if let Some(hit) = guard.get(&key) {
@@ -1206,7 +1213,7 @@ pub fn extract_icon_for_path_cached(path: &str, cache: &Mutex<IconCache>) -> Opt
                 return None;
             }
         }
-        match extract_uwp_icon_by_aumid(trimmed) {
+        match extract_uwp_icon_by_aumid(uwp_source) {
             Some(extracted) => {
                 lock_unpoisoned(cache).put(key, extracted.clone());
                 return Some(extracted);
@@ -2516,6 +2523,34 @@ pub fn terminate_process_pids(pids: &[u32]) -> Result<(), String> {
     summarize_pid_termination_results(&outcomes)
 }
 
+fn is_ms_or_shell_uri(low_target: &str) -> bool {
+    if low_target.starts_with("shell:") {
+        return true;
+    }
+    if low_target.starts_with("ms-") {
+        if let Some(scheme) = low_target.split(':').next() {
+            return scheme.len() > 3 && !scheme.contains('\\') && !scheme.contains('/');
+        }
+    }
+    false
+}
+
+/// Canonicalizes non-launchable Windows Settings UWP host targets (`SystemSettings.exe` or
+/// `shell:AppsFolder\windows.immersivecontrolpanel_...`) to `"ms-settings:"`, while preserving
+/// other targets cleanly (trimming whitespace and surrounding quotes).
+pub fn canonicalize_uwp_launch_target(target: &str) -> std::borrow::Cow<'_, str> {
+    let clean = target.trim().trim_matches('"').trim();
+    let norm_slashes = clean.replace('/', "\\").to_ascii_lowercase();
+    if norm_slashes.ends_with(r"\systemsettings.exe")
+        || norm_slashes == "systemsettings.exe"
+        || norm_slashes
+            == r"shell:appsfolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+    {
+        return std::borrow::Cow::Borrowed("ms-settings:");
+    }
+    std::borrow::Cow::Borrowed(clean)
+}
+
 /// Validates and normalizes target + optional CLI args for direct Win32 `ShellExecuteW`
 /// launch (`"runas"` or `"open"`), avoiding any shell/PowerShell string interpolation.
 pub fn normalize_launch_spec(
@@ -2546,6 +2581,14 @@ pub fn normalize_launch_spec(
         return Err("Пустой путь запуска".to_string());
     }
 
+    let canonical_target = canonicalize_uwp_launch_target(clean_target).into_owned();
+    let low_target = canonical_target.to_ascii_lowercase();
+    let verb = if as_admin && !is_ms_or_shell_uri(&low_target) {
+        "runas"
+    } else {
+        "open"
+    };
+
     let extra_args = args.map(str::trim).filter(|s| !s.is_empty());
     if let Some(a) = extra_args {
         if a.contains('\0') || a.contains('\r') || a.contains('\n') {
@@ -2561,9 +2604,9 @@ pub fn normalize_launch_spec(
     };
 
     Ok(NormalizedLaunchSpec {
-        target: clean_target.to_string(),
+        target: canonical_target,
         args: merged_args,
-        verb: if as_admin { "runas" } else { "open" },
+        verb,
     })
 }
 
@@ -2582,9 +2625,21 @@ pub fn launch_target_with_args(
     as_admin: bool,
 ) -> Result<(), String> {
     let spec = normalize_launch_spec(target, args, as_admin)?;
+    let final_target = canonicalize_uwp_launch_target(&spec.target);
+    let low_target = final_target.to_ascii_lowercase();
+    let effective_verb = if is_ms_or_shell_uri(&low_target) {
+        "open"
+    } else {
+        spec.verb
+    };
+    let is_shell_appsfolder = low_target.starts_with("shell:appsfolder\\");
+
+    // Acquire STA COM on tokio::spawn_blocking worker threads so ShellExecuteW handles
+    // `shell:AppsFolder\...` and `ms-settings:` URIs reliably (AD-5).
+    let _com = ComGuard::init_sta();
     unsafe {
-        let verb = wide(spec.verb);
-        let file = wide(&spec.target);
+        let verb = wide(effective_verb);
+        let file = wide(final_target.as_ref());
         let params_wide = spec.args.as_deref().map(wide);
         let params_ptr = params_wide
             .as_ref()
@@ -2600,7 +2655,14 @@ pub fn launch_target_with_args(
         );
         let code = res.0 as isize;
         if code <= 32 {
-            return Err(format_shell_execute_error(code, &spec.target));
+            if is_shell_appsfolder {
+                return std::process::Command::new("explorer.exe")
+                    .raw_arg(final_target.as_ref())
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|_| format_shell_execute_error(code, final_target.as_ref()));
+            }
+            return Err(format_shell_execute_error(code, final_target.as_ref()));
         }
     }
     Ok(())
@@ -5014,5 +5076,74 @@ mod tests {
         let uri = extract_path_icon_raw(quoted_settings)
             .expect("quoted shell:AppsFolder AUMID must extract cleanly");
         assert!(uri.starts_with("data:image/png;base64,"));
+
+        // 4. ms-settings: and ms-settings:* extract authentic Windows Settings UWP icon
+        let ms_root = extract_path_icon_raw("ms-settings:")
+            .expect("ms-settings: must extract Windows Settings icon");
+        assert!(ms_root.starts_with("data:image/png;base64,"));
+        let cache = Mutex::new(IconCache::new(8));
+        let ms_net = extract_icon_for_path_cached("ms-settings:network", &cache)
+            .expect("ms-settings:network must extract and cache Windows Settings icon");
+        assert_eq!(ms_net, ms_root);
+        let cached_hit = cache
+            .lock()
+            .unwrap()
+            .get(&icon_cache::aumid_key(WINDOWS_SETTINGS_AUMID));
+        assert_eq!(cached_hit.as_deref(), Some(ms_net.as_str()));
+    }
+
+    #[test]
+    fn canonicalize_uwp_launch_target_and_uri_verb_coercion() {
+        assert_eq!(
+            canonicalize_uwp_launch_target(r"C:\Windows\ImmersiveControlPanel\SystemSettings.exe"),
+            "ms-settings:"
+        );
+        assert_eq!(
+            canonicalize_uwp_launch_target(r#"  "C:/Windows/ImmersiveControlPanel/SystemSettings.exe"  "#),
+            "ms-settings:"
+        );
+        assert_eq!(
+            canonicalize_uwp_launch_target(
+                r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+            ),
+            "ms-settings:"
+        );
+        assert_eq!(
+            canonicalize_uwp_launch_target("ms-settings:network-wifi"),
+            "ms-settings:network-wifi"
+        );
+        assert_eq!(
+            canonicalize_uwp_launch_target(
+                r#" "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" "#
+            ),
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        );
+
+        // Coerce "runas" -> "open" for ms-* and shell: URIs (and SystemSettings.exe)
+        let settings_spec = normalize_launch_spec(
+            r"C:\Windows\ImmersiveControlPanel\SystemSettings.exe",
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(settings_spec.target, "ms-settings:");
+        assert_eq!(settings_spec.verb, "open");
+
+        let ms_net_spec = normalize_launch_spec("ms-settings:network", None, true).unwrap();
+        assert_eq!(ms_net_spec.target, "ms-settings:network");
+        assert_eq!(ms_net_spec.verb, "open");
+
+        let uwp_spec = normalize_launch_spec(
+            r#""shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App" -p PowerShell"#,
+            Some("--maximized"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            uwp_spec.target,
+            r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(uwp_spec.args.as_deref(), Some("-p PowerShell --maximized"));
+        assert_eq!(uwp_spec.verb, "open");
     }
 }

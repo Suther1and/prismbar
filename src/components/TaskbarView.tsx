@@ -373,6 +373,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         target.includes(':\\') ||
         target.startsWith('\\\\') ||
         low.startsWith('shell:appsfolder\\') ||
+        low.startsWith('ms-settings:') ||
         low.startsWith('http://') ||
         low.startsWith('https://');
       if (
@@ -620,23 +621,40 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     }).catch(() => {});
   };
 
-  const triggerLaunchHop = useCallback((id: string) => {
-    const existing = launchTimersRef.current.get(id);
-    if (existing !== undefined) {
-      window.clearTimeout(existing);
-    }
-    setLaunchingIds((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
-    const timerId = window.setTimeout(() => {
+  const clearLaunchHop = useCallback((id: string) => {
+    const timerId = launchTimersRef.current.get(id);
+    if (timerId !== undefined) {
+      window.clearTimeout(timerId);
       launchTimersRef.current.delete(id);
-      setLaunchingIds((prev) => {
-        if (!prev[id]) return prev;
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }, TASKBAR_LAUNCH_HOP_MS);
-    launchTimersRef.current.set(id, timerId);
+    }
+    setLaunchingIds((prev) => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   }, []);
+
+  const triggerLaunchHop = useCallback(
+    (id: string) => {
+      const existing = launchTimersRef.current.get(id);
+      if (existing !== undefined) {
+        window.clearTimeout(existing);
+      }
+      setLaunchingIds((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
+      const timerId = window.setTimeout(() => {
+        launchTimersRef.current.delete(id);
+        setLaunchingIds((prev) => {
+          if (!prev[id]) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      }, TASKBAR_LAUNCH_HOP_MS);
+      launchTimersRef.current.set(id, timerId);
+    },
+    [],
+  );
 
   const hideHoverPill = useCallback(() => {
     pillVisibleRef.current = false;
@@ -728,6 +746,8 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         hwnd: action.hwnd,
         toggleMinimize: action.toggleMinimize,
       }).catch(() => {});
+    } else if (action.target === 'cmd:settings') {
+      ipc('open_start_settings').catch(() => {});
     } else {
       triggerLaunchHop(item.id);
       ipc('launch_item', {
@@ -735,7 +755,9 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         args: action.args,
         asAdmin: false,
         closeStart: false,
-      }).catch(() => {});
+      }).catch(() => {
+        clearLaunchHop(item.id);
+      });
     }
   };
 
@@ -753,6 +775,10 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       item.remoteGroup?.exePath ||
       (item.matchAumid ? `shell:AppsFolder\\${item.matchAumid}` : '');
     if (!launchTarget) return;
+    if (launchTarget === 'cmd:settings') {
+      ipc('open_start_settings').catch(() => {});
+      return;
+    }
     if (!item.group || item.group.windows.length === 0) {
       triggerLaunchHop(item.id);
     }
@@ -762,7 +788,9 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         args: item.args ?? null,
         asAdmin: false,
         closeStart: false,
-      }).catch(() => {});
+      }).catch(() => {
+        clearLaunchHop(item.id);
+      });
     });
   };
 

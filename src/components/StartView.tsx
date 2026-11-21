@@ -17,6 +17,7 @@ import {
   importConfigDialog,
   ipc,
   isCacheIconKey,
+  isNonLaunchableUwpHostExe,
   isTauri,
   normalizeStartStatePayload,
   onEvent,
@@ -31,6 +32,7 @@ import {
   restoreTrayApp,
   setAppearanceSettings,
   setSpaceWidgets,
+  setTaskbarWidgets,
   surfaceExitAck,
   toggleStart,
   updatePin,
@@ -55,6 +57,7 @@ import {
   type WeatherSnapshot,
 } from '../lib/ipc';
 import {
+  buildPinFromSearchItem,
   buildSearchCorpus,
   isPrintableSearchTrigger,
   rankSearchResults,
@@ -90,7 +93,6 @@ import {
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
-  ArrowLeftIcon,
   CopyIcon,
   EditIcon,
   ExternalWindowIcon,
@@ -105,6 +107,7 @@ import {
   UnpinIcon,
 } from './Icons';
 import { StartCommandPalette } from './start/StartCommandPalette';
+import { StartFileExplorer } from './start/StartFileExplorer';
 import { StartHeader } from './start/StartHeader';
 import { StartPinDrawer } from './start/StartPinDrawer';
 import { StartSettingsOverlay } from './start/StartSettingsOverlay';
@@ -164,12 +167,21 @@ function clampPopoverPos(x: number, y: number, width: number, estHeight: number)
   };
 }
 
-function findExistingTaskbarPin(item: PinItem, taskbarPins: PinItem[]): PinItem | null {
+function extractTargetAumid(target: string | null | undefined): string {
+  const trimmed = (target ?? '').trim().toLowerCase();
+  const prefix = 'shell:appsfolder\\';
+  return trimmed.startsWith(prefix) ? trimmed.slice(prefix.length).trim() : '';
+}
+
+function findMatchingPinInList(item: PinItem, pins: readonly PinItem[]): PinItem | null {
   const normTarget = (item.target ?? '').trim().replace(/\//g, '\\').toLowerCase();
-  const normAumid = (item.matchAumid ?? '').trim().toLowerCase();
+  const normAumid =
+    (item.matchAumid ?? '').trim().toLowerCase() || extractTargetAumid(item.target);
   return (
-    taskbarPins.find((tp) => {
-      if (normAumid && tp.matchAumid && tp.matchAumid.trim().toLowerCase() === normAumid) {
+    pins.find((tp) => {
+      const tpAumid =
+        (tp.matchAumid ?? '').trim().toLowerCase() || extractTargetAumid(tp.target);
+      if (normAumid && tpAumid && tpAumid === normAumid) {
         return true;
       }
       if (normTarget && tp.target.trim().replace(/\//g, '\\').toLowerCase() === normTarget) {
@@ -178,6 +190,10 @@ function findExistingTaskbarPin(item: PinItem, taskbarPins: PinItem[]): PinItem 
       return false;
     }) ?? null
   );
+}
+
+function findExistingTaskbarPin(item: PinItem, taskbarPins: PinItem[]): PinItem | null {
+  return findMatchingPinInList(item, taskbarPins);
 }
 
 export const StartView: React.FC = () => {
@@ -247,12 +263,21 @@ export const StartView: React.FC = () => {
   const [savingPinEdit, setSavingPinEdit] = useState(false);
   const editTitleInputRef = useRef<HTMLInputElement>(null);
 
-  // Command Palette
+  // Command Palette & Search Context Menu
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchTrigger, setSearchTrigger] = useState<'keyboard' | 'click'>('keyboard');
   const [query, setQuery] = useState('');
   const [cmdIdx, setCmdIdx] = useState(0);
   const cmdInputRef = useRef<HTMLInputElement>(null);
+  const [searchCtx, setSearchCtx] = useState<{
+    x: number;
+    y: number;
+    item: SearchCorpusItem;
+  } | null>(null);
+  const [searchCtxIdx, setSearchCtxIdx] = useState<number>(0);
+  const lastSearchCtxRef = useRef<{ x: number; y: number; item: SearchCorpusItem } | null>(null);
+  if (searchCtx) lastSearchCtxRef.current = searchCtx;
+  const searchCtxPresence = useAnimatedPresence(Boolean(searchCtx), 95);
 
   // Refs for lifecycle, WAAPI spring & drag-lock audio coordination
   const reducedMotion = useReducedMotion();
@@ -436,6 +461,7 @@ export const StartView: React.FC = () => {
   const resetTransientOverlays = useCallback(() => {
     setSearchOpen(false);
     setQuery('');
+    setSearchCtx(null);
     setPowerOpen(false);
     setArmedPower(null);
     setPeriphOpen(false);
@@ -976,6 +1002,7 @@ export const StartView: React.FC = () => {
         target.includes(':\\') ||
         target.startsWith('\\\\') ||
         low.startsWith('shell:appsfolder\\') ||
+        low.startsWith('ms-settings:') ||
         low.startsWith('http://') ||
         low.startsWith('https://');
       if (resolvable && !resolvedTargetsRef.current.has(low)) {
@@ -1058,6 +1085,7 @@ export const StartView: React.FC = () => {
       setSpace(nextId);
       setSearchOpen(false);
       setQuery('');
+      setSearchCtx(null);
       setDrawerOpen(false);
       setSettingsOpen(false);
       setAddingSpace(false);
@@ -1257,6 +1285,7 @@ export const StartView: React.FC = () => {
           break;
       }
 
+      setSearchCtx(null);
       setSearchOpen(false);
       setQuery('');
     },
@@ -1287,6 +1316,11 @@ export const StartView: React.FC = () => {
           .then(() => showToast(action.toast))
           .catch((err) => showToast(formatIpcError(err)));
       } else if (action.type === 'launch') {
+        if (action.target === 'cmd:settings') {
+          setSettingsOpen(true);
+          setDrawerOpen(false);
+          return;
+        }
         ipc('launch_item', {
           target: action.target,
           args: action.args,
@@ -1527,10 +1561,222 @@ export const StartView: React.FC = () => {
     return actions;
   }, [activeCtxSource, config?.taskbarPins, handleApplyConfig, launchPin, openTileEditPopover, showToast]);
 
+  // Dismiss Search Context Menu when clicking anywhere outside it
+  useEffect(() => {
+    if (!searchCtx) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if ((e.target as Element | null)?.closest('.search-ctx-menu')) return;
+      setSearchCtx(null);
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  }, [searchCtx]);
+
+  // Search Result Context Menu actions
+  const activeSearchCtxSource = searchCtx ?? lastSearchCtxRef.current;
+  const searchCtxActions = useMemo<TileCtxAction[]>(() => {
+    if (!activeSearchCtxSource) return [];
+    const { item } = activeSearchCtxSource;
+    const actions: TileCtxAction[] = [];
+
+    const primaryLabel =
+      item.source === 'window'
+        ? 'Перейти к окну'
+        : item.source === 'clipboard'
+          ? 'Вставить'
+          : item.source === 'audio_device'
+            ? 'Переключить'
+            : item.source === 'command'
+              ? 'Выполнить'
+              : 'Открыть';
+
+    actions.push({
+      id: 'open',
+      label: primaryLabel,
+      icon: item.kind === 'folder' ? <FolderSvg className="ic14" /> : <ExternalWindowIcon className="ic14" />,
+      run: () => {
+        dispatchSearchLaunch(item, false, false);
+      },
+    });
+
+    const pinCandidate = buildPinFromSearchItem(item);
+    if (pinCandidate) {
+      const existingTbPin = findMatchingPinInList(pinCandidate, config?.taskbarPins ?? []);
+      if (existingTbPin) {
+        actions.push({
+          id: 'unpin-tb',
+          label: 'Открепить с панели задач',
+          icon: <UnpinIcon className="ic14" />,
+          run: () => {
+            ipc<TestBarConfig>('remove_pin', { space: 'taskbar', itemId: existingTbPin.id })
+              .then((next) => {
+                handleApplyConfig(next);
+                showToast('Откреплено с панели задач');
+              })
+              .catch((err) => showToast(formatIpcError(err)));
+            setSearchCtx(null);
+          },
+        });
+      } else {
+        actions.push({
+          id: 'pin-tb',
+          label: 'Закрепить на панели задач',
+          icon: <PinIcon className="ic14" />,
+          run: () => {
+            ipc<TestBarConfig>('add_pin', {
+              space: 'taskbar',
+              item: { ...pinCandidate, id: `tb-${Date.now()}`, iconData: null },
+            })
+              .then((next) => {
+                handleApplyConfig(next);
+                showToast('Закреплено на панели задач');
+              })
+              .catch((err) => showToast(formatIpcError(err)));
+            setSearchCtx(null);
+          },
+        });
+      }
+
+      if (activeSpace && !findMatchingPinInList(pinCandidate, activeSpace.items)) {
+        actions.push({
+          id: 'pin-space',
+          label: `Закрепить в пространстве «${activeSpace.name}»`,
+          icon: <PinIcon className="ic14" />,
+          run: () => {
+            ipc<TestBarConfig>('add_pin', {
+              space: activeSpace.id,
+              item: { ...pinCandidate, id: `pin-${Date.now()}`, iconData: null },
+            })
+              .then((next) => {
+                handleApplyConfig(next);
+                showToast(`Закреплено: ${pinCandidate.title}`);
+              })
+              .catch((err) => showToast(formatIpcError(err)));
+            setSearchCtx(null);
+          },
+        });
+      }
+    }
+
+    if (
+      item.source !== 'win_settings' &&
+      item.source !== 'command' &&
+      item.source !== 'clipboard' &&
+      item.source !== 'audio_device' &&
+      item.source !== 'web' &&
+      item.kind !== 'folder' &&
+      item.kind !== 'combo' &&
+      !isNonLaunchableUwpHostExe(item.target) &&
+      canRunAsAdmin(item.target)
+    ) {
+      actions.push({
+        id: 'admin',
+        label: 'Запустить от администратора',
+        icon: <ShieldIcon className="ic14" />,
+        run: () => {
+          ipc('launch_item', {
+            target: item.target,
+            args: item.args ?? null,
+            asAdmin: true,
+            closeStart: true,
+          }).catch((err) => showToast(formatIpcError(err)));
+          setSearchCtx(null);
+          setSearchOpen(false);
+          setQuery('');
+        },
+      });
+    }
+
+    if (item.kind === 'folder') {
+      actions.push({
+        id: 'open-testbar',
+        label: 'Открыть в TestBar',
+        icon: <FolderSvg className="ic14" />,
+        run: () => {
+          setSearchCtx(null);
+          setSearchOpen(false);
+          setQuery('');
+          setWidgetBuilderOpen(false);
+          setActiveExplorerPath(item.target);
+        },
+      });
+
+      if (canOpenFileLocation(item.target)) {
+        actions.push({
+          id: 'open-explorer',
+          label: 'Открыть в Проводнике Windows',
+          icon: <ExternalWindowIcon className="ic14" />,
+          run: () => {
+            fsOpenInExplorer(item.target).catch((err) => showToast(formatIpcError(err)));
+            setSearchCtx(null);
+            setSearchOpen(false);
+            setQuery('');
+          },
+        });
+        actions.push({
+          id: 'terminal',
+          label: 'Открыть в терминале',
+          icon: <TerminalIcon className="ic14" />,
+          run: () => {
+            ipc('open_terminal_at', { path: item.target }).catch((err) =>
+              showToast(formatIpcError(err)),
+            );
+            setSearchCtx(null);
+            setSearchOpen(false);
+            setQuery('');
+          },
+        });
+      }
+    } else if (
+      item.source !== 'win_settings' &&
+      item.source !== 'command' &&
+      item.source !== 'clipboard' &&
+      item.source !== 'audio_device' &&
+      item.source !== 'web' &&
+      canOpenFileLocation(item.target)
+    ) {
+      actions.push({
+        id: 'location',
+        label: 'Расположение файла',
+        icon: <FolderSvg className="ic14" />,
+        run: () => {
+          ipc('open_location', { path: item.target }).catch((err) =>
+            showToast(formatIpcError(err)),
+          );
+          setSearchCtx(null);
+          setSearchOpen(false);
+          setQuery('');
+        },
+      });
+    }
+
+    if (
+      item.source !== 'clipboard' &&
+      item.source !== 'audio_device' &&
+      item.target.trim() &&
+      !item.target.trim().toLowerCase().startsWith('cmd:')
+    ) {
+      actions.push({
+        id: 'copy',
+        label: 'Скопировать путь',
+        icon: <CopyIcon className="ic14" />,
+        run: () => {
+          ipc('copy_to_clipboard', { text: item.target })
+            .then(() => showToast('Путь скопирован'))
+            .catch((err) => showToast(formatIpcError(err)));
+          setSearchCtx(null);
+        },
+      });
+    }
+
+    return actions;
+  }, [activeSearchCtxSource, activeSpace, config?.taskbarPins, dispatchSearchLaunch, handleApplyConfig, showToast]);
+
   // Global keyboard handler: zero-loss type-anywhere search, Ctrl+1..9, Tab, tileCtx nav, Esc, Shift
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Shift') setShiftHeld(true);
+      if (e.defaultPrevented) return;
 
       // Ctrl+1..9 direct Space switcher (works unless actively typing inside a modal input)
       const activeEl = document.activeElement as HTMLElement | null;
@@ -1554,6 +1800,36 @@ export const StartView: React.FC = () => {
           setTileEdit(null);
         }
         return;
+      }
+
+      // Search Result Context Menu keyboard navigation
+      if (searchCtx) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setSearchCtxIdx((i) =>
+            searchCtxActions.length > 0 ? (i + 1) % searchCtxActions.length : 0,
+          );
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setSearchCtxIdx((i) =>
+            searchCtxActions.length > 0
+              ? (i - 1 + searchCtxActions.length) % searchCtxActions.length
+              : 0,
+          );
+          return;
+        }
+        if (e.key === 'Enter' && searchCtxActions[searchCtxIdx]) {
+          e.preventDefault();
+          searchCtxActions[searchCtxIdx].run();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setSearchCtx(null);
+          return;
+        }
       }
 
       // Tile Context Menu keyboard navigation
@@ -1585,6 +1861,8 @@ export const StartView: React.FC = () => {
       if (e.key === 'Escape') {
         if (tileEdit) {
           setTileEdit(null);
+        } else if (searchCtx) {
+          setSearchCtx(null);
         } else if (searchOpen) {
           setSearchOpen(false);
           setQuery('');
@@ -1702,6 +1980,9 @@ export const StartView: React.FC = () => {
     drawerOpen,
     settingsOpen,
     periphOpen,
+    searchCtx,
+    searchCtxIdx,
+    searchCtxActions,
     tileCtx,
     tileCtxIdx,
     tileCtxActions,
@@ -1944,6 +2225,23 @@ export const StartView: React.FC = () => {
     [],
   );
 
+  const openSearchContextMenu = useCallback(
+    (e: React.MouseEvent, item: SearchCorpusItem) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const pos = clampPopoverPos(e.clientX, e.clientY, 244, 320);
+      setTileCtx(null);
+      setTileEdit(null);
+      setSearchCtxIdx(0);
+      setSearchCtx({
+        x: pos.x,
+        y: pos.y,
+        item,
+      });
+    },
+    [],
+  );
+
   const activeAccentHex = activeSpace?.accentHex?.trim() || '#52B8F2';
   const activeAccentRgb = normalizeRgbTriplet(activeSpace?.accentRgb) ?? '82, 184, 242';
   const spaceAccentStyle = useMemo(
@@ -1965,6 +2263,7 @@ export const StartView: React.FC = () => {
       data-visible={startVisible ? 'true' : 'false'}
       style={spaceAccentStyle}
       onClick={() => {
+        if (searchCtx) setSearchCtx(null);
         if (tileCtx) setTileCtx(null);
         if (tileEdit) setTileEdit(null);
         if (powerOpen) {
@@ -2097,36 +2396,34 @@ export const StartView: React.FC = () => {
         >
           {activeExplorerPath !== null ? (
             <div className="v3-explorer-slot" data-explorer-path={activeExplorerPath}>
-              <div className="v3-explorer-placeholder">
-                <div className="v3-explorer-slot-head">
-                  <div className="v3-explorer-slot-path" title={activeExplorerPath}>
-                    <FolderSvg className="ic16" />
-                    <span>{activeExplorerPath}</span>
-                  </div>
-                  <div className="hdr-actions">
-                    <button
-                      type="button"
-                      className="pin-any-btn"
-                      onClick={() => {
-                        fsOpenInExplorer(activeExplorerPath).catch((err) =>
-                          showToast(formatIpcError(err)),
-                        );
-                      }}
-                    >
-                      <ExternalWindowIcon className="ic14" />
-                      <span>Проводник Windows</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="pin-any-btn"
-                      onClick={() => setActiveExplorerPath(null)}
-                    >
-                      <ArrowLeftIcon className="ic14" />
-                      <span>Закрыть</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
+              <StartFileExplorer
+                initialPath={activeExplorerPath}
+                activeSpaceId={space}
+                onClose={() => setActiveExplorerPath(null)}
+                onPinFolder={async (folderPath, folderName) => {
+                  try {
+                    const next = await ipc<TestBarConfig>('add_pin', {
+                      space,
+                      item: {
+                        id: `pin-${Date.now()}`,
+                        kind: 'folder',
+                        title: folderName || folderPath,
+                        subtitle: 'Папка',
+                        target: folderPath,
+                        altAction: 'Открыть в терминале',
+                        accentRgb: activeSpace?.accentRgb || '56,189,248',
+                        iconKey: 'folder',
+                        iconData: null,
+                      },
+                    });
+                    handleApplyConfig(next);
+                    showToast(`Закреплено: ${folderName || folderPath}`);
+                  } catch (err) {
+                    showToast(formatIpcError(err));
+                  }
+                }}
+                onShowToast={showToast}
+              />
             </div>
           ) : activeSpace ? (
             <StartSpaces
@@ -2214,6 +2511,10 @@ export const StartView: React.FC = () => {
             const next = await setAppearanceSettings(params);
             handleApplyConfig(next);
           }}
+          onSetTaskbarWidgets={async (params) => {
+            const next = await setTaskbarWidgets(params);
+            handleApplyConfig(next);
+          }}
           onRefreshIndexes={async () => {
             await refreshIndexes();
             showToast('Индекс обновлён');
@@ -2255,10 +2556,15 @@ export const StartView: React.FC = () => {
           results={searchResults}
           selectedIdx={cmdIdx}
           inputRef={cmdInputRef}
-          onQueryChange={setQuery}
+          onQueryChange={(next) => {
+            setQuery(next);
+            setSearchCtx(null);
+          }}
           onSelectIdx={setCmdIdx}
           onLaunch={dispatchSearchLaunch}
+          onItemContextMenu={openSearchContextMenu}
           onClose={() => {
+            setSearchCtx(null);
             setSearchOpen(false);
             setQuery('');
           }}
@@ -2295,6 +2601,35 @@ export const StartView: React.FC = () => {
                 role="menuitem"
                 className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === tileCtxIdx ? 'focused' : ''}`}
                 onMouseEnter={() => setTileCtxIdx(idx)}
+                onClick={act.run}
+              >
+                {act.icon}
+                <span className="ctx-item-label">{act.label}</span>
+              </button>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
+
+      {/* SEARCH CONTEXT MENU — Rendered OUTSIDE .start-chassis overflow: hidden above .search-backdrop */}
+      {searchCtxPresence.mounted && activeSearchCtxSource && (
+        <div
+          className="flyout-card ctx-card tile-ctx-menu search-ctx-menu"
+          data-phase={searchCtxPresence.phase}
+          role="menu"
+          aria-label={activeSearchCtxSource.item.name}
+          style={{ left: activeSearchCtxSource.x, top: activeSearchCtxSource.y, zIndex: 95 }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="ctx-sec">{activeSearchCtxSource.item.name}</div>
+          {searchCtxActions.map((act, idx) => (
+            <React.Fragment key={act.id}>
+              {act.danger && <div className="ctx-sep" />}
+              <button
+                type="button"
+                role="menuitem"
+                className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === searchCtxIdx ? 'focused' : ''}`}
+                onMouseEnter={() => setSearchCtxIdx(idx)}
                 onClick={act.run}
               >
                 {act.icon}

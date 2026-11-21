@@ -41,7 +41,8 @@
 }
 
 /* When mounted inside .space-stage (which already provides 12px 20px 14px 20px padding) */
-.space-stage > .fx-root {
+.space-stage > .fx-root,
+.v3-explorer-slot > .fx-root {
   position: relative;
   width: 100%;
   height: 100%;

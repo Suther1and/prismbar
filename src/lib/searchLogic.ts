@@ -1,7 +1,9 @@
 import { canOpenFileLocation, canRunAsAdmin } from './flyoutLogic';
 import {
+  formatAppsFolderTarget,
   iconCache,
   isCacheIconKey,
+  isNonLaunchableUwpHostExe,
   type AppWindowGroup,
   type AudioState,
   type ClipboardEntry,
@@ -17,6 +19,7 @@ import { collectPhoneticAliases, swapLayout } from './layoutMap';
 export type SearchSourceKind =
   | 'window'
   | 'command'
+  | 'win_settings'
   | 'audio_device'
   | 'clipboard'
   | 'web'
@@ -59,6 +62,7 @@ export interface SearchCorpusItem {
   iconData?: string | null;
   iconKey?: string | null;
   cacheIconKey?: string | null;
+  matchAumid?: string | null;
   comboTargets?: string[] | null;
   pinned: boolean;
   badge?: SearchBadge | null;
@@ -346,9 +350,256 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
   return commands;
 }
 
+const WIN_SETTINGS_APP_AUMID =
+  'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel';
+
+export function buildWindowsSettingsItems(): SearchCorpusItem[] {
+  const specs: Array<{
+    id: string;
+    name: string;
+    subtitle: string;
+    target: string;
+    keywords: string[];
+  }> = [
+    {
+      id: 'winset:settings',
+      name: 'Параметры Windows',
+      subtitle: 'Системные параметры Windows 11',
+      target: 'ms-settings:',
+      keywords: [
+        'параметры windows',
+        'параметры',
+        'настройки windows',
+        'windows settings',
+        'settings',
+        'systemsettings',
+      ],
+    },
+    {
+      id: 'winset:network',
+      name: 'Сеть и интернет',
+      subtitle: 'Подключения, состояние сети и параметры',
+      target: 'ms-settings:network',
+      keywords: [
+        'сеть',
+        'интернет',
+        'настройка сети',
+        'сеть и интернет',
+        'подключение',
+        'network',
+        'internet',
+        'lan',
+      ],
+    },
+    {
+      id: 'winset:wifi',
+      name: 'Wi-Fi',
+      subtitle: 'Беспроводные сети и адаптер Wi-Fi',
+      target: 'ms-settings:network-wifi',
+      keywords: ['wifi', 'wi-fi', 'вайфай', 'вай-фай', 'беспроводная сеть', 'сеть'],
+    },
+    {
+      id: 'winset:ethernet',
+      name: 'Ethernet и проводная сеть',
+      subtitle: 'Проводное подключение и параметры адаптера',
+      target: 'ms-settings:network-ethernet',
+      keywords: ['ethernet', 'проводная сеть', 'кабель', 'lan', 'сеть'],
+    },
+    {
+      id: 'winset:vpn',
+      name: 'VPN',
+      subtitle: 'Профили и подключения VPN',
+      target: 'ms-settings:network-vpn',
+      keywords: ['vpn', 'впн', 'сеть'],
+    },
+    {
+      id: 'winset:proxy',
+      name: 'Прокси-сервер',
+      subtitle: 'Параметры прокси-сервера Windows',
+      target: 'ms-settings:network-proxy',
+      keywords: ['прокси', 'proxy', 'сеть'],
+    },
+    {
+      id: 'winset:ncpa',
+      name: 'Сетевые подключения (адаптеры)',
+      subtitle: 'Панель сетевых адаптеров, DNS и IP',
+      target: 'ncpa.cpl',
+      keywords: [
+        'сетевые подключения',
+        'адаптеры',
+        'сетевая карта',
+        'dns',
+        'ip',
+        'ncpa',
+        'сеть и интернет',
+        'настройка сети',
+      ],
+    },
+    {
+      id: 'winset:bluetooth',
+      name: 'Bluetooth и устройства',
+      subtitle: 'Беспроводные устройства, мыши, наушники',
+      target: 'ms-settings:bluetooth',
+      keywords: ['bluetooth', 'bt', 'блютуз', 'блютус', 'устройства', 'наушники', 'мышь'],
+    },
+    {
+      id: 'winset:sound',
+      name: 'Звук (Параметры Windows)',
+      subtitle: 'Устройства вывода, микрофон и громкость',
+      target: 'ms-settings:sound',
+      keywords: ['звук windows', 'звук', 'аудио', 'микрофон', 'устройства воспроизведения', 'sound'],
+    },
+    {
+      id: 'winset:display',
+      name: 'Дисплей и мониторы',
+      subtitle: 'Разрешение, масштаб, частота и HDR',
+      target: 'ms-settings:display',
+      keywords: ['дисплей', 'экран', 'монитор', 'разрешение', 'герцовка', 'hdr', 'масштаб', 'display'],
+    },
+    {
+      id: 'winset:personalization',
+      name: 'Персонализация и обои',
+      subtitle: 'Фон рабочего стола, цвета и темы',
+      target: 'ms-settings:personalization',
+      keywords: ['персонализация', 'обои', 'тема', 'фон', 'wallpaper', 'personalization'],
+    },
+    {
+      id: 'winset:appsfeatures',
+      name: 'Приложения и удаление программ',
+      subtitle: 'Установленные приложения и компоненты',
+      target: 'ms-settings:appsfeatures',
+      keywords: ['приложения', 'программы', 'удалить программу', 'apps', 'uninstall'],
+    },
+    {
+      id: 'winset:startupapps',
+      name: 'Автозагрузка Windows',
+      subtitle: 'Программы при входе в систему',
+      target: 'ms-settings:startupapps',
+      keywords: ['автозагрузка', 'автозапуск', 'startup'],
+    },
+    {
+      id: 'winset:defaultapps',
+      name: 'Приложения по умолчанию',
+      subtitle: 'Браузер и программы по умолчанию',
+      target: 'ms-settings:defaultapps',
+      keywords: ['приложения по умолчанию', 'браузер по умолчанию', 'default apps'],
+    },
+    {
+      id: 'winset:storagesense',
+      name: 'Хранилище и диски',
+      subtitle: 'Свободное место и очистка дисков',
+      target: 'ms-settings:storagesense',
+      keywords: ['хранилище', 'диски', 'место на диске', 'storage'],
+    },
+    {
+      id: 'winset:powersleep',
+      name: 'Питание и батарея',
+      subtitle: 'Сон, экран и схема питания',
+      target: 'ms-settings:powersleep',
+      keywords: ['питание', 'батарея', 'энергосбережение', 'power', 'battery'],
+    },
+    {
+      id: 'winset:windowsupdate',
+      name: 'Обновление Windows',
+      subtitle: 'Центр обновления Windows 11',
+      target: 'ms-settings:windowsupdate',
+      keywords: ['обновления', 'центр обновления', 'windows update', 'update'],
+    },
+    {
+      id: 'winset:regionlanguage',
+      name: 'Время и язык',
+      subtitle: 'Языки, ввод и раскладка клавиатуры',
+      target: 'ms-settings:regionlanguage',
+      keywords: ['язык', 'раскладка', 'время и язык', 'регион', 'language', 'keyboard'],
+    },
+    {
+      id: 'winset:dateandtime',
+      name: 'Дата и время',
+      subtitle: 'Часовой пояс и синхронизация времени',
+      target: 'ms-settings:dateandtime',
+      keywords: ['время', 'дата', 'часовой пояс', 'date', 'time'],
+    },
+    {
+      id: 'winset:windowsdefender',
+      name: 'Безопасность и Защитник Windows',
+      subtitle: 'Защита от вирусов и брандмауэр',
+      target: 'ms-settings:windowsdefender',
+      keywords: ['безопасность', 'защитник', 'антивирус', 'брандмауэр', 'defender', 'security', 'firewall'],
+    },
+    {
+      id: 'winset:gaming',
+      name: 'Игровой режим',
+      subtitle: 'Оптимизация Windows для игр',
+      target: 'ms-settings:gaming-gamemode',
+      keywords: ['игровой режим', 'игры', 'game mode', 'gaming'],
+    },
+    {
+      id: 'winset:about',
+      name: 'О системе',
+      subtitle: 'Характеристики ПК и версия Windows',
+      target: 'ms-settings:about',
+      keywords: ['о системе', 'характеристики', 'версия windows', 'about', 'system'],
+    },
+    {
+      id: 'winset:control',
+      name: 'Панель управления',
+      subtitle: 'Классическая панель управления Windows',
+      target: 'control.exe',
+      keywords: ['панель управления', 'control panel', 'control'],
+    },
+    {
+      id: 'winset:devmgmt',
+      name: 'Диспетчер устройств',
+      subtitle: 'Оборудование и драйверы устройств',
+      target: 'devmgmt.msc',
+      keywords: ['диспетчер устройств', 'драйверы', 'устройства', 'device manager', 'devmgmt'],
+    },
+    {
+      id: 'winset:diskmgmt',
+      name: 'Управление дисками',
+      subtitle: 'Разделы, тома и буквы дисков',
+      target: 'diskmgmt.msc',
+      keywords: ['управление дисками', 'разделы', 'диски', 'disk management', 'diskmgmt'],
+    },
+    {
+      id: 'winset:services',
+      name: 'Службы Windows',
+      subtitle: 'Системные службы и их запуск',
+      target: 'services.msc',
+      keywords: ['службы', 'сервисы', 'services', 'services.msc'],
+    },
+    {
+      id: 'winset:mmsys',
+      name: 'Классические параметры звука',
+      subtitle: 'Устройства воспроизведения и записи (mmsys)',
+      target: 'mmsys.cpl',
+      keywords: ['классические параметры звука', 'звук', 'динамики', 'микрофон', 'mmsys'],
+    },
+  ];
+
+  return specs.map((s) => ({
+    id: s.id,
+    name: s.name,
+    subtitle: s.subtitle,
+    category: 'Параметры Windows',
+    target: s.target,
+    args: null,
+    kind: 'app',
+    source: 'win_settings',
+    iconData: null,
+    iconKey: s.id,
+    cacheIconKey: null,
+    matchAumid: null,
+    pinned: false,
+    badge: { text: 'Параметры', variant: 'cmd' },
+    keywords: s.keywords,
+    frecencyKey: s.id,
+  }));
+}
+
 /**
  * Builds the complete Start Menu Command Palette corpus spanning live open windows,
- * bilingual system & WASAPI audio commands, lossless clipboard vault entries,
+ * bilingual system & WASAPI audio commands, Windows 11 Settings, lossless clipboard vault entries,
  * ALL Spaces, Steam games, installed `.lnk` + UWP apps, and indexed user files.
  */
 export function buildSearchCorpus({
@@ -387,6 +638,7 @@ export function buildSearchCorpus({
         iconData: groupIcon,
         iconKey: g.iconKey || g.name.toLowerCase(),
         cacheIconKey,
+        matchAumid: g.aumid ?? null,
         pinned: false,
         badge: { text: 'Открыто', variant: 'open' },
         hwnd: w.hwnd,
@@ -431,6 +683,7 @@ export function buildSearchCorpus({
         iconData,
         iconKey: p.iconKey,
         cacheIconKey,
+        matchAumid: p.matchAumid ?? null,
         comboTargets: p.comboTargets ?? null,
         pinned: true,
         frecencyKey: p.kind === 'combo' ? `combo:${p.id}` : `target:${normKey(p.target) || p.id}`,
@@ -439,16 +692,23 @@ export function buildSearchCorpus({
   };
 
   if (config) {
-    addPinList(config.personalPins, 'Личное');
-    addPinList(config.personalLinks, 'Быстрый доступ');
-    addPinList(config.workFolders, 'Работа · Папка');
-    addPinList(config.workApps, 'Работа');
-    addPinList(config.studioPins, 'Студия');
-    addPinList(config.studioTools, 'Студия · Инструмент');
-    addPinList(config.gameLaunchers, 'Игры · Лаунчер');
-    addPinList(config.gameCombos, 'Игры · Связка');
-    for (const cs of config.customSpaces) {
-      addPinList(cs.items, cs.name);
+    if (config.spaces && config.spaces.length > 0) {
+      for (const sp of config.spaces) {
+        addPinList(sp.items, sp.name);
+      }
+      addPinList(config.gameCombos, 'Игры · Связка');
+    } else {
+      addPinList(config.personalPins, 'Личное');
+      addPinList(config.personalLinks, 'Быстрый доступ');
+      addPinList(config.workFolders, 'Работа · Папка');
+      addPinList(config.workApps, 'Работа');
+      addPinList(config.studioPins, 'Студия');
+      addPinList(config.studioTools, 'Студия · Инструмент');
+      addPinList(config.gameLaunchers, 'Игры · Лаунчер');
+      addPinList(config.gameCombos, 'Игры · Связка');
+      for (const cs of config.customSpaces) {
+        addPinList(cs.items, cs.name);
+      }
     }
   }
 
@@ -465,13 +725,23 @@ export function buildSearchCorpus({
       iconData: g.coverData ?? null,
       iconKey: 'steam',
       cacheIconKey: null,
+      matchAumid: null,
       pinned: false,
       frecencyKey: `game:${g.appId}`,
     });
   }
 
   for (const a of apps) {
-    const isUwp = Boolean(a.aumid) || a.target.toLowerCase().startsWith('shell:appsfolder\\');
+    const aumidLow = (a.aumid ?? '').trim().toLowerCase();
+    const targetLow = a.target.trim().toLowerCase();
+    // Skip raw unpinned UWP Settings entry so curated `Параметры Windows` (ms-settings:) doesn't duplicate
+    if (
+      aumidLow === WIN_SETTINGS_APP_AUMID ||
+      targetLow === `shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`
+    ) {
+      continue;
+    }
+    const isUwp = Boolean(a.aumid) || targetLow.startsWith('shell:appsfolder\\');
     const cacheIconKey = isCacheIconKey(a.iconKey) ? a.iconKey : null;
     const iconData = resolveCachedIconData(iconMap, cacheIconKey, a.target, a.iconData);
     pushUnique({
@@ -486,6 +756,7 @@ export function buildSearchCorpus({
       iconData,
       iconKey: a.iconKey || a.name,
       cacheIconKey,
+      matchAumid: a.aumid ?? null,
       pinned: false,
       frecencyKey: `target:${normKey(a.target)}`,
     });
@@ -513,6 +784,17 @@ export function buildSearchCorpus({
   // System & Audio commands
   for (const cmd of buildSystemCommandItems(audio)) {
     pool.push(cmd);
+  }
+
+  // Windows 11 Settings, Network & System management tools
+  const hasPinnedWinSettings =
+    seenTargets.has(`app:shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`) ||
+    seenTargets.has('app:ms-settings:');
+  for (const ws of buildWindowsSettingsItems()) {
+    if (ws.id === 'winset:settings' && hasPinnedWinSettings) {
+      continue;
+    }
+    pushUnique(ws);
   }
 
   // Clipboard Vault entries (up to 40)
@@ -812,6 +1094,8 @@ function scoreTerm(
     score += 90;
   } else if (item.pinned) {
     score += 80;
+  } else if (item.source === 'win_settings') {
+    score += 50;
   }
 
   if (item.source === 'app' || item.source === 'uwp' || item.source === 'pinned') {
@@ -852,11 +1136,18 @@ export function rankSearchResults(
     };
   }
 
-  // 2. Empty query: curated overview (live windows first + top frecency/pinned apps; skip noise commands/clips)
+  // 2. Empty query: curated overview (live windows first + top frecency/pinned apps; skip noise commands/clips/settings)
   if (!q) {
     const openWins = corpus.filter((c) => c.source === 'window').slice(0, 3);
     const launchables = corpus
-      .filter((c) => c.source !== 'window' && c.source !== 'command' && c.source !== 'audio_device' && c.source !== 'clipboard')
+      .filter(
+        (c) =>
+          c.source !== 'window' &&
+          c.source !== 'command' &&
+          c.source !== 'win_settings' &&
+          c.source !== 'audio_device' &&
+          c.source !== 'clipboard',
+      )
       .map((item) => ({
         item,
         weight:
@@ -1082,9 +1373,152 @@ export function resolveSearchLaunchPayload(
     args: {
       target: item.target,
       args: item.args ?? null,
-      asAdmin: ctrlKey && canRunAsAdmin(item.target),
+      asAdmin: ctrlKey && item.source !== 'win_settings' && canRunAsAdmin(item.target),
       closeStart: true,
     },
+  };
+}
+
+function extractBasenameLower(path: string): string {
+  const norm = normKey(path);
+  if (!norm || norm.endsWith('\\')) return '';
+  const idx = norm.lastIndexOf('\\');
+  return idx >= 0 ? norm.slice(idx + 1) : norm;
+}
+
+function extractAppsFolderAumid(target: string): string {
+  const trimmed = target.trim();
+  const prefix = 'shell:appsfolder\\';
+  return trimmed.toLowerCase().startsWith(prefix)
+    ? trimmed.slice(prefix.length).trim()
+    : '';
+}
+
+/**
+ * Converts a pinnable search result into a canonical `PinItem` (for Taskbar or active Space),
+ * preferring `shell:AppsFolder\<aumid>` for non-launchable UWP host executables and returning
+ * `null` for transient non-pinnable entries (clipboard, audio devices, web bangs, power actions).
+ */
+export function buildPinFromSearchItem(
+  item: SearchCorpusItem,
+  id = `pin-${Date.now()}`,
+): PinItem | null {
+  if (
+    item.source === 'clipboard' ||
+    item.source === 'audio_device' ||
+    item.source === 'web' ||
+    item.kind === 'combo'
+  ) {
+    return null;
+  }
+  if (
+    item.source === 'command' &&
+    item.commandId !== 'task_manager' &&
+    item.commandId !== 'settings'
+  ) {
+    return null;
+  }
+
+  const trimmedAumid = item.matchAumid?.trim() || '';
+  const rawTarget = item.target.trim();
+  const resolvedTarget =
+    trimmedAumid && (!rawTarget || isNonLaunchableUwpHostExe(rawTarget))
+      ? formatAppsFolderTarget(trimmedAumid)
+      : rawTarget || (trimmedAumid ? formatAppsFolderTarget(trimmedAumid) : '');
+  if (!resolvedTarget) return null;
+
+  const title =
+    (item.source === 'window' ? item.subtitle.trim() || item.name.trim() : item.name.trim()) ||
+    'Элемент';
+
+  if (item.kind === 'folder') {
+    return {
+      id,
+      kind: 'folder',
+      title,
+      subtitle: 'Папка',
+      target: resolvedTarget,
+      args: null,
+      altAction: 'Открыть в терминале',
+      accentRgb: '242,180,75',
+      iconKey: item.iconKey || 'folder',
+      iconData: null,
+      matchExe: null,
+      matchAumid: null,
+    };
+  }
+
+  if (item.kind === 'file') {
+    return {
+      id,
+      kind: 'file',
+      title,
+      subtitle: 'Файл',
+      target: resolvedTarget,
+      args: null,
+      altAction: 'Скопировать путь',
+      accentRgb: '82,184,242',
+      iconKey: item.iconKey || 'file',
+      iconData: null,
+      matchExe: null,
+      matchAumid: null,
+    };
+  }
+
+  if (item.kind === 'url') {
+    return {
+      id,
+      kind: 'url',
+      title,
+      subtitle: 'Ссылка',
+      target: resolvedTarget,
+      args: null,
+      altAction: 'Скопировать путь',
+      accentRgb: '167,139,250',
+      iconKey: item.iconKey || 'url',
+      iconData: null,
+      matchExe: null,
+      matchAumid: null,
+    };
+  }
+
+  const resolvedAumid = trimmedAumid || extractAppsFolderAumid(resolvedTarget) || null;
+  const exeBase =
+    !resolvedTarget.toLowerCase().startsWith('shell:appsfolder\\') &&
+    !isNonLaunchableUwpHostExe(resolvedTarget)
+      ? extractBasenameLower(resolvedTarget)
+      : '';
+  const matchExe =
+    exeBase && exeBase.endsWith('.exe') && exeBase !== 'applicationframehost.exe'
+      ? exeBase
+      : null;
+  const canElevate =
+    item.source !== 'win_settings' &&
+    item.commandId !== 'settings' &&
+    canRunAsAdmin(resolvedTarget);
+
+  return {
+    id,
+    kind: 'app',
+    title,
+    subtitle:
+      item.source === 'win_settings'
+        ? 'Параметры'
+        : item.source === 'game'
+          ? item.subtitle || 'Игра'
+          : item.commandId === 'settings'
+            ? 'TestBar'
+            : item.commandId === 'task_manager'
+              ? 'Система'
+              : item.subtitle || 'Приложение',
+    target: resolvedTarget,
+    args: item.args ?? null,
+    altAction: canElevate ? 'От имени администратора' : '',
+    accentRgb: '129,140,248',
+    iconKey: item.cacheIconKey || item.iconKey || title.toLowerCase(),
+    iconData: null,
+    matchExe,
+    matchAumid: resolvedAumid,
   };
 }
 
@@ -1107,6 +1541,7 @@ export function resolveSearchSecondaryAction(item: SearchCorpusItem | undefined)
   }
   if (
     item.source !== 'command' &&
+    item.source !== 'win_settings' &&
     item.source !== 'audio_device' &&
     item.source !== 'web' &&
     canOpenFileLocation(item.target)

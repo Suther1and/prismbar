@@ -1,14 +1,16 @@
 import { formatSelectedDateHeader } from './calendarLogic';
-import type {
-  AppWindowGroup,
-  AudioMasterState,
-  FlyoutRequest,
-  MergedBarItem,
-  NetworkInfo,
-  OpenWindowInfo,
-  PeripheralBattery,
-  PinItem,
-  TelemetryState,
+import {
+  formatAppsFolderTarget,
+  isNonLaunchableUwpHostExe,
+  type AppWindowGroup,
+  type AudioMasterState,
+  type FlyoutRequest,
+  type MergedBarItem,
+  type NetworkInfo,
+  type OpenWindowInfo,
+  type PeripheralBattery,
+  type PinItem,
+  type TelemetryState,
 } from './ipc';
 
 export type TaskbarMonitor = 'primary' | 'secondary';
@@ -621,9 +623,17 @@ export function buildBarContextMenuRequest(
  * preserving `matchExe`, `matchAumid`, `iconKey`, and `args` for clean deduplication (AD-4).
  */
 export function buildPinFromAppContext(payload: AppContextPayload, id = `tb-${Date.now()}`): PinItem {
+  const trimmedAumid = payload.aumid?.trim() || '';
+  const rawTarget = payload.target?.trim() || '';
   const resolvedTarget =
-    payload.target || (payload.aumid ? `shell:AppsFolder\\${payload.aumid}` : '');
+    trimmedAumid && (!rawTarget || isNonLaunchableUwpHostExe(rawTarget))
+      ? formatAppsFolderTarget(trimmedAumid)
+      : rawTarget || (trimmedAumid ? formatAppsFolderTarget(trimmedAumid) : '');
   const trimmedName = payload.name.trim() || 'Приложение';
+  const cleanMatchExe =
+    payload.matchExe && payload.matchExe.trim().toLowerCase() !== 'applicationframehost.exe'
+      ? payload.matchExe
+      : null;
   return {
     id,
     kind: 'app',
@@ -635,8 +645,8 @@ export function buildPinFromAppContext(payload: AppContextPayload, id = `tb-${Da
     accentRgb: '129,140,248',
     iconKey: payload.iconKey || trimmedName.toLowerCase(),
     iconData: null,
-    matchExe: payload.matchExe ?? null,
-    matchAumid: payload.aumid ?? null,
+    matchExe: cleanMatchExe,
+    matchAumid: trimmedAumid || null,
   };
 }
 

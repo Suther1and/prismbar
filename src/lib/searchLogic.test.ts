@@ -11,6 +11,7 @@ import type {
   TestBarConfig,
 } from './ipc';
 import {
+  buildPinFromSearchItem,
   buildSearchCorpus,
   getPrimaryActionLabel,
   isPrintableSearchTrigger,
@@ -586,5 +587,200 @@ describe('searchLogic corpus, Raycast ranking, open windows, commands, clipboard
     expect(isPrintableSearchTrigger({ key: 'c', ctrlKey: true, altKey: false, metaKey: false })).toBe(false);
     expect(isPrintableSearchTrigger({ key: 'Tab', ctrlKey: false, altKey: false, metaKey: false })).toBe(false);
     expect(isPrintableSearchTrigger({ key: 'Shift', ctrlKey: false, altKey: false, metaKey: false })).toBe(false);
+  });
+
+  it('indexes Windows 11 Settings & Network items cleanly with RU/EN + wrong-layout queries and avoids UWP Settings duplication', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: [
+        ...sampleApps,
+        {
+          id: 'uwp-settings-dup',
+          name: 'Параметры',
+          category: 'Система',
+          target: 'shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+          aumid: 'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+          iconKey: 'aumid:settings',
+          iconData: null,
+        },
+      ],
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      audio: sampleAudio,
+    });
+
+    // Only one Settings root entry (`Параметры Windows`, no duplicate UWP `Параметры`)
+    const settingsRoots = corpus.filter(
+      (c) =>
+        c.target === 'ms-settings:' ||
+        c.matchAumid ===
+          'windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+    );
+    expect(settingsRoots).toHaveLength(1);
+    expect(settingsRoots[0].name).toBe('Параметры Windows');
+
+    const netRu = rankSearchResults(corpus, 'сеть и интернет');
+    expect(netRu.items[0]?.id).toBe('winset:network');
+    expect(netRu.items[0]?.source).toBe('win_settings');
+    expect(resolveSearchLaunchPayload(netRu.items[0], false)).toEqual({
+      command: 'launch_item',
+      args: { target: 'ms-settings:network', args: null, asAdmin: false, closeStart: true },
+    });
+
+    const wifiHit = rankSearchResults(corpus, 'вайфай');
+    expect(wifiHit.items[0]?.id).toBe('winset:wifi');
+    expect(wifiHit.items[0]?.target).toBe('ms-settings:network-wifi');
+
+    const netEn = rankSearchResults(corpus, 'network');
+    expect(netEn.items[0]?.id).toBe('winset:network');
+
+    const btShort = rankSearchResults(corpus, 'bt');
+    expect(btShort.items[0]?.id).toBe('winset:bluetooth');
+
+    const btRu = rankSearchResults(corpus, 'блютуз');
+    expect(btRu.items[0]?.id).toBe('winset:bluetooth');
+
+    const settingsHit = rankSearchResults(corpus, 'параметры');
+    expect(settingsHit.items[0]?.id).toBe('winset:settings');
+    expect(settingsHit.items[0]?.target).toBe('ms-settings:');
+
+    // Wrong layout "ctnm" ("сеть") hits Network & Internet cleanly
+    const swappedNet = rankSearchResults(corpus, 'ctnm');
+    expect(swappedNet.items.some((i) => i.id === 'winset:network')).toBe(true);
+  });
+
+  it('indexes config.spaces pins first and propagates matchAumid across sources', () => {
+    const cfgV2: TestBarConfig = {
+      ...makeConfig(),
+      schemaVersion: 2,
+      spaces: [
+        {
+          id: 'custom-dev',
+          name: 'Разработка',
+          accentHex: '#38BDF8',
+          accentRgb: '56,189,248',
+          layoutKind: 'grid',
+          showHeroRow: true,
+          widgets: ['media'],
+          items: [
+            makePin({
+              id: 'sp-wt',
+              title: 'My Terminal',
+              subtitle: 'Терминал',
+              target: 'shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+              matchAumid: 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+            }),
+            makePin({
+              id: 'sp-dir',
+              kind: 'folder',
+              title: 'Исходники',
+              subtitle: 'Папка',
+              target: 'D:\\Code\\Workspace',
+            }),
+          ],
+        },
+      ],
+    };
+
+    const corpus = buildSearchCorpus({
+      config: cfgV2,
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      groups: [
+        {
+          ...sampleGroups[0],
+          aumid: 'Figma.Desktop!App',
+        },
+      ],
+    });
+
+    // Spaces pins are indexed; legacy fields are NOT indexed when config.spaces is non-empty
+    const myTerm = corpus.find((c) => c.name === 'My Terminal');
+    expect(myTerm?.source).toBe('pinned');
+    expect(myTerm?.matchAumid).toBe('Microsoft.WindowsTerminal_8wekyb3d8bbwe!App');
+    expect(corpus.some((c) => c.name === 'Исходники' && c.kind === 'folder')).toBe(true);
+    expect(corpus.some((c) => c.name === 'Портфель Акций')).toBe(false);
+
+    // Propagates matchAumid on open windows and indexed UWP apps
+    expect(corpus.find((c) => c.source === 'window')?.matchAumid).toBe('Figma.Desktop!App');
+    expect(corpus.find((c) => c.name === 'Calculator')?.matchAumid).toBe(
+      'Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+    );
+  });
+
+  it('buildPinFromSearchItem builds valid pins for apps, UWP hosts, folders, win_settings and rejects transient items', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      audio: sampleAudio,
+      clips: sampleClips,
+      groups: [
+        {
+          key: 'aumid:calc',
+          name: 'Калькулятор',
+          exePath: 'C:\\Windows\\System32\\ApplicationFrameHost.exe',
+          aumid: 'Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+          iconKey: 'aumid:calc',
+          iconData: null,
+          isActive: true,
+          windows: [
+            {
+              hwnd: 777,
+              pid: 888,
+              title: 'Калькулятор — Вычисления',
+              exePath: 'C:\\Windows\\System32\\ApplicationFrameHost.exe',
+              exeName: 'ApplicationFrameHost',
+              aumid: 'Microsoft.WindowsCalculator_8wekyb3d8bbwe!App',
+              isActive: true,
+              isMinimized: false,
+            },
+          ],
+        },
+      ],
+    });
+
+    // UWP window hosted by ApplicationFrameHost.exe resolves cleanly to shell:AppsFolder\<aumid>
+    const calcWin = corpus.find((c) => c.source === 'window' && c.hwnd === 777)!;
+    const calcPin = buildPinFromSearchItem(calcWin, 'pin-calc-win');
+    expect(calcPin).not.toBeNull();
+    expect(calcPin?.title).toBe('Калькулятор');
+    expect(calcPin?.target).toBe('shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App');
+    expect(calcPin?.matchAumid).toBe('Microsoft.WindowsCalculator_8wekyb3d8bbwe!App');
+    expect(calcPin?.matchExe).toBeNull();
+
+    // Windows Settings ms-settings:* item builds valid pin
+    const netSetting = corpus.find((c) => c.id === 'winset:network')!;
+    const netPin = buildPinFromSearchItem(netSetting, 'pin-net');
+    expect(netPin).not.toBeNull();
+    expect(netPin?.kind).toBe('app');
+    expect(netPin?.target).toBe('ms-settings:network');
+    expect(netPin?.altAction).toBe('');
+
+    // Folder item builds folder pin
+    const folderItem = corpus.find((c) => c.name === 'Дизайн-Макеты')!;
+    const folderPin = buildPinFromSearchItem(folderItem, 'pin-dir');
+    expect(folderPin?.kind).toBe('folder');
+    expect(folderPin?.target).toBe('C:\\Users\\user\\Desktop\\Дизайн-Макеты');
+
+    // task_manager and settings commands are pinnable; lock / clipboard / audio_device / web are rejected
+    const taskmgr = corpus.find((c) => c.commandId === 'task_manager')!;
+    expect(buildPinFromSearchItem(taskmgr, 'pin-tm')?.target).toBe('C:\\Windows\\System32\\Taskmgr.exe');
+    const tbSettings = corpus.find((c) => c.commandId === 'settings')!;
+    expect(buildPinFromSearchItem(tbSettings, 'pin-tbs')?.target).toBe('cmd:settings');
+
+    const lockCmd = corpus.find((c) => c.commandId === 'lock')!;
+    const clipItem = corpus.find((c) => c.source === 'clipboard')!;
+    const audioItem = corpus.find((c) => c.source === 'audio_device')!;
+    const webItem = rankSearchResults(corpus, 'g tauri').items[0];
+    expect(buildPinFromSearchItem(lockCmd)).toBeNull();
+    expect(buildPinFromSearchItem(clipItem)).toBeNull();
+    expect(buildPinFromSearchItem(audioItem)).toBeNull();
+    expect(buildPinFromSearchItem(webItem)).toBeNull();
   });
 });

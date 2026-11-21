@@ -3204,8 +3204,11 @@ fn find_matching_running_group_icon_source(
 }
 
 fn icon_cache_key_for_source(src: &str) -> String {
-    if src.trim().to_ascii_lowercase().starts_with("shell:appsfolder\\") {
+    let low = src.trim().to_ascii_lowercase();
+    if low.starts_with("shell:appsfolder\\") {
         icon_cache::aumid_key(src)
+    } else if low.starts_with("ms-settings:") {
+        icon_cache::aumid_key(windows_tracker::WINDOWS_SETTINGS_AUMID)
     } else {
         icon_cache::path_icon_key(src)
     }
@@ -3230,8 +3233,10 @@ async fn resolve_pin_icons(
             }
             let low = trimmed.to_ascii_lowercase();
             let is_winapps_alias = windows_tracker::is_windows_apps_execution_alias(trimmed);
-            let is_uri_scheme =
-                trimmed.contains("://") || low.starts_with("ms-") || low.starts_with("mailto:");
+            let is_ms_settings = low.starts_with("ms-settings:");
+            let is_uri_scheme = trimmed.contains("://")
+                || (low.starts_with("ms-") && !is_ms_settings)
+                || low.starts_with("mailto:");
 
             // Prefer UWP / installed_apps match FIRST for 0-byte WindowsApps aliases (e.g. wt.exe)
             // and URL fallbacks (e.g. https://claude.ai when Claude Desktop is installed) so they
@@ -3245,7 +3250,12 @@ async fn resolve_pin_icons(
                 windows_tracker::extract_icon_for_path_cached(trimmed, &state.icon_cache)
             {
                 let key = icon_cache_key_for_source(trimmed);
-                new_sources.push((key, trimmed.to_string()));
+                let registered_src = if is_ms_settings {
+                    windows_tracker::WINDOWS_SETTINGS_AUMID.to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                new_sources.push((key, registered_src));
                 out.insert(trimmed.to_string(), uri);
             } else {
                 needs_index_lookup.push((trimmed.to_string(), false));
@@ -3514,22 +3524,26 @@ async fn add_pin(
         let target_trimmed = item.target.trim().to_string();
         if (item.kind == "app" || item.kind == "file") && !target_trimmed.is_empty() {
             let low = target_trimmed.to_ascii_lowercase();
+            let is_ms_settings = low.starts_with("ms-settings:");
             let is_resolvable = target_trimmed.contains(":\\")
                 || target_trimmed.starts_with("\\\\")
-                || low.starts_with("shell:appsfolder\\");
+                || low.starts_with("shell:appsfolder\\")
+                || is_ms_settings;
             if is_resolvable {
-                let key = if low.starts_with("shell:appsfolder\\") {
-                    icon_cache::aumid_key(&target_trimmed)
-                } else {
-                    icon_cache::path_icon_key(&target_trimmed)
-                };
+                let key = icon_cache_key_for_source(&target_trimmed);
                 if windows_tracker::extract_icon_for_path_cached(&target_trimmed, &state.icon_cache)
                     .is_some()
                 {
-                    state.register_icon_sources(vec![(key.clone(), target_trimmed)]);
+                    let source_to_register = if is_ms_settings {
+                        windows_tracker::WINDOWS_SETTINGS_AUMID.to_string()
+                    } else {
+                        target_trimmed
+                    };
+                    state.register_icon_sources(vec![(key.clone(), source_to_register)]);
                     if item.icon_key.trim().is_empty()
                         || item.icon_key == "app"
                         || item.icon_key == "file"
+                        || item.icon_key == "settings"
                     {
                         item.icon_key = key;
                     }

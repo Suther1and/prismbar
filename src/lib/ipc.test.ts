@@ -46,6 +46,7 @@ import {
   iconCache,
   importConfigDialog,
   isCacheIconKey,
+  isNonLaunchableUwpHostExe,
   launchNewWindow,
   listDirectory,
   loadGameCover,
@@ -332,10 +333,18 @@ describe('mergeTaskbarItems', () => {
     expect(merged[1].iconData).toBe('data:image/png;base64,WT');
 
     // Unpinned UWP Settings resolves icon straight from iconCache via iconKey
+    // and prefers shell:AppsFolder\<aumid> over non-launchable SystemSettings.exe
     expect(merged[2].pinned).toBe(false);
     expect(merged[2].name).toBe('Параметры');
+    expect(merged[2].target).toBe(
+      'shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel',
+    );
     expect(merged[2].iconData).toBe('data:image/png;base64,SETTINGS');
     expect(merged[2].cacheIconKey).toBe('aumid:settings');
+    expect(isNonLaunchableUwpHostExe('C:\\Windows\\ImmersiveControlPanel\\SystemSettings.exe')).toBe(true);
+    expect(isNonLaunchableUwpHostExe('C:/Windows/System32/ApplicationFrameHost.exe')).toBe(true);
+    expect(isNonLaunchableUwpHostExe('C:\\Program Files\\WindowsApps\\Calc\\Calc.exe')).toBe(true);
+    expect(isNonLaunchableUwpHostExe('C:\\Windows\\notepad.exe')).toBe(false);
   });
 
   it('prioritizes exact matchAumid over matchExe and title fallback', () => {
