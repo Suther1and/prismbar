@@ -281,45 +281,43 @@ uint8_t *tb_mac_thumbnail_png_for_path(const char *path_utf8, int32_t size, size
             }
         }
 
-        if (@available(macOS 10.15, *)) {
-            NSURL *url = [NSURL fileURLWithPath:path];
-            if (url) {
-                QLThumbnailGenerationRequest *req = [[QLThumbnailGenerationRequest alloc]
-                    initWithFileAtURL:url
-                                 size:CGSizeMake((CGFloat)target_size, (CGFloat)target_size)
-                                scale:1.0
-                  representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                __block NSImage *ql_image = nil;
-                [[QLThumbnailGenerator sharedGenerator]
-                    generateBestRepresentationForRequest:req
-                                       completionHandler:^(
-                                           QLThumbnailRepresentation * _Nullable thumbnail,
-                                           NSError * _Nullable error
-                                       ) {
-                                           (void)error;
-                                           if (thumbnail) {
-                                               CGImageRef cg = [thumbnail CGImage];
-                                               if (cg) {
-                                                   ql_image = [[NSImage alloc]
-                                                       initWithCGImage:cg
-                                                                  size:NSMakeSize(
-                                                                      (CGFloat)CGImageGetWidth(cg),
-                                                                      (CGFloat)CGImageGetHeight(cg)
-                                                                  )];
-                                               }
+        NSURL *url = [NSURL fileURLWithPath:path];
+        if (url) {
+            QLThumbnailGenerationRequest *req = [[QLThumbnailGenerationRequest alloc]
+                initWithFileAtURL:url
+                             size:CGSizeMake((CGFloat)target_size, (CGFloat)target_size)
+                            scale:1.0
+              representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block NSImage *ql_image = nil;
+            [[QLThumbnailGenerator sharedGenerator]
+                generateBestRepresentationForRequest:req
+                                   completionHandler:^(
+                                       QLThumbnailRepresentation * _Nullable thumbnail,
+                                       NSError * _Nullable error
+                                   ) {
+                                       (void)error;
+                                       if (thumbnail) {
+                                           CGImageRef cg = [thumbnail CGImage];
+                                           if (cg) {
+                                               ql_image = [[NSImage alloc]
+                                                   initWithCGImage:cg
+                                                              size:NSMakeSize(
+                                                                  (CGFloat)CGImageGetWidth(cg),
+                                                                  (CGFloat)CGImageGetHeight(cg)
+                                                              )];
                                            }
-                                           dispatch_semaphore_signal(sem);
-                                       }];
-                dispatch_time_t timeout = dispatch_time(
-                    DISPATCH_TIME_NOW,
-                    (int64_t)(250 * NSEC_PER_MSEC)
-                );
-                if (dispatch_semaphore_wait(sem, timeout) == 0 && ql_image != nil) {
-                    uint8_t *png = tb_encode_nsimage_to_png(ql_image, target_size, out_len);
-                    if (png) {
-                        return png;
-                    }
+                                       }
+                                       dispatch_semaphore_signal(sem);
+                                   }];
+            dispatch_time_t timeout = dispatch_time(
+                DISPATCH_TIME_NOW,
+                (int64_t)(250 * NSEC_PER_MSEC)
+            );
+            if (dispatch_semaphore_wait(sem, timeout) == 0 && ql_image != nil) {
+                uint8_t *png = tb_encode_nsimage_to_png(ql_image, target_size, out_len);
+                if (png) {
+                    return png;
                 }
             }
         }

@@ -4,6 +4,7 @@ fn main() {
         cc::Build::new()
             .file("src/macos/bridge.m")
             .flag("-fobjc-arc")
+            .flag("-mmacosx-version-min=11.0")
             .compile("testbar_mac_bridge");
         for framework in [
             "Cocoa",
