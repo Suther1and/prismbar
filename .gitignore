@@ -9,6 +9,10 @@ TestBar.exe
 *.exe
 *.msi
 *.nsis
+TestBar-macOS-arm64.dmg
+*.dmg
+*.app/
+release/
 
 # BMAD local render cache & ephemeral scratch
 _bmad/render/

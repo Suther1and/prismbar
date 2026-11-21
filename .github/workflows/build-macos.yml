@@ -1,0 +1,142 @@
+name: Build TestBar macOS M1 (.dmg)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional release tag (e.g. v3.0.0) to attach .dmg to a GitHub Release'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS M1 (aarch64-apple-darwin)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Setup Rust toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Generate macOS app icon (icon.icns)
+        run: |
+          set -euo pipefail
+          SRC_ICON="src-tauri/icons/128x128.png"
+          test -f "$SRC_ICON"
+          ICONSET="${RUNNER_TEMP:-/tmp}/icon.iconset"
+          rm -rf "$ICONSET"
+          mkdir -p "$ICONSET"
+
+          sips -s format png -z 16 16     "$SRC_ICON" --out "$ICONSET/icon_16x16.png"
+          sips -s format png -z 32 32     "$SRC_ICON" --out "$ICONSET/icon_16x16@2x.png"
+          sips -s format png -z 32 32     "$SRC_ICON" --out "$ICONSET/icon_32x32.png"
+          sips -s format png -z 64 64     "$SRC_ICON" --out "$ICONSET/icon_32x32@2x.png"
+          sips -s format png -z 128 128   "$SRC_ICON" --out "$ICONSET/icon_128x128.png"
+          sips -s format png -z 256 256   "$SRC_ICON" --out "$ICONSET/icon_128x128@2x.png"
+          sips -s format png -z 256 256   "$SRC_ICON" --out "$ICONSET/icon_256x256.png"
+          sips -s format png -z 512 512   "$SRC_ICON" --out "$ICONSET/icon_256x256@2x.png"
+          sips -s format png -z 512 512   "$SRC_ICON" --out "$ICONSET/icon_512x512.png"
+          sips -s format png -z 1024 1024 "$SRC_ICON" --out "$ICONSET/icon_512x512@2x.png"
+
+          iconutil -c icns "$ICONSET" -o "src-tauri/icons/icon.icns"
+          rm -rf "$ICONSET"
+          test -s "src-tauri/icons/icon.icns"
+          ls -lh "src-tauri/icons/icon.icns"
+
+      - name: Install JS dependencies
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile || {
+            echo "::warning::pnpm-lock.yaml out of sync, falling back to pnpm install"
+            pnpm install
+          }
+
+      - name: Run frontend unit tests
+        run: pnpm test
+
+      - name: Build frontend bundle
+        run: pnpm build
+
+      - name: Run macOS Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build macOS .app bundle (aarch64-apple-darwin)
+        run: |
+          set -euo pipefail
+          pnpm tauri build --target aarch64-apple-darwin --bundles app
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TestBar.app"
+          test -d "$APP_PATH"
+          ls -ld "$APP_PATH"
+
+      - name: Ad-hoc codesign TestBar.app
+        run: |
+          set -euo pipefail
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TestBar.app"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Package .dmg installer
+        run: |
+          set -euo pipefail
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/TestBar.app"
+          rm -rf release
+          mkdir -p release/stage
+
+          ditto "$APP_PATH" "release/stage/TestBar.app"
+          ln -s /Applications "release/stage/Applications"
+
+          printf '%s\n' \
+            "1) Перетащи TestBar в папку «Программы» (Applications)." \
+            "2) Если macOS скажет, что разработчик не проверен: Системные настройки -> Конфиденциальность и безопасность -> «Открыть всё равно»." \
+            "3) При первом запуске выдай доступ в «Универсальный доступ» (кнопка будет прямо в окне), чтобы меню открывалось по одиночному нажатию Command." \
+            > "release/stage/Как запустить.txt"
+
+          hdiutil create -volname "TestBar" -srcfolder "release/stage" -ov -format UDZO "release/TestBar-macOS-arm64.dmg"
+          test -s "release/TestBar-macOS-arm64.dmg"
+          ls -lh "release/TestBar-macOS-arm64.dmg"
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TestBar-macOS-arm64-dmg
+          path: release/TestBar-macOS-arm64.dmg
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          name: TestBar ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }} (macOS M1)
+          files: release/TestBar-macOS-arm64.dmg
+          generate_release_notes: true
