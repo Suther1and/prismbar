@@ -8,6 +8,13 @@ export interface SpotCardProps extends React.HTMLAttributes<HTMLDivElement> {
 
 const SHEEN_HALF = 160;
 
+function isHoverGlowOff(): boolean {
+  return (
+    typeof document !== 'undefined' &&
+    document.documentElement.dataset.hoverGlow === 'off'
+  );
+}
+
 export const SpotCard: React.FC<SpotCardProps> = ({
   className = '',
   bentoIndex,
@@ -43,7 +50,7 @@ export const SpotCard: React.FC<SpotCardProps> = ({
   }, []);
 
   const scheduleSheen = (clientX: number, clientY: number) => {
-    if (reducedMotion || !sheenRef.current) return;
+    if (reducedMotion || isHoverGlowOff() || !sheenRef.current) return;
     const rect = rectRef.current;
     if (!rect) return;
     pendingCoordsRef.current = {
@@ -55,7 +62,7 @@ export const SpotCard: React.FC<SpotCardProps> = ({
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         const coords = pendingCoordsRef.current;
-        if (coords && sheenRef.current) {
+        if (coords && sheenRef.current && !isHoverGlowOff()) {
           sheenRef.current.style.transform = `translate3d(${coords.x}px, ${coords.y}px, 0)`;
         }
       });
@@ -65,7 +72,7 @@ export const SpotCard: React.FC<SpotCardProps> = ({
   };
 
   const handlePointerEnter = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!reducedMotion && cardRef.current) {
+    if (!reducedMotion && !isHoverGlowOff() && cardRef.current) {
       const r = cardRef.current.getBoundingClientRect();
       rectRef.current = { left: r.left, top: r.top };
       scheduleSheen(e.clientX, e.clientY);
@@ -74,7 +81,7 @@ export const SpotCard: React.FC<SpotCardProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!reducedMotion) {
+    if (!reducedMotion && !isHoverGlowOff()) {
       if (!rectRef.current && cardRef.current) {
         const r = cardRef.current.getBoundingClientRect();
         rectRef.current = { left: r.left, top: r.top };
