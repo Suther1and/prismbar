@@ -2823,7 +2823,7 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             "Finder",
             "Файлы и диски",
             finder_target,
-            "Новое окно",
+            "Открыть в Finder",
             "56,189,248",
             "explorer",
         ),
@@ -5986,8 +5986,16 @@ mod tests {
         let cfg = load_config_from(&corrupt_path);
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.bar_mode, "dock");
-        assert!(!cfg.taskbar_pins.is_empty());
-        assert_eq!(cfg.spaces.len(), 4);
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!cfg.taskbar_pins.is_empty());
+            assert_eq!(cfg.spaces.len(), 4);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(cfg.taskbar_pins.is_empty());
+            assert_eq!(cfg.spaces.len(), 3);
+        }
 
         let bak_path = corrupt_backup_path(&corrupt_path);
         assert!(bak_path.exists(), "corrupt config must be backed up to .corrupt.bak");
@@ -6062,6 +6070,20 @@ mod tests {
     #[test]
     fn uniform_list_crud_reorder_and_edge_cases() {
         let mut cfg = TestBarConfig::default();
+        if !cfg.spaces.iter().any(|s| s.id == "games") {
+            cfg.spaces.push(SpaceConfig {
+                id: "games".to_string(),
+                name: "Игры".to_string(),
+                accent_hex: "#FB7185".to_string(),
+                accent_rgb: "251,113,133".to_string(),
+                layout_kind: SPACE_LAYOUT_GAMES.to_string(),
+                show_hero_row: false,
+                bottom_section_title: None,
+                widgets: vec![],
+                header_widgets: vec![],
+                items: vec![],
+            });
+        }
         cfg.custom_spaces.push(CustomSpace {
             id: "custom-lab".to_string(),
             name: "Lab".to_string(),

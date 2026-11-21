@@ -1550,6 +1550,13 @@ export const StartView: React.FC = () => {
             .catch((err) => showToast(formatIpcError(err)));
           break;
         case 'launch_item':
+          if (isMac && item.kind === 'folder' && !ctrlKey && item.target.trim().startsWith('/')) {
+            setWidgetBuilderOpen(false);
+            explorerSessionRef.current = null;
+            setActiveExplorerPath(item.target);
+            trackFrecency();
+            break;
+          }
           ipc('launch_item', payload.args)
             .then(trackFrecency)
             .catch((err) => showToast(formatIpcError(err)));

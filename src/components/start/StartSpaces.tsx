@@ -2856,6 +2856,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     return () => window.clearTimeout(deferTimer);
   }, [startVisible, isGamesLayout, displayedGames]);
 
+  const isMacFinderTile = useCallback(
+    (item: PinItem) =>
+      isMac &&
+      (item.id === 'p-finder' || item.target.trim().toLowerCase().endsWith('/finder.app')),
+    [isMac],
+  );
+
   const handlePinTileClick = useCallback(
     (item: PinItem, eventShift: boolean) => {
       if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
@@ -2870,9 +2877,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         }
         return;
       }
+      if (isMacFinderTile(item)) {
+        if (eventShift || shiftHeld) {
+          onLaunchPin(item);
+        } else {
+          onOpenFolder('~');
+        }
+        return;
+      }
       onLaunchPin(item);
     },
-    [editMode, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
+    [editMode, isMacFinderTile, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
   );
 
   // Always-on pointer-based pin reordering (6px threshold, Main <-> Bottom & Hero <-> Compact <-> Small, immune to Tauri v2 dragDropEnabled)
@@ -3164,7 +3179,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const isFolder = item.kind === 'folder';
     const isFile = item.kind === 'file';
     const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder
+    const honestAlt = isFolder || isMacFinderTile(item)
       ? getFolderShiftLabel(effectivePlatform)
       : getHonestShiftBadge(item, effectivePlatform);
 
@@ -3239,7 +3254,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const isFile = item.kind === 'file';
     const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
     const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder
+    const honestAlt = isFolder || isMacFinderTile(item)
       ? getFolderShiftLabel(effectivePlatform)
       : getHonestShiftBadge(item, effectivePlatform);
     const qIcCls = [
