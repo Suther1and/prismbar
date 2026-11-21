@@ -11,6 +11,7 @@ import {
   getEntryTypeLabel,
   navigateHistoryBack,
   navigateHistoryForward,
+  normalizeHistoryPath,
   pushHistoryPath,
   type FileEntry,
 } from './fileExplorerLogic';
@@ -253,5 +254,41 @@ describe('formatting helpers', () => {
     );
     expect(getEntryTypeLabel({ isDir: false, category: 'code', extension: 'ts' })).toBe('Код TS');
     expect(getEntryTypeLabel({ isDir: false, category: 'file', extension: '' })).toBe('Файл');
+  });
+});
+
+describe('POSIX history normalization and navigation', () => {
+  it('preserves POSIX forward slashes and strips trailing slashes except root', () => {
+    expect(normalizeHistoryPath('/')).toBe('/');
+    expect(normalizeHistoryPath('///')).toBe('/');
+    expect(normalizeHistoryPath('/Users/alex/Desktop/')).toBe('/Users/alex/Desktop');
+    expect(normalizeHistoryPath('/Volumes/WorkSSD///')).toBe('/Volumes/WorkSSD');
+    expect(normalizeHistoryPath('C:\\Users\\alex\\')).toBe('c:\\users\\alex');
+    expect(normalizeHistoryPath('C:\\')).toBe('c:\\');
+    expect(normalizeHistoryPath('\\\\server\\share\\')).toBe('\\\\server\\share');
+  });
+
+  it('pushes and navigates POSIX paths without turning / into \\', () => {
+    let h = createHistoryState('/');
+    h = pushHistoryPath(h, '/'); // duplicate root ignored
+    h = pushHistoryPath(h, '///'); // duplicate normalized root ignored
+    expect(h.entries).toEqual(['/']);
+
+    h = pushHistoryPath(h, '/Users/alex/Desktop/');
+    h = pushHistoryPath(h, '/Users/alex/Desktop'); // trailing-slash duplicate ignored
+    h = pushHistoryPath(h, '/Volumes/WorkSSD');
+    expect(h.entries).toEqual(['/', '/Users/alex/Desktop/', '/Volumes/WorkSSD']);
+    expect(h.index).toBe(2);
+
+    const back1 = navigateHistoryBack(h);
+    expect(back1.path).toBe('/Users/alex/Desktop/');
+    h = back1.state;
+
+    const back2 = navigateHistoryBack(h);
+    expect(back2.path).toBe('/');
+    h = back2.state;
+
+    const fwd = navigateHistoryForward(h);
+    expect(fwd.path).toBe('/Users/alex/Desktop/');
   });
 });

@@ -219,8 +219,17 @@ export function computeVirtualGridRange(params: VirtualGridRangeParams): Virtual
   };
 }
 
-function normalizePathKey(path: string): string {
-  let norm = path.trim().replace(/\//g, '\\').toLowerCase();
+export function normalizeHistoryPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/')) {
+    let norm = trimmed.replace(/\/+/g, '/');
+    while (norm.length > 1 && norm.endsWith('/')) {
+      norm = norm.slice(0, -1);
+    }
+    return norm;
+  }
+  let norm = trimmed.replace(/\//g, '\\').toLowerCase();
   while (norm.length > 3 && norm.endsWith('\\')) {
     norm = norm.slice(0, -1);
   }
@@ -251,7 +260,7 @@ export function pushHistoryPath(
   if (!trimmed) return state;
 
   const current = state.index >= 0 ? state.entries[state.index] : undefined;
-  if (current !== undefined && normalizePathKey(current) === normalizePathKey(trimmed)) {
+  if (current !== undefined && normalizeHistoryPath(current) === normalizeHistoryPath(trimmed)) {
     return state;
   }
 

@@ -9,6 +9,13 @@ import startSpacesSrc from '../components/start/StartSpaces.tsx?raw';
 import startViewSrc from '../components/StartView.tsx?raw';
 import type { ClipboardEntry, PinItem, SpaceConfig, TestBarConfig } from './ipc';
 import {
+  extractTargetBasename,
+  getAvailableSpaceWidgetIds,
+  getSupportedSpaceWidgetCatalog,
+  isMacAppBundle,
+  isNativeIconTarget,
+} from './platform';
+import {
   applyOptimisticMovePinInSpace,
   applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
@@ -37,11 +44,14 @@ import {
   GAME_CARD_MAX_TILT_DEG,
   getBatteryColor,
   getClipboardKindLabel,
+  getFolderShiftLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
   getPinnedItemInSpace,
   getSpaceDisplayName,
   getSpacePinList,
+  getSpaceTemplates,
+  getSpaceWidgetCatalog,
   getSpaceWidgetPlacement,
   getStartChassisAnimClass,
   getTelemetryLevelClass,
@@ -1349,5 +1359,75 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       { id: 'batteries', side: 'left' },
     ]);
     expect(resolveSpaceHeaderWidgets({ widgets: ['audio_mixer'], headerWidgets: [] })).toEqual([]);
+  });
+
+  it('adapts widgets, templates, path targets, and shift badges cleanly for macOS', () => {
+    expect(getAvailableSpaceWidgetIds('windows')).toHaveLength(12);
+    const macWidgetIds = getAvailableSpaceWidgetIds('macos');
+    expect(macWidgetIds).toHaveLength(9);
+    expect(macWidgetIds).not.toContain('audio_mixer');
+    expect(macWidgetIds).not.toContain('media');
+    expect(macWidgetIds).not.toContain('game_combos');
+    expect(getSupportedSpaceWidgetCatalog('macos').map((w) => w.id)).toEqual(macWidgetIds);
+    expect(getSpaceWidgetCatalog('macos').map((w) => w.id)).toEqual(macWidgetIds);
+
+    expect(isNativeIconTarget('/Applications/Safari.app')).toBe(true);
+    expect(isNativeIconTarget('C:\\Windows\\notepad.exe')).toBe(true);
+    expect(isNativeIconTarget('https://example.com')).toBe(false);
+    expect(isNativeIconTarget('x-apple.systempreferences:com.apple.Sound-Settings.extension')).toBe(
+      false,
+    );
+
+    expect(isMacAppBundle('/Applications/Safari.app')).toBe(true);
+    expect(isMacAppBundle('/Applications/Xcode.app/')).toBe(true);
+    expect(isMacAppBundle('/Users/alex/note.txt')).toBe(false);
+
+    expect(extractTargetBasename('/Applications/Safari.app')).toBe('Safari');
+    expect(extractTargetBasename('/Applications/Xcode.app/')).toBe('Xcode');
+    expect(extractTargetBasename('C:\\Tools\\code.exe')).toBe('code');
+    expect(extractTargetBasename('/Users/alex/report.pdf')).toBe('report.pdf');
+
+    const adminPin: PinItem = {
+      id: 'p-adm',
+      kind: 'app',
+      title: 'Terminal',
+      subtitle: 'App',
+      target: '/System/Applications/Utilities/Terminal.app',
+      altAction: 'От имени администратора',
+      accentRgb: '56,189,248',
+      iconKey: 'terminal',
+      runAsAdmin: true,
+    };
+    expect(getHonestShiftBadge(adminPin, 'macos')).toBeNull();
+
+    const folderPin: PinItem = {
+      id: 'p-dir',
+      kind: 'folder',
+      title: 'Desktop',
+      subtitle: 'Папка',
+      target: '/Users/alex/Desktop',
+      altAction: 'Проводник Windows',
+      accentRgb: '242,180,75',
+      iconKey: 'folder',
+    };
+    expect(getFolderShiftLabel('windows')).toBe('Проводник Windows');
+    expect(getFolderShiftLabel('macos')).toBe('Finder');
+    expect(getHonestShiftBadge(folderPin, 'macos')).toBe('Finder');
+
+    const macTemplates = getSpaceTemplates('macos');
+    expect(macTemplates.some((t) => t.id === 'games')).toBe(false);
+    for (const tpl of macTemplates) {
+      expect(tpl.widgets).not.toContain('audio_mixer');
+      expect(tpl.widgets).not.toContain('media');
+      expect(tpl.widgets).not.toContain('game_combos');
+    }
+
+    const macSpaces = resolveConfiguredSpaces(null, 'macos');
+    expect(macSpaces.some((s) => s.id === 'games')).toBe(false);
+    for (const sp of macSpaces) {
+      expect(sp.widgets).not.toContain('audio_mixer');
+      expect(sp.widgets).not.toContain('media');
+      expect(sp.widgets).not.toContain('game_combos');
+    }
   });
 });

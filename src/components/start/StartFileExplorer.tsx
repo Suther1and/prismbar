@@ -9,6 +9,7 @@ import {
   getEntryTypeLabel,
   navigateHistoryBack,
   navigateHistoryForward,
+  normalizeHistoryPath,
   pushHistoryPath,
   canGoBack,
   canGoForward,
@@ -18,6 +19,7 @@ import {
   type ExplorerViewMode,
 } from '../../lib/fileExplorerLogic';
 import { formatIpcError } from '../../lib/flyoutLogic';
+import { detectPlatform, type AppPlatform } from '../../lib/platform';
 import type { ExplorerSessionSnapshot } from '../../lib/startLogic';
 import {
   fsCopyFilesToClipboard,
@@ -75,6 +77,7 @@ export type { ExplorerSessionSnapshot };
 export interface StartFileExplorerProps {
   initialPath: string;
   activeSpaceId: string;
+  platform?: AppPlatform;
   initialSession?: ExplorerSessionSnapshot | null;
   onSessionChange?: (snap: ExplorerSessionSnapshot) => void;
   onClose: () => void;
@@ -117,12 +120,7 @@ interface ExplorerCtxAction {
 }
 
 function normalizePathKey(p: string | null | undefined): string {
-  if (!p) return '';
-  let norm = p.trim().replace(/\//g, '\\').toLowerCase();
-  while (norm.length > 3 && norm.endsWith('\\')) {
-    norm = norm.slice(0, -1);
-  }
-  return norm;
+  return p ? normalizeHistoryPath(p) : '';
 }
 
 function makeThumbCacheKey(
@@ -217,12 +215,14 @@ async function copyTextToClipboard(text: string): Promise<void> {
 export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
   initialPath,
   activeSpaceId,
+  platform,
   initialSession = null,
   onSessionChange,
   onClose,
   onPinFolder,
   onShowToast,
 }) => {
+  const isMac = (platform ?? detectPlatform()) === 'macos';
   const bootPath = initialSession?.path?.trim() || initialPath;
   const [listing, setListing] = useState<DirectoryListing | null>(null);
   const [history, setHistory] = useState<ExplorerHistoryState>(() =>
@@ -1094,7 +1094,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
 
     items.push({
       id: 'reveal',
-      label: 'Показать в Проводнике Windows',
+      label: isMac ? 'Показать в Finder' : 'Показать в Проводнике Windows',
       icon: <FolderSvg className="ic14" />,
       run: () => {
         setCtxMenu(null);
@@ -1114,7 +1114,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
     });
 
     return items;
-  }, [ctxMenu, openEntry, startRenameEntry, copyEntryFile, copyEntryPath, trashEntry, onShowToast]);
+  }, [ctxMenu, isMac, openEntry, startRenameEntry, copyEntryFile, copyEntryPath, trashEntry, onShowToast]);
 
   // Unified Escape handler obeying strict priority chain
   const handleEscapePriority = useCallback(() => {
@@ -1175,18 +1175,24 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
       return;
     }
 
-    // Alt+ArrowLeft / Alt+ArrowRight history navigation
-    if (e.altKey && !e.ctrlKey && !e.metaKey) {
-      if (e.key === 'ArrowLeft') {
+    // Alt+ArrowLeft / Alt+ArrowRight and macOS Cmd+[ / Cmd+] history navigation
+    if ((e.altKey && !e.ctrlKey && !e.metaKey) || (isMac && e.metaKey && !e.ctrlKey && !e.altKey)) {
+      if (e.key === 'ArrowLeft' || (e.metaKey && e.key === '[')) {
         e.preventDefault();
         e.stopPropagation();
         handleGoBack();
         return;
       }
-      if (e.key === 'ArrowRight') {
+      if (e.key === 'ArrowRight' || (e.metaKey && e.key === ']')) {
         e.preventDefault();
         e.stopPropagation();
         handleGoForward();
+        return;
+      }
+      if (e.metaKey && e.key === 'ArrowUp') {
+        e.preventDefault();
+        e.stopPropagation();
+        handleGoUp();
         return;
       }
     }
@@ -1332,7 +1338,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
       ref={rootRef}
       className="fx-root"
       role="dialog"
-      aria-label={`Проводник: ${currentFolderNameLabel(currentPath, listing)}`}
+      aria-label={`${isMac ? 'Файлы' : 'Проводник'}: ${currentFolderNameLabel(currentPath, listing)}`}
       data-space-id={activeSpaceId}
       tabIndex={-1}
       onKeyDown={handleContainerKeyDown}
@@ -1503,11 +1509,12 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
               <button
                 type="button"
                 className="fx-pill-btn"
+                title={isMac ? 'Показать в Finder' : 'Открыть в Проводнике Windows'}
                 disabled={!currentPath}
                 onClick={handleOpenInExplorerHere}
               >
                 <ExternalWindowIcon className="ic14" />
-                <span>Проводник</span>
+                <span>{isMac ? 'Finder' : 'Проводник'}</span>
               </button>
 
               <button
@@ -1698,7 +1705,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
 
         {/* BODY: LEFT SIDEBAR + VIRTUALIZED MAIN VIEWPORT */}
         <div className="fx-body">
-          <aside className="fx-sidebar" aria-label="Разделы и диски">
+          <aside className="fx-sidebar" aria-label={isMac ? 'Разделы и тома' : 'Разделы и диски'}>
             {listing && listing.quickRoots.length > 0 && (
               <div className="fx-side-sec">
                 <div className="fx-side-title">Быстрый доступ</div>
@@ -1722,7 +1729,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
 
             {listing && listing.drives.length > 0 && (
               <div className="fx-side-sec">
-                <div className="fx-side-title">Диски</div>
+                <div className="fx-side-title">{isMac ? 'Тома' : 'Диски'}</div>
                 {listing.drives.map((drive) => {
                   const isActive = normalizePathKey(drive.path) === currentKey;
                   const { ratio, levelClass } = getDriveUsageLevel(drive);

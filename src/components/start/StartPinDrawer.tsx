@@ -8,6 +8,7 @@ import {
   type TestBarConfig,
 } from '../../lib/ipc';
 import { matchesQuery } from '../../lib/layoutMap';
+import { detectPlatform, type AppPlatform } from '../../lib/platform';
 import {
   getPinnedItemInSpace,
   getSpaceDisplayName,
@@ -31,6 +32,7 @@ export interface StartPinDrawerProps {
   config: TestBarConfig | null;
   apps: IndexedApp[];
   iconMap: Record<string, string>;
+  platform?: AppPlatform;
   onClose: () => void;
   onPinFolder: () => Promise<void>;
   onPinFile: () => Promise<void>;
@@ -44,12 +46,14 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
   config,
   apps,
   iconMap,
+  platform,
   onClose,
   onPinFolder,
   onPinFile,
   onPinUrl,
   onTogglePinApp,
 }) => {
+  const isMac = (platform ?? detectPlatform()) === 'macos';
   const { mounted, phase } = useAnimatedPresence(open, 115);
 
   const [filterText, setFilterText] = useState('');
@@ -189,7 +193,9 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
           <span className="pin-source-ic amber"><FolderSvg className="ic18" color="#F2B44B" /></span>
           <div className="pin-source-meta">
             <div className="pin-source-title">Папка</div>
-            <div className="pin-source-sub">Любая директория на диске</div>
+            <div className="pin-source-sub">
+              {isMac ? 'Любая папка на Mac' : 'Любая директория на диске'}
+            </div>
           </div>
         </button>
 
@@ -200,8 +206,10 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         >
           <span className="pin-source-ic sky"><FileSvg className="ic18" color="#52B8F2" /></span>
           <div className="pin-source-meta">
-            <div className="pin-source-title">Файл</div>
-            <div className="pin-source-sub">Программа, документ или скрипт</div>
+            <div className="pin-source-title">{isMac ? 'Файл / Программа (.app)' : 'Файл'}</div>
+            <div className="pin-source-sub">
+              {isMac ? 'Приложение .app, документ или скрипт' : 'Программа, документ или скрипт'}
+            </div>
           </div>
         </button>
 
@@ -318,8 +326,10 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
               (cacheKey ? iconMap[cacheKey] || iconCache.get(cacheKey) : null) ||
               a.iconData ||
               iconMap[a.target] ||
+              iconMap[a.target.toLowerCase()] ||
               null;
-            const isUwp = Boolean(a.aumid) || a.target.toLowerCase().startsWith('shell:appsfolder\\');
+            const isUwp =
+              !isMac && (Boolean(a.aumid) || a.target.toLowerCase().startsWith('shell:appsfolder\\'));
             return (
               <button
                 key={a.id}

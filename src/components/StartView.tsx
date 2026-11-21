@@ -12,8 +12,10 @@ import {
   fetchIconsBatch,
   findMatchingGroupForPin,
   fsOpenInExplorer,
+  getAccessibilityStatus,
   getNetworkSnapshot,
   getPeripheralBatteries,
+  getPlatformInfo,
   getQuickTogglesState,
   getWeather,
   hideBatteryDevice,
@@ -25,9 +27,11 @@ import {
   isTauri,
   normalizeStartStatePayload,
   onEvent,
+  openAccessibilitySettings,
   openScreenSnip,
   pasteClipboardEntry,
   pickCustomIconImage,
+  quitApp,
   recordFrecency,
   refreshIndexes,
   refreshPeripheralBatteries,
@@ -35,6 +39,7 @@ import {
   restoreAllTrayApps,
   restoreTrayApp,
   setAppearanceSettings,
+  setMacSettings,
   setSpaceWidgetLayout,
   setSpaceWidgets,
   setTaskbarWidgets,
@@ -67,6 +72,12 @@ import {
   type WeatherCityOption,
   type WeatherSnapshot,
 } from '../lib/ipc';
+import {
+  detectPlatform,
+  extractTargetBasename,
+  isMacAppBundle,
+  isNativeIconTarget,
+} from '../lib/platform';
 import {
   buildPinFromSearchItem,
   buildSearchCorpus,
@@ -227,6 +238,10 @@ function findExistingTaskbarPin(item: PinItem, taskbarPins: PinItem[]): PinItem 
 }
 
 export const StartView: React.FC = () => {
+  const platform = useMemo(() => detectPlatform(), []);
+  const isMac = platform === 'macos';
+  const [accessibilityTrusted, setAccessibilityTrusted] = useState<boolean | null>(null);
+  const [accessBannerDismissed, setAccessBannerDismissed] = useState(false);
   const [config, setConfig] = useState<TestBarConfig | null>(null);
   const [groups, setGroups] = useState<AppWindowGroup[]>([]);
   const [apps, setApps] = useState<IndexedApp[]>([]);
@@ -458,7 +473,10 @@ export const StartView: React.FC = () => {
   configRef.current = config;
   spaceRef.current = space;
 
-  const resolvedSpaces = useMemo(() => resolveConfiguredSpaces(config), [config]);
+  const resolvedSpaces = useMemo(
+    () => resolveConfiguredSpaces(config, platform),
+    [config, platform],
+  );
   const activeSpace = useMemo(
     () => resolvedSpaces.find((s) => s.id === space) ?? resolvedSpaces[0],
     [resolvedSpaces, space],
@@ -556,24 +574,36 @@ export const StartView: React.FC = () => {
     ipc<TestBarConfig>('get_config')
       .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
       .catch(() => {});
-    ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
+    if (!isMac) {
+      ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
+    } else {
+      getPlatformInfo()
+        .then((info) => setAccessibilityTrusted(info.accessibilityTrusted))
+        .catch(() => {
+          getAccessibilityStatus()
+            .then(setAccessibilityTrusted)
+            .catch(() => {});
+        });
+    }
     ipc<IndexedApp[]>('get_installed_apps').then(setApps).catch(() => {});
-  }, []);
+  }, [isMac]);
 
   // Deferred secondary widget hydration (runs on first Start open or calm idle)
   const hydrateSecondaryData = useCallback(() => {
     if (secondaryHydratedRef.current) return;
     secondaryHydratedRef.current = true;
     ipc<IndexedFile[]>('get_indexed_files').then(setFiles).catch(() => {});
-    ipc<SteamGame[]>('get_steam_games').then(setGames).catch(() => {});
+    if (!isMac) {
+      ipc<SteamGame[]>('get_steam_games').then(setGames).catch(() => {});
+      ipc<MediaState>('get_media_state').then(setMedia).catch(() => {});
+      ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
+    }
     ipc<ClipboardEntry[]>('get_clipboard_history').then(setClips).catch(() => {});
-    ipc<MediaState>('get_media_state').then(setMedia).catch(() => {});
-    ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
     ipc<TelemetryState>('get_telemetry').then(setTelem).catch(() => {});
     getPeripheralBatteries()
       .then(setPeriphs)
       .catch(() => ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {}));
-  }, []);
+  }, [isMac]);
 
   useEffect(() => {
     hydrateCoreData();
@@ -585,65 +615,80 @@ export const StartView: React.FC = () => {
       onEvent<TestBarConfig>('config-updated', (next) =>
         setConfig((prev) => applyConfigUpdate(prev, next)),
       ),
-      onEvent<AppWindowGroup[]>('windows-updated', (next) => {
-        if (!startActiveRef.current) {
-          pendingHiddenRef.current.groups = next;
-          hasPendingHiddenRef.current = true;
-          return;
-        }
-        setGroups(next);
-      }),
       onEvent<IndexedApp[]>('apps-indexed', setApps),
       onEvent<IndexedFile[]>('files-indexed', setFiles),
-      onEvent<SteamGame[]>('games-indexed', setGames),
-      onEvent<AudioState>('audio-mixer-updated', (incoming) => {
-        if (!startActiveRef.current) {
-          pendingHiddenRef.current.audio = incoming;
-          pendingHiddenRef.current.audioMaster = undefined;
-          hasPendingHiddenRef.current = true;
-          return;
-        }
-        setAudio((prev) =>
-          mergeAudioStateRespectingLocks(prev, incoming, audioDragLocksRef.current, Date.now()),
-        );
-      }),
-      onEvent<AudioMasterState>('audio-master-updated', (master) => {
-        if (!startActiveRef.current) {
-          if (pendingHiddenRef.current.audio) {
-            pendingHiddenRef.current.audio = {
-              ...pendingHiddenRef.current.audio,
-              available: master.available,
-              masterVolume: master.masterVolume,
-              masterMuted: master.masterMuted,
-              micMuted: master.micMuted,
-            };
-          } else {
-            pendingHiddenRef.current.audioMaster = master;
-          }
-          hasPendingHiddenRef.current = true;
-          return;
-        }
-        setAudio((prev) => {
-          if (!prev) return prev;
-          const masterLock = audioDragLocksRef.current.get('__master__');
-          const keepMasterVol = masterLock !== undefined && masterLock > Date.now();
-          return {
-            ...prev,
-            available: master.available,
-            masterVolume: keepMasterVol ? prev.masterVolume : master.masterVolume,
-            masterMuted: master.masterMuted,
-            micMuted: master.micMuted,
-          };
-        });
-      }),
-      onEvent<MediaState>('media-updated', (next) => {
-        if (!startActiveRef.current) {
-          pendingHiddenRef.current.media = next;
-          hasPendingHiddenRef.current = true;
-          return;
-        }
-        setMedia(next);
-      }),
+      ...(isMac
+        ? [
+            onEvent<{ trusted?: boolean } | boolean>('accessibility-status-updated', (payload) => {
+              const trusted =
+                typeof payload === 'boolean' ? payload : Boolean(payload?.trusted);
+              setAccessibilityTrusted(trusted);
+            }),
+          ]
+        : [
+            onEvent<AppWindowGroup[]>('windows-updated', (next) => {
+              if (!startActiveRef.current) {
+                pendingHiddenRef.current.groups = next;
+                hasPendingHiddenRef.current = true;
+                return;
+              }
+              setGroups(next);
+            }),
+            onEvent<SteamGame[]>('games-indexed', setGames),
+            onEvent<AudioState>('audio-mixer-updated', (incoming) => {
+              if (!startActiveRef.current) {
+                pendingHiddenRef.current.audio = incoming;
+                pendingHiddenRef.current.audioMaster = undefined;
+                hasPendingHiddenRef.current = true;
+                return;
+              }
+              setAudio((prev) =>
+                mergeAudioStateRespectingLocks(
+                  prev,
+                  incoming,
+                  audioDragLocksRef.current,
+                  Date.now(),
+                ),
+              );
+            }),
+            onEvent<AudioMasterState>('audio-master-updated', (master) => {
+              if (!startActiveRef.current) {
+                if (pendingHiddenRef.current.audio) {
+                  pendingHiddenRef.current.audio = {
+                    ...pendingHiddenRef.current.audio,
+                    available: master.available,
+                    masterVolume: master.masterVolume,
+                    masterMuted: master.masterMuted,
+                    micMuted: master.micMuted,
+                  };
+                } else {
+                  pendingHiddenRef.current.audioMaster = master;
+                }
+                hasPendingHiddenRef.current = true;
+                return;
+              }
+              setAudio((prev) => {
+                if (!prev) return prev;
+                const masterLock = audioDragLocksRef.current.get('__master__');
+                const keepMasterVol = masterLock !== undefined && masterLock > Date.now();
+                return {
+                  ...prev,
+                  available: master.available,
+                  masterVolume: keepMasterVol ? prev.masterVolume : master.masterVolume,
+                  masterMuted: master.masterMuted,
+                  micMuted: master.micMuted,
+                };
+              });
+            }),
+            onEvent<MediaState>('media-updated', (next) => {
+              if (!startActiveRef.current) {
+                pendingHiddenRef.current.media = next;
+                hasPendingHiddenRef.current = true;
+                return;
+              }
+              setMedia(next);
+            }),
+          ]),
       onEvent<TelemetryState>('telemetry-updated', (next) => {
         if (!startActiveRef.current) {
           pendingHiddenRef.current.telem = next;
@@ -701,6 +746,11 @@ export const StartView: React.FC = () => {
           startActiveRef.current = true;
           flushPendingHiddenState();
           cancelChassisAnims();
+          if (isMac) {
+            getAccessibilityStatus()
+              .then(setAccessibilityTrusted)
+              .catch(() => {});
+          }
           setShiftHeld((prev) => (prev ? false : prev));
           const closedAt = lastStartClosedAtRef.current;
           lastStartClosedAtRef.current = null;
@@ -715,7 +765,7 @@ export const StartView: React.FC = () => {
           }
           const explorerResuming = activeExplorerPathRef.current !== null && !explorerExpired;
           const remember = configRef.current?.startRememberSpace ?? false;
-          const configured = resolveConfiguredSpaces(configRef.current);
+          const configured = resolveConfiguredSpaces(configRef.current, platform);
           const defaultSpaceId = configured[0]?.id ?? 'personal';
           if (!remember && spaceRef.current !== defaultSpaceId && !explorerResuming) {
             setSpaceDir(0);
@@ -938,6 +988,8 @@ export const StartView: React.FC = () => {
     resetTransientOverlays,
     cancelPendingOpenArm,
     cancelChassisAnims,
+    isMac,
+    platform,
   ]);
 
   // If active space was removed or deleted remotely, fall back to first available space
@@ -1215,12 +1267,11 @@ export const StartView: React.FC = () => {
       const target = p.target.trim();
       const low = target.toLowerCase();
       const resolvable =
-        target.includes(':\\') ||
-        target.startsWith('\\\\') ||
-        low.startsWith('shell:appsfolder\\') ||
-        low.startsWith('ms-settings:') ||
-        low.startsWith('http://') ||
-        low.startsWith('https://');
+        isNativeIconTarget(target) ||
+        (!isMac &&
+          (low.startsWith('ms-settings:') ||
+            low.startsWith('http://') ||
+            low.startsWith('https://')));
       if (resolvable && !resolvedTargetsRef.current.has(low)) {
         resolvedTargetsRef.current.add(low);
         targetsToResolve.push(target);
@@ -1368,9 +1419,9 @@ export const StartView: React.FC = () => {
   const searchCorpus = useMemo(
     () =>
       searchOpen
-        ? buildSearchCorpus({ config, apps, games, files, iconMap, groups, audio, clips })
+        ? buildSearchCorpus({ config, apps, games, files, iconMap, groups, audio, clips, platform })
         : [],
-    [searchOpen, config, apps, games, files, iconMap, groups, audio, clips],
+    [searchOpen, config, apps, games, files, iconMap, groups, audio, clips, platform],
   );
 
   const searchResults = useMemo<RankedSearchResult>(
@@ -1380,7 +1431,7 @@ export const StartView: React.FC = () => {
 
   const dispatchSearchSecondary = useCallback(
     (item: SearchCorpusItem) => {
-      const secondary = resolveSearchSecondaryAction(item);
+      const secondary = resolveSearchSecondaryAction(item, platform);
       if (!secondary) return;
       switch (secondary.type) {
         case 'close_window':
@@ -1415,7 +1466,7 @@ export const StartView: React.FC = () => {
           break;
       }
     },
-    [showToast],
+    [platform, showToast],
   );
 
   const dispatchSearchLaunch = useCallback(
@@ -1425,7 +1476,7 @@ export const StartView: React.FC = () => {
         return;
       }
 
-      const payload = resolveSearchLaunchPayload(item, ctrlKey);
+      const payload = resolveSearchLaunchPayload(item, ctrlKey, platform);
       const frecKey = item.frecencyKey ?? item.id;
       const shouldRecordFrecency = item.source !== 'clipboard' && item.source !== 'web';
 
@@ -1509,7 +1560,7 @@ export const StartView: React.FC = () => {
       setSearchOpen(false);
       setQuery('');
     },
-    [dispatchSearchSecondary, handleApplyConfig, showToast],
+    [dispatchSearchSecondary, handleApplyConfig, platform, showToast],
   );
 
   const launchPin = useCallback(
@@ -1526,7 +1577,7 @@ export const StartView: React.FC = () => {
         });
         return;
       }
-      const action = resolvePinAction(item, shiftHeld);
+      const action = resolvePinAction(item, shiftHeld, platform);
       if (action.type === 'terminal') {
         ipc('open_terminal_at', { path: action.path }).catch((err) =>
           showToast(formatIpcError(err)),
@@ -1544,17 +1595,19 @@ export const StartView: React.FC = () => {
         ipc('launch_item', {
           target: action.target,
           args: action.args,
-          asAdmin: Boolean(action.asAdmin || item.runAsAdmin),
+          asAdmin: !isMac && Boolean(action.asAdmin || item.runAsAdmin),
           closeStart: action.closeStart,
         })
           .then(() => {
-            const normTarget = item.target.trim().replace(/\//g, '\\').toLowerCase();
+            const normTarget = isMac
+              ? item.target.trim().toLowerCase()
+              : item.target.trim().replace(/\//g, '\\').toLowerCase();
             recordFrecency(`target:${normTarget || item.id}`).then(handleApplyConfig).catch(() => {});
           })
           .catch((err) => showToast(formatIpcError(err)));
       }
     },
-    [editMode, shiftHeld, showToast, handleApplyConfig],
+    [editMode, shiftHeld, showToast, handleApplyConfig, isMac, platform],
   );
 
   // Centered Tile Edit Modal handlers
@@ -1611,7 +1664,7 @@ export const StartView: React.FC = () => {
         iconData: nextIconData,
         tileSize: editTileSize,
         section: editSection,
-        runAsAdmin: tileEdit.item.kind === 'app' ? editRunAsAdmin : undefined,
+        runAsAdmin: tileEdit.item.kind === 'app' ? (isMac ? false : editRunAsAdmin) : undefined,
       });
       handleApplyConfig(updated);
       setTileEdit(null);
@@ -1643,7 +1696,7 @@ export const StartView: React.FC = () => {
       });
       actions.push({
         id: 'open-explorer',
-        label: 'Открыть в Проводнике Windows',
+        label: isMac ? 'Открыть в Finder' : 'Открыть в Проводнике Windows',
         icon: <ExternalWindowIcon className="ic14" />,
         run: () => {
           fsOpenInExplorer(item.target).catch((err) => showToast(formatIpcError(err)));
@@ -1662,7 +1715,7 @@ export const StartView: React.FC = () => {
       });
     }
 
-    if (item.kind === 'app' && canRunAsAdmin(item.target)) {
+    if (item.kind === 'app' && canRunAsAdmin(item.target, platform)) {
       actions.push({
         id: 'admin',
         label: 'От имени администратора',
@@ -1696,7 +1749,7 @@ export const StartView: React.FC = () => {
     if (item.kind !== 'folder' && canOpenFileLocation(item.target)) {
       actions.push({
         id: 'location',
-        label: 'Расположение файла',
+        label: isMac ? 'Показать в Finder' : 'Расположение файла',
         icon: <FolderSvg className="ic14" />,
         run: () => {
           ipc('open_location', { path: item.target }).catch((err) =>
@@ -1804,7 +1857,7 @@ export const StartView: React.FC = () => {
       });
     }
 
-    if (item.kind === 'app') {
+    if (!isMac && item.kind === 'app') {
       const existingTbPin = findExistingTaskbarPin(item, config?.taskbarPins ?? []);
       if (existingTbPin) {
         actions.push({
@@ -1859,7 +1912,16 @@ export const StartView: React.FC = () => {
     });
 
     return actions;
-  }, [activeCtxSource, config?.taskbarPins, handleApplyConfig, launchPin, openTileEditPopover, showToast]);
+  }, [
+    activeCtxSource,
+    config?.taskbarPins,
+    handleApplyConfig,
+    isMac,
+    launchPin,
+    openTileEditPopover,
+    platform,
+    showToast,
+  ]);
 
   const emptyCtxActions = useMemo<TileCtxAction[]>(() => {
     const currentSpaceName = activeSpace?.name ?? 'Пространство';
@@ -1961,42 +2023,44 @@ export const StartView: React.FC = () => {
       },
     });
 
-    const pinCandidate = buildPinFromSearchItem(item);
+    const pinCandidate = buildPinFromSearchItem(item, undefined, platform);
     if (pinCandidate) {
-      const existingTbPin = findMatchingPinInList(pinCandidate, config?.taskbarPins ?? []);
-      if (existingTbPin) {
-        actions.push({
-          id: 'unpin-tb',
-          label: 'Открепить с панели задач',
-          icon: <UnpinIcon className="ic14" />,
-          run: () => {
-            ipc<TestBarConfig>('remove_pin', { space: 'taskbar', itemId: existingTbPin.id })
-              .then((next) => {
-                handleApplyConfig(next);
-                showToast('Откреплено с панели задач');
+      if (!isMac) {
+        const existingTbPin = findMatchingPinInList(pinCandidate, config?.taskbarPins ?? []);
+        if (existingTbPin) {
+          actions.push({
+            id: 'unpin-tb',
+            label: 'Открепить с панели задач',
+            icon: <UnpinIcon className="ic14" />,
+            run: () => {
+              ipc<TestBarConfig>('remove_pin', { space: 'taskbar', itemId: existingTbPin.id })
+                .then((next) => {
+                  handleApplyConfig(next);
+                  showToast('Откреплено с панели задач');
+                })
+                .catch((err) => showToast(formatIpcError(err)));
+              setSearchCtx(null);
+            },
+          });
+        } else {
+          actions.push({
+            id: 'pin-tb',
+            label: 'Закрепить на панели задач',
+            icon: <PinIcon className="ic14" />,
+            run: () => {
+              ipc<TestBarConfig>('add_pin', {
+                space: 'taskbar',
+                item: { ...pinCandidate, id: `tb-${Date.now()}`, iconData: null },
               })
-              .catch((err) => showToast(formatIpcError(err)));
-            setSearchCtx(null);
-          },
-        });
-      } else {
-        actions.push({
-          id: 'pin-tb',
-          label: 'Закрепить на панели задач',
-          icon: <PinIcon className="ic14" />,
-          run: () => {
-            ipc<TestBarConfig>('add_pin', {
-              space: 'taskbar',
-              item: { ...pinCandidate, id: `tb-${Date.now()}`, iconData: null },
-            })
-              .then((next) => {
-                handleApplyConfig(next);
-                showToast('Закреплено на панели задач');
-              })
-              .catch((err) => showToast(formatIpcError(err)));
-            setSearchCtx(null);
-          },
-        });
+                .then((next) => {
+                  handleApplyConfig(next);
+                  showToast('Закреплено на панели задач');
+                })
+                .catch((err) => showToast(formatIpcError(err)));
+              setSearchCtx(null);
+            },
+          });
+        }
       }
 
       if (activeSpace && !findMatchingPinInList(pinCandidate, activeSpace.items)) {
@@ -2034,7 +2098,7 @@ export const StartView: React.FC = () => {
       item.kind !== 'folder' &&
       item.kind !== 'combo' &&
       !isNonLaunchableUwpHostExe(item.target) &&
-      canRunAsAdmin(item.target)
+      canRunAsAdmin(item.target, platform)
     ) {
       actions.push({
         id: 'admin',
@@ -2071,7 +2135,7 @@ export const StartView: React.FC = () => {
       if (canOpenFileLocation(item.target)) {
         actions.push({
           id: 'open-explorer',
-          label: 'Открыть в Проводнике Windows',
+          label: isMac ? 'Открыть в Finder' : 'Открыть в Проводнике Windows',
           icon: <ExternalWindowIcon className="ic14" />,
           run: () => {
             fsOpenInExplorer(item.target).catch((err) => showToast(formatIpcError(err)));
@@ -2104,7 +2168,7 @@ export const StartView: React.FC = () => {
     ) {
       actions.push({
         id: 'location',
-        label: 'Расположение файла',
+        label: isMac ? 'Показать в Finder' : 'Расположение файла',
         icon: <FolderSvg className="ic14" />,
         run: () => {
           ipc('open_location', { path: item.target }).catch((err) =>
@@ -2137,7 +2201,16 @@ export const StartView: React.FC = () => {
     }
 
     return actions;
-  }, [activeSearchCtxSource, activeSpace, config?.taskbarPins, dispatchSearchLaunch, handleApplyConfig, showToast]);
+  }, [
+    activeSearchCtxSource,
+    activeSpace,
+    config?.taskbarPins,
+    dispatchSearchLaunch,
+    handleApplyConfig,
+    isMac,
+    platform,
+    showToast,
+  ]);
 
   // Global keyboard handler: zero-loss type-anywhere search, Ctrl+1..9, Tab, tileCtx nav, Esc, Shift
   useEffect(() => {
@@ -2152,7 +2225,15 @@ export const StartView: React.FC = () => {
         (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') &&
         activeEl !== cmdInputRef.current;
 
-      if (e.ctrlKey && !e.altKey && !e.metaKey && e.key >= '1' && e.key <= '9' && !typingInField) {
+      const spaceShortcutModifier =
+        (e.ctrlKey && !e.metaKey) || (isMac && e.metaKey && !e.ctrlKey);
+      if (
+        spaceShortcutModifier &&
+        !e.altKey &&
+        e.key >= '1' &&
+        e.key <= '9' &&
+        !typingInField
+      ) {
         const idx = Number(e.key) - 1;
         if (idx >= 0 && idx < allSpaceIds.length) {
           e.preventDefault();
@@ -2414,7 +2495,7 @@ export const StartView: React.FC = () => {
     try {
       const picked = await ipc<string | null>('pick_folder');
       if (!picked) return;
-      const baseName = picked.split('\\').filter(Boolean).pop() || picked;
+      const baseName = picked.split(/[\\/]/).filter(Boolean).pop() || picked;
       const hasSpaces = Boolean(config?.spaces && config.spaces.length > 0);
       const targetSpace = hasSpaces
         ? space
@@ -2449,28 +2530,37 @@ export const StartView: React.FC = () => {
     try {
       const picked = await ipc<string | null>('pick_file');
       if (!picked) return;
-      const baseName = picked.split('\\').filter(Boolean).pop() || picked;
-      const isExe = picked.toLowerCase().endsWith('.exe');
+      const baseName = picked.split(/[\\/]/).filter(Boolean).pop() || picked;
+      const lower = picked.toLowerCase();
+      const isExe = lower.endsWith('.exe');
+      const isMacApp = isMac && isMacAppBundle(picked);
+      const isApp = isExe || isMacApp;
       const hasSpaces = Boolean(config?.spaces && config.spaces.length > 0);
       const targetSpace = hasSpaces
         ? space
         : space === 'personal'
-          ? isExe
+          ? isApp
             ? 'personal'
             : 'personal_links'
           : space;
-      const title = isExe ? baseName.replace(/\.exe$/i, '') : baseName;
+      const title = isApp ? extractTargetBasename(picked) || baseName : baseName;
       const updated = await ipc<TestBarConfig>('add_pin', {
         space: targetSpace,
         item: {
           id: `pin-${Date.now()}`,
-          kind: isExe ? 'app' : 'file',
+          kind: isApp ? 'app' : 'file',
           title,
-          subtitle: isExe ? 'Программа' : 'Файл',
+          subtitle: isApp ? 'Программа' : 'Файл',
           target: picked,
-          altAction: isExe ? 'От имени администратора' : 'Скопировать путь',
+          altAction: isMacApp
+            ? ''
+            : isExe
+              ? isMac
+                ? ''
+                : 'От имени администратора'
+              : 'Скопировать путь',
           accentRgb: '82,184,242',
-          iconKey: isExe ? baseName.toLowerCase() : 'file',
+          iconKey: isApp ? baseName.toLowerCase() : 'file',
           iconData: null,
           tileSize: config?.defaultTileSize ?? 'compact',
         },
@@ -2524,7 +2614,7 @@ export const StartView: React.FC = () => {
           title: app.name,
           subtitle: app.category,
           target: app.target,
-          altAction: isUwp ? '' : 'От имени администратора',
+          altAction: isUwp || isMac ? '' : 'От имени администратора',
           accentRgb: '139,150,248',
           iconKey: app.iconKey || app.name.toLowerCase(),
           iconData: null,
@@ -2587,7 +2677,7 @@ export const StartView: React.FC = () => {
     const updated = await deleteSpace(id);
     handleApplyConfig(updated);
     if (spaceRef.current === id) {
-      const fallback = resolveConfiguredSpaces(updated)[0]?.id ?? 'personal';
+      const fallback = resolveConfiguredSpaces(updated, platform)[0]?.id ?? 'personal';
       setSpaceDir(-1);
       setSpace(fallback);
     }
@@ -2767,6 +2857,7 @@ export const StartView: React.FC = () => {
         />
 
         <StartHeader
+          platform={platform}
           space={space}
           spaces={resolvedSpaces}
           headerWidgets={activeHeaderWidgets}
@@ -2965,6 +3056,36 @@ export const StartView: React.FC = () => {
           onOpenWidgetBuilder={handleOpenWidgetBuilder}
         />
 
+        {isMac && accessibilityTrusted === false && !accessBannerDismissed && (
+          <div className="mac-ax-banner" role="status">
+            <div className="mac-ax-banner-lead">
+              <ShieldIcon className="ic14" />
+              <span>
+                Чтобы открывать TestBar одиночным нажатием ⌘ Command, разреши доступ в Настройках
+              </span>
+            </div>
+            <div className="mac-ax-banner-actions">
+              <button
+                type="button"
+                className="mac-ax-banner-btn"
+                onClick={() => {
+                  openAccessibilitySettings().catch((err) => showToast(formatIpcError(err)));
+                }}
+              >
+                Открыть настройки
+              </button>
+              <button
+                type="button"
+                className="mac-ax-banner-close"
+                aria-label="Скрыть уведомление"
+                onClick={() => setAccessBannerDismissed(true)}
+              >
+                <CloseWindowIcon className="ic12" />
+              </button>
+            </div>
+          </div>
+        )}
+
         <div
           className="space-stage"
           onClick={() => {
@@ -2983,6 +3104,7 @@ export const StartView: React.FC = () => {
           {activeExplorerPath !== null ? (
             <div className="v3-explorer-slot" data-explorer-path={activeExplorerPath}>
               <StartFileExplorer
+                platform={platform}
                 initialPath={activeExplorerPath}
                 initialSession={explorerSessionRef.current}
                 onSessionChange={(snap) => {
@@ -3021,6 +3143,7 @@ export const StartView: React.FC = () => {
             </div>
           ) : activeSpace ? (
             <StartSpaces
+              platform={platform}
               space={space}
               activeSpace={activeSpace}
               config={config}
@@ -3084,6 +3207,7 @@ export const StartView: React.FC = () => {
         </div>
 
         <StartPinDrawer
+          platform={platform}
           open={drawerOpen}
           space={space}
           config={config}
@@ -3097,6 +3221,16 @@ export const StartView: React.FC = () => {
         />
 
         <StartSettingsOverlay
+          platform={platform}
+          accessibilityTrusted={accessibilityTrusted}
+          onOpenAccessibilitySettings={openAccessibilitySettings}
+          onSetMacSettings={async (params) => {
+            const next = await setMacSettings(params);
+            handleApplyConfig(next);
+          }}
+          onQuitApp={() => {
+            quitApp().catch((err) => showToast(formatIpcError(err)));
+          }}
           open={settingsOpen}
           config={config}
           onClose={() => setSettingsOpen(false)}
@@ -3472,26 +3606,28 @@ export const StartView: React.FC = () => {
                       />
                     </div>
 
-                    <div className="tile-edit-switch-row">
-                      <div className="tile-edit-switch-meta">
-                        <span className="tile-edit-switch-title">
-                          Запускать от имени администратора
-                        </span>
-                        <span className="tile-edit-switch-sub">
-                          Повышенные права Windows при открытии
-                        </span>
+                    {!isMac && (
+                      <div className="tile-edit-switch-row">
+                        <div className="tile-edit-switch-meta">
+                          <span className="tile-edit-switch-title">
+                            Запускать от имени администратора
+                          </span>
+                          <span className="tile-edit-switch-sub">
+                            Повышенные права Windows при открытии
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={editRunAsAdmin}
+                          aria-label="Запускать от имени администратора"
+                          className={`glass-switch ${editRunAsAdmin ? 'on' : ''}`}
+                          onClick={() => setEditRunAsAdmin((v) => !v)}
+                        >
+                          <span className="glass-switch-thumb" />
+                        </button>
                       </div>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={editRunAsAdmin}
-                        aria-label="Запускать от имени администратора"
-                        className={`glass-switch ${editRunAsAdmin ? 'on' : ''}`}
-                        onClick={() => setEditRunAsAdmin((v) => !v)}
-                      >
-                        <span className="glass-switch-thumb" />
-                      </button>
-                    </div>
+                    )}
                   </>
                 )}
 
@@ -3505,7 +3641,9 @@ export const StartView: React.FC = () => {
                     value={editPinAltAction}
                     onChange={(e) => setEditPinAltAction(e.target.value)}
                   >
-                    {ALT_ACTION_OPTIONS.map((opt) => (
+                    {ALT_ACTION_OPTIONS.filter(
+                      (opt) => !(isMac && opt.value === 'От имени администратора'),
+                    ).map((opt) => (
                       <option key={opt.value || 'none'} value={opt.value}>
                         {opt.label}
                       </option>

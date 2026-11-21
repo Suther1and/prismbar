@@ -621,4 +621,43 @@ describe('Weather & Battery flyout logic, formatters, temperature range bars & i
     expect(startSettingsSrc).toContain('restoreBatteryDevice');
     expect(startSettingsSrc).toContain('restoreAllBatteryDevices');
   });
+
+  it('supports POSIX targets and suppresses admin elevation + Windows-only tabs on macOS', () => {
+    expect(canOpenFileLocation('/Applications/Safari.app')).toBe(true);
+    expect(canOpenFileLocation('/Users/alex/Downloads')).toBe(true);
+    expect(canOpenFileLocation('/')).toBe(true);
+    expect(
+      canOpenFileLocation('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'),
+    ).toBe(false);
+
+    expect(canRunAsAdmin('C:\\Windows\\notepad.exe', 'windows')).toBe(true);
+    expect(canRunAsAdmin('/Applications/Safari.app', 'macos')).toBe(false);
+    expect(canRunAsAdmin('C:\\Windows\\notepad.exe', 'macos')).toBe(false);
+
+    const macSettingsHtml = renderToStaticMarkup(
+      createElement(StartSettingsOverlay, {
+        open: true,
+        platform: 'macos',
+        accessibilityTrusted: false,
+        config: null,
+        onClose: () => {},
+        onSetBarMode: async () => {},
+        onSetSecondaryMode: async () => {},
+        onSetAutostart: async () => {},
+        onSetAppearance: async () => {},
+        onRefreshIndexes: async () => {},
+        onRestoreTrayApp: async () => {},
+        onRestoreAllTrayApps: async () => {},
+        onExportConfig: async () => {},
+        onImportConfig: async () => {},
+        onRestoreWindowsAndExit: () => {},
+      }),
+    );
+    expect(macSettingsHtml).toContain('Внешний вид');
+    expect(macSettingsHtml).toContain('Меню «Пуск»');
+    expect(macSettingsHtml).toContain('Устройства');
+    expect(macSettingsHtml).toContain('Система');
+    expect(macSettingsHtml).not.toContain('Нижняя панель');
+    expect(macSettingsHtml).not.toContain('Вернуть Windows');
+  });
 });

@@ -8,6 +8,7 @@ import type {
   TrayAppItem,
   WeatherCityOption,
 } from './ipc';
+import { detectPlatform, type AppPlatform } from './platform';
 
 export type FlyoutPhase = 'closed' | 'open' | 'closing';
 
@@ -236,13 +237,22 @@ export function canOpenFileLocation(target: string | null | undefined): boolean 
   const t = (target ?? '').trim();
   if (!t) return false;
   const low = t.toLowerCase();
-  if (low.includes('://') || low.startsWith('shell:') || low.startsWith('ms-')) {
+  if (
+    low.includes('://') ||
+    low.startsWith('shell:') ||
+    low.startsWith('ms-') ||
+    low.startsWith('x-apple.systempreferences:')
+  ) {
     return false;
   }
-  return t.includes(':\\') || t.includes(':/') || t.startsWith('\\\\');
+  return t.startsWith('/') || t.includes(':\\') || t.includes(':/') || t.startsWith('\\\\');
 }
 
-export function canRunAsAdmin(target: string | null | undefined): boolean {
+export function canRunAsAdmin(
+  target: string | null | undefined,
+  platform: AppPlatform = detectPlatform(),
+): boolean {
+  if (platform === 'macos') return false;
   const t = (target ?? '').trim();
   if (!t) return false;
   const low = t.toLowerCase();
@@ -250,7 +260,8 @@ export function canRunAsAdmin(target: string | null | undefined): boolean {
     low.startsWith('http://') ||
     low.startsWith('https://') ||
     low.startsWith('shell:') ||
-    low.startsWith('ms-')
+    low.startsWith('ms-') ||
+    low.startsWith('x-apple.systempreferences:')
   );
 }
 

@@ -26,18 +26,24 @@ import {
   type WeatherSnapshot,
 } from '../../lib/ipc';
 import {
+  detectPlatform,
+  getAvailableSpaceWidgetIds,
+  getSupportedSpaceWidgetCatalog,
+  type AppPlatform,
+} from '../../lib/platform';
+import {
   computeSlidingPillRect,
   filterVisibleBatteries,
   formatPeripheralSourceLabel,
   formatStartTemperature,
   getBatteryColor,
+  getSpaceTemplates,
   isLowBatteryPercent,
   MAX_MODULAR_SPACES,
   MODULAR_SPACE_ACCENTS,
   moveSpaceIdInOrder,
   planHeaderWidgetSlots,
   resolveSpaceHeaderWidgets,
-  SPACE_TEMPLATES,
   SPACE_WIDGET_CATALOG,
   toggleSpaceWidget,
   validateSpaceName,
@@ -171,6 +177,7 @@ export interface StartHeaderProps {
   onSetQuickToggles?: (state: QuickTogglesState) => void;
   onConfigUpdated?: (config: TestBarConfig) => void;
   onShowToast?: (msg: string) => void;
+  platform?: AppPlatform;
 }
 
 interface HeaderBounds {
@@ -285,7 +292,22 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onSetQuickToggles,
   onConfigUpdated,
   onShowToast,
+  platform,
 }) => {
+  const effectivePlatform = platform ?? detectPlatform();
+  const isMac = effectivePlatform === 'macos';
+  const supportedWidgetIds = useMemo(
+    () => new Set(getAvailableSpaceWidgetIds(effectivePlatform)),
+    [effectivePlatform],
+  );
+  const supportedWidgetCatalog = useMemo(
+    () => getSupportedSpaceWidgetCatalog(effectivePlatform),
+    [effectivePlatform],
+  );
+  const availableTemplates = useMemo(
+    () => getSpaceTemplates(effectivePlatform),
+    [effectivePlatform],
+  );
   const reducedMotion = useReducedMotion();
   const focusTimer = useFocusTimer();
   const headerRef = useRef<HTMLElement>(null);
@@ -704,7 +726,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
 
   const handleSelectTemplate = (tplId: SpaceTemplateId) => {
     setNewSpaceTemplate(tplId);
-    const spec = SPACE_TEMPLATES.find((t) => t.id === tplId);
+    const spec = availableTemplates.find((t) => t.id === tplId);
     if (spec) {
       setSelectedAccent(findMatchingAccent(spec.accentHex));
       setNewWidgets([...spec.widgets]);
@@ -882,10 +904,15 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   };
 
   const activeSpaceObj = spaces.find((s) => s.id === space) ?? null;
-  const resolvedHeaderWidgets = useMemo(
-    () => headerWidgets ?? resolveSpaceHeaderWidgets(activeSpaceObj),
-    [headerWidgets, activeSpaceObj],
-  );
+  const resolvedHeaderWidgets = useMemo(() => {
+    const raw = headerWidgets ?? resolveSpaceHeaderWidgets(activeSpaceObj);
+    if (!isMac) return raw;
+    return raw.filter(
+      (entry) =>
+        supportedWidgetIds.has(entry.id) &&
+        !(entry.id === 'batteries' && visiblePeriphs.length === 0),
+    );
+  }, [headerWidgets, activeSpaceObj, isMac, supportedWidgetIds, visiblePeriphs.length]);
 
   const headerWidthMap = useMemo<Partial<Record<SpaceWidgetId, number>>>(
     () => ({
@@ -1019,7 +1046,11 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
       case 'weather':
         return weatherPillTemp;
       case 'batteries':
-        return visiblePeriphs.length > 0 ? `${visiblePeriphs[0].percent}%` : 'Звук';
+        return visiblePeriphs.length > 0
+          ? `${visiblePeriphs[0].percent}%`
+          : isMac
+            ? 'Устройства'
+            : 'Звук';
       case 'media':
         return media?.hasSession ? media.title || 'Медиа' : 'Медиа';
       case 'audio_mixer':
@@ -1049,13 +1080,23 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
 
   const renderHeaderPill = (entry: SpaceHeaderWidget) => {
     const id = entry.id;
+    if (isMac && !supportedWidgetIds.has(id)) {
+      return null;
+    }
     if (id === 'batteries') {
+      if (isMac && visiblePeriphs.length === 0) {
+        return null;
+      }
       return (
         <button
           key={id}
           type="button"
           className={`hdr-widget-pill periph-pill ${periphOpen ? 'open' : ''} ${hasLowBat ? 'has-low-bat' : ''}`}
-          title="Беспроводные устройства и вывод звука"
+          title={
+            isMac
+              ? 'Беспроводные устройства и батарея'
+              : 'Беспроводные устройства и вывод звука'
+          }
           onClick={(e) => handleSelectHeaderWidget('batteries', e.currentTarget)}
         >
           {inlinePeriphs.length === 0 ? (
@@ -1173,7 +1214,8 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     const isOpen = openStandaloneWidgetId === id;
     const isTimerRunning = id === 'timer' && focusTimer.state.running;
     const isToggleActive =
-      id === 'quick_toggles' && Boolean(quickToggles?.keepAwake || audio?.micMuted);
+      id === 'quick_toggles' &&
+      Boolean(quickToggles?.keepAwake || (!isMac && audio?.micMuted));
     const meta = getWidgetMeta(id);
 
     return (
@@ -1248,6 +1290,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         return (
           <QuickTogglesWidgetCard
             mode="popover"
+            platform={effectivePlatform}
             audio={audio}
             quickToggles={quickToggles}
             onSetAudio={onSetAudio}
@@ -1513,7 +1556,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
               <div className="tile-edit-field">
                 <span className="tile-edit-lbl">Шаблон</span>
                 <div className="space-tpl-grid">
-                  {SPACE_TEMPLATES.map((tpl) => (
+                  {availableTemplates.map((tpl) => (
                     <button
                       key={tpl.id}
                       type="button"
@@ -1571,7 +1614,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
               <div className="tile-edit-field">
                 <span className="tile-edit-lbl">Виджеты</span>
                 <div className="space-widget-chips">
-                  {SPACE_WIDGET_CATALOG.map((w) => {
+                  {supportedWidgetCatalog.map((w) => {
                     const active = newWidgets.includes(w.id);
                     return (
                       <button
@@ -1660,29 +1703,31 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                 </div>
               </div>
 
-              <div className="tile-edit-field">
-                <span className="tile-edit-lbl">Макет пространства</span>
-                <div className="space-seg-2" role="radiogroup" aria-label="Макет пространства">
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={editLayoutKind === 'grid'}
-                    className={`space-preset-btn ${editLayoutKind === 'grid' ? 'active' : ''}`}
-                    onClick={() => setEditLayoutKind('grid')}
-                  >
-                    Обычная сетка
-                  </button>
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={editLayoutKind === 'games'}
-                    className={`space-preset-btn ${editLayoutKind === 'games' ? 'active' : ''}`}
-                    onClick={() => setEditLayoutKind('games')}
-                  >
-                    Библиотека игр
-                  </button>
+              {!isMac && (
+                <div className="tile-edit-field">
+                  <span className="tile-edit-lbl">Макет пространства</span>
+                  <div className="space-seg-2" role="radiogroup" aria-label="Макет пространства">
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={editLayoutKind === 'grid'}
+                      className={`space-preset-btn ${editLayoutKind === 'grid' ? 'active' : ''}`}
+                      onClick={() => setEditLayoutKind('grid')}
+                    >
+                      Обычная сетка
+                    </button>
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={editLayoutKind === 'games'}
+                      className={`space-preset-btn ${editLayoutKind === 'games' ? 'active' : ''}`}
+                      onClick={() => setEditLayoutKind('games')}
+                    >
+                      Библиотека игр
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="tile-edit-field">
                 <label className="tile-edit-lbl" htmlFor="tb-space-bottom-title">
@@ -1691,7 +1736,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                 <input
                   id="tb-space-bottom-title"
                   className="space-create-input"
-                  placeholder={editLayoutKind === 'games' ? 'Лаунчеры и закреплённое' : 'Быстрый доступ'}
+                  placeholder={!isMac && editLayoutKind === 'games' ? 'Лаунчеры и закреплённое' : 'Быстрый доступ'}
                   maxLength={32}
                   value={editBottomTitle}
                   onChange={(e) => {
@@ -1913,29 +1958,33 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
             </div>
           )}
 
-          <div className="pp-sec">Вывод звука</div>
-          {(audio?.devices ?? []).length === 0 ? (
-            <div className="pp-empty">Устройства вывода не найдены</div>
-          ) : (
-            (audio?.devices ?? []).map((d) => (
-              <button
-                key={d.id}
-                type="button"
-                className={`pp-row ${d.isDefault ? 'active' : ''}`}
-                onClick={() => {
-                  onSelectAudioDevice(d.id);
-                  onClosePeriph();
-                }}
-              >
-                <span className="pp-ic"><VolIcon /></span>
-                <div className="pp-meta">
-                  <div className="pp-name">{d.shortName}</div>
-                  <div className="pp-sub" style={{ color: d.isDefault ? 'var(--accent)' : 'var(--t3)' }}>
-                    {d.isDefault ? 'Активный вывод' : 'Переключить'}
-                  </div>
-                </div>
-              </button>
-            ))
+          {!isMac && (
+            <>
+              <div className="pp-sec">Вывод звука</div>
+              {(audio?.devices ?? []).length === 0 ? (
+                <div className="pp-empty">Устройства вывода не найдены</div>
+              ) : (
+                (audio?.devices ?? []).map((d) => (
+                  <button
+                    key={d.id}
+                    type="button"
+                    className={`pp-row ${d.isDefault ? 'active' : ''}`}
+                    onClick={() => {
+                      onSelectAudioDevice(d.id);
+                      onClosePeriph();
+                    }}
+                  >
+                    <span className="pp-ic"><VolIcon /></span>
+                    <div className="pp-meta">
+                      <div className="pp-name">{d.shortName}</div>
+                      <div className="pp-sub" style={{ color: d.isDefault ? 'var(--accent)' : 'var(--t3)' }}>
+                        {d.isDefault ? 'Активный вывод' : 'Переключить'}
+                      </div>
+                    </div>
+                  </button>
+                ))
+              )}
+            </>
           )}
         </div>
       )}

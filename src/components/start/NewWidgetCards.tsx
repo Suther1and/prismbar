@@ -21,6 +21,7 @@ import {
   type TestBarConfig,
 } from '../../lib/ipc';
 import { formatIpcError } from '../../lib/flyoutLogic';
+import { detectPlatform, type AppPlatform } from '../../lib/platform';
 import { TIMER_PRESETS, useFocusTimer } from '../../lib/timerStore';
 import {
   CaffeineIcon,
@@ -696,6 +697,7 @@ export const NetworkWidgetCard: React.FC<NetworkWidgetCardProps> = ({
 export interface QuickTogglesWidgetCardProps {
   audio?: AudioState | null;
   quickToggles?: QuickTogglesState | null;
+  platform?: AppPlatform;
   onSetAudio?: (audio: AudioState, fromServer?: boolean) => void;
   onSetQuickToggles?: (state: QuickTogglesState) => void;
   onShowToast?: (msg: string) => void;
@@ -712,12 +714,14 @@ const POWER_PLANS: ReadonlyArray<{ id: PowerPlanKind; label: string }> = [
 export const QuickTogglesWidgetCard: React.FC<QuickTogglesWidgetCardProps> = ({
   audio,
   quickToggles,
+  platform,
   onSetAudio,
   onSetQuickToggles,
   onShowToast,
   mode = 'card',
   bentoIndex,
 }) => {
+  const isMac = (platform ?? detectPlatform()) === 'macos';
   const [fallbackToggles, setFallbackToggles] = useState<QuickTogglesState | null>(null);
   const [fallbackAudio, setFallbackAudio] = useState<AudioState | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -746,7 +750,7 @@ export const QuickTogglesWidgetCard: React.FC<QuickTogglesWidgetCardProps> = ({
         })
         .catch(() => {});
     }
-    if (audio === undefined) {
+    if (!isMac && audio === undefined) {
       ipc<AudioState>('get_audio_state')
         .then((st) => {
           if (active) setFallbackAudio(st);
@@ -756,7 +760,7 @@ export const QuickTogglesWidgetCard: React.FC<QuickTogglesWidgetCardProps> = ({
     return () => {
       active = false;
     };
-  }, [quickToggles, audio]);
+  }, [quickToggles, audio, isMac]);
 
   const effectiveToggles = quickToggles ?? fallbackToggles;
   const effectiveAudio = audio ?? fallbackAudio;
@@ -877,53 +881,58 @@ export const QuickTogglesWidgetCard: React.FC<QuickTogglesWidgetCardProps> = ({
         )}
       </div>
 
-      <div className="nw-toggle-grid">
-        <button
-          type="button"
-          className={`sys-tgl nw-tgl-btn ${!micMuted ? 'on' : ''}`}
-          disabled={busyKey === 'mic'}
-          onClick={() => void handleToggleMic()}
-        >
-          <MicIcon className="ic14" muted={micMuted} />
-          <div className="nw-tgl-meta">
-            <div className="sys-tgl-t">Микрофон</div>
-            <div className="sys-tgl-s">{micMuted ? 'Выключен' : 'Активен'}</div>
-          </div>
-          <span className={`mic-status-dot ${micMuted ? 'muted' : ''}`} aria-hidden="true" />
-        </button>
+      <div className="nw-toggle-grid" style={isMac ? { gridTemplateColumns: '1fr' } : undefined}>
+        {!isMac && (
+          <button
+            type="button"
+            className={`sys-tgl nw-tgl-btn ${!micMuted ? 'on' : ''}`}
+            disabled={busyKey === 'mic'}
+            onClick={() => void handleToggleMic()}
+          >
+            <MicIcon className="ic14" muted={micMuted} />
+            <div className="nw-tgl-meta">
+              <div className="sys-tgl-t">Микрофон</div>
+              <div className="sys-tgl-s">{micMuted ? 'Выключен' : 'Активен'}</div>
+            </div>
+            <span className={`mic-status-dot ${micMuted ? 'muted' : ''}`} aria-hidden="true" />
+          </button>
+        )}
 
         <button
           type="button"
           className={`sys-tgl nw-tgl-btn ${keepAwake ? 'on' : ''}`}
+          title={isMac ? 'Не давать Mac уснуть (Caffeine)' : undefined}
           disabled={busyKey === 'awake'}
           onClick={() => void handleToggleAwake()}
         >
           <CaffeineIcon className="ic14" />
           <div className="nw-tgl-meta">
-            <div className="sys-tgl-t">Не спать</div>
+            <div className="sys-tgl-t">{isMac ? 'Не спать (Caffeine)' : 'Не спать'}</div>
             <div className="sys-tgl-s">{keepAwake ? 'Активен' : 'Выкл'}</div>
           </div>
         </button>
       </div>
 
-      <div className="nw-power-seg" role="radiogroup" aria-label="Схема питания">
-        {POWER_PLANS.map((plan) => {
-          const isActive = activePlan === plan.id;
-          return (
-            <button
-              key={plan.id}
-              type="button"
-              role="radio"
-              aria-checked={isActive}
-              disabled={Boolean(busyKey)}
-              className={`nw-power-btn ${isActive ? 'active' : ''}`}
-              onClick={() => void handleSelectPlan(plan.id)}
-            >
-              {plan.label}
-            </button>
-          );
-        })}
-      </div>
+      {!isMac && (
+        <div className="nw-power-seg" role="radiogroup" aria-label="Схема питания">
+          {POWER_PLANS.map((plan) => {
+            const isActive = activePlan === plan.id;
+            return (
+              <button
+                key={plan.id}
+                type="button"
+                role="radio"
+                aria-checked={isActive}
+                disabled={Boolean(busyKey)}
+                className={`nw-power-btn ${isActive ? 'active' : ''}`}
+                onClick={() => void handleSelectPlan(plan.id)}
+              >
+                {plan.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       <div className="nw-toggle-actions">
         <button
