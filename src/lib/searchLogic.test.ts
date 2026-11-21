@@ -73,9 +73,9 @@ function makeConfig(): TestBarConfig {
       makePin({
         id: 'wf-tb',
         kind: 'folder',
-        title: 'testbar-workspace',
+        title: 'Workspace',
         subtitle: 'Проект',
-        target: 'C:\\Users\\user\\Documents\\testbar',
+        target: 'C:\\Users\\User\\Documents\\Workspace',
       }),
     ],
     workApps: [
@@ -96,10 +96,10 @@ function makeConfig(): TestBarConfig {
     ],
     studioTools: [
       makePin({
-        id: 'wiz',
-        title: 'WizTree',
-        subtitle: 'Диски',
-        target: 'C:\\Program Files\\WizTree\\WizTree64.exe',
+        id: 'tool-7z',
+        title: '7-Zip',
+        subtitle: 'Архиватор',
+        target: 'C:\\Program Files\\7-Zip\\7zFM.exe',
       }),
     ],
     gameLaunchers: [
@@ -112,12 +112,12 @@ function makeConfig(): TestBarConfig {
     ],
     gameCombos: [
       makePin({
-        id: 'combo-poe',
+        id: 'combo-cs2',
         kind: 'combo',
-        title: 'PoE 2 + Trade',
+        title: 'Counter-Strike 2 + Discord',
         subtitle: 'Связка',
         target: '',
-        comboTargets: ['steam://rungameid/2694490', 'C:\\Tools\\ExiledExchange.exe'],
+        comboTargets: ['steam://rungameid/730', 'C:\\Tools\\Discord.exe'],
       }),
     ],
     customSpaces: [
@@ -182,10 +182,10 @@ const sampleApps: IndexedApp[] = [
 
 const sampleGames: SteamGame[] = [
   {
-    appId: '2694490',
-    name: 'Path of Exile 2',
+    appId: '730',
+    name: 'Counter-Strike 2',
     launcher: 'Steam',
-    target: 'steam://rungameid/2694490',
+    target: 'steam://rungameid/730',
     coverData: null,
     lastUpdated: 1730000000,
   },
@@ -283,14 +283,14 @@ describe('searchLogic corpus, Raycast ranking, open windows, commands, clipboard
     const names = corpus.map((c) => c.name);
     expect(names).toContain('Telegram');
     expect(names).toContain('Загрузки');
-    expect(names).toContain('testbar-workspace');
+    expect(names).toContain('Workspace');
     expect(names).toContain('Cursor');
     expect(names).toContain('Photoshop 2025');
-    expect(names).toContain('WizTree');
+    expect(names).toContain('7-Zip');
     expect(names).toContain('Battle.net');
-    expect(names).toContain('PoE 2 + Trade');
+    expect(names).toContain('Counter-Strike 2 + Discord');
     expect(names).toContain('Портфель Акций');
-    expect(names).toContain('Path of Exile 2');
+    expect(names).toContain('Counter-Strike 2');
     expect(names).toContain('Notion');
     expect(names).toContain('Calculator');
     expect(names).toContain('Quarterly-Report-2026.pdf');
@@ -572,10 +572,10 @@ describe('searchLogic corpus, Raycast ranking, open windows, commands, clipboard
       args: { target: calc.target, args: null, asAdmin: false, closeStart: true },
     });
 
-    const combo = corpus.find((c) => c.name === 'PoE 2 + Trade')!;
+    const combo = corpus.find((c) => c.name === 'Counter-Strike 2 + Discord')!;
     expect(resolveSearchLaunchPayload(combo, false)).toEqual({
       command: 'launch_combo',
-      args: { targets: ['steam://rungameid/2694490', 'C:\\Tools\\ExiledExchange.exe'] },
+      args: { targets: ['steam://rungameid/730', 'C:\\Tools\\Discord.exe'] },
     });
   });
 

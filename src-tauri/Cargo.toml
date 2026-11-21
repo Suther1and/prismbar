@@ -1,6 +1,6 @@
 [package]
 name = "testbar"
-version = "1.0.0"
+version = "3.0.0"
 description = "TestBar — Windows 11 Taskbar & Start Menu Replacement"
 authors = ["TestBar"]
 edition = "2021"

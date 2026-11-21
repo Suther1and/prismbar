@@ -296,8 +296,8 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     const folder = makePin({
       id: 'wf',
       kind: 'folder',
-      title: 'testbar',
-      target: 'C:\\Users\\u\\Documents\\testbar',
+      title: 'workspace',
+      target: 'C:\\Users\\User\\Documents\\workspace',
       altAction: 'Открыть в терминале',
     });
     expect(resolvePinAction(folder, true)).toEqual({
@@ -538,9 +538,9 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
   });
 
   it('formats single-line telemetry ratios, sparkline ring buffer, SVG paths, disk strip & 2-click safe process kill', () => {
-    expect(formatMemoryRatio(18.4, 64)).toBe('18.4 / 64 ГБ');
-    expect(formatMemoryRatio(6.0, 24.0)).toBe('6 / 24 ГБ');
-    expect(formatMemoryRatio(18.4, 64)).not.toContain('\n');
+    expect(formatMemoryRatio(18.4, 32)).toBe('18.4 / 32 ГБ');
+    expect(formatMemoryRatio(6.0, 16.0)).toBe('6 / 16 ГБ');
+    expect(formatMemoryRatio(18.4, 32)).not.toContain('\n');
 
     expect(formatDiskSummary({ usedPct: 68, freeGb: 142.4 })).toBe('142 ГБ своб.');
     expect(formatDiskSummary({ usedPct: 95, freeGb: -1 })).toBe('0 ГБ своб.');
@@ -708,10 +708,10 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     // Game Combo builder validation
     expect(validateGameComboInput('   ', ['a', 'b']).ok).toBe(false);
     expect(validateGameComboInput('Solo', ['steam://rungameid/570']).ok).toBe(false);
-    expect(validateGameComboInput('  PoE 2 + Discord ', ['steam://rungameid/2694490', 'C:\\Discord.exe'])).toEqual({
+    expect(validateGameComboInput('  Dota 2 + Discord ', ['steam://rungameid/570', 'C:\\Discord.exe'])).toEqual({
       ok: true,
-      name: 'PoE 2 + Discord',
-      steps: ['steam://rungameid/2694490', 'C:\\Discord.exe'],
+      name: 'Dota 2 + Discord',
+      steps: ['steam://rungameid/570', 'C:\\Discord.exe'],
     });
 
     // Game Combo multi-target launch dispatch
@@ -722,7 +722,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       target: '',
       comboTargets: [
         'steam://rungameid/570',
-        '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+        '"C:\\Users\\User\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
         '   ',
       ],
     });
@@ -731,7 +731,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       args: {
         targets: [
           'steam://rungameid/570',
-          '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+          '"C:\\Users\\User\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
         ],
       },
     });
@@ -739,7 +739,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       type: 'combo',
       targets: [
         'steam://rungameid/570',
-        '"C:\\Users\\loki2\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
+        '"C:\\Users\\User\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
       ],
     });
 

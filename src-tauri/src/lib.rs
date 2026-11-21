@@ -6135,9 +6135,9 @@ mod integration_tests {
           "gameCombos": [
             {
               "id": "g-1",
-              "name": "PoE2",
+              "name": "Game Combo",
               "subtitle": "Steam",
-              "targets": ["steam://rungameid/2694490"],
+              "targets": ["steam://rungameid/730"],
               "accentRgb": "251,113,133"
             }
           ],
@@ -6179,9 +6179,9 @@ mod integration_tests {
                 PinItem {
                     id: "tool-1".to_string(),
                     kind: "app".to_string(),
-                    title: "WizTree".to_string(),
-                    subtitle: "Disk".to_string(),
-                    target: r"C:\Program Files\WizTree\WizTree64.exe".to_string(),
+                    title: "7-Zip".to_string(),
+                    subtitle: "Archive".to_string(),
+                    target: r"C:\Program Files\7-Zip\7zFM.exe".to_string(),
                     args: None,
                     alt_action: String::new(),
                     alt_label: None,
@@ -6201,7 +6201,7 @@ mod integration_tests {
         assert_eq!(c3.revision, 2);
         assert_eq!(
             c3.studio_tools[0].match_exe.as_deref(),
-            Some("wiztree64.exe")
+            Some("7zfm.exe")
         );
 
         let disk_cfg = config::load_config_from(&cfg_path);
@@ -6598,8 +6598,8 @@ mod integration_tests {
 
     #[test]
     fn combo_target_parser_supports_uris_quoted_unquoted_args_and_discord_squirrel() {
-        let steam = windows_tracker::parse_combo_target("steam://rungameid/2694490").unwrap();
-        assert_eq!(steam.target, "steam://rungameid/2694490");
+        let steam = windows_tracker::parse_combo_target("steam://rungameid/730").unwrap();
+        assert_eq!(steam.target, "steam://rungameid/730");
         assert_eq!(steam.args, None);
 
         let quoted = windows_tracker::parse_combo_target(

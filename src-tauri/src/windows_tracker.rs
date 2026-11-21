@@ -4138,8 +4138,8 @@ mod tests {
             OpenWindowInfo {
                 hwnd: 104,
                 pid: 5001,
-                title: "VS Code — testbar".to_string(),
-                exe_path: r"C:\Users\loki2\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+                title: "VS Code — workspace".to_string(),
+                exe_path: r"C:\Users\User\AppData\Local\Programs\Microsoft VS Code\Code.exe"
                     .to_string(),
                 exe_name: "VS Code".to_string(),
                 aumid: None,
@@ -4152,7 +4152,7 @@ mod tests {
                 hwnd: 105,
                 pid: 5002,
                 title: "VS Code — notes".to_string(),
-                exe_path: r"C:/Users/loki2/AppData/Local/Programs/Microsoft VS Code/code.exe"
+                exe_path: r"C:/Users/User/AppData/Local/Programs/Microsoft VS Code/code.exe"
                     .to_string(),
                 exe_name: "VS Code".to_string(),
                 aumid: None,
@@ -4335,13 +4335,13 @@ mod tests {
 
         // Recent matching for VS Code: keeps code files & folders, skips images/exe, deduplicates, respects limit
         let recent = vec![
-            ("Cargo.toml.lnk".to_string(), r"C:\Projects\testbar\Cargo.toml".to_string()),
-            ("duplicate.lnk".to_string(), r"c:/projects/testbar/cargo.toml".to_string()),
-            ("photo.png.lnk".to_string(), r"C:\Users\loki2\Pictures\photo.png".to_string()),
+            ("Cargo.toml.lnk".to_string(), r"C:\Projects\workspace\Cargo.toml".to_string()),
+            ("duplicate.lnk".to_string(), r"c:/projects/workspace/cargo.toml".to_string()),
+            ("photo.png.lnk".to_string(), r"C:\Users\User\Pictures\photo.png".to_string()),
             ("Code.exe.lnk".to_string(), r"C:\Program Files\VS Code\Code.exe".to_string()),
-            ("testbar".to_string(), r"C:\Users\loki2\Documents\testbar".to_string()),
-            ("lib.rs".to_string(), r"C:\Projects\testbar\src\lib.rs".to_string()),
-            ("index.ts".to_string(), r"C:\Projects\testbar\src\index.ts".to_string()),
+            ("workspace".to_string(), r"C:\Users\User\Documents\workspace".to_string()),
+            ("lib.rs".to_string(), r"C:\Projects\workspace\src\lib.rs".to_string()),
+            ("index.ts".to_string(), r"C:\Projects\workspace\src\index.ts".to_string()),
         ];
 
         let code_recent = match_recent_entries_for_app(
@@ -4353,8 +4353,8 @@ mod tests {
         assert_eq!(code_recent.len(), 3);
         assert_eq!(code_recent[0].title, "Cargo.toml");
         assert_eq!(code_recent[0].kind, "recent");
-        assert_eq!(code_recent[0].target, r"C:\Projects\testbar\Cargo.toml");
-        assert_eq!(code_recent[1].title, "testbar");
+        assert_eq!(code_recent[0].target, r"C:\Projects\workspace\Cargo.toml");
+        assert_eq!(code_recent[1].title, "workspace");
         assert_eq!(code_recent[2].title, "lib.rs");
 
         // Notepad matches text/toml, ignores folders and png
@@ -4367,7 +4367,7 @@ mod tests {
         let exp_recent =
             match_recent_entries_for_app(r"C:\Windows\explorer.exe", None, &recent, 4);
         assert_eq!(exp_recent.len(), 1);
-        assert_eq!(exp_recent[0].title, "testbar");
+        assert_eq!(exp_recent[0].title, "workspace");
     }
 
     #[test]

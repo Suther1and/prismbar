@@ -15,7 +15,7 @@ export const PHONETIC_ALIASES: Record<string, string[]> = {
   spark: ['спарк', 'почта'],
   photoshop: ['фотошоп', 'фш'],
   lightroom: ['лайтрум'],
-  obsidian: ['обсидиан', 'второй мозг'],
+  obsidian: ['обсидиан', 'заметки'],
   discord: ['дискорд', 'дс'],
   explorer: ['проводник', 'файлы'],
   steam: ['стим', 'игры'],

@@ -71,7 +71,7 @@ function makeRunningItem(overrides: Partial<MergedBarItem> = {}): MergedBarItem 
         {
           hwnd: 101,
           pid: 5500,
-          title: 'testbar — VS Code',
+          title: 'workspace — VS Code',
           exePath: 'C:\\Program Files\\VS Code\\Code.exe',
           exeName: 'VS Code',
           aumid: null,
@@ -566,9 +566,9 @@ describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => 
       iconKey: 'spark',
     };
     const sparkSecondaryGroup: AppWindowGroup = {
-      key: 'c:\\users\\loki2\\appdata\\local\\programs\\sparkdesktop\\spark desktop.exe',
+      key: 'c:\\users\\user\\appdata\\local\\programs\\sparkdesktop\\spark desktop.exe',
       name: 'Spark Desktop',
-      exePath: 'C:\\Users\\loki2\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
+      exePath: 'C:\\Users\\User\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
       aumid: null,
       iconKey: 'exe:spark1234',
       iconData: null,
@@ -578,7 +578,7 @@ describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => 
           hwnd: 909,
           pid: 4242,
           title: 'Inbox — Spark',
-          exePath: 'C:\\Users\\loki2\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
+          exePath: 'C:\\Users\\User\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
           exeName: 'Spark Desktop',
           aumid: null,
           isActive: false,

@@ -967,7 +967,7 @@ export function formatGbValue(value: number): string {
 }
 
 /**
- * Formats strictly single-line memory usage (e.g. `18.4 / 64 ГБ`) with zero raw RPM/MHz numbers.
+ * Formats strictly single-line memory usage (e.g. `18.4 / 32 ГБ`) with zero raw RPM/MHz numbers.
  */
 export function formatMemoryRatio(usedGb: number, totalGb: number): string {
   return `${formatGbValue(usedGb)} / ${formatGbValue(totalGb)} ГБ`;

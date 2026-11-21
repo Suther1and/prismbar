@@ -163,7 +163,12 @@
   max-height: calc(100vh - 108px);
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-width: thin;
+  color-scheme: dark;
+}
+.space-create-pop.v3-space-pop::-webkit-scrollbar,
+.space-manage-pop.v3-space-pop::-webkit-scrollbar {
+  width: 4px;
+  height: 0;
 }
 
 .space-tpl-grid {
@@ -320,7 +325,11 @@
   overflow-x: hidden;
   padding-right: 4px;
   margin-right: -4px;
-  scrollbar-width: thin;
+  color-scheme: dark;
+}
+.widgets-col.widgets-scrollable::-webkit-scrollbar {
+  width: 4px;
+  height: 0;
 }
 .widgets-col.widgets-scrollable > .spot-card {
   flex-shrink: 0;
@@ -432,7 +441,11 @@
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 2px;
-  scrollbar-width: thin;
+  color-scheme: dark;
+}
+.widget-cfg-list::-webkit-scrollbar {
+  width: 4px;
+  height: 0;
 }
 .widget-cfg-row {
   display: flex;
@@ -744,7 +757,11 @@
   max-height: calc(100vh - 28px);
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-width: thin;
+  color-scheme: dark;
+}
+.tile-edit-pop.v3-tile-edit::-webkit-scrollbar {
+  width: 4px;
+  height: 0;
 }
 
 .tile-edit-preview {
@@ -852,7 +869,11 @@
   border-radius: 10px;
   background: var(--surface-well);
   border: 1px solid var(--stroke-subtle);
-  scrollbar-width: thin;
+  color-scheme: dark;
+}
+.tile-icon-grid::-webkit-scrollbar {
+  width: 4px;
+  height: 0;
 }
 .tile-icon-opt {
   height: 34px;

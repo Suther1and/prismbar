@@ -2593,21 +2593,23 @@ export const StartView: React.FC = () => {
           onClick={(e) => e.stopPropagation()}
         >
           <div className="ctx-sec">{activeCtxSource.item.title}</div>
-          {tileCtxActions.map((act, idx) => (
-            <React.Fragment key={act.id}>
-              {act.danger && <div className="ctx-sep" />}
-              <button
-                type="button"
-                role="menuitem"
-                className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === tileCtxIdx ? 'focused' : ''}`}
-                onMouseEnter={() => setTileCtxIdx(idx)}
-                onClick={act.run}
-              >
-                {act.icon}
-                <span className="ctx-item-label">{act.label}</span>
-              </button>
-            </React.Fragment>
-          ))}
+          <div className="ctx-scroll">
+            {tileCtxActions.map((act, idx) => (
+              <React.Fragment key={act.id}>
+                {act.danger && <div className="ctx-sep" />}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === tileCtxIdx ? 'focused' : ''}`}
+                  onMouseEnter={() => setTileCtxIdx(idx)}
+                  onClick={act.run}
+                >
+                  {act.icon}
+                  <span className="ctx-item-label">{act.label}</span>
+                </button>
+              </React.Fragment>
+            ))}
+          </div>
         </div>
       )}
 
@@ -2622,21 +2624,23 @@ export const StartView: React.FC = () => {
           onClick={(e) => e.stopPropagation()}
         >
           <div className="ctx-sec">{activeSearchCtxSource.item.name}</div>
-          {searchCtxActions.map((act, idx) => (
-            <React.Fragment key={act.id}>
-              {act.danger && <div className="ctx-sep" />}
-              <button
-                type="button"
-                role="menuitem"
-                className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === searchCtxIdx ? 'focused' : ''}`}
-                onMouseEnter={() => setSearchCtxIdx(idx)}
-                onClick={act.run}
-              >
-                {act.icon}
-                <span className="ctx-item-label">{act.label}</span>
-              </button>
-            </React.Fragment>
-          ))}
+          <div className="ctx-scroll">
+            {searchCtxActions.map((act, idx) => (
+              <React.Fragment key={act.id}>
+                {act.danger && <div className="ctx-sep" />}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={`ctx-item ${act.danger ? 'danger' : ''} ${idx === searchCtxIdx ? 'focused' : ''}`}
+                  onMouseEnter={() => setSearchCtxIdx(idx)}
+                  onClick={act.run}
+                >
+                  {act.icon}
+                  <span className="ctx-item-label">{act.label}</span>
+                </button>
+              </React.Fragment>
+            ))}
+          </div>
         </div>
       )}
 

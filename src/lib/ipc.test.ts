@@ -662,18 +662,18 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
       altLabel: null,
     });
 
-    await addGameCombo({ name: 'PoE2', steps: ['steam://rungameid/2694490'] });
+    await addGameCombo({ name: 'Game Combo', steps: ['steam://rungameid/730'] });
     expect(invokeMock).toHaveBeenLastCalledWith('add_game_combo', {
-      name: 'PoE2',
+      name: 'Game Combo',
       subtitle: null,
       accent: null,
-      steps: ['steam://rungameid/2694490'],
+      steps: ['steam://rungameid/730'],
     });
 
-    await updateGameCombo({ id: 'combo-1', name: 'PoE2 Updated' });
+    await updateGameCombo({ id: 'combo-1', name: 'Game Combo Updated' });
     expect(invokeMock).toHaveBeenLastCalledWith('update_game_combo', {
       id: 'combo-1',
-      name: 'PoE2 Updated',
+      name: 'Game Combo Updated',
       subtitle: null,
       accent: null,
       steps: null,
