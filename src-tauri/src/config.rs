@@ -44,6 +44,7 @@ pub const SPACE_WIDGET_IDS: &[&str] = &[
 ];
 
 pub const MAX_FRECENCY_ENTRIES: usize = 200;
+pub const MAX_CUSTOM_ICON_DATA_BYTES: usize = 128 * 1024;
 const SAVE_RENAME_RETRIES: usize = 3;
 const SAVE_RENAME_RETRY_DELAY_MS: u64 = 15;
 const MAX_IMPORT_CONFIG_BYTES: usize = 4 * 1024 * 1024;
@@ -961,6 +962,36 @@ fn sanitize_optional_nonempty(opt: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+pub fn sanitize_custom_icon_data(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CUSTOM_ICON_DATA_BYTES {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let prefix = [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/jpg;base64,",
+        "data:image/webp;base64,",
+        "data:image/gif;base64,",
+        "data:image/bmp;base64,",
+        "data:image/x-icon;base64,",
+        "data:image/vnd.microsoft.icon;base64,",
+    ]
+    .iter()
+    .copied()
+    .find(|p| low.starts_with(p))?;
+    let payload = &trimmed[prefix.len()..];
+    if payload.is_empty()
+        || !payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
     let mut changed = false;
 
@@ -1053,12 +1084,6 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         changed = true;
     }
 
-    let clean_icon_data = sanitize_optional_nonempty(&item.icon_data);
-    if item.icon_data != clean_icon_data {
-        item.icon_data = clean_icon_data;
-        changed = true;
-    }
-
     let clean_custom_icon = sanitize_optional_nonempty(&item.custom_icon);
     if item.custom_icon != clean_custom_icon {
         item.custom_icon = clean_custom_icon;
@@ -1068,6 +1093,16 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
     let clean_custom_color = item.custom_color.as_deref().and_then(sanitize_custom_color);
     if item.custom_color != clean_custom_color {
         item.custom_color = clean_custom_color;
+        changed = true;
+    }
+
+    let clean_icon_data = if item.custom_icon.as_deref() == Some("custom_image") {
+        item.icon_data.as_deref().and_then(sanitize_custom_icon_data)
+    } else {
+        None
+    };
+    if item.icon_data != clean_icon_data {
+        item.icon_data = clean_icon_data;
         changed = true;
     }
 
@@ -2543,13 +2578,10 @@ pub fn update_pin_v2(
     let Some((pin_item, force_combo)) = find_pin_mut(cfg, space, pin_id) else {
         return Err(format!("Элемент '{pin_id}' не найден в '{space}'"));
     };
-    let mut changed = false;
+    let before = pin_item.clone();
 
     if let Some(clean) = next_title {
-        if pin_item.title != clean {
-            pin_item.title = clean;
-            changed = true;
-        }
+        pin_item.title = clean;
     }
 
     if let Some(raw_target) = target {
@@ -2559,71 +2591,45 @@ pub fn update_pin_v2(
             if pin_item.kind == "app" {
                 pin_item.match_exe = None;
             }
-            changed = true;
         }
     }
 
     if let Some(raw_args) = args {
         let trimmed = raw_args.trim();
-        let next_args = (!trimmed.is_empty()).then(|| trimmed.to_string());
-        if pin_item.args != next_args {
-            pin_item.args = next_args;
-            changed = true;
-        }
+        pin_item.args = (!trimmed.is_empty()).then(|| trimmed.to_string());
     }
 
     if let Some(raw_alt) = alt_action {
-        let clean = raw_alt.trim().to_string();
-        if pin_item.alt_action != clean {
-            pin_item.alt_action = clean;
-            changed = true;
-        }
+        pin_item.alt_action = raw_alt.trim().to_string();
     }
 
     if let Some(raw_label) = alt_label {
         let trimmed = raw_label.trim();
-        let next_label = (!trimmed.is_empty()).then(|| trimmed.to_string());
-        if pin_item.alt_label != next_label {
-            pin_item.alt_label = next_label;
-            changed = true;
-        }
+        pin_item.alt_label = (!trimmed.is_empty()).then(|| trimmed.to_string());
     }
 
     if let Some(next_icon_opt) = custom_icon {
-        let cleaned = next_icon_opt
+        pin_item.custom_icon = next_icon_opt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        if pin_item.custom_icon != cleaned {
-            pin_item.custom_icon = cleaned;
-            changed = true;
-        }
     }
 
     if let Some(next_color_opt) = custom_color {
-        let cleaned = next_color_opt.as_deref().and_then(sanitize_custom_color);
-        if pin_item.custom_color != cleaned {
-            pin_item.custom_color = cleaned;
-            changed = true;
-        }
+        pin_item.custom_color = next_color_opt.as_deref().and_then(sanitize_custom_color);
     }
 
     if let Some(next_data_opt) = icon_data {
-        let cleaned = next_data_opt
+        pin_item.icon_data = next_data_opt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        if pin_item.icon_data != cleaned {
-            pin_item.icon_data = cleaned;
-            changed = true;
-        }
     }
 
-    if normalize_pin(pin_item, force_combo) {
-        changed = true;
-    }
+    normalize_pin(pin_item, force_combo);
+    let mut changed = *pin_item != before;
 
     // Mirror edits made through legacy sub-list keys into the corresponding v2 space if present.
     if let Some(parent_id) = legacy_parent_space_id(space) {
@@ -2632,6 +2638,7 @@ pub fn update_pin_v2(
             if let Some(mirror) = sp.items.iter_mut().find(|p| p.id == pin_id) {
                 if *mirror != updated_clone {
                     *mirror = updated_clone;
+                    changed = true;
                 }
             }
         }
@@ -3205,7 +3212,9 @@ fn apply_healed_target(
         if !valid_ns && !pin.icon_key.is_empty() {
             pin.icon_key.clear();
         }
-        pin.icon_data = None;
+        if pin.custom_icon.as_deref() != Some("custom_image") {
+            pin.icon_data = None;
+        }
     }
     changed
 }
@@ -4912,7 +4921,7 @@ mod tests {
             vec!["m-url", "m-app", "m-dir"]
         );
 
-        // update_pin_v2 sets custom_icon, custom_color, icon_data; None keeps unchanged; Some(None) clears
+        // update_pin_v2 preserves safe icon_data when custom_icon == "custom_image"
         assert!(update_pin_v2(
             &mut cfg,
             &space.id,
@@ -4922,7 +4931,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some("  terminal  ".to_string())),
+            Some(Some("  custom_image  ".to_string())),
             Some(Some(" #34d399 ".to_string())),
             Some(Some("data:image/png;base64,AAA".to_string())),
         )
@@ -4937,11 +4946,11 @@ mod tests {
             .find(|i| i.id == "m-app")
             .unwrap();
         assert_eq!(edited.title, "Editor");
-        assert_eq!(edited.custom_icon.as_deref(), Some("terminal"));
+        assert_eq!(edited.custom_icon.as_deref(), Some("custom_image"));
         assert_eq!(edited.custom_color.as_deref(), Some("#34D399"));
         assert_eq!(edited.icon_data.as_deref(), Some("data:image/png;base64,AAA"));
 
-        // Roundtrip JSON preserves customIcon / customColor, omits when None
+        // Roundtrip JSON preserves customIcon / customColor / custom_image iconData
         let json = export_config_json(&cfg).expect("export");
         let back = import_config_json(&json).expect("import");
         let edited_back = back
@@ -4953,10 +4962,88 @@ mod tests {
             .iter()
             .find(|i| i.id == "m-app")
             .unwrap();
-        assert_eq!(edited_back.custom_icon.as_deref(), Some("terminal"));
+        assert_eq!(edited_back.custom_icon.as_deref(), Some("custom_image"));
         assert_eq!(edited_back.custom_color.as_deref(), Some("#34D399"));
+        assert_eq!(
+            edited_back.icon_data.as_deref(),
+            Some("data:image/png;base64,AAA")
+        );
 
-        // Leave custom_icon untouched (None), clear custom_color & icon_data (Some(None))
+        // Unsafe SVG or oversized >128KB icon_data is rejected even for custom_image
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("data:image/svg+xml;base64,PHN2Zz4=".to_string())),
+        )
+        .unwrap());
+        assert_eq!(
+            cfg.spaces
+                .iter()
+                .find(|s| s.id == space.id)
+                .unwrap()
+                .items
+                .iter()
+                .find(|i| i.id == "m-app")
+                .unwrap()
+                .icon_data,
+            None
+        );
+
+        let huge = format!("data:image/png;base64,{}", "A".repeat(MAX_CUSTOM_ICON_DATA_BYTES + 1));
+        assert!(!update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(huge)),
+        )
+        .unwrap());
+
+        // Restore valid icon_data, then switch custom_icon to "terminal" -> clears icon_data automatically
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("data:image/png;base64,BBB".to_string())),
+        )
+        .unwrap());
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("  terminal  ".to_string())),
+            None,
+            None,
+        )
+        .unwrap());
+
+        // Leave custom_icon untouched (None), clear custom_color (Some(None))
         assert!(update_pin_v2(
             &mut cfg,
             &space.id,
@@ -4968,7 +5055,7 @@ mod tests {
             None,
             None,
             Some(None),
-            Some(None),
+            None,
         )
         .unwrap());
         let cleared = cfg

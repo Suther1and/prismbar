@@ -35,6 +35,8 @@ pub enum FlyoutKind {
     #[serde(alias = "quick")]
     Sound,
     Calendar,
+    Weather,
+    Battery,
     #[serde(alias = "ctx_app")]
     ContextApp,
     #[serde(alias = "ctx_taskbar")]
@@ -52,7 +54,14 @@ impl FlyoutKind {
     }
 
     pub fn toggles_on_reclick(self) -> bool {
-        matches!(self, FlyoutKind::Tray | FlyoutKind::Sound | FlyoutKind::Calendar)
+        matches!(
+            self,
+            FlyoutKind::Tray
+                | FlyoutKind::Sound
+                | FlyoutKind::Calendar
+                | FlyoutKind::Weather
+                | FlyoutKind::Battery
+        )
     }
 }
 
@@ -1010,6 +1019,8 @@ mod tests {
             ("\"tray\"", FlyoutKind::Tray),
             ("\"sound\"", FlyoutKind::Sound),
             ("\"calendar\"", FlyoutKind::Calendar),
+            ("\"weather\"", FlyoutKind::Weather),
+            ("\"battery\"", FlyoutKind::Battery),
             ("\"context_app\"", FlyoutKind::ContextApp),
             ("\"context_bar\"", FlyoutKind::ContextBar),
             ("\"osd\"", FlyoutKind::Osd),
@@ -1029,6 +1040,8 @@ mod tests {
             FlyoutKind::Tray,
             FlyoutKind::Sound,
             FlyoutKind::Calendar,
+            FlyoutKind::Weather,
+            FlyoutKind::Battery,
             FlyoutKind::ContextApp,
             FlyoutKind::ContextBar,
         ];
@@ -1076,6 +1089,42 @@ mod tests {
         let ctx2 = coord.request_open_flyout(FlyoutKind::ContextApp, 950);
         assert!(ctx2.emit_flyout_show);
         assert_eq!(coord.active_flyout(), Some(FlyoutKind::ContextApp));
+    }
+
+    #[test]
+    fn weather_and_battery_flyouts_are_interactive_and_toggle_on_reclick() {
+        for kind in [FlyoutKind::Weather, FlyoutKind::Battery] {
+            assert!(!kind.is_non_activating());
+            assert!(kind.is_interactive_click());
+            assert!(kind.toggles_on_reclick());
+
+            let mut coord = WindowCoordinator::new();
+            let _ = coord.request_toggle_start(Some(true), 100);
+            let opened = coord.request_open_flyout(kind, 200);
+            assert_eq!(opened.start_visible, Some(false));
+            assert_eq!(opened.flyout_visible, Some(true));
+            assert_eq!(opened.flyout_non_activating, Some(false));
+            assert!(opened.emit_flyout_show);
+            assert_eq!(coord.active_flyout(), Some(kind));
+
+            let toggled_off = coord.request_open_flyout(kind, 250);
+            assert_eq!(toggled_off.flyout_visible, Some(false));
+            assert!(toggled_off.emit_flyout_hide);
+            assert_eq!(coord.active_flyout(), None);
+
+            let reopened = coord.request_open_flyout(kind, 300);
+            assert_eq!(reopened.flyout_visible, Some(true));
+            assert_eq!(coord.active_flyout(), Some(kind));
+
+            let blurred = coord.on_flyout_focus_lost(300 + FLYOUT_OPEN_FOCUS_GRACE_MS);
+            assert_eq!(blurred.flyout_visible, Some(false));
+            assert_eq!(coord.active_flyout(), None);
+
+            assert_eq!(
+                coord.request_open_flyout(kind, 300 + FLYOUT_OPEN_FOCUS_GRACE_MS + 50),
+                CoordinatorActions::default()
+            );
+        }
     }
 
     #[test]

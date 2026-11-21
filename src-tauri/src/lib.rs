@@ -1,12 +1,15 @@
 pub mod apps_indexer;
 pub mod audio;
 pub mod backdrop;
+pub mod battery;
 pub mod config;
 pub mod coordinator;
+pub mod file_explorer;
 pub mod icon_cache;
 pub mod media;
 pub mod system_widgets;
 pub mod telemetry;
+pub mod weather;
 pub mod win_shell;
 pub mod windows_tracker;
 
@@ -319,11 +322,12 @@ fn flyout_backdrop_insets_and_radius(kind: FlyoutKind, sf: f64) -> (BackdropInse
     let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
     let pad = (FLYOUT_ROOT_PAD_LOGICAL * sf).round() as i32;
     let radius_logical = match kind {
-        FlyoutKind::Calendar => 18.0,
+        FlyoutKind::Calendar | FlyoutKind::Weather => 18.0,
         FlyoutKind::Preview => 15.0,
         FlyoutKind::Osd => 21.0,
         FlyoutKind::Tray
         | FlyoutKind::Sound
+        | FlyoutKind::Battery
         | FlyoutKind::ContextApp
         | FlyoutKind::ContextBar => 16.0,
     };
@@ -2159,6 +2163,40 @@ fn apply_coordinator_actions(
                     let alerts = system_widgets::get_session_alerts();
                     let _ = app.emit_to("flyout", "session-alerts-updated", &alerts);
                 }
+                FlyoutKind::Weather => {
+                    let h_weather = app.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        let st_w = h_weather.state::<AppState>();
+                        let (city_opt, lat_opt, lon_opt) = {
+                            let cfg = lock_unpoisoned(&st_w.config);
+                            let trimmed = cfg.taskbar_widgets.weather_city.trim();
+                            let city = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                            (
+                                city,
+                                cfg.taskbar_widgets.weather_lat,
+                                cfg.taskbar_widgets.weather_lon,
+                            )
+                        };
+                        let snap = weather::get_weather(city_opt.as_deref(), lat_opt, lon_opt, false);
+                        if lock_unpoisoned(&st_w.coordinator).active_flyout()
+                            == Some(FlyoutKind::Weather)
+                        {
+                            let _ = h_weather.emit_to("flyout", "weather-updated", &snap);
+                        }
+                    });
+                }
+                FlyoutKind::Battery => {
+                    let h_bat = app.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        let periphs = battery::get_peripheral_batteries();
+                        let st_b = h_bat.state::<AppState>();
+                        if lock_unpoisoned(&st_b.coordinator).active_flyout()
+                            == Some(FlyoutKind::Battery)
+                        {
+                            let _ = h_bat.emit_to("flyout", "peripherals-updated", &periphs);
+                        }
+                    });
+                }
                 _ => {}
             }
         }
@@ -2359,6 +2397,51 @@ where
 }
 
 // ======================= TAURI IPC COMMANDS =======================
+
+/// Tri-state IPC argument distinguishing omitted (`Unset` -> keep unchanged),
+/// explicit JSON `null` (`Null` -> clear), and a provided value (`Value(T)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchArg<T> {
+    Unset,
+    Null,
+    Value(T),
+}
+
+impl<T> PatchArg<T> {
+    pub fn into_double_option(self) -> Option<Option<T>> {
+        match self {
+            PatchArg::Unset => None,
+            PatchArg::Null => Some(None),
+            PatchArg::Value(v) => Some(Some(v)),
+        }
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R>
+    for PatchArg<T>
+{
+    fn from_command(
+        command: tauri::ipc::CommandItem<'de, R>,
+    ) -> Result<Self, tauri::ipc::InvokeError> {
+        let name = command.name;
+        let arg = command.key;
+        match command.message.payload() {
+            tauri::ipc::InvokeBody::Json(v) => match v.get(arg) {
+                None => Ok(PatchArg::Unset),
+                Some(serde_json::Value::Null) => Ok(PatchArg::Null),
+                Some(val) => T::deserialize(val)
+                    .map(PatchArg::Value)
+                    .map_err(|e| tauri::Error::InvalidArgs(name, arg, e).into()),
+            },
+            tauri::ipc::InvokeBody::Raw(_) => Err(tauri::Error::InvalidArgs(
+                name,
+                arg,
+                serde::de::Error::custom("expected json body"),
+            )
+            .into()),
+        }
+    }
+}
 
 #[tauri::command]
 fn get_config(state: State<AppState>) -> TestBarConfig {
@@ -2738,6 +2821,18 @@ fn collect_pin_hints_for_target(cfg: &TestBarConfig, target: &str) -> Vec<PinIco
     ];
     for list in lists {
         for pin in list {
+            if pin.target.trim().eq_ignore_ascii_case(needle) {
+                hints.push(PinIconLookupHint {
+                    title: pin.title.clone(),
+                    icon_key: pin.icon_key.clone(),
+                    match_exe: pin.match_exe.clone(),
+                    match_aumid: pin.match_aumid.clone(),
+                });
+            }
+        }
+    }
+    for sp in &cfg.spaces {
+        for pin in &sp.items {
             if pin.target.trim().eq_ignore_ascii_case(needle) {
                 hints.push(PinIconLookupHint {
                     title: pin.title.clone(),
@@ -3441,7 +3536,14 @@ async fn add_pin(
                 }
             }
         }
-        item.icon_data = None;
+        if item.custom_icon.as_deref() != Some("custom_image") {
+            item.icon_data = None;
+        } else {
+            item.icon_data = item
+                .icon_data
+                .as_deref()
+                .and_then(config::sanitize_custom_icon_data);
+        }
 
         let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
             config::add_pin_to_space(cfg, &space, item)
@@ -3453,6 +3555,7 @@ async fn add_pin(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn update_pin(
     app: AppHandle,
     state: State<AppState>,
@@ -3463,10 +3566,16 @@ fn update_pin(
     args: Option<String>,
     alt_action: Option<String>,
     alt_label: Option<String>,
+    custom_icon: PatchArg<String>,
+    custom_color: PatchArg<String>,
+    icon_data: PatchArg<String>,
 ) -> Result<TestBarConfig, String> {
+    let custom_icon_opt = custom_icon.into_double_option();
+    let custom_color_opt = custom_color.into_double_option();
+    let icon_data_opt = icon_data.into_double_option();
     let mut inner_err: Option<String> = None;
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
-        match config::update_pin(
+        match config::update_pin_v2(
             cfg,
             &space,
             &pin_id,
@@ -3475,6 +3584,9 @@ fn update_pin(
             args.clone(),
             alt_action.clone(),
             alt_label.clone(),
+            custom_icon_opt.clone(),
+            custom_color_opt.clone(),
+            icon_data_opt.clone(),
         ) {
             Ok(changed) => changed,
             Err(err) => {
@@ -3613,6 +3725,198 @@ fn delete_custom_space(
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         config::delete_custom_space(cfg, &id)
     })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn create_space(
+    app: AppHandle,
+    state: State<AppState>,
+    name: String,
+    template: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    widgets: Option<Vec<String>>,
+) -> Result<TestBarConfig, String> {
+    let tpl = template.unwrap_or_else(|| "blank".to_string());
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::create_space_from_template(
+            cfg,
+            name.clone(),
+            &tpl,
+            accent_hex.clone(),
+            accent_rgb.clone(),
+            widgets.clone(),
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_space(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    name: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    layout_kind: Option<String>,
+    show_hero_row: Option<bool>,
+    widgets: Option<Vec<String>>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::update_space_config(
+            cfg,
+            &id,
+            name.clone(),
+            accent_hex.clone(),
+            accent_rgb.clone(),
+            layout_kind.clone(),
+            show_hero_row,
+            widgets.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_space(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::delete_space_by_id(cfg, &id) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn reorder_spaces(
+    app: AppHandle,
+    state: State<AppState>,
+    ordered_ids: Vec<String>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::reorder_spaces_by_ids(cfg, ordered_ids.clone()) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn set_space_widgets(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    widgets: Vec<String>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::set_space_widgets_by_id(cfg, &id, widgets.clone()) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn set_taskbar_widgets(
+    app: AppHandle,
+    state: State<AppState>,
+    show_weather: Option<bool>,
+    show_batteries: Option<bool>,
+    show_telemetry: Option<bool>,
+    weather_city: Option<String>,
+    weather_lat: PatchArg<f64>,
+    weather_lon: PatchArg<f64>,
+    weather_units: Option<String>,
+) -> Result<TestBarConfig, String> {
+    let lat_patch = weather_lat.into_double_option();
+    let lon_patch = weather_lon.into_double_option();
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        let mut next = cfg.taskbar_widgets.clone();
+        if let Some(v) = show_weather {
+            next.show_weather = v;
+        }
+        if let Some(v) = show_batteries {
+            next.show_batteries = v;
+        }
+        if let Some(v) = show_telemetry {
+            next.show_telemetry = v;
+        }
+        if let Some(ref city) = weather_city {
+            next.weather_city = city.clone();
+        }
+        if let Some(lat) = lat_patch {
+            next.weather_lat = lat;
+        }
+        if let Some(lon) = lon_patch {
+            next.weather_lon = lon;
+        }
+        if let Some(ref units) = weather_units {
+            next.weather_units = units.clone();
+        }
+        match config::set_taskbar_widgets(cfg, next) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
     Ok(updated)
 }
 
@@ -3834,6 +4138,58 @@ async fn pick_file(app: AppHandle) -> Result<Option<String>, String> {
     })
     .await
     .map_err(|e| format!("task join error: {e}"))
+}
+
+fn load_custom_icon_image_data_uri(path: &std::path::Path) -> Result<String, String> {
+    let path_str = path.to_string_lossy().to_string();
+    let mut thumbs = file_explorer::get_file_thumbnails(vec![path_str.clone()], 64);
+    if let Some(uri) = thumbs.remove(&path_str) {
+        if let Some(valid) = config::sanitize_custom_icon_data(&uri) {
+            return Ok(valid);
+        }
+    }
+
+    let is_png = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    if is_png {
+        if let Ok(bytes) = std::fs::read(path) {
+            const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+            if bytes.len() <= 92 * 1024 && bytes.starts_with(PNG_MAGIC) {
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+                let uri = format!("data:image/png;base64,{b64}");
+                if let Some(valid) = config::sanitize_custom_icon_data(&uri) {
+                    return Ok(valid);
+                }
+            }
+        }
+    }
+
+    Err("Не удалось загрузить изображение иконки (максимум 128 КБ)".to_string())
+}
+
+#[tauri::command]
+async fn pick_custom_icon_image(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+        let picked = rfd::FileDialog::new()
+            .set_title("Выбери изображение для иконки")
+            .add_filter("Изображения", &["png", "jpg", "jpeg", "webp", "ico", "bmp"])
+            .pick_file();
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            refocus_start_if_open(&h, &h.state::<AppState>());
+        });
+        let Some(path) = picked else {
+            return Ok(None);
+        };
+        load_custom_icon_image_data_uri(&path).map(Some)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -4241,6 +4597,151 @@ async fn get_peripherals() -> Result<Vec<PeripheralBattery>, String> {
 }
 
 #[tauri::command]
+async fn get_peripheral_batteries() -> Result<Vec<battery::PeripheralBattery>, String> {
+    tauri::async_runtime::spawn_blocking(battery::get_peripheral_batteries)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn refresh_peripheral_batteries(
+    app: AppHandle,
+) -> Result<Vec<battery::PeripheralBattery>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let list = battery::refresh_peripheral_batteries();
+        let _ = app.emit_to("start", "peripherals-updated", &list);
+        let _ = app.emit_to("flyout", "peripherals-updated", &list);
+        list
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn list_directory(
+    path: String,
+    sort_by: Option<String>,
+    sort_dir: Option<String>,
+    show_hidden: Option<bool>,
+) -> Result<file_explorer::DirectoryListing, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_explorer::list_directory(
+            &path,
+            sort_by.as_deref(),
+            sort_dir.as_deref(),
+            show_hidden.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn get_file_thumbnails(
+    paths: Vec<String>,
+    size: Option<u32>,
+) -> Result<HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_explorer::get_file_thumbnails(paths, size.unwrap_or(48))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn fs_open_item(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || file_explorer::fs_open_item(&path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_create_folder(
+    parent_path: String,
+    name: String,
+) -> Result<file_explorer::FileEntry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_explorer::fs_create_folder(&parent_path, &name)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_rename_item(
+    path: String,
+    new_name: String,
+) -> Result<file_explorer::FileEntry, String> {
+    tauri::async_runtime::spawn_blocking(move || file_explorer::fs_rename_item(&path, &new_name))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        file_explorer::fs_copy_files_to_clipboard(paths)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_trash_items(paths: Vec<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || file_explorer::fs_trash_items(paths))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_open_in_explorer(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || file_explorer::fs_open_in_explorer(&path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn get_weather(
+    app: AppHandle,
+    city: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    force: Option<bool>,
+) -> Result<weather::WeatherSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let has_explicit_city = city
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_explicit_coords =
+            lat.is_some_and(f64::is_finite) && lon.is_some_and(f64::is_finite);
+        let (eff_city, eff_lat, eff_lon) = if has_explicit_city || has_explicit_coords {
+            (city, lat, lon)
+        } else {
+            let st = app.state::<AppState>();
+            let cfg = lock_unpoisoned(&st.config);
+            let trimmed = cfg.taskbar_widgets.weather_city.trim();
+            let c_opt = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            (
+                c_opt,
+                cfg.taskbar_widgets.weather_lat,
+                cfg.taskbar_widgets.weather_lon,
+            )
+        };
+        weather::get_weather(eff_city.as_deref(), eff_lat, eff_lon, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn search_weather_cities(query: String) -> Result<Vec<weather::WeatherCityOption>, String> {
+    tauri::async_runtime::spawn_blocking(move || weather::search_weather_cities(&query))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
 async fn get_tray_apps(app: AppHandle) -> Result<Vec<TrayAppItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -4506,6 +5007,12 @@ pub fn run(hide_native: bool) {
             add_custom_space,
             update_custom_space,
             delete_custom_space,
+            create_space,
+            update_space,
+            delete_space,
+            reorder_spaces,
+            set_space_widgets,
+            set_taskbar_widgets,
             add_game_combo,
             update_game_combo,
             delete_game_combo,
@@ -4515,6 +5022,7 @@ pub fn run(hide_native: bool) {
             record_frecency,
             pick_folder,
             pick_file,
+            pick_custom_icon_image,
             export_config_dialog,
             import_config_dialog,
             get_audio_state,
@@ -4542,6 +5050,18 @@ pub fn run(hide_native: bool) {
             get_keyboard_layout,
             switch_keyboard_layout,
             get_peripherals,
+            get_peripheral_batteries,
+            refresh_peripheral_batteries,
+            list_directory,
+            get_file_thumbnails,
+            fs_open_item,
+            fs_create_folder,
+            fs_rename_item,
+            fs_copy_files_to_clipboard,
+            fs_trash_items,
+            fs_open_in_explorer,
+            get_weather,
+            search_weather_cities,
             get_tray_apps,
             activate_tray_app,
             end_tray_app_task,
@@ -5657,6 +6177,8 @@ mod integration_tests {
                     match_exe: None,
                     match_aumid: None,
                     combo_targets: None,
+                    custom_icon: None,
+                    custom_color: None,
                 },
             )
         })
@@ -6389,6 +6911,14 @@ mod integration_tests {
             (BackdropInsets::uniform(16), 18.0)
         );
         assert_eq!(
+            flyout_backdrop_insets_and_radius(FlyoutKind::Weather, 1.0),
+            (BackdropInsets::uniform(16), 18.0)
+        );
+        assert_eq!(
+            flyout_backdrop_insets_and_radius(FlyoutKind::Battery, 1.0),
+            (BackdropInsets::uniform(16), 16.0)
+        );
+        assert_eq!(
             flyout_backdrop_insets_and_radius(FlyoutKind::Preview, 1.0),
             (BackdropInsets::uniform(16), 15.0)
         );
@@ -6524,5 +7054,51 @@ mod integration_tests {
         assert_eq!(hash_media_state(&med_a), hash_media_state(&med_b));
         med_b.title = "Track B".into();
         assert_ne!(hash_media_state(&med_a), hash_media_state(&med_b));
+    }
+
+    #[test]
+    fn wave3a_patch_arg_pin_hints_spaces_and_custom_icon_loader() {
+        assert_eq!(PatchArg::<String>::Unset.into_double_option(), None);
+        assert_eq!(PatchArg::<String>::Null.into_double_option(), Some(None));
+        assert_eq!(
+            PatchArg::Value("terminal".to_string()).into_double_option(),
+            Some(Some("terminal".to_string()))
+        );
+        assert_eq!(PatchArg::<f64>::Null.into_double_option(), Some(None));
+        assert_eq!(
+            PatchArg::Value(55.75).into_double_option(),
+            Some(Some(55.75))
+        );
+
+        let mut cfg = TestBarConfig::default();
+        cfg.spaces[0].items.push(PinItem {
+            id: "sp-custom".into(),
+            kind: "app".into(),
+            title: "Custom App".into(),
+            target: r"C:\Apps\Custom\custom.exe".into(),
+            icon_key: "custom-k".into(),
+            match_exe: Some("custom.exe".into()),
+            ..Default::default()
+        });
+        let hints = collect_pin_hints_for_target(&cfg, r"C:\Apps\Custom\custom.exe");
+        assert!(hints.iter().any(|h| h.icon_key == "custom-k"));
+
+        // Verify load_custom_icon_image_data_uri returns valid data:image/png;base64,... for a tiny PNG
+        let dir = make_lib_temp_dir("custom-icon");
+        let png_path = dir.join("tiny.png");
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255])
+                .unwrap();
+        }
+        std::fs::write(&png_path, &png_bytes).unwrap();
+        let data_uri = load_custom_icon_image_data_uri(&png_path).expect("tiny PNG should load");
+        assert!(data_uri.starts_with("data:image/png;base64,"));
+        assert!(config::sanitize_custom_icon_data(&data_uri).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

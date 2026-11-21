@@ -44,6 +44,7 @@ function makeConfig(): TestBarConfig {
     secondaryTaskbarMode: 'testbar',
     autostart: false,
     taskbarPins: [],
+    spaces: [],
     personalPins: [
       makePin({
         id: 'tg',

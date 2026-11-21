@@ -17,6 +17,8 @@ export interface PinItem {
   matchExe?: string | null;
   matchAumid?: string | null;
   comboTargets?: string[] | null;
+  customIcon?: string | null;
+  customColor?: string | null;
 }
 
 export type WidgetPreset =
@@ -24,6 +26,39 @@ export type WidgetPreset =
   | 'telemetry_processes'
   | 'audio_mic'
   | 'full_grid';
+
+export type SpaceWidgetId =
+  | 'media'
+  | 'audio_mixer'
+  | 'clipboard'
+  | 'pc_health'
+  | 'top_processes'
+  | 'game_combos'
+  | 'weather'
+  | 'batteries';
+
+export type SpaceLayoutKind = 'grid' | 'games';
+
+export interface SpaceConfig {
+  id: string;
+  name: string;
+  accentHex: string;
+  accentRgb: string;
+  layoutKind: SpaceLayoutKind;
+  showHeroRow: boolean;
+  widgets: SpaceWidgetId[];
+  items: PinItem[];
+}
+
+export interface TaskbarWidgetSettings {
+  showWeather: boolean;
+  showBatteries: boolean;
+  showTelemetry: boolean;
+  weatherCity: string;
+  weatherLat?: number | null;
+  weatherLon?: number | null;
+  weatherUnits: 'c' | 'f';
+}
 
 export interface CustomSpace {
   id: string;
@@ -57,6 +92,8 @@ export interface TestBarConfig {
   hiddenTrayKeys?: string[];
   frecency?: Record<string, FrecencyEntry>;
   taskbarPins: PinItem[];
+  spaces: SpaceConfig[];
+  taskbarWidgets?: TaskbarWidgetSettings;
   personalPins: PinItem[];
   personalLinks: PinItem[];
   workFolders: PinItem[];
@@ -245,10 +282,130 @@ export interface ClipboardEntry {
   pinned: boolean;
 }
 
-export interface PeripheralBattery {
-  name: string;
-  kind: 'mouse' | 'audio' | 'other';
+export interface BatterySubLevel {
+  label: string;
   percent: number;
+  charging: boolean;
+}
+
+export interface PeripheralBattery {
+  id: string;
+  name: string;
+  kind: 'mouse' | 'headphones' | 'audio' | 'keyboard' | 'gamepad' | 'other' | string;
+  percent: number;
+  charging: boolean;
+  source: string;
+  connected: boolean;
+  subLevels?: BatterySubLevel[] | null;
+}
+
+export interface BreadcrumbPart {
+  name: string;
+  path: string;
+}
+
+export interface DriveEntry {
+  letter: string;
+  path: string;
+  label: string;
+  totalBytes: number;
+  freeBytes: number;
+}
+
+export interface QuickRoot {
+  id: string;
+  label: string;
+  path: string;
+  kind: string;
+}
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  isHidden: boolean;
+  sizeBytes: number;
+  modifiedMs: number;
+  extension: string;
+  category:
+    | 'folder'
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'code'
+    | 'archive'
+    | 'document'
+    | 'app'
+    | 'file'
+    | string;
+  hasPreview: boolean;
+}
+
+export interface DirectoryListing {
+  currentPath: string;
+  parentPath: string | null;
+  breadcrumbs: BreadcrumbPart[];
+  entries: FileEntry[];
+  totalCount: number;
+  drives: DriveEntry[];
+  quickRoots: QuickRoot[];
+}
+
+export type WeatherConditionKey =
+  | 'sun'
+  | 'moon'
+  | 'partly-cloudy-day'
+  | 'partly-cloudy-night'
+  | 'cloud'
+  | 'fog'
+  | 'drizzle'
+  | 'rain'
+  | 'snow'
+  | 'storm'
+  | string;
+
+export interface WeatherCityOption {
+  name: string;
+  country: string;
+  admin1: string;
+  lat: number;
+  lon: number;
+}
+
+export interface HourlyForecast {
+  time: string;
+  tempC: number;
+  conditionIcon: WeatherConditionKey;
+  precipProb: number;
+}
+
+export interface DailyForecast {
+  date: string;
+  label: string;
+  tempMinC: number;
+  tempMaxC: number;
+  conditionIcon: WeatherConditionKey;
+  precipProb: number;
+}
+
+export interface WeatherSnapshot {
+  available: boolean;
+  stale: boolean;
+  city: string;
+  lat: number;
+  lon: number;
+  tempC: number;
+  feelsLikeC: number;
+  humidity: number;
+  windKmh: number;
+  conditionCode: number;
+  conditionIcon: WeatherConditionKey;
+  conditionLabel: string;
+  isDay: boolean;
+  hourly: HourlyForecast[];
+  daily: DailyForecast[];
+  updatedAtMs: number;
+  error: string | null;
 }
 
 export interface TrayAppItem {
@@ -281,6 +438,8 @@ export type FlyoutKind =
   | 'tray'
   | 'sound'
   | 'calendar'
+  | 'weather'
+  | 'battery'
   | 'context_app'
   | 'context_bar'
   | 'osd'
@@ -937,8 +1096,11 @@ export function updatePin(params: {
   args?: string;
   altAction?: string;
   altLabel?: string;
+  customIcon?: string | null;
+  customColor?: string | null;
+  iconData?: string | null;
 }): Promise<TestBarConfig> {
-  return ipc<TestBarConfig>('update_pin', {
+  const payload: Record<string, unknown> = {
     space: params.space,
     pinId: params.pinId,
     title: params.title ?? null,
@@ -946,7 +1108,160 @@ export function updatePin(params: {
     args: params.args ?? null,
     altAction: params.altAction ?? null,
     altLabel: params.altLabel ?? null,
+  };
+  if (params.customIcon !== undefined) payload.customIcon = params.customIcon;
+  if (params.customColor !== undefined) payload.customColor = params.customColor;
+  if (params.iconData !== undefined) payload.iconData = params.iconData;
+  return ipc<TestBarConfig>('update_pin', payload);
+}
+
+export function createSpace(params: {
+  name: string;
+  template?: 'blank' | 'personal' | 'work' | 'studio' | 'games' | string;
+  accentHex?: string;
+  accentRgb?: string;
+  widgets?: SpaceWidgetId[];
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('create_space', {
+    name: params.name,
+    template: params.template ?? null,
+    accentHex: params.accentHex ?? null,
+    accentRgb: params.accentRgb ?? null,
+    widgets: params.widgets ?? null,
   });
+}
+
+export function updateSpace(params: {
+  id: string;
+  name?: string;
+  accentHex?: string;
+  accentRgb?: string;
+  layoutKind?: SpaceLayoutKind;
+  showHeroRow?: boolean;
+  widgets?: SpaceWidgetId[];
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('update_space', {
+    id: params.id,
+    name: params.name ?? null,
+    accentHex: params.accentHex ?? null,
+    accentRgb: params.accentRgb ?? null,
+    layoutKind: params.layoutKind ?? null,
+    showHeroRow: params.showHeroRow ?? null,
+    widgets: params.widgets ?? null,
+  });
+}
+
+export function deleteSpace(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('delete_space', { id });
+}
+
+export function reorderSpaces(orderedIds: string[]): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('reorder_spaces', { orderedIds });
+}
+
+export function setSpaceWidgets(id: string, widgets: SpaceWidgetId[]): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('set_space_widgets', { id, widgets });
+}
+
+export function setTaskbarWidgets(params: {
+  showWeather?: boolean;
+  showBatteries?: boolean;
+  showTelemetry?: boolean;
+  weatherCity?: string;
+  weatherLat?: number | null;
+  weatherLon?: number | null;
+  weatherUnits?: 'c' | 'f';
+}): Promise<TestBarConfig> {
+  const payload: Record<string, unknown> = {
+    showWeather: params.showWeather ?? null,
+    showBatteries: params.showBatteries ?? null,
+    showTelemetry: params.showTelemetry ?? null,
+    weatherCity: params.weatherCity ?? null,
+    weatherUnits: params.weatherUnits ?? null,
+  };
+  if (params.weatherLat !== undefined) payload.weatherLat = params.weatherLat;
+  if (params.weatherLon !== undefined) payload.weatherLon = params.weatherLon;
+  return ipc<TestBarConfig>('set_taskbar_widgets', payload);
+}
+
+export function pickCustomIconImage(): Promise<string | null> {
+  return ipc<string | null>('pick_custom_icon_image');
+}
+
+export function listDirectory(
+  path: string,
+  opts?: {
+    sortBy?: 'name' | 'date' | 'size' | 'type';
+    sortDir?: 'asc' | 'desc';
+    showHidden?: boolean;
+  },
+): Promise<DirectoryListing> {
+  return ipc<DirectoryListing>('list_directory', {
+    path,
+    sortBy: opts?.sortBy ?? null,
+    sortDir: opts?.sortDir ?? null,
+    showHidden: opts?.showHidden ?? null,
+  });
+}
+
+export function getFileThumbnails(
+  paths: string[],
+  size?: number,
+): Promise<Record<string, string>> {
+  return ipc<Record<string, string>>('get_file_thumbnails', {
+    paths,
+    size: size ?? null,
+  });
+}
+
+export function fsOpenItem(path: string): Promise<void> {
+  return ipc<void>('fs_open_item', { path });
+}
+
+export function fsCreateFolder(parentPath: string, name: string): Promise<FileEntry> {
+  return ipc<FileEntry>('fs_create_folder', { parentPath, name });
+}
+
+export function fsRenameItem(path: string, newName: string): Promise<FileEntry> {
+  return ipc<FileEntry>('fs_rename_item', { path, newName });
+}
+
+export function fsCopyFilesToClipboard(paths: string[]): Promise<void> {
+  return ipc<void>('fs_copy_files_to_clipboard', { paths });
+}
+
+export function fsTrashItems(paths: string[]): Promise<number> {
+  return ipc<number>('fs_trash_items', { paths });
+}
+
+export function fsOpenInExplorer(path: string): Promise<void> {
+  return ipc<void>('fs_open_in_explorer', { path });
+}
+
+export function getWeather(params?: {
+  city?: string;
+  lat?: number;
+  lon?: number;
+  force?: boolean;
+}): Promise<WeatherSnapshot> {
+  return ipc<WeatherSnapshot>('get_weather', {
+    city: params?.city ?? null,
+    lat: params?.lat ?? null,
+    lon: params?.lon ?? null,
+    force: params?.force ?? null,
+  });
+}
+
+export function searchWeatherCities(query: string): Promise<WeatherCityOption[]> {
+  return ipc<WeatherCityOption[]>('search_weather_cities', { query });
+}
+
+export function getPeripheralBatteries(): Promise<PeripheralBattery[]> {
+  return ipc<PeripheralBattery[]>('get_peripheral_batteries');
+}
+
+export function refreshPeripheralBatteries(): Promise<PeripheralBattery[]> {
+  return ipc<PeripheralBattery[]>('refresh_peripheral_batteries');
 }
 
 export function addGameCombo(params: {

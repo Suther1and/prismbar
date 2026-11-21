@@ -21,21 +21,33 @@ import {
   addGameCombo,
   applyConfigUpdate,
   clearIconCache,
+  createSpace,
   deleteClipboardEntry,
   deleteCustomSpace,
   deleteGameCombo,
+  deleteSpace,
   dismissOverlays,
   emptyRecycleBin,
   exportConfigDialog,
   fetchIconsBatch,
+  fsCopyFilesToClipboard,
+  fsCreateFolder,
+  fsOpenInExplorer,
+  fsOpenItem,
+  fsRenameItem,
+  fsTrashItems,
   getAudioPeaks,
   getClipboardPaused,
+  getFileThumbnails,
+  getPeripheralBatteries,
+  getWeather,
   hideTrayApp,
   ICON_CACHE_MAX_ENTRIES,
   iconCache,
   importConfigDialog,
   isCacheIconKey,
   launchNewWindow,
+  listDirectory,
   loadGameCover,
   LruIconCache,
   mergeTaskbarItems,
@@ -44,16 +56,22 @@ import {
   onEvent,
   openScreenSnip,
   pasteClipboardEntry,
+  pickCustomIconImage,
   recordFrecency,
   refreshIndexes,
+  refreshPeripheralBatteries,
+  reorderSpaces,
   restoreAllTrayApps,
   restoreTrayApp,
+  searchWeatherCities,
   seekMedia,
   selectMediaSession,
   setAppearanceSettings,
   setClipboardPaused,
   setInputDevice,
   setSessionState,
+  setSpaceWidgets,
+  setTaskbarWidgets,
   shouldApplyConfigUpdate,
   snapWindow,
   surfaceCommitAck,
@@ -63,6 +81,7 @@ import {
   updateCustomSpace,
   updateGameCombo,
   updatePin,
+  updateSpace,
   type AppWindowGroup,
   type PinItem,
   type TestBarConfig,
@@ -76,6 +95,7 @@ function makeConfig(revision: number, barMode: 'dock' | 'edge' = 'dock'): TestBa
     secondaryTaskbarMode: 'testbar',
     autostart: false,
     taskbarPins: [],
+    spaces: [],
     personalPins: [],
     personalLinks: [],
     workFolders: [],
@@ -678,6 +698,154 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
 
     await importConfigDialog();
     expect(invokeMock).toHaveBeenLastCalledWith('import_config_dialog', undefined);
+  });
+
+  it('serializes Wave 3 V3 space, taskbar widget, pin v2, explorer, weather, and battery IPC commands', async () => {
+    await createSpace({
+      name: 'Design',
+      template: 'studio',
+      accentHex: '#34D399',
+      widgets: ['weather', 'batteries'],
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('create_space', {
+      name: 'Design',
+      template: 'studio',
+      accentHex: '#34D399',
+      accentRgb: null,
+      widgets: ['weather', 'batteries'],
+    });
+
+    await updateSpace({
+      id: 'design',
+      name: 'Design Pro',
+      layoutKind: 'grid',
+      showHeroRow: true,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_space', {
+      id: 'design',
+      name: 'Design Pro',
+      accentHex: null,
+      accentRgb: null,
+      layoutKind: 'grid',
+      showHeroRow: true,
+      widgets: null,
+    });
+
+    await deleteSpace('design');
+    expect(invokeMock).toHaveBeenLastCalledWith('delete_space', { id: 'design' });
+
+    await reorderSpaces(['work', 'personal']);
+    expect(invokeMock).toHaveBeenLastCalledWith('reorder_spaces', {
+      orderedIds: ['work', 'personal'],
+    });
+
+    await setSpaceWidgets('work', ['pc_health', 'weather']);
+    expect(invokeMock).toHaveBeenLastCalledWith('set_space_widgets', {
+      id: 'work',
+      widgets: ['pc_health', 'weather'],
+    });
+
+    // Omitted weatherLat/weatherLon stay omitted so Rust PatchArg::Unset preserves coords
+    await setTaskbarWidgets({ showBatteries: true, showTelemetry: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_taskbar_widgets', {
+      showWeather: null,
+      showBatteries: true,
+      showTelemetry: true,
+      weatherCity: null,
+      weatherUnits: null,
+    });
+
+    // Explicit null clears saved coordinates
+    await setTaskbarWidgets({ weatherCity: '', weatherLat: null, weatherLon: null });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_taskbar_widgets', {
+      showWeather: null,
+      showBatteries: null,
+      showTelemetry: null,
+      weatherCity: '',
+      weatherLat: null,
+      weatherLon: null,
+      weatherUnits: null,
+    });
+
+    await updatePin({
+      space: 'personal',
+      pinId: 'pin-1',
+      customIcon: 'custom_image',
+      customColor: null,
+      iconData: 'data:image/png;base64,AAA',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_pin', {
+      space: 'personal',
+      pinId: 'pin-1',
+      title: null,
+      target: null,
+      args: null,
+      altAction: null,
+      altLabel: null,
+      customIcon: 'custom_image',
+      customColor: null,
+      iconData: 'data:image/png;base64,AAA',
+    });
+
+    await pickCustomIconImage();
+    expect(invokeMock).toHaveBeenLastCalledWith('pick_custom_icon_image', undefined);
+
+    await listDirectory('C:\\Users', { sortBy: 'date', sortDir: 'desc', showHidden: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('list_directory', {
+      path: 'C:\\Users',
+      sortBy: 'date',
+      sortDir: 'desc',
+      showHidden: true,
+    });
+
+    await getFileThumbnails(['C:\\a.png'], 64);
+    expect(invokeMock).toHaveBeenLastCalledWith('get_file_thumbnails', {
+      paths: ['C:\\a.png'],
+      size: 64,
+    });
+
+    await fsOpenItem('C:\\a.png');
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_open_item', { path: 'C:\\a.png' });
+
+    await fsCreateFolder('C:\\Temp', 'Sub');
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_create_folder', {
+      parentPath: 'C:\\Temp',
+      name: 'Sub',
+    });
+
+    await fsRenameItem('C:\\Temp\\Sub', 'Sub2');
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_rename_item', {
+      path: 'C:\\Temp\\Sub',
+      newName: 'Sub2',
+    });
+
+    await fsCopyFilesToClipboard(['C:\\a.png']);
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_copy_files_to_clipboard', {
+      paths: ['C:\\a.png'],
+    });
+
+    await fsTrashItems(['C:\\a.png']);
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_trash_items', { paths: ['C:\\a.png'] });
+
+    await fsOpenInExplorer('C:\\a.png');
+    expect(invokeMock).toHaveBeenLastCalledWith('fs_open_in_explorer', { path: 'C:\\a.png' });
+
+    await getWeather({ city: 'Москва', lat: 55.75, lon: 37.62, force: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('get_weather', {
+      city: 'Москва',
+      lat: 55.75,
+      lon: 37.62,
+      force: true,
+    });
+
+    await searchWeatherCities('Казань');
+    expect(invokeMock).toHaveBeenLastCalledWith('search_weather_cities', { query: 'Казань' });
+
+    await getPeripheralBatteries();
+    expect(invokeMock).toHaveBeenLastCalledWith('get_peripheral_batteries', undefined);
+
+    await refreshPeripheralBatteries();
+    expect(invokeMock).toHaveBeenLastCalledWith('refresh_peripheral_batteries', undefined);
   });
 
   it('binds onEvent strictly to getCurrentWebviewWindow().listen() to prevent cross-window event clobbering', async () => {

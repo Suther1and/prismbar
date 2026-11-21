@@ -429,6 +429,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       secondaryTaskbarMode: 'testbar',
       autostart: false,
       taskbarPins: [],
+      spaces: [],
       personalPins: [
         makePin({
           id: 'calc',
@@ -762,6 +763,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       secondaryTaskbarMode: 'testbar',
       autostart: false,
       taskbarPins: [],
+      spaces: [],
       personalPins: [
         makePin({ id: 'zen', title: 'Zen', target: 'C:\\Apps\\zen.exe' }),
         makePin({ id: 'tg', title: 'Telegram', target: 'C:\\Apps\\Telegram.exe' }),

@@ -5750,7 +5750,7 @@ mod tests {
         assert!(!is_start_menu_core_window_class(""));
 
         // Verify win_event_start_guard_proc does not invoke SW_HIDE anywhere in its code
-        let src = include_str!("win_shell.rs");
+        let src = include_str!("win_shell.rs").replace("\r\n", "\n");
         let start = src
             .find("\nunsafe extern \"system\" fn win_event_start_guard_proc(")
             .expect("win_event_start_guard_proc must exist");

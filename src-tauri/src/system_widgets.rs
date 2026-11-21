@@ -5,13 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::core::{GUID, PCWSTR, PWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-    SetupDiGetDevicePropertyW, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA,
-};
-use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_FriendlyName, DEVPROPTYPE, DEVPROPKEY,
-};
 use windows::Win32::Foundation::{
     CloseHandle, GlobalFree, BOOL, ERROR_SUCCESS, E_UNEXPECTED, FILETIME, HANDLE, HGLOBAL, HWND,
     LPARAM, LRESULT, RECT, S_FALSE, S_OK, WPARAM,
@@ -76,12 +69,6 @@ const MAX_TRAY_APPS: usize = 48;
 const MAX_SESSION_ALERTS: usize = 8;
 const MAX_PLAUSIBLE_LINK_SPEED_BPS: u64 = 1_000_000_000_000; // 1 Tbps upper sanity bound
 
-// DEVPKEY_Bluetooth_Battery: {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, pid 2
-const DEVPKEY_BLUETOOTH_BATTERY: DEVPROPKEY = DEVPROPKEY {
-    fmtid: GUID::from_u128(0x104ea319_6ee2_4701_bd47_8ddbf425bbe5),
-    pid: 2,
-};
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardEntry {
@@ -98,14 +85,6 @@ pub struct ClipboardEntry {
     pub char_count: usize,
     #[serde(default)]
     pub kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PeripheralBattery {
-    pub name: String,
-    pub kind: String, // "mouse" | "audio" | "other"
-    pub percent: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1271,180 +1250,12 @@ pub fn switch_keyboard_layout() -> String {
     after
 }
 
-// ======================= BLUETOOTH PERIPHERALS =======================
+// ======================= BLUETOOTH & HID PERIPHERALS =======================
 
-fn classify_peripheral_kind(clean_name: &str) -> &'static str {
-    let low = clean_name.to_ascii_lowercase();
-    if low.contains("mouse")
-        || low.contains("мышь")
-        || low.contains("logi")
-        || low.contains("razer")
-        || low.contains("superlight")
-        || low.contains("viper")
-    {
-        "mouse"
-    } else if low.contains("airpods")
-        || low.contains("head")
-        || low.contains("buds")
-        || low.contains("pods")
-        || low.contains("sony")
-        || low.contains("bose")
-    {
-        "audio"
-    } else {
-        "other"
-    }
-}
+pub use crate::battery::PeripheralBattery;
 
-const PERIPHERAL_BATTERY_CACHE_TTL: Duration = Duration::from_secs(30);
-
-static PERIPHERAL_BATTERY_CACHE: OnceLock<Mutex<Option<(Instant, Vec<PeripheralBattery>)>>> =
-    OnceLock::new();
-static PERIPHERAL_BATTERY_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-struct DevInfoGuard(HDEVINFO);
-
-impl Drop for DevInfoGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = SetupDiDestroyDeviceInfoList(self.0);
-            }
-        }
-    }
-}
-
-fn scan_peripheral_batteries_live() -> Vec<PeripheralBattery> {
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-
-    for enumerator in ["BTH", "BTHLE"] {
-        let enum_w = wide(enumerator);
-        unsafe {
-            let Ok(hdev) = SetupDiGetClassDevsW(
-                None,
-                PCWSTR(enum_w.as_ptr()),
-                HWND::default(),
-                DIGCF_PRESENT | DIGCF_ALLCLASSES,
-            ) else {
-                continue;
-            };
-            let _hdev_guard = DevInfoGuard(hdev);
-
-            let mut idx = 0u32;
-            loop {
-                let mut info = SP_DEVINFO_DATA {
-                    cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-                    ..Default::default()
-                };
-                if SetupDiEnumDeviceInfo(hdev, idx, &mut info).is_err() {
-                    break;
-                }
-                idx += 1;
-
-                let mut prop_type = DEVPROPTYPE(0);
-                let mut bat_buf = [0u8; 4];
-                let mut req_size = 0u32;
-                if SetupDiGetDevicePropertyW(
-                    hdev,
-                    &info,
-                    &DEVPKEY_BLUETOOTH_BATTERY,
-                    &mut prop_type,
-                    Some(&mut bat_buf),
-                    Some(&mut req_size),
-                    0,
-                )
-                .is_ok()
-                    && req_size >= 1
-                {
-                    let pct = bat_buf[0].min(100);
-                    // Properly aligned `[u16; 256]` (align 2) avoids unaligned `*const u16` UB.
-                    let mut name_buf = [0u16; 256];
-                    let name_bytes = std::slice::from_raw_parts_mut(
-                        name_buf.as_mut_ptr() as *mut u8,
-                        std::mem::size_of_val(&name_buf),
-                    );
-                    let mut name_req = 0u32;
-                    let name = if SetupDiGetDevicePropertyW(
-                        hdev,
-                        &info,
-                        &DEVPKEY_Device_FriendlyName,
-                        &mut prop_type,
-                        Some(name_bytes),
-                        Some(&mut name_req),
-                        0,
-                    )
-                    .is_ok()
-                        && name_req >= 2
-                    {
-                        let u16_len = ((name_req as usize) / 2).min(name_buf.len());
-                        let slice = &name_buf[..u16_len];
-                        let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-                        String::from_utf16_lossy(&slice[..end])
-                    } else {
-                        "Bluetooth".to_string()
-                    };
-
-                    let clean_name = name
-                        .replace(" Hands-Free AG", "")
-                        .replace(" Avrcp Transport", "")
-                        .replace(" Stereo", "")
-                        .trim()
-                        .to_string();
-
-                    if !clean_name.is_empty() && seen.insert(clean_name.to_ascii_lowercase()) {
-                        results.push(PeripheralBattery {
-                            kind: classify_peripheral_kind(&clean_name).to_string(),
-                            name: clean_name,
-                            percent: pct,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    results
-}
-
-/// Reads real Bluetooth device battery percentages reported by Windows 11 PnP
-/// (`DEVPKEY_Bluetooth_Battery`), restricted strictly to `"BTH"` and `"BTHLE"` enumerators.
-/// Cached for 30s and guarded by single-flight `try_lock` so rapid `Win` presses NEVER stack
-/// parallel SetupAPI/PnP device-tree scans.
 pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
-    let cache = PERIPHERAL_BATTERY_CACHE.get_or_init(|| Mutex::new(None));
-    {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((ts, ref list)) = *guard {
-            if ts.elapsed() < PERIPHERAL_BATTERY_CACHE_TTL {
-                return list.clone();
-            }
-        }
-    }
-
-    let scan_lock = PERIPHERAL_BATTERY_SCAN_LOCK.get_or_init(|| Mutex::new(()));
-    let Ok(_scan_guard) = scan_lock.try_lock() else {
-        // Another thread is already performing the PnP Bluetooth scan; return cached snapshot immediately.
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        return guard
-            .as_ref()
-            .map(|(_, list)| list.clone())
-            .unwrap_or_default();
-    };
-
-    {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((ts, ref list)) = *guard {
-            if ts.elapsed() < PERIPHERAL_BATTERY_CACHE_TTL {
-                return list.clone();
-            }
-        }
-    }
-
-    let fresh = scan_peripheral_batteries_live();
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some((Instant::now(), fresh.clone()));
-    fresh
+    crate::battery::get_peripheral_batteries()
 }
 
 // ======================= TWO-TIER TRAY BACKGROUND APPS =======================
