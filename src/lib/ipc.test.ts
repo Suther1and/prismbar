@@ -1,12 +1,55 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
+}));
+
 import {
+  addGameCombo,
   applyConfigUpdate,
   clearIconCache,
+  deleteClipboardEntry,
+  deleteCustomSpace,
+  deleteGameCombo,
+  dismissOverlays,
+  emptyRecycleBin,
+  exportConfigDialog,
   fetchIconsBatch,
+  getAudioPeaks,
+  getClipboardPaused,
+  hideTrayApp,
+  ICON_CACHE_MAX_ENTRIES,
   iconCache,
+  importConfigDialog,
   isCacheIconKey,
+  launchNewWindow,
+  loadGameCover,
+  LruIconCache,
   mergeTaskbarItems,
+  minimizeOtherWindows,
+  normalizeStartStatePayload,
+  openScreenSnip,
+  pasteClipboardEntry,
+  recordFrecency,
+  refreshIndexes,
+  restoreAllTrayApps,
+  restoreTrayApp,
+  seekMedia,
+  selectMediaSession,
+  setAppearanceSettings,
+  setClipboardPaused,
+  setInputDevice,
+  setSessionState,
   shouldApplyConfigUpdate,
+  snapWindow,
+  surfaceCommitAck,
+  surfaceExitAck,
+  toggleStart,
+  toggleWindowTopmost,
+  updateCustomSpace,
+  updateGameCombo,
+  updatePin,
   type AppWindowGroup,
   type PinItem,
   type TestBarConfig,
@@ -388,5 +431,230 @@ describe('fetchIconsBatch and iconCache', () => {
     const retried = await fetchIconsBatch(['aumid:retry'], okFetcher);
     expect(retried).toEqual({ 'aumid:retry': 'data:image/png;base64,OK' });
     expect(iconCache.get('aumid:retry')).toBe('data:image/png;base64,OK');
+  });
+
+  it('bounds iconCache to 384 entries and refreshes recency on read/write (LRU)', () => {
+    expect(ICON_CACHE_MAX_ENTRIES).toBe(384);
+
+    // Small LRU eviction behavior: touching key 'a' keeps it alive when 'd' arrives
+    const lru = new LruIconCache(3);
+    lru.set('a', 'A');
+    lru.set('b', 'B');
+    lru.set('c', 'C');
+    expect(lru.get('a')).toBe('A'); // 'a' becomes MRU; 'b' is now oldest LRU
+    lru.set('d', 'D');
+    expect(lru.size).toBe(3);
+    expect(lru.has('b')).toBe(false);
+    expect(lru.get('a')).toBe('A');
+    expect(lru.get('c')).toBe('C');
+    expect(lru.get('d')).toBe('D');
+
+    // Global iconCache stays strictly bounded at 384 entries
+    clearIconCache();
+    for (let i = 0; i < 420; i++) {
+      iconCache.set(`exe:k${i}`, `data:image/png;base64,${i}`);
+    }
+    expect(iconCache.size).toBe(ICON_CACHE_MAX_ENTRIES);
+    expect(iconCache.has('exe:k0')).toBe(false);
+    expect(iconCache.has('exe:k35')).toBe(false);
+    expect(iconCache.has('exe:k36')).toBe(true);
+    expect(iconCache.has('exe:k419')).toBe(true);
+  });
+});
+
+describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  it('normalizes both legacy boolean and structured StartStateEvent payloads', () => {
+    expect(normalizeStartStatePayload(true)).toEqual({
+      open: true,
+      gen: 0,
+      monitor: null,
+      immediate: false,
+    });
+    expect(normalizeStartStatePayload(false)).toEqual({
+      open: false,
+      gen: 0,
+      monitor: null,
+      immediate: false,
+    });
+    expect(
+      normalizeStartStatePayload({ open: true, gen: 9, monitor: 'secondary', immediate: false }),
+    ).toEqual({
+      open: true,
+      gen: 9,
+      monitor: 'secondary',
+      immediate: false,
+    });
+    expect(normalizeStartStatePayload({ open: false, gen: 10, immediate: true })).toEqual({
+      open: false,
+      gen: 10,
+      monitor: null,
+      immediate: true,
+    });
+  });
+
+  it('serializes Paint-Sync, audio/media, window productivity, clipboard, and config IPC commands with exact camelCase args', async () => {
+    await surfaceCommitAck('flyout', 7, 240);
+    expect(invokeMock).toHaveBeenLastCalledWith('surface_commit_ack', {
+      surface: 'flyout',
+      gen: 7,
+      measuredHeight: 240,
+    });
+
+    await surfaceExitAck('start', 8);
+    expect(invokeMock).toHaveBeenLastCalledWith('surface_exit_ack', { surface: 'start', gen: 8 });
+
+    await dismissOverlays();
+    expect(invokeMock).toHaveBeenLastCalledWith('dismiss_overlays', undefined);
+
+    await toggleStart(true, 'secondary');
+    expect(invokeMock).toHaveBeenLastCalledWith('toggle_start', {
+      force: true,
+      monitor: 'secondary',
+    });
+
+    await getAudioPeaks();
+    expect(invokeMock).toHaveBeenLastCalledWith('get_audio_peaks', undefined);
+
+    await setInputDevice('mic-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('set_input_device', { deviceId: 'mic-1' });
+
+    await setSessionState({ appKey: 'chrome.exe', muted: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_session_state', {
+      appKey: 'chrome.exe',
+      volume: null,
+      muted: true,
+      pid: null,
+      pids: null,
+    });
+
+    await seekMedia(42.5);
+    expect(invokeMock).toHaveBeenLastCalledWith('seek_media', { positionSec: 42.5 });
+
+    await selectMediaSession('spotify.exe');
+    expect(invokeMock).toHaveBeenLastCalledWith('select_media_session', {
+      sessionId: 'spotify.exe',
+    });
+
+    await snapWindow(1234, 'left');
+    expect(invokeMock).toHaveBeenLastCalledWith('snap_window', { hwnd: 1234, zone: 'left' });
+
+    await toggleWindowTopmost(1234);
+    expect(invokeMock).toHaveBeenLastCalledWith('toggle_window_topmost', { hwnd: 1234 });
+
+    await minimizeOtherWindows(1234);
+    expect(invokeMock).toHaveBeenLastCalledWith('minimize_other_windows', { keepHwnd: 1234 });
+
+    await launchNewWindow('C:\\Apps\\Code.exe', '--profile Dev', true);
+    expect(invokeMock).toHaveBeenLastCalledWith('launch_new_window', {
+      exePath: 'C:\\Apps\\Code.exe',
+      args: '--profile Dev',
+      closeStart: true,
+    });
+
+    await deleteClipboardEntry('clip-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('delete_clipboard_entry', { id: 'clip-1' });
+
+    await setClipboardPaused(true);
+    expect(invokeMock).toHaveBeenLastCalledWith('set_clipboard_paused', { paused: true });
+
+    await getClipboardPaused();
+    expect(invokeMock).toHaveBeenLastCalledWith('get_clipboard_paused', undefined);
+
+    await pasteClipboardEntry('hello\nworld');
+    expect(invokeMock).toHaveBeenLastCalledWith('paste_clipboard_entry', { text: 'hello\nworld' });
+
+    await emptyRecycleBin();
+    expect(invokeMock).toHaveBeenLastCalledWith('empty_recycle_bin', undefined);
+
+    await openScreenSnip();
+    expect(invokeMock).toHaveBeenLastCalledWith('open_screen_snip', undefined);
+
+    await loadGameCover('C:\\Steam\\cover.jpg');
+    expect(invokeMock).toHaveBeenLastCalledWith('load_game_cover', {
+      coverPath: 'C:\\Steam\\cover.jpg',
+    });
+
+    await refreshIndexes();
+    expect(invokeMock).toHaveBeenLastCalledWith('refresh_indexes', undefined);
+
+    await updateCustomSpace({
+      id: 'custom-1',
+      name: 'Media',
+      accentHex: '#38BDF8',
+      widgetPreset: 'audio_mic',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_custom_space', {
+      id: 'custom-1',
+      name: 'Media',
+      accent: null,
+      accentHex: '#38BDF8',
+      accentRgb: null,
+      widgetPreset: 'audio_mic',
+    });
+
+    await deleteCustomSpace('custom-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('delete_custom_space', { id: 'custom-1' });
+
+    await updatePin({ space: 'personal', pinId: 'zen', title: 'Zen', altAction: 'Приватное окно' });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_pin', {
+      space: 'personal',
+      pinId: 'zen',
+      title: 'Zen',
+      target: null,
+      args: null,
+      altAction: 'Приватное окно',
+      altLabel: null,
+    });
+
+    await addGameCombo({ name: 'PoE2', steps: ['steam://rungameid/2694490'] });
+    expect(invokeMock).toHaveBeenLastCalledWith('add_game_combo', {
+      name: 'PoE2',
+      subtitle: null,
+      accent: null,
+      steps: ['steam://rungameid/2694490'],
+    });
+
+    await updateGameCombo({ id: 'combo-1', name: 'PoE2 Updated' });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_game_combo', {
+      id: 'combo-1',
+      name: 'PoE2 Updated',
+      subtitle: null,
+      accent: null,
+      steps: null,
+    });
+
+    await deleteGameCombo('combo-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('delete_game_combo', { id: 'combo-1' });
+
+    await setAppearanceSettings({ glassDepth: 'crystal', clockShowSeconds: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_appearance_settings', {
+      glassDepth: 'crystal',
+      clockShowSeconds: true,
+      clockShowWeekday: null,
+      startRememberSpace: null,
+    });
+
+    await hideTrayApp('steam.exe');
+    expect(invokeMock).toHaveBeenLastCalledWith('hide_tray_app', { key: 'steam.exe' });
+
+    await restoreTrayApp('steam.exe');
+    expect(invokeMock).toHaveBeenLastCalledWith('restore_tray_app', { key: 'steam.exe' });
+
+    await restoreAllTrayApps();
+    expect(invokeMock).toHaveBeenLastCalledWith('restore_all_tray_apps', undefined);
+
+    await recordFrecency('app:vscode');
+    expect(invokeMock).toHaveBeenLastCalledWith('record_frecency', { itemId: 'app:vscode' });
+
+    await exportConfigDialog();
+    expect(invokeMock).toHaveBeenLastCalledWith('export_config_dialog', undefined);
+
+    await importConfigDialog();
+    expect(invokeMock).toHaveBeenLastCalledWith('import_config_dialog', undefined);
   });
 });

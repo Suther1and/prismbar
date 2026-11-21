@@ -10,6 +10,14 @@ pub const REOPEN_DEBOUNCE_MS: u64 = 180;
 /// transient WebView2/Win-key `Focused(false)` jitter does not dismiss Start.
 pub const START_OPEN_FOCUS_GRACE_MS: u64 = 200;
 
+/// Grace window in milliseconds immediately after opening an interactive click flyout
+/// during which transient WebView2 `Focused(false)` jitter does not dismiss the flyout.
+pub const FLYOUT_OPEN_FOCUS_GRACE_MS: u64 = 160;
+
+/// Non-clipped logical shadow root padding for Start and Flyout transparent WebView2 windows (AD-1).
+pub const START_ROOT_PAD_LOGICAL: f64 = 24.0;
+pub const FLYOUT_ROOT_PAD_LOGICAL: f64 = 18.0;
+
 /// Win32 `WS_CAPTION` (`WS_BORDER | WS_DLGFRAME`) bitmask.
 pub const WS_CAPTION_FLAG: u32 = 0x00C0_0000;
 /// Win32 `WS_THICKFRAME` bitmask.
@@ -132,12 +140,42 @@ pub struct ForegroundWindowInfo {
     pub rect: PixelRect,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedForegroundWindow {
+    pub visible: bool,
+    pub is_own_process: bool,
+    pub is_maximized: bool,
+    pub class_name: String,
+    pub style: u32,
+    pub window_rect: PixelRect,
+    pub extended_rect: PixelRect,
+    pub monitor_rect: PixelRect,
+    pub work_area_rect: PixelRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MonitorFullscreenState {
+    pub primary: bool,
+    pub secondary: bool,
+}
+
+fn is_shell_desktop_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "MultitaskingViewFrame"
+    )
+}
+
 /// Single authoritative fullscreen classifier (AD-6).
 ///
 /// Returns `true` ONLY when:
 /// - `SHQueryUserNotificationState` reports `QUNS_RUNNING_D3D_FULL_SCREEN` or `QUNS_PRESENTATION_MODE`, OR
-/// - The visible foreground window belongs to another non-shell process, has neither
-///   full `WS_CAPTION` nor `WS_THICKFRAME`, and covers the entire primary monitor.
+/// - The visible foreground window belongs to another non-shell process and covers the entire primary monitor,
+///   either without full `WS_CAPTION`/`WS_THICKFRAME` OR as a UWP `ApplicationFrameWindow` covering past the AppBar.
 pub fn classify_fullscreen(
     notification_state: NotificationState,
     foreground: Option<&ForegroundWindowInfo>,
@@ -156,11 +194,19 @@ pub fn classify_fullscreen(
     if !fg.visible || fg.is_own_process {
         return false;
     }
-    if matches!(
-        fg.class_name.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    ) {
+    if is_shell_desktop_class(&fg.class_name) {
         return false;
+    }
+
+    if !fg.rect.covers(primary_monitor) {
+        return false;
+    }
+
+    // Packaged UWP apps hosted in ApplicationFrameWindow (Netflix, Photos, Movies & TV,
+    // Windows Terminal F11) keep WS_CAPTION | WS_THICKFRAME even in true fullscreen;
+    // when maximized normally their DWM extended rect stops above the AppBar.
+    if fg.class_name == "ApplicationFrameWindow" {
+        return true;
     }
 
     let has_caption = (fg.style & WS_CAPTION_FLAG) == WS_CAPTION_FLAG;
@@ -169,7 +215,71 @@ pub fn classify_fullscreen(
         return false;
     }
 
-    fg.rect.covers(primary_monitor)
+    true
+}
+
+/// Per-monitor authoritative fullscreen classifier using `DWMWA_EXTENDED_FRAME_BOUNDS` and
+/// `MonitorFromWindow` attribution so:
+/// - `QUNS_RUNNING_D3D_FULL_SCREEN` / `QUNS_PRESENTATION_MODE` only suppresses the monitor
+///   actually hosting the foreground window (never hiding Monitor 1's taskbar when a game is on Monitor 2).
+/// - UWP `ApplicationFrameWindow` and borderless engines retaining `WS_CAPTION`/`WS_THICKFRAME`
+///   are detected accurately without false-triggering on maximized desktop apps (even on Monitor 2
+///   where `work_area_rect == monitor_rect`).
+pub fn classify_fullscreen_for_monitor(
+    notification_state: NotificationState,
+    foreground: Option<&DetailedForegroundWindow>,
+    target_monitor: PixelRect,
+    is_primary_target: bool,
+) -> bool {
+    if target_monitor.width() <= 0 || target_monitor.height() <= 0 {
+        return false;
+    }
+
+    if matches!(
+        notification_state,
+        NotificationState::RunningD3dFullScreen | NotificationState::PresentationMode
+    ) {
+        return match foreground {
+            Some(fg) if !fg.is_own_process && fg.monitor_rect.width() > 0 => {
+                fg.monitor_rect == target_monitor || fg.extended_rect.covers(target_monitor)
+            }
+            _ => is_primary_target,
+        };
+    }
+
+    let Some(fg) = foreground else {
+        return false;
+    };
+    if !fg.visible || fg.is_own_process {
+        return false;
+    }
+    if is_shell_desktop_class(&fg.class_name) {
+        return false;
+    }
+
+    let covers_target = fg.extended_rect.covers(target_monitor);
+    if !covers_target {
+        return false;
+    }
+
+    let has_caption = (fg.style & WS_CAPTION_FLAG) == WS_CAPTION_FLAG;
+    let has_thickframe = (fg.style & WS_THICKFRAME_FLAG) != 0;
+    if !has_caption && !has_thickframe {
+        return true;
+    }
+
+    let has_reserved_appbar = fg.work_area_rect.width() > 0
+        && fg.work_area_rect.height() > 0
+        && fg.work_area_rect != target_monitor;
+
+    // UWP ApplicationFrameWindow in fullscreen covers past reserved work area (primary) or runs un-maximized full-monitor (secondary).
+    if fg.class_name == "ApplicationFrameWindow" {
+        return !fg.is_maximized || has_reserved_appbar;
+    }
+
+    // Borderless games/engines that retain WS_CAPTION/WS_THICKFRAME while placing an un-maximized
+    // frame over the entire monitor (including the reserved AppBar strip).
+    !fg.is_maximized && has_reserved_appbar && fg.extended_rect == target_monitor
 }
 
 /// Computes effective WebView2 / UI scale factor combining monitor DPI scale and
@@ -246,25 +356,37 @@ pub fn windows_update_targets_with_secondary(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CoordinatorActions {
     pub taskbar_visible: Option<bool>,
+    pub secondary_taskbar_visible: Option<bool>,
     pub start_visible: Option<bool>,
     pub flyout_visible: Option<bool>,
     pub flyout_non_activating: Option<bool>,
     pub emit_flyout_show: bool,
     pub emit_flyout_hide: bool,
     pub emit_start_state: Option<bool>,
+    pub hide_flyout_immediate: bool,
+    pub hide_start_immediate: bool,
+    pub start_anim_gen: Option<u64>,
+    pub flyout_anim_gen: Option<u64>,
+    pub start_target_monitor: Option<String>,
 }
 
 /// Pure, Win32-independent state machine owning lifecycle, focus, preemption,
-/// anti-double-toggle debounce, modal picker guard, and fullscreen suppression
-/// for the 3 pre-warmed TestBar windows (`taskbar`, `start`, `flyout`).
+/// anti-double-toggle debounce, modal picker guard, per-monitor fullscreen suppression,
+/// and monotonic animation generations for the pre-warmed TestBar windows.
 #[derive(Debug, Default)]
 pub struct WindowCoordinator {
     start_open: bool,
     active_flyout: Option<FlyoutKind>,
     fullscreen_suppressed: bool,
+    primary_fullscreen: bool,
+    secondary_fullscreen: bool,
     modal_picker_depth: u32,
     last_dismissed_ms: HashMap<TriggerId, u64>,
     last_start_opened_ms: Option<u64>,
+    last_flyout_opened_ms: Option<u64>,
+    start_anim_gen: u64,
+    flyout_anim_gen: u64,
+    start_target_monitor: Option<String>,
 }
 
 impl WindowCoordinator {
@@ -282,6 +404,18 @@ impl WindowCoordinator {
 
     pub fn is_flyout_visible(&self) -> bool {
         self.active_flyout.is_some()
+    }
+
+    pub fn start_anim_gen(&self) -> u64 {
+        self.start_anim_gen
+    }
+
+    pub fn flyout_anim_gen(&self) -> u64 {
+        self.flyout_anim_gen
+    }
+
+    pub fn start_target_monitor(&self) -> Option<&str> {
+        self.start_target_monitor.as_deref()
     }
 
     pub fn windows_update_targets(&self) -> Vec<&'static str> {
@@ -349,15 +483,31 @@ impl WindowCoordinator {
         self.fullscreen_suppressed
     }
 
+    pub fn is_primary_fullscreen(&self) -> bool {
+        self.primary_fullscreen
+    }
+
+    pub fn is_secondary_fullscreen(&self) -> bool {
+        self.secondary_fullscreen
+    }
+
     pub fn should_show_taskbar(&self) -> bool {
-        !self.fullscreen_suppressed
+        !self.primary_fullscreen
+    }
+
+    pub fn should_show_secondary_taskbar(&self) -> bool {
+        !self.secondary_fullscreen
     }
 
     /// Returns `true` only when `taskbar` bounds updates (`SetWindowPos`) may be applied.
     /// While fullscreen suppression is active, callers must record logical state without
     /// touching Win32 window position, Z-order, or visibility.
     pub fn should_apply_taskbar_bounds(&self) -> bool {
-        !self.fullscreen_suppressed
+        !self.primary_fullscreen
+    }
+
+    pub fn should_apply_secondary_taskbar_bounds(&self) -> bool {
+        !self.secondary_fullscreen
     }
 
     pub fn is_modal_picker_active(&self) -> bool {
@@ -372,6 +522,16 @@ impl WindowCoordinator {
         self.modal_picker_depth = self.modal_picker_depth.saturating_sub(1);
     }
 
+    fn next_start_gen(&mut self) -> u64 {
+        self.start_anim_gen = self.start_anim_gen.wrapping_add(1);
+        self.start_anim_gen
+    }
+
+    fn next_flyout_gen(&mut self) -> u64 {
+        self.flyout_anim_gen = self.flyout_anim_gen.wrapping_add(1);
+        self.flyout_anim_gen
+    }
+
     fn is_debounced(&self, trigger: TriggerId, now_ms: u64) -> bool {
         self.last_dismissed_ms
             .get(&trigger)
@@ -383,24 +543,64 @@ impl WindowCoordinator {
         if self.start_open {
             self.start_open = false;
             self.last_start_opened_ms = None;
+            let gen = self.next_start_gen();
             actions.start_visible = Some(false);
             actions.emit_start_state = Some(false);
+            actions.start_anim_gen = Some(gen);
         }
     }
 
     fn close_flyout(&mut self, actions: &mut CoordinatorActions) -> Option<FlyoutKind> {
         let closed = self.active_flyout.take()?;
+        self.last_flyout_opened_ms = None;
+        let gen = self.next_flyout_gen();
         actions.flyout_visible = Some(false);
         actions.emit_flyout_hide = true;
+        actions.flyout_anim_gen = Some(gen);
         Some(closed)
     }
 
+    /// Immediately cancels any active or exiting flyout animation and instructs the host to `SW_HIDE`.
+    pub fn hide_flyout_immediate(&mut self) -> CoordinatorActions {
+        let mut actions = CoordinatorActions::default();
+        let had_active = self.close_flyout(&mut actions).is_some();
+        if !had_active {
+            let gen = self.next_flyout_gen();
+            actions.flyout_anim_gen = Some(gen);
+        }
+        actions.hide_flyout_immediate = true;
+        actions
+    }
+
+    /// Immediately cancels any active or exiting Start animation and instructs the host to `SW_HIDE`.
+    pub fn hide_start_immediate(&mut self) -> CoordinatorActions {
+        let mut actions = CoordinatorActions::default();
+        let had_active = self.start_open;
+        self.close_start(&mut actions);
+        if !had_active {
+            let gen = self.next_start_gen();
+            actions.start_anim_gen = Some(gen);
+        }
+        actions.hide_start_immediate = true;
+        actions
+    }
+
+    /// Toggles Start Menu (explicitly overriding `fullscreen_suppressed` so pressing `Win`
+    /// inside fullscreen games/video opens Start cleanly instead of silently swallowing the key).
     pub fn request_toggle_start(&mut self, force: Option<bool>, now_ms: u64) -> CoordinatorActions {
+        self.request_toggle_start_on_monitor(force, None, now_ms)
+    }
+
+    /// Toggles Start Menu targeting an optional monitor (`"primary"` | `"secondary"`),
+    /// overriding fullscreen suppression and immediately cancelling any active/exiting flyout.
+    pub fn request_toggle_start_on_monitor(
+        &mut self,
+        force: Option<bool>,
+        monitor: Option<String>,
+        now_ms: u64,
+    ) -> CoordinatorActions {
         let target = force.unwrap_or(!self.start_open);
         if target == self.start_open {
-            return CoordinatorActions::default();
-        }
-        if target && self.fullscreen_suppressed {
             return CoordinatorActions::default();
         }
 
@@ -409,11 +609,21 @@ impl WindowCoordinator {
             if force.is_none() && self.is_debounced(TriggerId::Start, now_ms) {
                 return actions;
             }
-            let _ = self.close_flyout(&mut actions);
+            let had_flyout = self.close_flyout(&mut actions).is_some();
+            if !had_flyout {
+                // Bump flyout_anim_gen even if flyout was mid-exit so stale exit timers cancel immediately
+                actions.flyout_anim_gen = Some(self.next_flyout_gen());
+            }
+            actions.hide_flyout_immediate = true;
+
             self.start_open = true;
             self.last_start_opened_ms = Some(now_ms);
+            self.start_target_monitor = monitor;
+            let gen = self.next_start_gen();
             actions.start_visible = Some(true);
             actions.emit_start_state = Some(true);
+            actions.start_anim_gen = Some(gen);
+            actions.start_target_monitor = self.start_target_monitor.clone();
         } else {
             self.close_start(&mut actions);
         }
@@ -421,7 +631,21 @@ impl WindowCoordinator {
     }
 
     pub fn request_open_flyout(&mut self, kind: FlyoutKind, now_ms: u64) -> CoordinatorActions {
-        if self.fullscreen_suppressed {
+        self.request_open_flyout_on_monitor(kind, None, now_ms)
+    }
+
+    pub fn request_open_flyout_on_monitor(
+        &mut self,
+        kind: FlyoutKind,
+        monitor: Option<&str>,
+        now_ms: u64,
+    ) -> CoordinatorActions {
+        let monitor_suppressed = if monitor == Some("secondary") {
+            self.secondary_fullscreen
+        } else {
+            self.primary_fullscreen
+        };
+        if monitor_suppressed {
             return CoordinatorActions::default();
         }
 
@@ -446,13 +670,21 @@ impl WindowCoordinator {
             {
                 return actions;
             }
+            let had_start = self.start_open;
             self.close_start(&mut actions);
+            if !had_start {
+                actions.start_anim_gen = Some(self.next_start_gen());
+            }
+            actions.hide_start_immediate = true;
+            self.last_flyout_opened_ms = Some(now_ms);
         }
 
         self.active_flyout = Some(kind);
+        let gen = self.next_flyout_gen();
         actions.flyout_visible = Some(true);
         actions.flyout_non_activating = Some(kind.is_non_activating());
         actions.emit_flyout_show = true;
+        actions.flyout_anim_gen = Some(gen);
         actions
     }
 
@@ -497,6 +729,11 @@ impl WindowCoordinator {
         if !self.active_flyout.is_some_and(FlyoutKind::is_interactive_click) {
             return CoordinatorActions::default();
         }
+        if let Some(opened_at) = self.last_flyout_opened_ms {
+            if now_ms >= opened_at && (now_ms - opened_at) < FLYOUT_OPEN_FOCUS_GRACE_MS {
+                return CoordinatorActions::default();
+            }
+        }
         let mut actions = CoordinatorActions::default();
         if let Some(kind) = self.close_flyout(&mut actions) {
             self.last_dismissed_ms
@@ -531,21 +768,60 @@ impl WindowCoordinator {
         actions
     }
 
-    pub fn on_fullscreen_changed(&mut self, is_fullscreen: bool) -> CoordinatorActions {
-        if is_fullscreen == self.fullscreen_suppressed {
+    /// Updates per-monitor fullscreen suppression independently for primary and secondary displays.
+    pub fn set_monitor_fullscreen(
+        &mut self,
+        primary: bool,
+        secondary: bool,
+        _now_ms: u64,
+    ) -> CoordinatorActions {
+        if primary == self.primary_fullscreen && secondary == self.secondary_fullscreen {
             return CoordinatorActions::default();
         }
-        self.fullscreen_suppressed = is_fullscreen;
 
         let mut actions = CoordinatorActions::default();
-        if is_fullscreen {
-            actions.taskbar_visible = Some(false);
-            self.close_start(&mut actions);
-            let _ = self.close_flyout(&mut actions);
-        } else {
-            actions.taskbar_visible = Some(true);
+
+        if primary != self.primary_fullscreen {
+            self.primary_fullscreen = primary;
+            self.fullscreen_suppressed = primary;
+            if primary {
+                actions.taskbar_visible = Some(false);
+                self.close_start(&mut actions);
+                let _ = self.close_flyout(&mut actions);
+                actions.hide_start_immediate = true;
+                actions.hide_flyout_immediate = true;
+            } else {
+                actions.taskbar_visible = Some(true);
+            }
         }
+
+        if secondary != self.secondary_fullscreen {
+            self.secondary_fullscreen = secondary;
+            actions.secondary_taskbar_visible = Some(!secondary);
+            if secondary && self.start_target_monitor.as_deref() == Some("secondary") {
+                self.close_start(&mut actions);
+                actions.hide_start_immediate = true;
+            }
+        }
+
         actions
+    }
+
+    /// Single-authority per-monitor fullscreen re-evaluation (AD-6).
+    pub fn reevaluate_fullscreen_per_monitor(
+        &mut self,
+        state: MonitorFullscreenState,
+        now_ms: u64,
+    ) -> CoordinatorActions {
+        self.set_monitor_fullscreen(state.primary, state.secondary, now_ms)
+    }
+
+    pub fn set_fullscreen(&mut self, is_fullscreen: bool) -> CoordinatorActions {
+        self.on_fullscreen_changed(is_fullscreen)
+    }
+
+    pub fn on_fullscreen_changed(&mut self, is_fullscreen: bool) -> CoordinatorActions {
+        self.set_monitor_fullscreen(is_fullscreen, self.secondary_fullscreen, 0)
     }
 
     /// Single-authority fullscreen re-evaluation (AD-6).
@@ -1063,17 +1339,17 @@ mod tests {
         assert_eq!(forced.start_visible, Some(true));
         assert!(coord.is_start_open());
 
-        // Blocked while fullscreen_suppressed == true
+        // Explicit Start toggle overrides fullscreen_suppressed so physical Win key works in fullscreen apps
         let _ = coord.on_fullscreen_changed(true);
         assert!(!coord.is_start_open());
-        assert_eq!(
-            coord.request_toggle_start(None, 2000),
-            CoordinatorActions::default()
-        );
-        assert_eq!(
-            coord.request_toggle_start(Some(true), 2000),
-            CoordinatorActions::default()
-        );
+        let fs_open = coord.request_toggle_start(None, 2000);
+        assert_eq!(fs_open.start_visible, Some(true));
+        assert_eq!(fs_open.emit_start_state, Some(true));
+        assert!(fs_open.hide_flyout_immediate);
+        assert!(coord.is_start_open());
+
+        let fs_close = coord.request_toggle_start(Some(false), 2050);
+        assert_eq!(fs_close.start_visible, Some(false));
         assert!(!coord.is_start_open());
     }
 
@@ -1099,20 +1375,20 @@ mod tests {
         let _ = coord.request_toggle_start(Some(false), 170);
         let _ = coord.request_close_flyout();
 
-        // Transient Preview/Osd opening within 180ms after Sound blur does NOT bypass Sound debounce
+        // Transient Preview/Osd opening within 180ms after Sound blur (past 160ms grace) does NOT bypass Sound debounce
         let _ = coord.request_open_flyout(FlyoutKind::Sound, 1000);
-        let _ = coord.on_flyout_focus_lost(1100);
-        let prev = coord.request_open_flyout(FlyoutKind::Preview, 1150);
+        let _ = coord.on_flyout_focus_lost(1200);
+        let prev = coord.request_open_flyout(FlyoutKind::Preview, 1250);
         assert_eq!(prev.flyout_visible, Some(true));
         assert_eq!(coord.active_flyout(), Some(FlyoutKind::Preview));
         assert_eq!(
-            coord.request_open_flyout(FlyoutKind::Sound, 1200),
+            coord.request_open_flyout(FlyoutKind::Sound, 1300),
             CoordinatorActions::default()
         );
         assert_eq!(coord.active_flyout(), Some(FlyoutKind::Preview));
 
         // After 180ms window, Sound preempts Preview
-        let reopened = coord.request_open_flyout(FlyoutKind::Sound, 1280);
+        let reopened = coord.request_open_flyout(FlyoutKind::Sound, 1380);
         assert_eq!(reopened.flyout_visible, Some(true));
         assert_eq!(coord.active_flyout(), Some(FlyoutKind::Sound));
 
@@ -1486,5 +1762,275 @@ mod tests {
             vec!["taskbar", "start"]
         );
         assert_eq!(coord.audio_mixer_targets(), vec!["start"]);
+    }
+
+    #[test]
+    fn classify_fullscreen_for_monitor_handles_per_monitor_d3d_uwp_and_borderless() {
+        let primary = PixelRect::new(0, 0, 1920, 1080);
+        let primary_wa = PixelRect::new(0, 0, 1920, 1016);
+        let secondary = PixelRect::new(1920, 0, 3840, 1080);
+
+        // 1. D3D exclusive fullscreen on Monitor 2 ONLY suppresses secondary, NOT primary!
+        let d3d_on_sec = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "UnrealWindow".into(),
+            style: 0x1400_0000,
+            window_rect: secondary,
+            extended_rect: secondary,
+            monitor_rect: secondary,
+            work_area_rect: secondary,
+        };
+        assert!(!classify_fullscreen_for_monitor(
+            NotificationState::RunningD3dFullScreen,
+            Some(&d3d_on_sec),
+            primary,
+            true
+        ));
+        assert!(classify_fullscreen_for_monitor(
+            NotificationState::RunningD3dFullScreen,
+            Some(&d3d_on_sec),
+            secondary,
+            false
+        ));
+
+        // 2. UWP ApplicationFrameWindow (Netflix / Photos / Terminal F11) keeps WS_CAPTION | WS_THICKFRAME:
+        //    - Normally maximized on primary: extended_rect stops at work_area_rect (1016px) -> NOT fullscreen
+        let uwp_max_primary = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "ApplicationFrameWindow".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: PixelRect::new(-8, -8, 1928, 1024),
+            extended_rect: primary_wa,
+            monitor_rect: primary,
+            work_area_rect: primary_wa,
+        };
+        assert!(!classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&uwp_max_primary),
+            primary,
+            true
+        ));
+
+        //    - Fullscreen on primary: extended_rect covers full monitor (past AppBar) -> FULLSCREEN
+        let uwp_fs_primary = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "ApplicationFrameWindow".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: primary,
+            extended_rect: primary,
+            monitor_rect: primary,
+            work_area_rect: primary_wa,
+        };
+        assert!(classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&uwp_fs_primary),
+            primary,
+            true
+        ));
+
+        //    - Normally maximized UWP on Monitor 2 (where work_area == monitor_rect): is_maximized=true -> NOT fullscreen
+        let uwp_max_secondary = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "ApplicationFrameWindow".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: PixelRect::new(1912, -8, 3848, 1088),
+            extended_rect: secondary,
+            monitor_rect: secondary,
+            work_area_rect: secondary,
+        };
+        assert!(!classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&uwp_max_secondary),
+            secondary,
+            false
+        ));
+
+        //    - Fullscreen UWP on Monitor 2: un-maximized covering full monitor -> FULLSCREEN
+        let uwp_fs_secondary = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "ApplicationFrameWindow".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: secondary,
+            extended_rect: secondary,
+            monitor_rect: secondary,
+            work_area_rect: secondary,
+        };
+        assert!(classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&uwp_fs_secondary),
+            secondary,
+            false
+        ));
+
+        // 3. Borderless game retaining WS_CAPTION covering full primary monitor (including AppBar) -> FULLSCREEN
+        let borderless_with_caption = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "UnityWndClass".into(),
+            style: WS_CAPTION_FLAG,
+            window_rect: primary,
+            extended_rect: primary,
+            monitor_rect: primary,
+            work_area_rect: primary_wa,
+        };
+        assert!(classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&borderless_with_caption),
+            primary,
+            true
+        ));
+
+        // 4. Maximized Chrome on Monitor 2 (where work_area == monitor_rect) -> NOT fullscreen
+        let chrome_max_sec = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "Chrome_WidgetWin_1".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: PixelRect::new(1912, -8, 3848, 1088),
+            extended_rect: secondary,
+            monitor_rect: secondary,
+            work_area_rect: secondary,
+        };
+        assert!(!classify_fullscreen_for_monitor(
+            NotificationState::AcceptsNotifications,
+            Some(&chrome_max_sec),
+            secondary,
+            false
+        ));
+
+        // 5. Legacy classify_fullscreen also detects UWP ApplicationFrameWindow covering primary monitor
+        let uwp_legacy = ForegroundWindowInfo {
+            visible: true,
+            is_own_process: false,
+            class_name: "ApplicationFrameWindow".into(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            rect: primary,
+        };
+        assert!(classify_fullscreen(
+            NotificationState::AcceptsNotifications,
+            Some(&uwp_legacy),
+            primary
+        ));
+    }
+
+    #[test]
+    fn per_monitor_fullscreen_transitions_and_start_override() {
+        let mut coord = WindowCoordinator::new();
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_show_secondary_taskbar());
+
+        // Secondary enters fullscreen -> ONLY secondary taskbar hides; primary stays visible
+        let sec_enter = coord.set_monitor_fullscreen(false, true, 100);
+        assert_eq!(sec_enter.taskbar_visible, None);
+        assert_eq!(sec_enter.secondary_taskbar_visible, Some(false));
+        assert!(!coord.is_primary_fullscreen());
+        assert!(coord.is_secondary_fullscreen());
+        assert!(coord.should_show_taskbar());
+        assert!(!coord.should_show_secondary_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
+        assert!(!coord.should_apply_secondary_taskbar_bounds());
+
+        // Flyout on secondary is blocked while secondary is fullscreen, but primary flyout still opens!
+        assert_eq!(
+            coord.request_open_flyout_on_monitor(FlyoutKind::Sound, Some("secondary"), 120),
+            CoordinatorActions::default()
+        );
+        let primary_flyout =
+            coord.request_open_flyout_on_monitor(FlyoutKind::Sound, Some("primary"), 130);
+        assert_eq!(primary_flyout.flyout_visible, Some(true));
+
+        // Primary enters fullscreen -> hides primary taskbar and immediately dismisses open flyout
+        let pri_enter = coord.set_monitor_fullscreen(true, true, 200);
+        assert_eq!(pri_enter.taskbar_visible, Some(false));
+        assert_eq!(pri_enter.secondary_taskbar_visible, None);
+        assert_eq!(pri_enter.flyout_visible, Some(false));
+        assert!(pri_enter.hide_flyout_immediate);
+        assert!(pri_enter.hide_start_immediate);
+
+        // Pressing Win inside primary fullscreen overrides fullscreen_suppressed and opens Start!
+        let start_override =
+            coord.request_toggle_start_on_monitor(None, Some("primary".into()), 300);
+        assert_eq!(start_override.start_visible, Some(true));
+        assert_eq!(start_override.emit_start_state, Some(true));
+        assert_eq!(start_override.start_target_monitor.as_deref(), Some("primary"));
+        assert!(start_override.hide_flyout_immediate);
+        assert!(coord.is_start_open());
+
+        // Leaving secondary fullscreen restores only secondary taskbar
+        let sec_exit = coord.reevaluate_fullscreen_per_monitor(
+            MonitorFullscreenState {
+                primary: true,
+                secondary: false,
+            },
+            400,
+        );
+        assert_eq!(sec_exit.taskbar_visible, None);
+        assert_eq!(sec_exit.secondary_taskbar_visible, Some(true));
+        assert!(coord.should_show_secondary_taskbar());
+        assert!(!coord.should_show_taskbar());
+    }
+
+    #[test]
+    fn flyout_focus_grace_monotonic_anim_gens_and_immediate_preemption() {
+        let mut coord = WindowCoordinator::new();
+        assert_eq!(coord.start_anim_gen(), 0);
+        assert_eq!(coord.flyout_anim_gen(), 0);
+
+        // Open interactive flyout at t=1000
+        let open = coord.request_open_flyout(FlyoutKind::Sound, 1000);
+        assert_eq!(open.flyout_visible, Some(true));
+        assert!(open.hide_start_immediate);
+        let g1 = open.flyout_anim_gen.expect("flyout_anim_gen set on open");
+        assert_eq!(g1, 1);
+
+        // Transient WebView2 focus jitter within 160ms grace window is ignored
+        assert_eq!(
+            coord.on_flyout_focus_lost(1000),
+            CoordinatorActions::default()
+        );
+        assert_eq!(
+            coord.on_flyout_focus_lost(1000 + FLYOUT_OPEN_FOCUS_GRACE_MS - 1),
+            CoordinatorActions::default()
+        );
+        assert_eq!(coord.active_flyout(), Some(FlyoutKind::Sound));
+
+        // Explicit global outside click STILL dismisses immediately even inside grace window
+        let click_out = coord.on_global_mouse_down(50, 50, &[], 1050);
+        assert_eq!(click_out.flyout_visible, Some(false));
+        assert_eq!(click_out.flyout_anim_gen, Some(2));
+        assert_eq!(coord.active_flyout(), None);
+
+        // Re-open after debounce and verify focus-loss succeeds right at FLYOUT_OPEN_FOCUS_GRACE_MS
+        let reopen = coord.request_open_flyout(FlyoutKind::Calendar, 1500);
+        assert_eq!(reopen.flyout_anim_gen, Some(3));
+        let lost = coord.on_flyout_focus_lost(1500 + FLYOUT_OPEN_FOCUS_GRACE_MS);
+        assert_eq!(lost.flyout_visible, Some(false));
+        assert_eq!(lost.flyout_anim_gen, Some(4));
+
+        // Immediate hide preemption helpers bump generation monotonically even when already closed
+        let h_fly = coord.hide_flyout_immediate();
+        assert!(h_fly.hide_flyout_immediate);
+        assert_eq!(h_fly.flyout_anim_gen, Some(5));
+
+        let s_open = coord.request_toggle_start_on_monitor(Some(true), Some("secondary".into()), 2000);
+        assert_eq!(s_open.start_target_monitor.as_deref(), Some("secondary"));
+        let sg1 = s_open.start_anim_gen.unwrap();
+        let h_start = coord.hide_start_immediate();
+        assert!(h_start.hide_start_immediate);
+        assert_eq!(h_start.start_visible, Some(false));
+        assert!(h_start.start_anim_gen.unwrap() > sg1);
+        assert!(!coord.is_start_open());
     }
 }

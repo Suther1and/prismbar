@@ -1,7 +1,14 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Default maximum number of cached PNG data URIs in the unified `IconCache` (AD-6).
 pub const DEFAULT_ICON_CACHE_CAPACITY: usize = 256;
+
+/// Default TTL in milliseconds for negative icon-extraction misses (prevents 650ms poller thrash).
+pub const DEFAULT_NEGATIVE_MISS_TTL_MS: u64 = 30_000;
+
+/// Maximum number of bounded negative-miss entries tracked simultaneously.
+pub const MAX_NEGATIVE_MISS_ENTRIES: usize = 256;
 
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -69,12 +76,15 @@ struct CacheEntry {
     last_used: u64,
 }
 
-/// Bounded LRU icon cache mapping namespaced `icon_key` strings to PNG data URIs (AD-6).
+/// Bounded LRU icon cache mapping namespaced `icon_key` strings to PNG data URIs (AD-6),
+/// plus a bounded TTL negative-miss cache so iconless/elevated apps do not thrash GDI/`WM_GETICON`.
 #[derive(Debug)]
 pub struct IconCache {
     capacity: usize,
     tick: u64,
     entries: HashMap<String, CacheEntry>,
+    negative_ttl: Duration,
+    negative_misses: HashMap<String, Instant>,
 }
 
 impl Default for IconCache {
@@ -85,11 +95,17 @@ impl Default for IconCache {
 
 impl IconCache {
     pub fn new(capacity: usize) -> Self {
+        Self::with_negative_ttl(capacity, Duration::from_millis(DEFAULT_NEGATIVE_MISS_TTL_MS))
+    }
+
+    pub fn with_negative_ttl(capacity: usize, negative_ttl: Duration) -> Self {
         let cap = capacity.max(1);
         Self {
             capacity: cap,
             tick: 0,
             entries: HashMap::with_capacity(cap.min(DEFAULT_ICON_CACHE_CAPACITY)),
+            negative_ttl,
+            negative_misses: HashMap::new(),
         }
     }
 
@@ -109,9 +125,60 @@ impl IconCache {
         self.entries.contains_key(key)
     }
 
+    pub fn negative_miss_len(&self) -> usize {
+        self.negative_misses.len()
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.negative_misses.clear();
         self.tick = 0;
+    }
+
+    /// Returns `true` if `key` recently failed extraction and its negative-cache TTL has not expired.
+    pub fn is_negative_cached(&mut self, key: &str) -> bool {
+        if self.negative_ttl.is_zero() {
+            return false;
+        }
+        let Some(&recorded_at) = self.negative_misses.get(key) else {
+            return false;
+        };
+        if recorded_at.elapsed() < self.negative_ttl {
+            true
+        } else {
+            self.negative_misses.remove(key);
+            false
+        }
+    }
+
+    /// Records a failed icon extraction for `key` for up to `negative_ttl` (bounded to `MAX_NEGATIVE_MISS_ENTRIES`).
+    pub fn mark_negative_miss(&mut self, key: String) {
+        if key.is_empty() || self.negative_ttl.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        if self.negative_misses.len() >= MAX_NEGATIVE_MISS_ENTRIES
+            && !self.negative_misses.contains_key(&key)
+        {
+            let ttl = self.negative_ttl;
+            self.negative_misses
+                .retain(|_, ts| now.saturating_duration_since(*ts) < ttl);
+            if self.negative_misses.len() >= MAX_NEGATIVE_MISS_ENTRIES {
+                if let Some(oldest) = self
+                    .negative_misses
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.negative_misses.remove(&oldest);
+                }
+            }
+        }
+        self.negative_misses.insert(key, now);
+    }
+
+    pub fn clear_negative_miss(&mut self, key: &str) {
+        self.negative_misses.remove(key);
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -131,6 +198,7 @@ impl IconCache {
 
     /// Inserts or updates an icon entry, evicting the least-recently-used entry if full.
     pub fn put(&mut self, key: String, data_uri: String) {
+        self.negative_misses.remove(&key);
         let now = self.next_tick();
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.value = data_uri;
@@ -171,6 +239,30 @@ impl IconCache {
         let loaded = loader()?;
         self.put(key.to_string(), loaded.clone());
         Some(loaded)
+    }
+
+    /// Like `get_or_insert_with`, but suppresses repeated `loader` invocations while `key`
+    /// is negatively cached within its TTL window.
+    pub fn get_or_insert_with_negative_cache<F>(&mut self, key: &str, loader: F) -> Option<String>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        if let Some(hit) = self.get(key) {
+            return Some(hit);
+        }
+        if self.is_negative_cached(key) {
+            return None;
+        }
+        match loader() {
+            Some(loaded) => {
+                self.put(key.to_string(), loaded.clone());
+                Some(loaded)
+            }
+            None => {
+                self.mark_negative_miss(key.to_string());
+                None
+            }
+        }
     }
 
     /// Batch-fetches all cached icons matching `keys`, refreshing LRU recency for every hit.
@@ -324,5 +416,54 @@ mod tests {
         for kept in 4..260 {
             assert!(cache.contains_key(&format!("exe:{kept}")));
         }
+    }
+
+    #[test]
+    fn negative_miss_cache_suppresses_repeated_loads_expires_and_clears_on_put() {
+        let mut cache = IconCache::with_negative_ttl(8, Duration::from_millis(60));
+        let mut calls = 0usize;
+
+        // First miss invokes loader and records negative miss
+        assert_eq!(
+            cache.get_or_insert_with_negative_cache("exe:missing", || {
+                calls += 1;
+                None
+            }),
+            None
+        );
+        assert_eq!(calls, 1);
+        assert!(cache.is_negative_cached("exe:missing"));
+        assert_eq!(cache.negative_miss_len(), 1);
+
+        // Second call within TTL skips loader completely
+        assert_eq!(
+            cache.get_or_insert_with_negative_cache("exe:missing", || {
+                calls += 1;
+                Some("data:image/png;base64,SHOULD_NOT_RUN".into())
+            }),
+            None
+        );
+        assert_eq!(calls, 1);
+
+        // Explicit put clears the negative miss immediately
+        cache.put("exe:missing".into(), "data:image/png;base64,NOW_OK".into());
+        assert!(!cache.is_negative_cached("exe:missing"));
+        assert_eq!(
+            cache.get("exe:missing").as_deref(),
+            Some("data:image/png;base64,NOW_OK")
+        );
+
+        // TTL expiry allows retry after deadline
+        cache.mark_negative_miss("exe:ttl".into());
+        assert!(cache.is_negative_cached("exe:ttl"));
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(!cache.is_negative_cached("exe:ttl"));
+
+        // Negative miss table stays bounded by MAX_NEGATIVE_MISS_ENTRIES
+        let mut bounded = IconCache::with_negative_ttl(8, Duration::from_secs(60));
+        for i in 0..(MAX_NEGATIVE_MISS_ENTRIES + 20) {
+            bounded.mark_negative_miss(format!("exe:miss-{i}"));
+        }
+        assert!(bounded.negative_miss_len() <= MAX_NEGATIVE_MISS_ENTRIES);
     }
 }

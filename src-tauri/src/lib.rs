@@ -11,12 +11,12 @@ pub mod windows_tracker;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use apps_indexer::{IndexedApp, IndexedFile, SteamGame};
-use audio::{AudioMasterState, AudioState};
+use audio::{AudioMasterState, AudioPeaksSnapshot, AudioState};
 use config::{CustomSpace, PinItem, TestBarConfig};
 use coordinator::{
     BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect, WindowCoordinator,
@@ -30,12 +30,52 @@ use windows_tracker::{AppWindowGroup, JumpListItem};
 
 const DOCK_WINDOW_LOGICAL_HEIGHT: f64 = 84.0;
 const DOCK_HORIZONTAL_PADDING_LOGICAL: i32 = 36; // 18px left + 18px right transparent shadow margin
-const START_DEFAULT_LOGICAL_WIDTH: f64 = 1172.0;
-const START_DEFAULT_LOGICAL_HEIGHT: f64 = 712.0;
-const FLYOUT_EXIT_ANIM_MS: u64 = 130;
-const START_EXIT_ANIM_MS: u64 = 135;
+const START_DEFAULT_LOGICAL_WIDTH: f64 = 1140.0 + 2.0 * win_shell::START_ROOT_PAD_LOGICAL; // 1188px (24px shadow pad)
+const START_DEFAULT_LOGICAL_HEIGHT: f64 = 680.0 + 2.0 * win_shell::START_ROOT_PAD_LOGICAL; // 728px (24px shadow pad)
+const FLYOUT_ROOT_PAD_TOTAL_LOGICAL: f64 = 2.0 * win_shell::FLYOUT_ROOT_PAD_LOGICAL; // 36px (18px shadow pad)
+const PAINT_SYNC_SHOW_FAILSAFE_MS: u64 = 22;
+const FLYOUT_EXIT_ANIM_MS: u64 = 135;
+const START_EXIT_ANIM_MS: u64 = 145;
+const PREVIEW_GLIDE_DURATION_MS: u64 = 115;
+const PERIODIC_REINDEX_INTERVAL_SECS: u64 = 15 * 60;
+const MAX_ICON_SOURCES_ENTRIES: usize = 2048;
 
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StartStateEvent {
+    pub open: bool,
+    pub gen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub immediate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlyoutHideEvent {
+    pub gen: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSurfaceShow {
+    pub gen: u64,
+    pub rect: PixelRect,
+    pub scale_factor: f64,
+    pub bottom_anchor_y: i32,
+    pub monitor_top: i32,
+    pub activate: bool,
+    pub anchor_x: f64,
+    pub monitor: Option<String>,
+    pub was_already_visible: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSurfaceExit {
+    pub gen: u64,
+}
 
 pub struct AppState {
     pub config: Mutex<TestBarConfig>,
@@ -49,13 +89,21 @@ pub struct AppState {
     pub coordinator: Mutex<WindowCoordinator>,
     pub overlay_open: Arc<AtomicBool>,
     pub fullscreen_suppressed: Arc<AtomicBool>,
+    pub secondary_fullscreen_suppressed: Arc<AtomicBool>,
     pub taskbar_content_width: Mutex<i32>,
     pub secondary_taskbar_content_width: Mutex<i32>,
     pub secondary_taskbar_visible: Arc<AtomicBool>,
     pub last_flyout_req: Mutex<Option<FlyoutRequest>>,
+    pub last_flyout_bounds: Mutex<Option<(FlyoutKind, PixelRect)>>,
+    pub pending_start_show: Mutex<Option<PendingSurfaceShow>>,
+    pub pending_flyout_show: Mutex<Option<PendingSurfaceShow>>,
+    pub pending_start_exit: Mutex<Option<PendingSurfaceExit>>,
+    pub pending_flyout_exit: Mutex<Option<PendingSurfaceExit>>,
     pub flyout_anim_gen: Arc<AtomicU64>,
     pub start_anim_gen: Arc<AtomicU64>,
     pub dpi_override: AtomicU32,
+    pub last_external_fg: Arc<AtomicIsize>,
+    pub index_refresh_running: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -64,7 +112,9 @@ impl AppState {
         self.overlay_open.store(overlay_open, Ordering::Release);
         win_shell::set_overlay_open_hint(overlay_open);
         self.fullscreen_suppressed
-            .store(coord.is_fullscreen_suppressed(), Ordering::Release);
+            .store(coord.is_primary_fullscreen(), Ordering::Release);
+        self.secondary_fullscreen_suppressed
+            .store(coord.is_secondary_fullscreen(), Ordering::Release);
     }
 
     fn set_dpi_override(&self, dpi: u32) {
@@ -79,6 +129,82 @@ impl AppState {
         let dpi = self.dpi_override.load(Ordering::Acquire);
         (dpi > 0).then_some(dpi)
     }
+
+    fn register_icon_sources(&self, sources: Vec<(String, String)>) {
+        if sources.is_empty() {
+            return;
+        }
+        let mut map = lock_unpoisoned(&self.icon_sources);
+        if map.len() + sources.len() > MAX_ICON_SOURCES_ENTRIES {
+            map.clear();
+        }
+        for (k, src) in sources {
+            if !k.is_empty() && !src.is_empty() {
+                map.insert(k, src);
+            }
+        }
+    }
+}
+
+fn capture_external_foreground_hwnd(state: &AppState) -> isize {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if !fg.0.is_null() && IsWindow(fg).as_bool() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            if pid != 0 && pid != GetCurrentProcessId() {
+                let raw = fg.0 as isize;
+                state.last_external_fg.store(raw, Ordering::Release);
+                return raw;
+            }
+        }
+    }
+    state.last_external_fg.load(Ordering::Acquire)
+}
+
+fn build_pid_to_hwnd_map(groups: &[AppWindowGroup]) -> HashMap<u32, isize> {
+    let mut map = HashMap::new();
+    for g in groups {
+        for w in &g.windows {
+            if w.pid != 0 && w.hwnd != 0 {
+                if w.is_active {
+                    map.insert(w.pid, w.hwnd);
+                } else {
+                    map.entry(w.pid).or_insert(w.hwnd);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn sample_audio_state_with_icon_sources(state: &AppState) -> AudioState {
+    let mut cache = lock_unpoisoned(&state.icon_cache);
+    let res = audio::get_audio_state_with_icons(&mut cache);
+    drop(cache);
+    match res {
+        Ok((aud, sources)) => {
+            state.register_icon_sources(sources);
+            aud
+        }
+        Err(_) => audio::get_audio_state(),
+    }
+}
+
+fn sample_telemetry_with_icon_sources(state: &AppState) -> TelemetryState {
+    let pid_to_hwnd = {
+        let groups = lock_unpoisoned(&state.last_window_groups);
+        build_pid_to_hwnd_map(&groups)
+    };
+    let mut cache = lock_unpoisoned(&state.icon_cache);
+    let (telem, sources) = telemetry::sample_telemetry_with_icons(&mut cache, &pid_to_hwnd);
+    drop(cache);
+    state.register_icon_sources(sources);
+    telem
 }
 
 fn now_ms() -> u64 {
@@ -119,6 +245,7 @@ struct WindowItemDigest {
     title: String,
     is_active: bool,
     is_minimized: bool,
+    is_topmost: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +277,7 @@ fn compute_windows_fingerprint(groups: &[AppWindowGroup]) -> WindowsFingerprint 
                     title: w.title.clone(),
                     is_active: w.is_active,
                     is_minimized: w.is_minimized,
+                    is_topmost: w.is_topmost,
                 })
                 .collect(),
         })
@@ -290,6 +418,7 @@ where
     actions
 }
 
+#[cfg(test)]
 fn apply_fullscreen_snapshot(
     state: &AppState,
     hint_entering: Option<bool>,
@@ -313,9 +442,15 @@ fn apply_fullscreen_snapshot(
     act
 }
 
-fn reevaluate_fullscreen(app: &AppHandle, hint_entering: Option<bool>) -> CoordinatorActions {
-    let snap = win_shell::query_fullscreen_snapshot();
-    let actions = apply_fullscreen_snapshot(&app.state::<AppState>(), hint_entering, &snap);
+fn reevaluate_fullscreen(app: &AppHandle, _hint_entering: Option<bool>) -> CoordinatorActions {
+    let per_mon = win_shell::detect_fullscreen_per_monitor();
+    let actions = {
+        let state = app.state::<AppState>();
+        let mut coord = lock_unpoisoned(&state.coordinator);
+        let act = coord.reevaluate_fullscreen_per_monitor(per_mon, monotonic_ms());
+        state.sync_overlay_flag(&coord);
+        act
+    };
     apply_coordinator_actions(app, &actions, None);
     actions
 }
@@ -412,28 +547,27 @@ fn compute_start_bounds(mon: win_shell::MonitorRect, sf: f64) -> PixelRect {
     let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
     let mon_w = mon.width.max(0);
     let mon_h = mon.height.max(0);
-    let avail_w = ((mon_w as f64 / sf) - 24.0).max(320.0);
-    let avail_h = ((mon_h as f64 / sf) - 88.0).max(320.0);
+    let avail_w = ((mon_w as f64 / sf) - 16.0).max(320.0);
+    let avail_h = ((mon_h as f64 / sf) - 80.0).max(320.0);
     let logical_w = avail_w.min(START_DEFAULT_LOGICAL_WIDTH);
     let logical_h = avail_h.min(START_DEFAULT_LOGICAL_HEIGHT);
     let max_w_px = (mon_w - 16).max(0);
     let max_h_px = (mon_h - 16).max(0);
     let w_px = ((logical_w * sf).round() as i32).clamp(0, max_w_px);
     let h_px = ((logical_h * sf).round() as i32).clamp(0, max_h_px);
-    let bar_gap = (76.0 * sf).round() as i32;
+    // Keep visible chassis at the exact 92px logical clearance above monitor bottom (68 + 24px shadow pad).
+    let bar_gap = (68.0 * sf).round() as i32;
     let x_px = mon.left + (mon_w - w_px) / 2;
     let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
     PixelRect::new(x_px, y_px, x_px + w_px, y_px + h_px)
 }
 
-/// Synchronizes both Tauri/WebView2 inner controller bounds and synchronous Win32 HWND bounds
+/// Applies Win32 HWND bounds and topmost Z-order in a single atomic `SetWindowPos` call
 /// without activating or forcing hidden windows visible (AD-1).
-fn apply_webview_bounds(win: &WebviewWindow, hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
+fn apply_webview_bounds(_win: &WebviewWindow, hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
     let w_clamped = w.max(1);
     let h_clamped = h.max(1);
-    let _ = win.set_size(tauri::PhysicalSize::new(w_clamped as u32, h_clamped as u32));
-    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-    win_shell::position_window(hwnd, x, y, w_clamped, h_clamped);
+    win_shell::set_window_bounds_atomic(hwnd, x, y, w_clamped, h_clamped, true);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +627,9 @@ fn position_taskbar_window(app: &AppHandle) {
 
 fn position_secondary_taskbar_window(app: &AppHandle) {
     let st = app.state::<AppState>();
+    if !lock_unpoisoned(&st.coordinator).should_apply_secondary_taskbar_bounds() {
+        return;
+    }
     let (bar_mode, sec_mode) = {
         let cfg = lock_unpoisoned(&st.config);
         (cfg.bar_mode.clone(), cfg.secondary_taskbar_mode.clone())
@@ -534,8 +671,9 @@ fn sync_secondary_taskbar(app: &AppHandle) {
         return;
     };
 
+    let sec_allowed = lock_unpoisoned(&st.coordinator).should_show_secondary_taskbar();
     let sec_mon = win_shell::secondary_monitor_rects().into_iter().next();
-    if sec_mode == config::SECONDARY_TASKBAR_MODE_TESTBAR {
+    if sec_mode == config::SECONDARY_TASKBAR_MODE_TESTBAR && sec_allowed {
         if let Some(mon) = sec_mon {
             let logical_w = *lock_unpoisoned(&st.secondary_taskbar_content_width);
             let text_scale = win_shell::windows_text_scale_factor();
@@ -545,16 +683,34 @@ fn sync_secondary_taskbar(app: &AppHandle) {
             win_shell::set_window_visible(hwnd, true, true);
             if !was_visible {
                 let win_snap = lock_unpoisoned(&st.last_window_groups).clone();
-                let start_open = lock_unpoisoned(&st.coordinator).is_start_open();
+                let (start_open, start_gen, start_mon) = {
+                    let c = lock_unpoisoned(&st.coordinator);
+                    (
+                        c.is_start_open(),
+                        c.start_anim_gen(),
+                        c.start_target_monitor().map(str::to_string),
+                    )
+                };
                 let layout = system_widgets::get_keyboard_layout_code();
                 let _ = app.emit_to("taskbar-secondary", "config-updated", &cfg_snapshot);
                 let _ = app.emit_to("taskbar-secondary", "windows-updated", &win_snap);
                 let _ = app.emit_to("taskbar-secondary", "layout-updated", &layout);
-                let _ = app.emit_to("taskbar-secondary", "start-state", start_open);
+                let _ = app.emit_to(
+                    "taskbar-secondary",
+                    "start-state",
+                    StartStateEvent {
+                        open: start_open,
+                        gen: start_gen,
+                        monitor: start_mon,
+                        immediate: false,
+                    },
+                );
                 let h_sec = app.clone();
                 std::thread::spawn(move || {
                     let master = audio::get_audio_master_state();
                     let _ = h_sec.emit_to("taskbar-secondary", "audio-master-updated", &master);
+                    let net = system_widgets::get_network_info();
+                    let _ = h_sec.emit_to("taskbar-secondary", "network-updated", &net);
                 });
             }
             return;
@@ -565,19 +721,59 @@ fn sync_secondary_taskbar(app: &AppHandle) {
     win_shell::set_window_visible(hwnd, false, true);
 }
 
-fn position_start_window(app: &AppHandle, win: &WebviewWindow, hwnd: isize) {
-    let sf = scale_factor(app);
-    let mon = win_shell::primary_monitor_rect();
-    let rect = compute_start_bounds(mon, sf);
-    apply_webview_bounds(win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+fn resolve_start_monitor_and_scale(
+    app: &AppHandle,
+    monitor: Option<&str>,
+) -> (win_shell::MonitorRect, f64, Option<String>) {
+    if monitor == Some("secondary") {
+        if let Some(sec_mon) = win_shell::secondary_monitor_rects().into_iter().next() {
+            let text_scale = win_shell::windows_text_scale_factor();
+            let sec_sf = coordinator::compute_effective_scale(sec_mon.dpi, text_scale);
+            return (sec_mon, sec_sf, Some("secondary".to_string()));
+        }
+    }
+    (
+        win_shell::primary_monitor_rect(),
+        scale_factor(app),
+        Some("primary".to_string()),
+    )
 }
 
-fn position_flyout_window(
+fn position_start_window_on_monitor(
     app: &AppHandle,
     win: &WebviewWindow,
     hwnd: isize,
-    req: &FlyoutRequest,
-) {
+    monitor: Option<&str>,
+) -> (PixelRect, f64, i32, Option<String>) {
+    let (mon, sf, resolved_monitor) = resolve_start_monitor_and_scale(app, monitor);
+    let rect = compute_start_bounds(mon, sf);
+    apply_webview_bounds(win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+    (rect, sf, mon.top, resolved_monitor)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComputedFlyoutLayout {
+    rect: PixelRect,
+    scale_factor: f64,
+    anchor_origin_x: f64,
+    bottom_anchor_y: i32,
+    monitor_top: i32,
+}
+
+fn compute_flyout_anchor_origin_x(
+    anchor_screen_x_px: i32,
+    win_left_px: i32,
+    total_w_logical: f64,
+    sf: f64,
+) -> f64 {
+    let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
+    let rel = (anchor_screen_x_px - win_left_px) as f64 / sf;
+    let pad = win_shell::FLYOUT_ROOT_PAD_LOGICAL;
+    let max_x = (total_w_logical - pad).max(pad);
+    rel.clamp(pad, max_x)
+}
+
+fn compute_flyout_layout(app: &AppHandle, req: &FlyoutRequest) -> ComputedFlyoutLayout {
     let use_secondary = req.monitor.as_deref() == Some("secondary");
     let (mon, sf, tb_label) = if use_secondary {
         if let Some(sec_mon) = win_shell::secondary_monitor_rects().into_iter().next() {
@@ -604,27 +800,204 @@ fn position_flyout_window(
         mon.left + (req.anchor_x_logical * sf).round() as i32
     };
 
-    let req_w = req.width.clamp(1, 2000);
-    let req_h = req.height.clamp(1, 2000);
-    let w_px = ((req_w + 24) as f64 * sf).round() as i32;
-    let h_px = ((req_h + 24) as f64 * sf).round() as i32;
+    let req_w = req.width.clamp(1, 2000) as f64;
+    let req_h = req.height.clamp(1, 2000) as f64;
+    let total_w_logical = req_w + FLYOUT_ROOT_PAD_TOTAL_LOGICAL;
+    let total_h_logical = req_h + FLYOUT_ROOT_PAD_TOTAL_LOGICAL;
+    let w_px = (total_w_logical * sf).round() as i32;
+    let h_px = (total_h_logical * sf).round() as i32;
     let is_edge =
         BarMode::from_config_str(&lock_unpoisoned(&app.state::<AppState>().config).bar_mode)
             == BarMode::Edge;
-    // Account for `.flyout-root`'s 12px bottom padding so Preview sits flush and click flyouts sit 10px above.
+    // Account for `.flyout-root`'s 18px bottom shadow pad so Preview sits flush and click flyouts sit 10px above.
     let gap_logical = match (is_edge, req.kind) {
-        (true, FlyoutKind::Preview) => 40.0,
-        (true, _) => 50.0,
-        (false, FlyoutKind::Preview) => 52.0,
-        (false, _) => 62.0,
+        (true, FlyoutKind::Preview) => 34.0,
+        (true, _) => 44.0,
+        (false, FlyoutKind::Preview) => 46.0,
+        (false, _) => 56.0,
     };
     let bar_gap = (gap_logical * sf).round() as i32;
 
     let mut x_px = anchor_screen_x_px - w_px / 2;
     x_px = x_px.clamp(mon.left + 8, (mon.right - w_px - 8).max(mon.left + 8));
-    let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
+    let bottom_anchor_y = mon.bottom - bar_gap;
+    let y_px = (bottom_anchor_y - h_px).max(mon.top + 8);
+    let anchor_origin_x = compute_flyout_anchor_origin_x(anchor_screen_x_px, x_px, total_w_logical, sf);
 
-    apply_webview_bounds(win, hwnd, x_px, y_px, w_px, h_px);
+    ComputedFlyoutLayout {
+        rect: PixelRect::new(x_px, y_px, x_px + w_px, y_px + h_px),
+        scale_factor: sf,
+        anchor_origin_x,
+        bottom_anchor_y,
+        monitor_top: mon.top,
+    }
+}
+
+fn position_flyout_window(
+    app: &AppHandle,
+    win: &WebviewWindow,
+    hwnd: isize,
+    req: &FlyoutRequest,
+) -> ComputedFlyoutLayout {
+    let layout = compute_flyout_layout(app, req);
+    apply_webview_bounds(
+        win,
+        hwnd,
+        layout.rect.left,
+        layout.rect.top,
+        layout.rect.width(),
+        layout.rect.height(),
+    );
+    layout
+}
+
+fn commit_pending_surface_show(
+    app: &AppHandle,
+    surface: &str,
+    gen: u64,
+    measured_height: Option<f64>,
+) {
+    let st = app.state::<AppState>();
+    match surface {
+        "start" => {
+            let pending = {
+                let mut slot = lock_unpoisoned(&st.pending_start_show);
+                if slot.as_ref().is_some_and(|p| p.gen == gen) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(p) = pending else { return };
+            if st.start_anim_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if !lock_unpoisoned(&st.coordinator).is_start_visible() {
+                return;
+            }
+            if let Some(win) = app.get_webview_window("start") {
+                if let Some(hwnd) = win_hwnd(&win) {
+                    let mut rect = p.rect;
+                    if let Some(mh) = measured_height.filter(|h| h.is_finite() && *h >= 240.0) {
+                        let new_h = ((mh.clamp(240.0, 960.0) + 2.0 * win_shell::START_ROOT_PAD_LOGICAL)
+                            * p.scale_factor)
+                            .round() as i32;
+                        if (new_h - rect.height()).abs() > 2 {
+                            let new_y = (p.bottom_anchor_y - new_h).max(p.monitor_top + 8);
+                            rect = PixelRect::new(rect.left, new_y, rect.right, new_y + new_h);
+                            apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+                        }
+                    } else if p.was_already_visible {
+                        apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+                    }
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                    win_shell::set_window_visible(hwnd, true, !p.activate);
+                    if p.activate {
+                        let _ = win.set_focus();
+                    }
+                }
+            }
+        }
+        "flyout" => {
+            let pending = {
+                let mut slot = lock_unpoisoned(&st.pending_flyout_show);
+                if slot.as_ref().is_some_and(|p| p.gen == gen) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(p) = pending else { return };
+            if st.flyout_anim_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let active_kind = lock_unpoisoned(&st.coordinator).active_flyout();
+            let Some(kind) = active_kind else { return };
+
+            if let Some(fly) = app.get_webview_window("flyout") {
+                if let Some(hwnd) = win_hwnd(&fly) {
+                    let mut rect = p.rect;
+                    let mut resized = false;
+                    if let Some(mh) = measured_height.filter(|h| h.is_finite() && *h >= 36.0) {
+                        let clamped_h = mh.clamp(48.0, 820.0);
+                        let new_h = ((clamped_h + FLYOUT_ROOT_PAD_TOTAL_LOGICAL) * p.scale_factor)
+                            .round() as i32;
+                        if (new_h - rect.height()).abs() > 2 {
+                            let new_y = (p.bottom_anchor_y - new_h).max(p.monitor_top + 8);
+                            rect = PixelRect::new(rect.left, new_y, rect.right, new_y + new_h);
+                            resized = true;
+                            if let Some(req) = lock_unpoisoned(&st.last_flyout_req).as_mut() {
+                                req.height = clamped_h.round() as i32;
+                            }
+                        }
+                    }
+                    if p.was_already_visible || resized {
+                        apply_webview_bounds(&fly, hwnd, rect.left, rect.top, rect.width(), rect.height());
+                    }
+                    *lock_unpoisoned(&st.last_flyout_bounds) = Some((kind, rect));
+                    win_shell::set_flyout_non_activating(!p.activate);
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                    win_shell::set_window_visible(hwnd, true, !p.activate);
+                    if p.activate {
+                        let _ = fly.set_focus();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn commit_pending_surface_exit(app: &AppHandle, surface: &str, gen: u64) {
+    let st = app.state::<AppState>();
+    match surface {
+        "start" => {
+            let pending = {
+                let mut slot = lock_unpoisoned(&st.pending_start_exit);
+                if slot.as_ref().is_some_and(|p| p.gen == gen) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if pending.is_none() || st.start_anim_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if lock_unpoisoned(&st.coordinator).is_start_visible() {
+                return;
+            }
+            if let Some(win) = app.get_webview_window("start") {
+                if let Some(hwnd) = win_hwnd(&win) {
+                    win_shell::set_window_visible(hwnd, false, true);
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                }
+            }
+        }
+        "flyout" => {
+            let pending = {
+                let mut slot = lock_unpoisoned(&st.pending_flyout_exit);
+                if slot.as_ref().is_some_and(|p| p.gen == gen) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if pending.is_none() || st.flyout_anim_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if lock_unpoisoned(&st.coordinator).is_flyout_visible() {
+                return;
+            }
+            win_shell::set_flyout_non_activating(false);
+            if let Some(fly) = app.get_webview_window("flyout") {
+                if let Some(hwnd) = win_hwnd(&fly) {
+                    win_shell::set_window_visible(hwnd, false, true);
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_taskbar_visibility_action<FPos, FVis>(
@@ -650,97 +1023,130 @@ fn apply_coordinator_actions(
 ) {
     let st = app.state::<AppState>();
 
-    // 1. Hide outgoing surfaces first (with animated flyout exit unless Start/fullscreen takes over)
-    if actions.flyout_visible == Some(false) {
+    // 1. Hide / preempt outgoing surfaces first (with click-through exit or immediate preemption)
+    let hide_flyout_now = actions.hide_flyout_immediate
+        || (actions.flyout_visible == Some(false)
+            && (actions.start_visible == Some(true) || actions.taskbar_visible == Some(false)));
+
+    if hide_flyout_now {
         *lock_unpoisoned(&st.last_flyout_req) = None;
-        let hide_gen = st.flyout_anim_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let hide_immediately =
-            actions.start_visible == Some(true) || actions.taskbar_visible == Some(false);
+        *lock_unpoisoned(&st.last_flyout_bounds) = None;
+        *lock_unpoisoned(&st.pending_flyout_show) = None;
+        *lock_unpoisoned(&st.pending_flyout_exit) = None;
+        win_shell::cancel_window_x_glide();
+        let hide_gen = actions
+            .flyout_anim_gen
+            .unwrap_or_else(|| st.flyout_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.flyout_anim_gen.store(hide_gen, Ordering::SeqCst);
+        let _ = app.emit("flyout-hide-immediate", FlyoutHideEvent { gen: hide_gen });
+        win_shell::set_flyout_non_activating(false);
+        if let Some(fly) = app.get_webview_window("flyout") {
+            if let Some(hwnd) = win_hwnd(&fly) {
+                win_shell::set_window_visible(hwnd, false, true);
+                win_shell::set_window_hit_transparent(hwnd, false);
+            }
+        }
+    } else if actions.flyout_visible == Some(false) {
+        *lock_unpoisoned(&st.last_flyout_req) = None;
+        *lock_unpoisoned(&st.last_flyout_bounds) = None;
+        *lock_unpoisoned(&st.pending_flyout_show) = None;
+        win_shell::cancel_window_x_glide();
+        let hide_gen = actions
+            .flyout_anim_gen
+            .unwrap_or_else(|| st.flyout_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.flyout_anim_gen.store(hide_gen, Ordering::SeqCst);
+        *lock_unpoisoned(&st.pending_flyout_exit) = Some(PendingSurfaceExit { gen: hide_gen });
 
+        win_shell::set_flyout_non_activating(true);
+        if let Some(fly) = app.get_webview_window("flyout") {
+            if let Some(hwnd) = win_hwnd(&fly) {
+                win_shell::set_window_hit_transparent(hwnd, true);
+            }
+        }
         if actions.emit_flyout_hide {
-            let _ = app.emit("flyout-hide", ());
+            let _ = app.emit("flyout-hide", FlyoutHideEvent { gen: hide_gen });
         }
 
-        if hide_immediately {
-            win_shell::set_flyout_non_activating(false);
-            if let Some(fly) = app.get_webview_window("flyout") {
-                if let Some(hwnd) = win_hwnd(&fly) {
-                    win_shell::set_window_visible(hwnd, false, true);
-                }
+        let h_hide = app.clone();
+        let anim_gen = Arc::clone(&st.flyout_anim_gen);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(FLYOUT_EXIT_ANIM_MS));
+            if anim_gen.load(Ordering::SeqCst) != hide_gen {
+                return;
             }
-        } else {
-            win_shell::set_flyout_non_activating(true);
-            let h_hide = app.clone();
-            let anim_gen = Arc::clone(&st.flyout_anim_gen);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(FLYOUT_EXIT_ANIM_MS));
-                if anim_gen.load(Ordering::SeqCst) != hide_gen {
-                    return;
-                }
-                let h = h_hide.clone();
-                let _ = h_hide.run_on_main_thread(move || {
-                    if anim_gen.load(Ordering::SeqCst) != hide_gen {
-                        return;
-                    }
-                    let still_hidden =
-                        !lock_unpoisoned(&h.state::<AppState>().coordinator).is_flyout_visible();
-                    if still_hidden {
-                        win_shell::set_flyout_non_activating(false);
-                        if let Some(fly) = h.get_webview_window("flyout") {
-                            if let Some(hwnd) = win_hwnd(&fly) {
-                                win_shell::set_window_visible(hwnd, false, true);
-                            }
-                        }
-                    }
-                });
+            let h = h_hide.clone();
+            let _ = h_hide.run_on_main_thread(move || {
+                commit_pending_surface_exit(&h, "flyout", hide_gen);
             });
-        }
+        });
     }
-    let mut start_state_emitted_early = false;
-    if actions.start_visible == Some(false) {
-        let hide_gen = st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let hide_immediately =
-            actions.flyout_visible == Some(true) || actions.taskbar_visible == Some(false);
 
+    let hide_start_now = actions.hide_start_immediate
+        || (actions.start_visible == Some(false)
+            && (actions.flyout_visible == Some(true) || actions.taskbar_visible == Some(false)));
+
+    if hide_start_now {
+        *lock_unpoisoned(&st.pending_start_show) = None;
+        *lock_unpoisoned(&st.pending_start_exit) = None;
+        let hide_gen = actions
+            .start_anim_gen
+            .unwrap_or_else(|| st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.start_anim_gen.store(hide_gen, Ordering::SeqCst);
+        let _ = app.emit(
+            "start-state",
+            StartStateEvent {
+                open: false,
+                gen: hide_gen,
+                monitor: None,
+                immediate: true,
+            },
+        );
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                win_shell::set_window_visible(hwnd, false, true);
+                win_shell::set_window_hit_transparent(hwnd, false);
+            }
+        }
+    } else if actions.start_visible == Some(false) {
+        *lock_unpoisoned(&st.pending_start_show) = None;
+        let hide_gen = actions
+            .start_anim_gen
+            .unwrap_or_else(|| st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.start_anim_gen.store(hide_gen, Ordering::SeqCst);
+        *lock_unpoisoned(&st.pending_start_exit) = Some(PendingSurfaceExit { gen: hide_gen });
+
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                win_shell::set_window_hit_transparent(hwnd, true);
+            }
+        }
         if actions.emit_start_state == Some(false) {
-            let _ = app.emit("start-state", false);
-            start_state_emitted_early = true;
+            let _ = app.emit(
+                "start-state",
+                StartStateEvent {
+                    open: false,
+                    gen: hide_gen,
+                    monitor: None,
+                    immediate: false,
+                },
+            );
         }
 
-        if hide_immediately {
-            if let Some(win) = app.get_webview_window("start") {
-                if let Some(hwnd) = win_hwnd(&win) {
-                    win_shell::set_window_visible(hwnd, false, true);
-                }
+        let h_hide = app.clone();
+        let anim_gen = Arc::clone(&st.start_anim_gen);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(START_EXIT_ANIM_MS));
+            if anim_gen.load(Ordering::SeqCst) != hide_gen {
+                return;
             }
-        } else {
-            let h_hide = app.clone();
-            let anim_gen = Arc::clone(&st.start_anim_gen);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(START_EXIT_ANIM_MS));
-                if anim_gen.load(Ordering::SeqCst) != hide_gen {
-                    return;
-                }
-                let h = h_hide.clone();
-                let _ = h_hide.run_on_main_thread(move || {
-                    if anim_gen.load(Ordering::SeqCst) != hide_gen {
-                        return;
-                    }
-                    let still_hidden =
-                        !lock_unpoisoned(&h.state::<AppState>().coordinator).is_start_visible();
-                    if still_hidden {
-                        if let Some(win) = h.get_webview_window("start") {
-                            if let Some(hwnd) = win_hwnd(&win) {
-                                win_shell::set_window_visible(hwnd, false, true);
-                            }
-                        }
-                    }
-                });
+            let h = h_hide.clone();
+            let _ = h_hide.run_on_main_thread(move || {
+                commit_pending_surface_exit(&h, "start", hide_gen);
             });
-        }
+        });
     }
 
-    // 2. Taskbar visibility (fullscreen auto-hide / restore)
+    // 2. Per-monitor taskbar visibility (fullscreen auto-hide / restore independently per display)
     apply_taskbar_visibility_action(
         actions.taskbar_visible,
         || position_taskbar_window(app),
@@ -753,17 +1159,68 @@ fn apply_coordinator_actions(
         },
     );
 
-    // 3. Show incoming surfaces via visibility only (never 1x1 shrink or per-open GWL_EXSTYLE flip)
-    if actions.start_visible == Some(true) {
-        // Cancel any pending delayed hide from a prior Start exit animation
-        st.start_anim_gen.fetch_add(1, Ordering::SeqCst);
-        if let Some(win) = app.get_webview_window("start") {
-            if let Some(hwnd) = win_hwnd(&win) {
-                position_start_window(app, &win, hwnd);
-                win_shell::set_window_visible(hwnd, true, false);
-                let _ = win.set_focus();
+    if let Some(sec_vis) = actions.secondary_taskbar_visible {
+        if sec_vis {
+            sync_secondary_taskbar(app);
+        } else {
+            st.secondary_taskbar_visible.store(false, Ordering::Release);
+            if let Some(tb2) = app.get_webview_window("taskbar-secondary") {
+                if let Some(hwnd) = win_hwnd(&tb2) {
+                    win_shell::set_window_visible(hwnd, false, true);
+                }
             }
         }
+    }
+
+    // 3. Emit-Before-Show Paint-Sync for Start Menu
+    if actions.start_visible == Some(true) {
+        capture_external_foreground_hwnd(&st);
+        *lock_unpoisoned(&st.pending_start_exit) = None;
+        let show_gen = actions
+            .start_anim_gen
+            .unwrap_or_else(|| st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.start_anim_gen.store(show_gen, Ordering::SeqCst);
+
+        let target_mon_req = actions.start_target_monitor.as_deref();
+        let (mon, sf, resolved_monitor) = resolve_start_monitor_and_scale(app, target_mon_req);
+        let rect = compute_start_bounds(mon, sf);
+        let was_visible = app
+            .get_webview_window("start")
+            .and_then(|w| win_hwnd(&w))
+            .is_some_and(|hwnd| win_shell::get_window_pixel_rect(hwnd).is_some());
+
+        if let Some(win) = app.get_webview_window("start") {
+            if let Some(hwnd) = win_hwnd(&win) {
+                win_shell::set_window_hit_transparent(hwnd, false);
+                if !was_visible {
+                    apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+                }
+            }
+        }
+
+        *lock_unpoisoned(&st.pending_start_show) = Some(PendingSurfaceShow {
+            gen: show_gen,
+            rect,
+            scale_factor: sf,
+            bottom_anchor_y: rect.bottom,
+            monitor_top: mon.top,
+            activate: true,
+            anchor_x: 0.0,
+            monitor: resolved_monitor.clone(),
+            was_already_visible: was_visible,
+        });
+
+        // Emit start-state BEFORE ShowWindow (Paint-Sync Protocol)
+        let _ = app.emit(
+            "start-state",
+            StartStateEvent {
+                open: true,
+                gen: show_gen,
+                monitor: resolved_monitor,
+                immediate: false,
+            },
+        );
+
         // Hydrate Start immediately on hidden -> visible transition (AD-6)
         let cfg_snapshot = lock_unpoisoned(&st.config).clone();
         let win_snapshot = lock_unpoisoned(&st.last_window_groups).clone();
@@ -773,63 +1230,160 @@ fn apply_coordinator_actions(
         let _ = app.emit_to("start", "windows-updated", &win_snapshot);
         let _ = app.emit_to("start", "clipboard-updated", &clips_snapshot);
         let _ = app.emit_to("start", "media-updated", &media_snapshot);
+
+        // 22ms max Paint-Sync failsafe timer so opening NEVER stalls
+        let h_fail = app.clone();
+        let anim_gen = Arc::clone(&st.start_anim_gen);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(PAINT_SYNC_SHOW_FAILSAFE_MS));
+            if anim_gen.load(Ordering::SeqCst) != show_gen {
+                return;
+            }
+            let h = h_fail.clone();
+            let _ = h_fail.run_on_main_thread(move || {
+                commit_pending_surface_show(&h, "start", show_gen, None);
+            });
+        });
+
         let h_hyd = app.clone();
         std::thread::spawn(move || {
-            let aud = audio::get_audio_state();
-            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+            let st_hyd = h_hyd.state::<AppState>();
+            let aud = sample_audio_state_with_icon_sources(&st_hyd);
+            if lock_unpoisoned(&st_hyd.coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "audio-mixer-updated", &aud);
                 let _ = h_hyd.emit_to("start", "audio-master-updated", &aud.to_master_state());
             } else {
                 return;
             }
             let med = media::poll_media_state();
-            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+            if lock_unpoisoned(&st_hyd.coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "media-updated", &med);
             } else {
                 return;
             }
-            let tel = telemetry::get_telemetry_cached(&h_hyd.state::<AppState>().icon_cache);
-            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+            let tel = sample_telemetry_with_icon_sources(&st_hyd);
+            if lock_unpoisoned(&st_hyd.coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "telemetry-updated", &tel);
             } else {
                 return;
             }
             let periphs = system_widgets::get_peripheral_batteries();
-            if lock_unpoisoned(&h_hyd.state::<AppState>().coordinator).is_start_visible() {
+            if lock_unpoisoned(&st_hyd.coordinator).is_start_visible() {
                 let _ = h_hyd.emit_to("start", "peripherals-updated", &periphs);
             }
         });
     }
 
+    // 4. Emit-Before-Show Paint-Sync + Preview Horizontal Glide for Flyout
     if actions.flyout_visible == Some(true) {
-        // Cancel any pending delayed hide from a prior exit animation
-        st.flyout_anim_gen.fetch_add(1, Ordering::SeqCst);
+        *lock_unpoisoned(&st.pending_flyout_exit) = None;
+        win_shell::cancel_window_x_glide();
+        let show_gen = actions
+            .flyout_anim_gen
+            .unwrap_or_else(|| st.flyout_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        st.flyout_anim_gen.store(show_gen, Ordering::SeqCst);
+        let non_activating = actions.flyout_non_activating.unwrap_or(false);
+
         if let Some(req) = flyout_req {
-            *lock_unpoisoned(&st.last_flyout_req) = Some(req.clone());
-        }
-        if let Some(fly) = app.get_webview_window("flyout") {
-            if let Some(hwnd) = win_hwnd(&fly) {
-                let non_activating = actions.flyout_non_activating.unwrap_or(false);
-                win_shell::set_flyout_non_activating(non_activating);
-                if let Some(req) = flyout_req {
-                    position_flyout_window(app, &fly, hwnd, req);
+            let layout = compute_flyout_layout(app, req);
+            let mut enriched = req.clone();
+            enriched.gen = show_gen;
+            enriched.anchor_origin_x = Some(layout.anchor_origin_x);
+            *lock_unpoisoned(&st.last_flyout_req) = Some(enriched.clone());
+
+            let fly_hwnd = app.get_webview_window("flyout").and_then(|w| win_hwnd(&w));
+            let was_visible =
+                fly_hwnd.is_some_and(|hwnd| win_shell::get_window_pixel_rect(hwnd).is_some());
+            let prev_bounds = *lock_unpoisoned(&st.last_flyout_bounds);
+
+            let is_same_width_preview_scrub = was_visible
+                && req.kind == FlyoutKind::Preview
+                && matches!(
+                    prev_bounds,
+                    Some((FlyoutKind::Preview, prev_rect))
+                        if (layout.rect.width() - prev_rect.width()).abs() <= 2
+                            && (layout.rect.height() - prev_rect.height()).abs() <= 2
+                );
+
+            if is_same_width_preview_scrub {
+                *lock_unpoisoned(&st.pending_flyout_show) = None;
+                if let (Some(hwnd), Some((_, prev_rect))) = (fly_hwnd, prev_bounds) {
+                    win_shell::set_flyout_non_activating(non_activating);
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                    win_shell::glide_window_x_dwm(
+                        hwnd,
+                        prev_rect.left,
+                        layout.rect.left,
+                        layout.rect.top,
+                        PREVIEW_GLIDE_DURATION_MS,
+                    );
                 }
-                win_shell::set_window_visible(hwnd, true, non_activating);
-                if !non_activating {
-                    let _ = fly.set_focus();
+                *lock_unpoisoned(&st.last_flyout_bounds) = Some((req.kind, layout.rect));
+                if actions.emit_flyout_show {
+                    let _ = app.emit("flyout-show", &enriched);
                 }
+            } else {
+                if let Some(fly) = app.get_webview_window("flyout") {
+                    if let Some(hwnd) = win_hwnd(&fly) {
+                        win_shell::set_flyout_non_activating(non_activating);
+                        win_shell::set_window_hit_transparent(hwnd, false);
+                        if !was_visible {
+                            apply_webview_bounds(
+                                &fly,
+                                hwnd,
+                                layout.rect.left,
+                                layout.rect.top,
+                                layout.rect.width(),
+                                layout.rect.height(),
+                            );
+                        }
+                    }
+                }
+
+                *lock_unpoisoned(&st.pending_flyout_show) = Some(PendingSurfaceShow {
+                    gen: show_gen,
+                    rect: layout.rect,
+                    scale_factor: layout.scale_factor,
+                    bottom_anchor_y: layout.bottom_anchor_y,
+                    monitor_top: layout.monitor_top,
+                    activate: !non_activating,
+                    anchor_x: layout.anchor_origin_x,
+                    monitor: req.monitor.clone(),
+                    was_already_visible: was_visible,
+                });
+
+                // Emit flyout-show BEFORE ShowWindow (Paint-Sync Protocol)
+                if actions.emit_flyout_show {
+                    let _ = app.emit("flyout-show", &enriched);
+                }
+
+                // 22ms max Paint-Sync failsafe timer
+                let h_fail = app.clone();
+                let anim_gen = Arc::clone(&st.flyout_anim_gen);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(PAINT_SYNC_SHOW_FAILSAFE_MS));
+                    if anim_gen.load(Ordering::SeqCst) != show_gen {
+                        return;
+                    }
+                    let h = h_fail.clone();
+                    let _ = h_fail.run_on_main_thread(move || {
+                        commit_pending_surface_show(&h, "flyout", show_gen, None);
+                    });
+                });
             }
-        }
-        // Hydrate Flyout immediately on hidden -> visible transition (AD-6)
-        let snapshot = lock_unpoisoned(&st.last_window_groups).clone();
-        let _ = app.emit_to("flyout", "windows-updated", &snapshot);
-        if let Some(req) = flyout_req {
+
+            // Hydrate Flyout immediately on hidden -> visible transition (AD-6)
+            let snapshot = lock_unpoisoned(&st.last_window_groups).clone();
+            let _ = app.emit_to("flyout", "windows-updated", &snapshot);
             match req.kind {
                 FlyoutKind::Sound => {
+                    let media_snap = media::get_media_snapshot();
+                    let _ = app.emit_to("flyout", "media-updated", &media_snap);
                     let h_aud = app.clone();
                     std::thread::spawn(move || {
-                        let aud = audio::get_audio_state();
-                        if lock_unpoisoned(&h_aud.state::<AppState>().coordinator).active_flyout()
+                        let st_aud = h_aud.state::<AppState>();
+                        let aud = sample_audio_state_with_icon_sources(&st_aud);
+                        if lock_unpoisoned(&st_aud.coordinator).active_flyout()
                             == Some(FlyoutKind::Sound)
                         {
                             let _ = h_aud.emit_to("flyout", "audio-mixer-updated", &aud);
@@ -839,6 +1393,18 @@ fn apply_coordinator_actions(
                                 &aud.to_master_state(),
                             );
                         }
+                        let med = media::poll_media_state();
+                        if lock_unpoisoned(&st_aud.coordinator).active_flyout()
+                            == Some(FlyoutKind::Sound)
+                        {
+                            let _ = h_aud.emit_to("flyout", "media-updated", &med);
+                        }
+                        let net = system_widgets::get_network_info();
+                        if lock_unpoisoned(&st_aud.coordinator).active_flyout()
+                            == Some(FlyoutKind::Sound)
+                        {
+                            let _ = h_aud.emit_to("flyout", "network-updated", &net);
+                        }
                     });
                 }
                 FlyoutKind::Calendar => {
@@ -847,21 +1413,6 @@ fn apply_coordinator_actions(
                 }
                 _ => {}
             }
-        }
-    }
-
-    // 4. Emit canonical state events
-    if let Some(vis) = actions.emit_start_state {
-        if !(start_state_emitted_early && !vis) {
-            let _ = app.emit("start-state", vis);
-        }
-    }
-    if actions.emit_flyout_hide && actions.flyout_visible != Some(false) {
-        let _ = app.emit("flyout-hide", ());
-    }
-    if actions.emit_flyout_show {
-        if let Some(req) = flyout_req {
-            let _ = app.emit("flyout-show", req);
         }
     }
 }
@@ -902,6 +1453,57 @@ pub struct FlyoutRequest {
     pub monitor: Option<String>,
     #[serde(default)]
     pub payload: serde_json::Value,
+    #[serde(default)]
+    pub gen: u64,
+    #[serde(default)]
+    pub anchor_origin_x: Option<f64>,
+}
+
+fn run_background_index_refresh(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if st
+        .index_refresh_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    struct ResetGuard(Arc<AtomicBool>);
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _reset = ResetGuard(Arc::clone(&st.index_refresh_running));
+
+    let apps = apps_indexer::scan_installed_apps_cached(&st.icon_cache, Some(&st.icon_sources));
+    *lock_unpoisoned(&st.installed_apps) = apps.clone();
+    let _ = app.emit_to("start", "apps-indexed", &apps);
+
+    let games = apps_indexer::scan_games_lightweight();
+    *lock_unpoisoned(&st.steam_games) = games.clone();
+    let _ = app.emit_to("start", "games-indexed", &games);
+
+    let files = apps_indexer::scan_user_files();
+    *lock_unpoisoned(&st.indexed_files) = files.clone();
+    let _ = app.emit_to("start", "files-indexed", &files);
+}
+
+fn emit_media_to_visible_surfaces(app: &AppHandle, st: &MediaState) {
+    let (start_vis, sound_vis) = {
+        let app_state = app.state::<AppState>();
+        let coord = lock_unpoisoned(&app_state.coordinator);
+        (
+            coord.is_start_visible(),
+            coord.active_flyout() == Some(FlyoutKind::Sound),
+        )
+    };
+    if start_vis {
+        let _ = app.emit_to("start", "media-updated", st);
+    }
+    if sound_vis {
+        let _ = app.emit_to("flyout", "media-updated", st);
+    }
 }
 
 // ======================= CONFIG TRANSACTION AUTHORITY =======================
@@ -1083,9 +1685,9 @@ fn resize_taskbar_dock(
 }
 
 #[tauri::command]
-fn toggle_start(app: AppHandle, force: Option<bool>) {
+fn toggle_start(app: AppHandle, force: Option<bool>, monitor: Option<String>) {
     dispatch_coordinator(&app, None, |coord| {
-        coord.request_toggle_start(force, monotonic_ms())
+        coord.request_toggle_start_on_monitor(force, monitor, monotonic_ms())
     });
 }
 
@@ -1100,17 +1702,33 @@ fn open_start_settings(app: AppHandle) {
 #[tauri::command]
 fn open_flyout(app: AppHandle, mut req: FlyoutRequest) {
     req.no_activate = req.kind.is_non_activating();
+    let monitor = req.monitor.clone();
     dispatch_coordinator(&app, Some(&req), |coord| {
-        coord.request_open_flyout(req.kind, monotonic_ms())
+        coord.request_open_flyout_on_monitor(req.kind, monitor.as_deref(), monotonic_ms())
     });
 }
 
 #[tauri::command]
+fn surface_commit_ack(app: AppHandle, surface: String, gen: u64, measured_height: Option<f64>) {
+    commit_pending_surface_show(&app, &surface, gen, measured_height);
+}
+
+#[tauri::command]
+fn surface_exit_ack(app: AppHandle, surface: String, gen: u64) {
+    commit_pending_surface_exit(&app, &surface, gen);
+}
+
+#[tauri::command]
+fn dismiss_overlays(app: AppHandle) {
+    close_start_and_flyout(&app, true, true);
+}
+
+#[tauri::command]
 fn resize_flyout(app: AppHandle, state: State<AppState>, width: Option<i32>, height: i32) {
-    let is_open = lock_unpoisoned(&state.coordinator).is_flyout_visible();
-    if !is_open {
+    let active_kind = lock_unpoisoned(&state.coordinator).active_flyout();
+    let Some(kind) = active_kind else {
         return;
-    }
+    };
     let updated_req = {
         let mut slot = lock_unpoisoned(&state.last_flyout_req);
         let Some(req) = slot.as_mut() else {
@@ -1119,12 +1737,13 @@ fn resize_flyout(app: AppHandle, state: State<AppState>, width: Option<i32>, hei
         if let Some(w) = width {
             req.width = w.clamp(120, 1200);
         }
-        req.height = height.clamp(80, 720);
+        req.height = height.clamp(48, 820);
         req.clone()
     };
     if let Some(fly) = app.get_webview_window("flyout") {
         if let Some(hwnd) = win_hwnd(&fly) {
-            position_flyout_window(&app, &fly, hwnd, &updated_req);
+            let layout = position_flyout_window(&app, &fly, hwnd, &updated_req);
+            *lock_unpoisoned(&state.last_flyout_bounds) = Some((kind, layout.rect));
         }
     }
 }
@@ -1155,72 +1774,117 @@ fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
 }
 
 #[tauri::command]
-fn get_open_windows(state: State<AppState>) -> Vec<AppWindowGroup> {
-    let groups = windows_tracker::list_open_window_groups_cached(&state.icon_cache);
-    *lock_unpoisoned(&state.last_window_groups) = groups.clone();
-    groups
+async fn get_open_windows(app: AppHandle) -> Result<Vec<AppWindowGroup>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (groups, sources) =
+            windows_tracker::list_open_window_groups_cached_with_sources(&state.icon_cache);
+        state.register_icon_sources(sources);
+        *lock_unpoisoned(&state.last_window_groups) = groups.clone();
+        groups
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_icons(state: State<AppState>, keys: Vec<String>) -> HashMap<String, String> {
-    let mut resolved = lock_unpoisoned(&state.icon_cache).get_batch(&keys);
-    let missing: Vec<(String, String)> = {
-        let sources = lock_unpoisoned(&state.icon_sources);
-        keys.iter()
-            .filter(|k| !k.is_empty() && !resolved.contains_key(*k))
-            .filter_map(|k| sources.get(k).map(|src| (k.clone(), src.clone())))
-            .collect()
-    };
-    for (key, src) in missing {
-        if let Some(uri) = windows_tracker::extract_icon_for_path_cached(&src, &state.icon_cache) {
-            resolved.insert(key, uri);
+async fn get_icons(app: AppHandle, keys: Vec<String>) -> Result<HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut resolved = lock_unpoisoned(&state.icon_cache).get_batch(&keys);
+        let missing: Vec<(String, String)> = {
+            let sources = lock_unpoisoned(&state.icon_sources);
+            keys.iter()
+                .filter(|k| !k.is_empty() && !resolved.contains_key(*k))
+                .filter_map(|k| sources.get(k).map(|src| (k.clone(), src.clone())))
+                .collect()
+        };
+        for (key, src) in missing {
+            if let Some(uri) =
+                windows_tracker::extract_icon_for_path_cached(&src, &state.icon_cache)
+            {
+                resolved.insert(key, uri);
+            }
         }
-    }
-    resolved
+        resolved
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn resolve_pin_icons(state: State<AppState>, targets: Vec<String>) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    for raw in targets {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-            continue;
+async fn resolve_pin_icons(
+    app: AppHandle,
+    targets: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut out = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut new_sources = Vec::new();
+        for raw in targets {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            let low = trimmed.to_ascii_lowercase();
+            let is_local_or_uwp = trimmed.contains(":\\")
+                || trimmed.starts_with("\\\\")
+                || low.starts_with("shell:appsfolder\\");
+            if !is_local_or_uwp {
+                continue;
+            }
+            if let Some(uri) =
+                windows_tracker::extract_icon_for_path_cached(trimmed, &state.icon_cache)
+            {
+                let key = if low.starts_with("shell:appsfolder\\") {
+                    icon_cache::aumid_key(trimmed)
+                } else {
+                    icon_cache::path_icon_key(trimmed)
+                };
+                new_sources.push((key, trimmed.to_string()));
+                out.insert(trimmed.to_string(), uri);
+            }
         }
-        let low = trimmed.to_ascii_lowercase();
-        let is_local_or_uwp =
-            trimmed.contains(":\\") || trimmed.starts_with("\\\\") || low.starts_with("shell:appsfolder\\");
-        if !is_local_or_uwp {
-            continue;
-        }
-        if let Some(uri) = windows_tracker::extract_icon_for_path_cached(trimmed, &state.icon_cache) {
-            let key = if low.starts_with("shell:appsfolder\\") {
-                icon_cache::aumid_key(trimmed)
-            } else {
-                icon_cache::path_icon_key(trimmed)
-            };
-            lock_unpoisoned(&state.icon_sources).insert(key, trimmed.to_string());
-            out.insert(trimmed.to_string(), uri);
-        }
-    }
-    out
+        state.register_icon_sources(new_sources);
+        out
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_jump_list(exe_path: String, aumid: Option<String>) -> Vec<JumpListItem> {
-    windows_tracker::get_jump_list(&exe_path, aumid.as_deref())
+async fn get_jump_list(
+    exe_path: String,
+    aumid: Option<String>,
+) -> Result<Vec<JumpListItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::get_jump_list(&exe_path, aumid.as_deref())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_window_thumbnail(hwnd: isize) -> Option<String> {
-    windows_tracker::capture_window_thumbnail(hwnd, 240, 140)
+async fn get_window_thumbnail(hwnd: isize) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::capture_window_thumbnail(hwnd, 240, 140)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn focus_window(app: AppHandle, hwnd: isize, toggle_minimize: bool) {
-    close_start_and_flyout(&app, false, true);
-    windows_tracker::focus_or_toggle_window(hwnd, toggle_minimize);
+async fn focus_window(app: AppHandle, hwnd: isize, toggle_minimize: bool) -> Result<(), String> {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, false, true);
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::focus_or_toggle_window(hwnd, toggle_minimize);
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
@@ -1229,17 +1893,44 @@ fn close_window_hwnd(hwnd: isize) {
 }
 
 #[tauri::command]
-fn kill_process_pid(pid: u32) -> Result<(), String> {
-    windows_tracker::terminate_process_by_pid(pid)
+async fn snap_window(hwnd: isize, zone: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::snap_window(hwnd, &zone))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn kill_process_group(pids: Vec<u32>) -> Result<(), String> {
-    telemetry::kill_process_group(&pids)
+async fn toggle_window_topmost(hwnd: isize) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::toggle_window_topmost(hwnd))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn launch_item(
+async fn minimize_other_windows(keep_hwnd: isize) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::minimize_other_windows(keep_hwnd)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn kill_process_pid(pid: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::terminate_process_by_pid(pid))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn kill_process_group(pids: Vec<u32>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || telemetry::kill_process_group(&pids))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn launch_item(
     app: AppHandle,
     target: String,
     args: Option<String>,
@@ -1247,28 +1938,69 @@ fn launch_item(
     close_start: bool,
 ) -> Result<(), String> {
     if close_start {
-        close_start_and_flyout(&app, true, true);
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            close_start_and_flyout(&h, true, true);
+        });
     }
-    windows_tracker::launch_target_with_args(&target, args.as_deref(), as_admin)
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::launch_target_with_args(&target, args.as_deref(), as_admin)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
+async fn launch_new_window(
+    app: AppHandle,
+    exe_path: String,
+    args: Option<String>,
+    close_start: Option<bool>,
+) -> Result<(), String> {
+    if close_start.unwrap_or(false) {
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            close_start_and_flyout(&h, true, true);
+        });
+    } else {
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            close_start_and_flyout(&h, false, true);
+        });
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        windows_tracker::launch_new_window_instance(&exe_path, args.as_deref())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
     let has_target = targets.iter().any(|t| !t.trim().is_empty());
     if has_target {
-        close_start_and_flyout(&app, true, false);
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            close_start_and_flyout(&h, true, false);
+        });
     }
-    windows_tracker::launch_combo_targets(&targets)
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::launch_combo_targets(&targets))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn open_location(path: String) -> Result<(), String> {
-    windows_tracker::open_file_location(&path)
+async fn open_location(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::open_file_location(&path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn open_terminal_at(path: String) -> Result<(), String> {
-    windows_tracker::open_in_terminal(&path)
+async fn open_terminal_at(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || windows_tracker::open_in_terminal(&path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -1287,21 +2019,103 @@ fn get_steam_games(state: State<AppState>) -> Vec<SteamGame> {
 }
 
 #[tauri::command]
-fn add_pin(
+async fn load_game_cover(cover_path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_indexer::load_game_cover_data(&cover_path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn refresh_indexes(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_background_index_refresh(&app);
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn add_pin(
     app: AppHandle,
-    state: State<AppState>,
     space: String,
     mut item: PinItem,
 ) -> Result<TestBarConfig, String> {
-    let force_combo = config::should_force_combo(&space, &item.kind);
-    config::normalize_pin(&mut item, force_combo);
-    if item.icon_data.is_none() && (item.kind == "app" || item.kind == "file") {
-        item.icon_data =
-            windows_tracker::extract_icon_for_path_cached(&item.target, &state.icon_cache);
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let force_combo = config::should_force_combo(&space, &item.kind);
+        config::normalize_pin(&mut item, force_combo);
+
+        // Resolve icon into unified IconCache & register icon_sources; NEVER store inline base64 icon_data in config.json!
+        let target_trimmed = item.target.trim().to_string();
+        if (item.kind == "app" || item.kind == "file") && !target_trimmed.is_empty() {
+            let low = target_trimmed.to_ascii_lowercase();
+            let is_resolvable = target_trimmed.contains(":\\")
+                || target_trimmed.starts_with("\\\\")
+                || low.starts_with("shell:appsfolder\\");
+            if is_resolvable {
+                let key = if low.starts_with("shell:appsfolder\\") {
+                    icon_cache::aumid_key(&target_trimmed)
+                } else {
+                    icon_cache::path_icon_key(&target_trimmed)
+                };
+                if windows_tracker::extract_icon_for_path_cached(&target_trimmed, &state.icon_cache)
+                    .is_some()
+                {
+                    state.register_icon_sources(vec![(key.clone(), target_trimmed)]);
+                    if item.icon_key.trim().is_empty()
+                        || item.icon_key == "app"
+                        || item.icon_key == "file"
+                    {
+                        item.icon_key = key;
+                    }
+                }
+            }
+        }
+        item.icon_data = None;
+
+        let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+            config::add_pin_to_space(cfg, &space, item)
+        })?;
+        Ok(updated)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+fn update_pin(
+    app: AppHandle,
+    state: State<AppState>,
+    space: String,
+    pin_id: String,
+    title: Option<String>,
+    target: Option<String>,
+    args: Option<String>,
+    alt_action: Option<String>,
+    alt_label: Option<String>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
-        config::add_pin_to_space(cfg, &space, item)
+        match config::update_pin(
+            cfg,
+            &space,
+            &pin_id,
+            title.clone(),
+            target.clone(),
+            args.clone(),
+            alt_action.clone(),
+            alt_label.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
     })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
     Ok(updated)
 }
 
@@ -1336,34 +2150,7 @@ fn sanitize_custom_space_accent(
     accent_hex: Option<&str>,
     accent_rgb: Option<&str>,
 ) -> (String, String) {
-    let hex = accent_hex
-        .map(str::trim)
-        .filter(|h| h.len() == 7 && h.starts_with('#') && h[1..].chars().all(|c| c.is_ascii_hexdigit()))
-        .unwrap_or("#A78BFA");
-    let rgb = accent_rgb
-        .map(str::trim)
-        .filter(|r| {
-            let parts: Vec<&str> = r.split(',').collect();
-            parts.len() == 3 && parts.iter().all(|p| p.trim().parse::<u8>().is_ok())
-        })
-        .map(|r| {
-            r.split(',')
-                .map(|p| p.trim())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_else(|| {
-            if let (Ok(r), Ok(g), Ok(b)) = (
-                u8::from_str_radix(&hex[1..3], 16),
-                u8::from_str_radix(&hex[3..5], 16),
-                u8::from_str_radix(&hex[5..7], 16),
-            ) {
-                format!("{r},{g},{b}")
-            } else {
-                "167,139,250".to_string()
-            }
-        });
-    (hex.to_uppercase(), rgb)
+    config::sanitize_accent_hex_rgb(accent_hex, accent_rgb)
 }
 
 #[tauri::command]
@@ -1373,11 +2160,16 @@ fn add_custom_space(
     name: String,
     accent_hex: Option<String>,
     accent_rgb: Option<String>,
+    widget_preset: Option<String>,
 ) -> Result<TestBarConfig, String> {
     let clean = name.trim().to_string();
     if clean.is_empty() {
         return Err("Пустое название".to_string());
     }
+    let preset = match widget_preset {
+        Some(ref p) if !p.trim().is_empty() => config::validate_widget_preset(p)?.to_string(),
+        _ => config::default_widget_preset(),
+    };
     let (hex, rgb) = sanitize_custom_space_accent(accent_hex.as_deref(), accent_rgb.as_deref());
     let id = format!("custom-{}", now_ms());
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
@@ -1386,9 +2178,225 @@ fn add_custom_space(
             name: clean,
             accent_hex: hex,
             accent_rgb: rgb,
+            widget_preset: preset,
             items: vec![],
         });
         true
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn update_custom_space(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    name: Option<String>,
+    accent: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    widget_preset: Option<String>,
+) -> Result<TestBarConfig, String> {
+    let eff_hex = accent_hex.or_else(|| {
+        accent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| a.starts_with('#'))
+            .map(str::to_string)
+    });
+    let eff_rgb = accent_rgb.or_else(|| {
+        accent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty() && !a.starts_with('#'))
+            .map(str::to_string)
+    });
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::update_custom_space(
+            cfg,
+            &id,
+            name.clone(),
+            eff_hex.clone(),
+            eff_rgb.clone(),
+            widget_preset.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_custom_space(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::delete_custom_space(cfg, &id)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn add_game_combo(
+    app: AppHandle,
+    state: State<AppState>,
+    name: String,
+    subtitle: Option<String>,
+    accent: Option<String>,
+    steps: Vec<String>,
+) -> Result<TestBarConfig, String> {
+    let id = format!("combo-{}", now_ms());
+    let sub = subtitle.unwrap_or_default();
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::add_game_combo(
+            cfg,
+            id.clone(),
+            name.clone(),
+            sub.clone(),
+            accent.clone(),
+            steps.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn update_game_combo(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    name: Option<String>,
+    subtitle: Option<String>,
+    accent: Option<String>,
+    steps: Option<Vec<String>>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::update_game_combo(
+            cfg,
+            &id,
+            name.clone(),
+            subtitle.clone(),
+            accent.clone(),
+            steps.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_game_combo(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::delete_game_combo(cfg, &id)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn set_appearance_settings(
+    app: AppHandle,
+    state: State<AppState>,
+    glass_depth: Option<String>,
+    clock_show_seconds: Option<bool>,
+    clock_show_weekday: Option<bool>,
+    start_remember_space: Option<bool>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::set_appearance_settings(
+            cfg,
+            glass_depth.clone(),
+            clock_show_seconds,
+            clock_show_weekday,
+            start_remember_space,
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn hide_tray_app(
+    app: AppHandle,
+    state: State<AppState>,
+    key: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, |cfg| config::hide_tray_key(cfg, &key))?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn restore_tray_app(
+    app: AppHandle,
+    state: State<AppState>,
+    key: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, |cfg| config::restore_tray_key(cfg, &key))?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn restore_all_tray_apps(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, config::restore_all_tray_keys)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn record_frecency(
+    app: AppHandle,
+    state: State<AppState>,
+    item_id: String,
+) -> Result<TestBarConfig, String> {
+    let ts = now_ms();
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::record_frecency(cfg, &item_id, ts)
     })?;
     Ok(updated)
 }
@@ -1405,53 +2413,164 @@ fn refocus_start_if_open(app: &AppHandle, state: &AppState) {
 }
 
 #[tauri::command]
-fn pick_folder(app: AppHandle, state: State<AppState>) -> Option<String> {
-    let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
-    let picked = apps_indexer::pick_folder_dialog();
-    refocus_start_if_open(&app, &state);
-    picked
+async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+        let picked = apps_indexer::pick_folder_dialog();
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            refocus_start_if_open(&h, &h.state::<AppState>());
+        });
+        picked
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn pick_file(app: AppHandle, state: State<AppState>) -> Option<String> {
-    let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
-    let picked = apps_indexer::pick_file_dialog();
-    refocus_start_if_open(&app, &state);
-    picked
+async fn pick_file(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+        let picked = apps_indexer::pick_file_dialog();
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            refocus_start_if_open(&h, &h.state::<AppState>());
+        });
+        picked
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_audio_state() -> AudioState {
-    audio::get_audio_state()
+async fn export_config_dialog(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+        let cfg_snapshot = lock_unpoisoned(&state.config).clone();
+        let picked = rfd::FileDialog::new()
+            .set_title("Экспорт конфигурации TestBar")
+            .add_filter("JSON", &["json"])
+            .set_file_name("testbar-config.json")
+            .save_file();
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            refocus_start_if_open(&h, &h.state::<AppState>());
+        });
+        let Some(path) = picked else {
+            return Ok(None);
+        };
+        let payload = config::export_config_json(&cfg_snapshot)?;
+        std::fs::write(&path, payload)
+            .map_err(|e| format!("Не удалось записать файл конфигурации: {e}"))?;
+        Ok(Some(path.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn get_audio_master_state() -> AudioMasterState {
-    audio::get_audio_master_state()
+async fn import_config_dialog(app: AppHandle) -> Result<Option<TestBarConfig>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
+        let picked = rfd::FileDialog::new()
+            .set_title("Импорт конфигурации TestBar")
+            .add_filter("JSON", &["json"])
+            .pick_file();
+        let h_refocus = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            refocus_start_if_open(&h_refocus, &h_refocus.state::<AppState>());
+        });
+        let Some(path) = picked else {
+            return Ok(None);
+        };
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Не удалось прочитать файл конфигурации: {e}"))?;
+        let imported = config::import_config_json(&raw)?;
+        let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+            let prev_rev = cfg.revision;
+            *cfg = imported;
+            // Preserve strictly monotonic revision across imports so frontend revision gates accept it
+            cfg.revision = prev_rev;
+            true
+        })?;
+        let clips = system_widgets::hydrate_pinned_clipboard(&updated.pinned_clipboard);
+        if should_emit_start_clipboard_update(&lock_unpoisoned(&state.coordinator)) {
+            let _ = app.emit_to("start", "clipboard-updated", &clips);
+        }
+        let h_sync = app.clone();
+        let bar_mode = updated.bar_mode.clone();
+        let hide_native = state.hide_native;
+        let _ = app.run_on_main_thread(move || {
+            if hide_native {
+                win_shell::update_appbar_mode(BarMode::from_config_str(&bar_mode));
+            }
+            position_taskbar_window(&h_sync);
+            sync_secondary_taskbar(&h_sync);
+        });
+        Ok(Some(updated))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn set_master_volume(
+async fn get_audio_state(app: AppHandle) -> Result<AudioState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        sample_audio_state_with_icon_sources(&state)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn get_audio_peaks() -> Result<AudioPeaksSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(audio::get_audio_peaks)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn get_audio_master_state() -> Result<AudioMasterState, String> {
+    tauri::async_runtime::spawn_blocking(audio::get_audio_master_state)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn set_master_volume(
     app: AppHandle,
     volume: u32,
     muted: Option<bool>,
 ) -> Result<AudioState, String> {
-    audio::set_master_volume(volume, muted)?;
-    let st = audio::get_audio_state();
-    emit_audio_state_targeted(&app, &st);
-    Ok(st)
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::set_master_volume(volume, muted)?;
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn set_mic_muted(app: AppHandle, muted: bool) -> Result<AudioState, String> {
-    audio::set_mic_muted(muted)?;
-    let st = audio::get_audio_state();
-    emit_audio_state_targeted(&app, &st);
-    Ok(st)
+async fn set_mic_muted(app: AppHandle, muted: bool) -> Result<AudioState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::set_mic_muted(muted)?;
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn set_session_volume(
+async fn set_session_volume(
     app: AppHandle,
     pid: u32,
     pids: Option<Vec<u32>>,
@@ -1459,51 +2578,149 @@ fn set_session_volume(
     volume: u32,
     muted: Option<bool>,
 ) -> Result<AudioState, String> {
-    audio::set_session_volume_for_app(
-        pid,
-        pids.as_deref(),
-        app_key.as_deref(),
-        volume,
-        muted,
-    )?;
-    let st = audio::get_audio_state();
-    emit_audio_state_targeted(&app, &st);
-    Ok(st)
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::set_session_volume_for_app(
+            pid,
+            pids.as_deref(),
+            app_key.as_deref(),
+            volume,
+            muted,
+        )?;
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn set_audio_device(app: AppHandle, device_id: String) -> Result<AudioState, String> {
-    if let Err(err) = audio::set_default_audio_device(&device_id) {
-        let _ = system_widgets::push_session_alert(
-            "warn",
-            "Ошибка переключения звука",
-            Some(err.clone()),
-        );
-        emit_session_alerts_if_calendar_open(&app);
-        return Err(err);
-    }
-    let st = audio::get_audio_state();
-    emit_audio_state_targeted(&app, &st);
-    Ok(st)
+async fn set_session_state(
+    app: AppHandle,
+    app_key: String,
+    volume: Option<f32>,
+    muted: Option<bool>,
+    pid: Option<u32>,
+    pids: Option<Vec<u32>>,
+) -> Result<AudioState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let normalized_vol = volume.map(|v| {
+            if !v.is_finite() {
+                0.0
+            } else if v > 1.0 {
+                (v.clamp(0.0, 100.0)) / 100.0
+            } else {
+                v.clamp(0.0, 1.0)
+            }
+        });
+        if pid.unwrap_or(0) != 0 || pids.as_ref().is_some_and(|p| !p.is_empty()) {
+            let vol_pct = normalized_vol.map(|s| (s * 100.0).round() as u32);
+            audio::set_session_state_for_app_pct(
+                pid.unwrap_or(0),
+                pids.as_deref(),
+                (!app_key.trim().is_empty()).then_some(app_key.as_str()),
+                vol_pct,
+                muted,
+            )?;
+        } else {
+            audio::set_session_state_for_app(&app_key, normalized_vol, muted)?;
+        }
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn get_media_state() -> MediaState {
-    media::get_media_state()
+async fn set_audio_device(app: AppHandle, device_id: String) -> Result<AudioState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(err) = audio::set_default_audio_device(&device_id) {
+            let _ = system_widgets::push_session_alert(
+                "warn",
+                "Ошибка переключения звука",
+                Some(err.clone()),
+            );
+            emit_session_alerts_if_calendar_open(&app);
+            return Err(err);
+        }
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn media_action(app: AppHandle, action: String) -> Result<MediaState, String> {
-    let st = media::media_action(&action)?;
-    if should_poll_start_widgets(&lock_unpoisoned(&app.state::<AppState>().coordinator)) {
-        let _ = app.emit_to("start", "media-updated", &st);
-    }
-    Ok(st)
+async fn set_input_device(app: AppHandle, device_id: String) -> Result<AudioState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(err) = audio::set_default_input_device(&device_id) {
+            let _ = system_widgets::push_session_alert(
+                "warn",
+                "Ошибка переключения микрофона",
+                Some(err.clone()),
+            );
+            emit_session_alerts_if_calendar_open(&app);
+            return Err(err);
+        }
+        let st = sample_audio_state_with_icon_sources(&app.state::<AppState>());
+        emit_audio_state_targeted(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn get_telemetry(state: State<AppState>) -> TelemetryState {
-    telemetry::get_telemetry_cached(&state.icon_cache)
+async fn get_media_state() -> Result<MediaState, String> {
+    tauri::async_runtime::spawn_blocking(media::get_media_state)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn media_action(app: AppHandle, action: String) -> Result<MediaState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = media::media_action(&action)?;
+        emit_media_to_visible_surfaces(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn seek_media(app: AppHandle, position_sec: f64) -> Result<MediaState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = media::seek_media(position_sec)?;
+        emit_media_to_visible_surfaces(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn select_media_session(app: AppHandle, session_id: String) -> Result<MediaState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = media::select_media_session(session_id)?;
+        emit_media_to_visible_surfaces(&app, &st);
+        Ok(st)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn get_telemetry(app: AppHandle) -> Result<TelemetryState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        sample_telemetry_with_icon_sources(&state)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
@@ -1537,6 +2754,54 @@ fn toggle_clip_pin(app: AppHandle, state: State<AppState>, id: String) -> Vec<Cl
 }
 
 #[tauri::command]
+fn delete_clipboard_entry(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Vec<ClipboardEntry> {
+    let removed_text = system_widgets::get_clipboard_history()
+        .into_iter()
+        .find(|c| c.id == id && c.pinned)
+        .map(|c| c.text);
+    let list = system_widgets::delete_clipboard_entry(&id);
+    if let Some(text) = removed_text {
+        let _ = mutate_config_and_emit(&app, &state, |cfg| {
+            config::set_pinned_clipboard(cfg, &text, false)
+        });
+    }
+    if should_emit_start_clipboard_update(&lock_unpoisoned(&state.coordinator)) {
+        let _ = app.emit_to("start", "clipboard-updated", &list);
+    }
+    list
+}
+
+#[tauri::command]
+fn set_clipboard_paused(paused: bool) -> bool {
+    system_widgets::set_clipboard_paused(paused)
+}
+
+#[tauri::command]
+fn get_clipboard_paused() -> bool {
+    system_widgets::is_clipboard_paused()
+}
+
+#[tauri::command]
+async fn paste_clipboard_entry(app: AppHandle, text: String) -> Result<(), String> {
+    let target_hwnd = app.state::<AppState>().last_external_fg.load(Ordering::Acquire);
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        dispatch_coordinator(&h, None, |coord| coord.hide_start_immediate());
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        // Give Start SW_HIDE a brief moment to release foreground before restoring target & injecting Ctrl+V
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        system_widgets::paste_clipboard_text(target_hwnd, &text)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
 fn clear_unpinned_clips(app: AppHandle, state: State<AppState>) -> Vec<ClipboardEntry> {
     let list = system_widgets::clear_unpinned_clipboard();
     if should_emit_start_clipboard_update(&lock_unpoisoned(&state.coordinator)) {
@@ -1551,43 +2816,97 @@ fn get_keyboard_layout() -> String {
 }
 
 #[tauri::command]
-fn switch_keyboard_layout(app: AppHandle) -> String {
-    let code = system_widgets::switch_keyboard_layout();
-    let _ = app.emit("layout-updated", &code);
-    code
+async fn switch_keyboard_layout(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let code = system_widgets::switch_keyboard_layout();
+        let _ = app.emit("layout-updated", &code);
+        code
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_peripherals() -> Vec<PeripheralBattery> {
-    system_widgets::get_peripheral_batteries()
+async fn get_peripherals() -> Result<Vec<PeripheralBattery>, String> {
+    tauri::async_runtime::spawn_blocking(system_widgets::get_peripheral_batteries)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn get_tray_apps(state: State<AppState>) -> Vec<TrayAppItem> {
-    let open_groups = windows_tracker::list_open_window_groups_cached(&state.icon_cache);
-    *lock_unpoisoned(&state.last_window_groups) = open_groups.clone();
-    system_widgets::list_tray_background_apps_cached(&state.icon_cache, &open_groups)
+async fn get_tray_apps(app: AppHandle) -> Result<Vec<TrayAppItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (open_groups, win_sources) =
+            windows_tracker::list_open_window_groups_cached_with_sources(&state.icon_cache);
+        state.register_icon_sources(win_sources);
+        *lock_unpoisoned(&state.last_window_groups) = open_groups.clone();
+
+        let hidden_keys = lock_unpoisoned(&state.config).hidden_tray_keys.clone();
+        let (tray_items, tray_sources) = {
+            let mut cache = lock_unpoisoned(&state.icon_cache);
+            system_widgets::list_tray_background_apps_filtered_with_open(
+                &mut cache,
+                &open_groups,
+                &hidden_keys,
+            )
+        };
+        state.register_icon_sources(tray_sources);
+        tray_items
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
-fn activate_tray_app(
+async fn activate_tray_app(
     app: AppHandle,
     hwnd: Option<isize>,
     exe_path: String,
 ) -> Result<(), String> {
-    close_start_and_flyout(&app, false, true);
-    system_widgets::activate_tray_app(hwnd, &exe_path)
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, false, true);
+    });
+    tauri::async_runtime::spawn_blocking(move || system_widgets::activate_tray_app(hwnd, &exe_path))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn end_tray_app_task(pids: Vec<u32>) -> Result<(), String> {
-    system_widgets::end_tray_app_task(&pids)
+async fn end_tray_app_task(pids: Vec<u32>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || system_widgets::end_tray_app_task(&pids))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn open_native_windows_tray(app: AppHandle) -> Result<(), String> {
-    close_start_and_flyout(&app, false, true);
-    system_widgets::trigger_native_tray_overflow()
+async fn open_native_windows_tray(app: AppHandle) -> Result<(), String> {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, false, true);
+    });
+    tauri::async_runtime::spawn_blocking(system_widgets::trigger_native_tray_overflow)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn empty_recycle_bin() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(system_widgets::empty_recycle_bin)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn open_screen_snip(app: AppHandle) -> Result<(), String> {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, true, true);
+    });
+    tauri::async_runtime::spawn_blocking(system_widgets::open_screen_snip)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -1603,14 +2922,21 @@ fn clear_session_alerts(app: AppHandle) -> Vec<SessionAlert> {
 }
 
 #[tauri::command]
-fn open_windows_notifications(app: AppHandle) -> Result<(), String> {
-    close_start_and_flyout(&app, false, true);
-    system_widgets::open_windows_notifications()
+async fn open_windows_notifications(app: AppHandle) -> Result<(), String> {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, false, true);
+    });
+    tauri::async_runtime::spawn_blocking(system_widgets::open_windows_notifications)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-fn get_network_info() -> NetworkInfo {
-    system_widgets::get_network_info()
+async fn get_network_info() -> Result<NetworkInfo, String> {
+    tauri::async_runtime::spawn_blocking(system_widgets::get_network_info)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
 }
 
 #[tauri::command]
@@ -1628,8 +2954,13 @@ fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
 }
 
 #[tauri::command]
-fn get_icon_for_path(state: State<AppState>, path: String) -> Option<String> {
-    windows_tracker::extract_icon_for_path_cached(&path, &state.icon_cache)
+async fn get_icon_for_path(app: AppHandle, path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        windows_tracker::extract_icon_for_path_cached(&path, &state.icon_cache)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 pub fn run_watchdog_mode(args: WatchdogArgs) {
@@ -1660,9 +2991,12 @@ pub fn run(hide_native: bool) {
 
     let overlay_open = Arc::new(AtomicBool::new(false));
     let fullscreen_suppressed = Arc::new(AtomicBool::new(false));
+    let secondary_fullscreen_suppressed = Arc::new(AtomicBool::new(false));
     let secondary_taskbar_visible = Arc::new(AtomicBool::new(false));
     let flyout_anim_gen = Arc::new(AtomicU64::new(0));
     let start_anim_gen = Arc::new(AtomicU64::new(0));
+    let last_external_fg = Arc::new(AtomicIsize::new(0));
+    let index_refresh_running = Arc::new(AtomicBool::new(false));
     win_shell::set_overlay_open_hint(false);
     let app_state = AppState {
         config: Mutex::new(initial_cfg),
@@ -1676,13 +3010,21 @@ pub fn run(hide_native: bool) {
         coordinator: Mutex::new(WindowCoordinator::new()),
         overlay_open: Arc::clone(&overlay_open),
         fullscreen_suppressed: Arc::clone(&fullscreen_suppressed),
+        secondary_fullscreen_suppressed: Arc::clone(&secondary_fullscreen_suppressed),
         taskbar_content_width: Mutex::new(620),
         secondary_taskbar_content_width: Mutex::new(620),
         secondary_taskbar_visible: Arc::clone(&secondary_taskbar_visible),
         last_flyout_req: Mutex::new(None),
+        last_flyout_bounds: Mutex::new(None),
+        pending_start_show: Mutex::new(None),
+        pending_flyout_show: Mutex::new(None),
+        pending_start_exit: Mutex::new(None),
+        pending_flyout_exit: Mutex::new(None),
         flyout_anim_gen: Arc::clone(&flyout_anim_gen),
         start_anim_gen: Arc::clone(&start_anim_gen),
         dpi_override: AtomicU32::new(0),
+        last_external_fg: Arc::clone(&last_external_fg),
+        index_refresh_running: Arc::clone(&index_refresh_running),
     };
 
     let app = tauri::Builder::default()
@@ -1692,10 +3034,14 @@ pub fn run(hide_native: bool) {
             set_bar_mode,
             set_secondary_taskbar_mode,
             set_autostart,
+            set_appearance_settings,
             resize_taskbar_dock,
             toggle_start,
             open_start_settings,
             open_flyout,
+            surface_commit_ack,
+            surface_exit_ack,
+            dismiss_overlays,
             resize_flyout,
             close_flyout,
             close_osd,
@@ -1707,33 +3053,60 @@ pub fn run(hide_native: bool) {
             get_window_thumbnail,
             focus_window,
             close_window_hwnd,
+            snap_window,
+            toggle_window_topmost,
+            minimize_other_windows,
             kill_process_pid,
             kill_process_group,
             launch_item,
+            launch_new_window,
             launch_combo,
             open_location,
             open_terminal_at,
             get_installed_apps,
             get_indexed_files,
             get_steam_games,
+            load_game_cover,
+            refresh_indexes,
             add_pin,
+            update_pin,
             remove_pin,
             reorder_pins,
             add_custom_space,
+            update_custom_space,
+            delete_custom_space,
+            add_game_combo,
+            update_game_combo,
+            delete_game_combo,
+            hide_tray_app,
+            restore_tray_app,
+            restore_all_tray_apps,
+            record_frecency,
             pick_folder,
             pick_file,
+            export_config_dialog,
+            import_config_dialog,
             get_audio_state,
+            get_audio_peaks,
             get_audio_master_state,
             set_master_volume,
             set_mic_muted,
             set_session_volume,
+            set_session_state,
             set_audio_device,
+            set_input_device,
             get_media_state,
             media_action,
+            seek_media,
+            select_media_session,
             get_telemetry,
             get_clipboard_history,
             copy_to_clipboard,
             toggle_clip_pin,
+            delete_clipboard_entry,
+            set_clipboard_paused,
+            get_clipboard_paused,
+            paste_clipboard_entry,
             clear_unpinned_clips,
             get_keyboard_layout,
             switch_keyboard_layout,
@@ -1742,6 +3115,8 @@ pub fn run(hide_native: bool) {
             activate_tray_app,
             end_tray_app_task,
             open_native_windows_tray,
+            empty_recycle_bin,
+            open_screen_snip,
             get_session_alerts,
             clear_session_alerts,
             open_windows_notifications,
@@ -1796,7 +3171,9 @@ pub fn run(hide_native: bool) {
                                         if actions.taskbar_visible != Some(true) {
                                             position_taskbar_window(&h);
                                         }
-                                        sync_secondary_taskbar(&h);
+                                        if actions.secondary_taskbar_visible != Some(true) {
+                                            sync_secondary_taskbar(&h);
+                                        }
                                     }
                                 });
                             },
@@ -1823,7 +3200,7 @@ pub fn run(hide_native: bool) {
             if let Some(start_win) = app.get_webview_window("start") {
                 if let Some(hwnd) = win_hwnd(&start_win) {
                     win_shell::style_overlay_window(hwnd, false);
-                    position_start_window(&handle, &start_win, hwnd);
+                    let _ = position_start_window_on_monitor(&handle, &start_win, hwnd, None);
                 }
                 let h_blur = handle.clone();
                 start_win.on_window_event(move |ev| {
@@ -1901,48 +3278,31 @@ pub fn run(hide_native: bool) {
                 }
             });
 
-            // Async background app (Start .lnk + UWP), Steam library & user files indexer (non-blocking startup)
+            // Async background app (Start .lnk + UWP), lightweight games (Steam/Epic/GOG), & user files indexer
+            // Runs at startup and repeats cleanly every 15 minutes so new installs/downloads appear automatically.
             let h_idx = handle.clone();
-            std::thread::spawn(move || {
-                let apps = {
-                    let st = h_idx.state::<AppState>();
-                    apps_indexer::scan_installed_apps_cached(&st.icon_cache, Some(&st.icon_sources))
-                };
-                {
-                    let st = h_idx.state::<AppState>();
-                    *lock_unpoisoned(&st.installed_apps) = apps.clone();
-                }
-                let _ = h_idx.emit("apps-indexed", &apps);
-
-                let games = apps_indexer::scan_steam_games();
-                {
-                    let st = h_idx.state::<AppState>();
-                    *lock_unpoisoned(&st.steam_games) = games.clone();
-                }
-                let _ = h_idx.emit("games-indexed", &games);
-
-                let files = apps_indexer::scan_user_files();
-                {
-                    let st = h_idx.state::<AppState>();
-                    *lock_unpoisoned(&st.indexed_files) = files.clone();
-                }
-                let _ = h_idx.emit("files-indexed", &files);
+            std::thread::spawn(move || loop {
+                run_background_index_refresh(&h_idx);
+                std::thread::sleep(std::time::Duration::from_secs(PERIODIC_REINDEX_INTERVAL_SECS));
             });
 
-            // Fast lightweight poller for open windows (diff-only visible-window broadcast),
-            // keyboard layout, native taskbar hide guard, and fullscreen auto-hide.
+            // Fast lightweight poller for open windows (diff-only visible-window broadcast + icon_sources),
+            // keyboard layout, external foreground tracking, native taskbar hide guard, and per-monitor fullscreen.
             let h_fast = handle.clone();
-            let fast_fs_suppressed = Arc::clone(&fullscreen_suppressed);
+            let fast_fs_primary = Arc::clone(&fullscreen_suppressed);
+            let fast_fs_secondary = Arc::clone(&secondary_fullscreen_suppressed);
             std::thread::spawn(move || {
                 let mut last_layout = String::new();
                 let mut last_windows_fp: Option<WindowsFingerprint> = None;
                 loop {
-                    let groups = {
+                    let (groups, win_sources) = {
                         let st = h_fast.state::<AppState>();
-                        windows_tracker::list_open_window_groups_cached(&st.icon_cache)
+                        capture_external_foreground_hwnd(&st);
+                        windows_tracker::list_open_window_groups_cached_with_sources(&st.icon_cache)
                     };
                     let targets = {
                         let st = h_fast.state::<AppState>();
+                        st.register_icon_sources(win_sources);
                         let sec_vis = st.secondary_taskbar_visible.load(Ordering::Acquire);
                         let coord = lock_unpoisoned(&st.coordinator);
                         let maybe_targets = diff_window_update_targets_with_secondary(
@@ -1972,8 +3332,10 @@ pub fn run(hide_native: bool) {
                         win_shell::ensure_native_taskbar_hidden_if_needed();
                     }
 
-                    let fs = win_shell::is_fullscreen_active();
-                    if fs != fast_fs_suppressed.load(Ordering::Acquire) {
+                    let fs = win_shell::detect_fullscreen_per_monitor();
+                    if fs.primary != fast_fs_primary.load(Ordering::Acquire)
+                        || fs.secondary != fast_fs_secondary.load(Ordering::Acquire)
+                    {
                         let h = h_fast.clone();
                         let _ = h_fast.run_on_main_thread(move || {
                             let _ = reevaluate_fullscreen(&h, None);
@@ -1984,8 +3346,8 @@ pub fn run(hide_native: bool) {
                 }
             });
 
-            // Slower poller for split audio (diff-gated, visible-surface targeted),
-            // and hidden-window-gated Start live widgets (media, telemetry, Bluetooth peripherals)
+            // Slower poller for split audio (diff-gated, visible-surface targeted with icon_sources),
+            // diff-gated network info, and hidden-window-gated Start/Sound live widgets.
             let h_slow = handle.clone();
             std::thread::spawn(move || {
                 let mut tick = 0u64;
@@ -1993,18 +3355,20 @@ pub fn run(hide_native: bool) {
                 let mut last_audio_mixer: Option<AudioState> = None;
                 let mut last_media: Option<MediaState> = None;
                 let mut last_periphs: Option<Vec<PeripheralBattery>> = None;
+                let mut last_network: Option<NetworkInfo> = None;
                 loop {
-                    let (mixer_needed, slow_plan) = {
+                    let (mixer_needed, sound_flyout_open, slow_plan) = {
                         let st = h_slow.state::<AppState>();
                         let coord = lock_unpoisoned(&st.coordinator);
                         (
                             !coord.audio_mixer_targets().is_empty(),
+                            coord.active_flyout() == Some(FlyoutKind::Sound),
                             plan_slow_poll_tick(&coord, tick, hide_native),
                         )
                     };
 
                     if mixer_needed {
-                        let audio_st = audio::get_audio_state();
+                        let audio_st = sample_audio_state_with_icon_sources(&h_slow.state::<AppState>());
                         let master = audio_st.to_master_state();
                         let (master_targets, mixer_targets) = {
                             let st = h_slow.state::<AppState>();
@@ -2051,26 +3415,42 @@ pub fn run(hide_native: bool) {
                         }
                     }
 
-                    if slow_plan.poll_media {
+                    if tick % 3 == 0 {
+                        let net = system_widgets::get_network_info();
+                        if last_network.as_ref() != Some(&net) {
+                            last_network = Some(net.clone());
+                            let (sec_vis, flyout_vis) = {
+                                let st = h_slow.state::<AppState>();
+                                let sv = st.secondary_taskbar_visible.load(Ordering::Acquire);
+                                let fv = lock_unpoisoned(&st.coordinator).is_flyout_visible();
+                                (sv, fv)
+                            };
+                            let _ = h_slow.emit_to("taskbar", "network-updated", &net);
+                            if sec_vis {
+                                let _ = h_slow.emit_to("taskbar-secondary", "network-updated", &net);
+                            }
+                            if flyout_vis {
+                                let _ = h_slow.emit_to("flyout", "network-updated", &net);
+                            }
+                        }
+                    }
+
+                    if slow_plan.poll_media || sound_flyout_open {
                         let media_st = media::poll_media_state();
-                        if last_media.as_ref() != Some(&media_st)
-                            && should_poll_start_widgets(
-                                &lock_unpoisoned(&h_slow.state::<AppState>().coordinator),
-                            )
-                        {
+                        if last_media.as_ref() != Some(&media_st) {
                             last_media = Some(media_st.clone());
-                            let _ = h_slow.emit_to("start", "media-updated", &media_st);
+                            emit_media_to_visible_surfaces(&h_slow, &media_st);
                         }
                     } else {
                         last_media = None;
+                    }
+
+                    if !slow_plan.poll_media {
                         last_periphs = None;
                     }
 
                     if slow_plan.poll_telemetry {
-                        let telem = {
-                            let st = h_slow.state::<AppState>();
-                            telemetry::get_telemetry_cached(&st.icon_cache)
-                        };
+                        let telem = sample_telemetry_with_icon_sources(&h_slow.state::<AppState>());
                         if should_poll_start_widgets(
                             &lock_unpoisoned(&h_slow.state::<AppState>().coordinator),
                         ) {
@@ -2166,13 +3546,21 @@ mod integration_tests {
             coordinator: Mutex::new(WindowCoordinator::new()),
             overlay_open: Arc::new(AtomicBool::new(false)),
             fullscreen_suppressed: Arc::new(AtomicBool::new(false)),
+            secondary_fullscreen_suppressed: Arc::new(AtomicBool::new(false)),
             taskbar_content_width: Mutex::new(width),
             secondary_taskbar_content_width: Mutex::new(width),
             secondary_taskbar_visible: Arc::new(AtomicBool::new(false)),
             last_flyout_req: Mutex::new(None),
+            last_flyout_bounds: Mutex::new(None),
+            pending_start_show: Mutex::new(None),
+            pending_flyout_show: Mutex::new(None),
+            pending_start_exit: Mutex::new(None),
+            pending_flyout_exit: Mutex::new(None),
             flyout_anim_gen: Arc::new(AtomicU64::new(0)),
             start_anim_gen: Arc::new(AtomicU64::new(0)),
             dpi_override: AtomicU32::new(0),
+            last_external_fg: Arc::new(AtomicIsize::new(0)),
+            index_refresh_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2427,7 +3815,7 @@ mod integration_tests {
         assert_eq!(dock_140.width(), 918);
         assert_eq!(dock_140.height(), 118);
 
-        // Start bounds at 1.0x on 1920x1080 -> full 1172x712 logical
+        // Start bounds at 1.0x on 1920x1080 -> full 1188x728 logical (1140x680 + 24px shadow pad on all 4 sides)
         let mon_1080 = win_shell::MonitorRect {
             left: 0,
             top: 0,
@@ -2438,15 +3826,15 @@ mod integration_tests {
             dpi: 96,
         };
         let start_100 = compute_start_bounds(mon_1080, 1.0);
-        assert_eq!(start_100.width(), 1172);
-        assert_eq!(start_100.height(), 712);
+        assert_eq!(start_100.width(), 1188);
+        assert_eq!(start_100.height(), 728);
         assert!(start_100.left >= mon_1080.left && start_100.right <= mon_1080.right);
         assert!(start_100.top >= mon_1080.top && start_100.bottom <= mon_1080.bottom);
 
-        // Start bounds at 1.4x on 2560x1440 -> full 1172x712 scaled to 1641x997
+        // Start bounds at 1.4x on 2560x1440 -> full 1188x728 scaled cleanly
         let start_1440_140 = compute_start_bounds(mon_1440, 1.4);
-        assert_eq!(start_1440_140.width(), (1172.0_f64 * 1.4).round() as i32);
-        assert_eq!(start_1440_140.height(), (712.0_f64 * 1.4).round() as i32);
+        assert_eq!(start_1440_140.width(), (1188.0_f64 * 1.4).round() as i32);
+        assert_eq!(start_1440_140.height(), (728.0_f64 * 1.4).round() as i32);
         assert!(start_1440_140.top >= mon_1440.top + 8);
 
         // Start bounds at 1.4x on 1920x1080 -> clamped cleanly inside monitor bounds
@@ -2477,6 +3865,7 @@ mod integration_tests {
                     aumid: None,
                     is_active: active,
                     is_minimized: minimized,
+                    is_topmost: false,
                 }],
             }]
         };
@@ -2735,6 +4124,7 @@ mod integration_tests {
                     target: r"C:\Program Files\WizTree\WizTree64.exe".to_string(),
                     args: None,
                     alt_action: String::new(),
+                    alt_label: None,
                     accent_rgb: "56,189,248".to_string(),
                     icon_key: "disk".to_string(),
                     icon_data: None,
@@ -2970,12 +4360,15 @@ mod integration_tests {
             master_volume: 52,
             master_muted: false,
             mic_muted: false,
+            master_peak: 0.0,
+            mic_peak: 0.0,
             devices: vec![audio::AudioDeviceInfo {
                 id: "d1".into(),
                 name: "Speakers (Realtek)".into(),
                 short_name: "Speakers".into(),
                 is_default: true,
             }],
+            input_devices: vec![],
             sessions: vec![],
         };
         let master1 = full.to_master_state();
@@ -3182,5 +4575,70 @@ mod integration_tests {
         );
 
         assert!(windows_tracker::parse_combo_target("   ").is_err());
+    }
+
+    #[test]
+    fn paint_sync_anchor_origin_event_shapes_pid_hwnd_map_and_icon_sources_work_cleanly() {
+        // 1. Anchor origin X clamps cleanly within [18, total_w - 18] logical px
+        assert!((compute_flyout_anchor_origin_x(500, 400, 320.0, 1.0) - 100.0).abs() < 1e-6);
+        assert!((compute_flyout_anchor_origin_x(405, 400, 320.0, 1.0) - 18.0).abs() < 1e-6);
+        assert!((compute_flyout_anchor_origin_x(999, 400, 320.0, 1.0) - 302.0).abs() < 1e-6);
+        assert!((compute_flyout_anchor_origin_x(700, 400, 320.0, 1.5) - 200.0).abs() < 1e-6);
+
+        // 2. StartStateEvent and FlyoutHideEvent serialize in camelCase
+        let start_ev = StartStateEvent {
+            open: true,
+            gen: 7,
+            monitor: Some("secondary".to_string()),
+            immediate: false,
+        };
+        let start_json = serde_json::to_value(&start_ev).unwrap();
+        assert_eq!(start_json["open"], true);
+        assert_eq!(start_json["gen"], 7);
+        assert_eq!(start_json["monitor"], "secondary");
+        assert!(start_json.get("immediate").is_none());
+
+        let hide_ev = FlyoutHideEvent { gen: 12 };
+        assert_eq!(serde_json::to_value(&hide_ev).unwrap()["gen"], 12);
+
+        // 3. build_pid_to_hwnd_map prefers active window for multi-window PIDs
+        let groups = vec![AppWindowGroup {
+            key: "code".into(),
+            name: "VS Code".into(),
+            exe_path: r"C:\Apps\Code.exe".into(),
+            aumid: None,
+            icon_key: Some("exe:123".into()),
+            icon_data: None,
+            is_active: true,
+            windows: vec![
+                windows_tracker::OpenWindowInfo {
+                    hwnd: 100,
+                    pid: 777,
+                    title: "Old".into(),
+                    is_active: false,
+                    ..Default::default()
+                },
+                windows_tracker::OpenWindowInfo {
+                    hwnd: 200,
+                    pid: 777,
+                    title: "Active".into(),
+                    is_active: true,
+                    ..Default::default()
+                },
+            ],
+        }];
+        let map = build_pid_to_hwnd_map(&groups);
+        assert_eq!(map.get(&777), Some(&200));
+
+        // 4. register_icon_sources stores valid pairs and skips blanks
+        let state = make_test_app_state("dock", 620);
+        state.register_icon_sources(vec![
+            ("exe:abc".into(), r"C:\Apps\Code.exe".into()),
+            ("".into(), r"C:\Bad.exe".into()),
+            ("exe:empty".into(), "".into()),
+        ]);
+        let sources = state.icon_sources.lock().unwrap();
+        assert_eq!(sources.get("exe:abc").map(String::as_str), Some(r"C:\Apps\Code.exe"));
+        assert_eq!(sources.len(), 1);
     }
 }

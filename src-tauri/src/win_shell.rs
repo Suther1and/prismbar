@@ -11,20 +11,22 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ALREADY_EXISTS,
     ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
-    WIN32_ERROR, WPARAM,
+    WAIT_OBJECT_0, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::{
-    AttachThreadInput, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
-    WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+    AttachThreadInput, CreateEventW, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId,
+    OpenEventW, OpenProcess, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+    PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -45,26 +47,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
-    CREATESTRUCTW, GWLP_USERDATA, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
-    SHOW_WINDOW_CMD,
-    SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCCREATE, WM_QUIT,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDPROC, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
+    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, PostQuitMessage,
+    PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, ShowWindowAsync,
+    SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, CREATESTRUCTW, GWLP_USERDATA,
+    GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT,
+    MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, SHOW_WINDOW_CMD, SM_CXSCREEN,
+    SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_NCCREATE, WM_QUIT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WNDCLASSEXW, WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_OVERLAPPED,
 };
 
+pub use crate::coordinator::{FLYOUT_ROOT_PAD_LOGICAL, START_ROOT_PAD_LOGICAL};
 use crate::coordinator::{
-    classify_fullscreen, compute_appbar_rect_scaled, compute_effective_scale, BarMode,
-    ForegroundWindowInfo, NotificationState, PixelRect,
+    classify_fullscreen, classify_fullscreen_for_monitor, compute_appbar_rect_scaled,
+    compute_effective_scale, BarMode, DetailedForegroundWindow, ForegroundWindowInfo,
+    MonitorFullscreenState, NotificationState, PixelRect,
 };
 
 pub const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\TestBar_SingleInstance_v1";
+pub const TASKBAR_CREATED_REHIDE_DELAYS_MS: [u64; 3] = [100, 300, 650];
 pub const WM_APPBAR_CALLBACK: u32 = WM_APP + 10;
 pub const WM_APPBAR_UPDATE_MODE: u32 = WM_APP + 12;
 pub const HOOK_EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -99,6 +105,8 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static FLYOUT_SUBCLASSED_HWND: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_NON_ACTIVATING: AtomicBool = AtomicBool::new(false);
+static WINDOW_GLIDE_GEN: AtomicU64 = AtomicU64::new(0);
+static CLEAN_EXIT_EVENT: Mutex<Option<CleanExitEventGuard>> = Mutex::new(None);
 
 pub(crate) fn set_overlay_open_hint(open: bool) {
     HOOK_OVERLAY_OPEN.store(open, Ordering::Release);
@@ -207,6 +215,105 @@ impl Drop for SingleInstanceGuard {
             self.handle = 0;
         }
     }
+}
+
+pub fn clean_exit_event_name(pid: u32) -> String {
+    format!(r"Local\TestBar_CleanExit_{pid}")
+}
+
+/// RAII Win32 manual-reset named event (`Local\TestBar_CleanExit_<pid>`) coordinating clean
+/// shutdown between TestBar and its companion `--watchdog` process so the watchdog exits
+/// silently on normal exit instead of racing `SPI_SETWORKAREA` twice.
+pub struct CleanExitEventGuard {
+    handle: isize,
+    pid: u32,
+}
+
+impl CleanExitEventGuard {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn signal(&self) -> bool {
+        if self.handle == 0 {
+            return false;
+        }
+        unsafe { SetEvent(HANDLE(self.handle as *mut _)).is_ok() }
+    }
+
+    pub fn is_signaled(&self) -> bool {
+        if self.handle == 0 {
+            return false;
+        }
+        unsafe { WaitForSingleObject(HANDLE(self.handle as *mut _), 0) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for CleanExitEventGuard {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe {
+                let _ = CloseHandle(HANDLE(self.handle as *mut _));
+            }
+            self.handle = 0;
+        }
+    }
+}
+
+/// Creates (or opens) the manual-reset named event `Local\TestBar_CleanExit_<pid>`.
+pub fn create_clean_exit_event(pid: u32) -> Result<CleanExitEventGuard, String> {
+    if pid == 0 {
+        return Err("clean-exit event pid must be non-zero".to_string());
+    }
+    let name = clean_exit_event_name(pid);
+    unsafe {
+        let wide_name = wide(&name);
+        let handle = CreateEventW(None, true, false, PCWSTR(wide_name.as_ptr()))
+            .map_err(|e| format!("CreateEventW({name}) failed: {e}"))?;
+        if handle.is_invalid() {
+            return Err(format!("CreateEventW({name}) returned invalid handle"));
+        }
+        Ok(CleanExitEventGuard {
+            handle: handle.0 as isize,
+            pid,
+        })
+    }
+}
+
+/// Signals `Local\TestBar_CleanExit_<pid>` so an attached watchdog exits silently once the parent exits.
+pub fn signal_clean_exit_event(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let name = clean_exit_event_name(pid);
+    unsafe {
+        let wide_name = wide(&name);
+        if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(wide_name.as_ptr())) {
+            let ok = SetEvent(handle).is_ok();
+            let _ = CloseHandle(handle);
+            return ok;
+        }
+    }
+    false
+}
+
+/// Non-blocking check returning `true` when `Local\TestBar_CleanExit_<pid>` exists and is signaled.
+pub fn is_clean_exit_signaled(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    const SYNCHRONIZE_RIGHT: SYNCHRONIZATION_ACCESS_RIGHTS =
+        SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
+    let name = clean_exit_event_name(pid);
+    unsafe {
+        let wide_name = wide(&name);
+        if let Ok(handle) = OpenEventW(SYNCHRONIZE_RIGHT, false, PCWSTR(wide_name.as_ptr())) {
+            let signaled = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+            let _ = CloseHandle(handle);
+            return signaled;
+        }
+    }
+    false
 }
 
 pub fn is_valid_rect(rect: PixelRect) -> bool {
@@ -498,6 +605,20 @@ pub fn capture_and_persist_original_workarea() -> Option<WorkAreaSnapshot> {
     Some(chosen)
 }
 
+fn is_workarea_compatible_with_monitor(wa: PixelRect, current_monitor: PixelRect) -> bool {
+    if !is_valid_rect(wa) || !is_valid_rect(current_monitor) || !current_monitor.covers(wa) {
+        return false;
+    }
+    let matched_edges = u8::from(wa.left == current_monitor.left)
+        + u8::from(wa.top == current_monitor.top)
+        + u8::from(wa.right == current_monitor.right)
+        + u8::from(wa.bottom == current_monitor.bottom);
+    if matched_edges < 3 {
+        return false;
+    }
+    wa.width() >= (current_monitor.width() / 2) && wa.height() >= (current_monitor.height() / 2)
+}
+
 fn resolve_recovery_workarea(
     explicit: Option<PixelRect>,
     in_memory: Option<WorkAreaSnapshot>,
@@ -505,16 +626,41 @@ fn resolve_recovery_workarea(
     current_monitor: PixelRect,
     current_dpi: u32,
 ) -> Option<PixelRect> {
-    explicit
-        .filter(|r| is_valid_rect(*r) && current_monitor.covers(*r))
+    let disk_snap = load_workarea_snapshot_from(disk_path);
+    let explicit_valid = explicit.filter(|&r| {
+        if !is_workarea_compatible_with_monitor(r, current_monitor) {
+            return false;
+        }
+        // If explicit --workarea matches an existing snapshot whose monitor or DPI no longer matches,
+        // reject it instead of restoring stale DPI-mismatched work-area geometry.
+        if let Some(mem) = in_memory {
+            if mem.work_area == r && !is_snapshot_compatible(&mem, current_monitor, current_dpi) {
+                return false;
+            }
+        }
+        if let Some(disk) = disk_snap {
+            if disk.work_area == r && !is_snapshot_compatible(&disk, current_monitor, current_dpi) {
+                return false;
+            }
+        }
+        true
+    });
+
+    explicit_valid
         .or_else(|| {
             in_memory
-                .filter(|s| is_snapshot_compatible(s, current_monitor, current_dpi))
+                .filter(|s| {
+                    is_snapshot_compatible(s, current_monitor, current_dpi)
+                        && is_workarea_compatible_with_monitor(s.work_area, current_monitor)
+                })
                 .map(|s| s.work_area)
         })
         .or_else(|| {
-            load_workarea_snapshot_from(disk_path)
-                .filter(|s| is_snapshot_compatible(s, current_monitor, current_dpi))
+            disk_snap
+                .filter(|s| {
+                    is_snapshot_compatible(s, current_monitor, current_dpi)
+                        && is_workarea_compatible_with_monitor(s.work_area, current_monitor)
+                })
                 .map(|s| s.work_area)
         })
 }
@@ -692,25 +838,174 @@ pub fn style_overlay_window(hwnd_raw: isize, no_activate: bool) {
 }
 
 pub fn force_focus_window(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
         let fg = GetForegroundWindow();
-        let fg_tid = GetWindowThreadProcessId(fg, None);
         let cur_tid = GetCurrentThreadId();
-        let target_tid = GetWindowThreadProcessId(hwnd, None);
-        if fg_tid != cur_tid {
-            let _ = AttachThreadInput(cur_tid, fg_tid, true);
-        }
-        if target_tid != cur_tid {
-            let _ = AttachThreadInput(cur_tid, target_tid, true);
-        }
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let fg_tid = if !fg.0.is_null()
+            && IsWindow(fg).as_bool()
+            && !IsHungAppWindow(fg).as_bool()
+        {
+            GetWindowThreadProcessId(fg, None)
+        } else {
+            0
+        };
+        let target_tid = if !IsHungAppWindow(hwnd).as_bool() {
+            GetWindowThreadProcessId(hwnd, None)
+        } else {
+            0
+        };
+
+        let attach_fg = fg_tid != 0 && fg_tid != cur_tid;
+        let attach_target = target_tid != 0 && target_tid != cur_tid && target_tid != fg_tid;
+        let fg_attached = attach_fg && AttachThreadInput(cur_tid, fg_tid, true).as_bool();
+        let target_attached =
+            attach_target && AttachThreadInput(cur_tid, target_tid, true).as_bool();
+
+        let _ = ShowWindowAsync(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-        if target_tid != cur_tid {
+
+        if target_attached {
             let _ = AttachThreadInput(cur_tid, target_tid, false);
         }
-        if fg_tid != cur_tid {
+        if fg_attached {
             let _ = AttachThreadInput(cur_tid, fg_tid, false);
+        }
+    }
+}
+
+/// Atomically applies physical pixel position, size, and optional topmost Z-order in a single
+/// `SetWindowPos` call without activating or showing a hidden window.
+pub fn set_window_bounds_atomic(
+    hwnd_raw: isize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    topmost: bool,
+) {
+    if hwnd_raw == 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
+        let (z_insert, flags) = if topmost {
+            (HWND_TOPMOST, SWP_NOACTIVATE)
+        } else {
+            (HWND::default(), SWP_NOZORDER | SWP_NOACTIVATE)
+        };
+        let _ = SetWindowPos(hwnd, z_insert, x, y, w, h, flags);
+    }
+}
+
+/// Smooth cubic ease-out horizontal interpolation helper for `glide_window_x_dwm`.
+pub fn interpolate_glide_x(from_x: i32, to_x: i32, progress: f64) -> i32 {
+    let t = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let eased = 1.0 - (1.0 - t).powi(3);
+    from_x + (((to_x - from_x) as f64) * eased).round() as i32
+}
+
+/// Cancels any currently running `glide_window_x_dwm` animation immediately.
+pub fn cancel_window_x_glide() {
+    WINDOW_GLIDE_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Glides a visible window horizontally using `SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE`
+/// synced to `DwmFlush()` so WebView2 never reallocates its swapchain during preview scrubbing.
+pub fn glide_window_x_dwm(hwnd_raw: isize, from_x: i32, to_x: i32, y: i32, duration_ms: u64) {
+    let my_gen = WINDOW_GLIDE_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    if hwnd_raw == 0 {
+        return;
+    }
+    if duration_ms == 0 || from_x == to_x {
+        unsafe {
+            let hwnd = HWND(hwnd_raw as *mut _);
+            if IsWindow(hwnd).as_bool() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    to_x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        return;
+    }
+
+    let duration_f = duration_ms.clamp(1, 1000) as f64;
+    std::thread::spawn(move || unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        let started = std::time::Instant::now();
+        let mut last_x = from_x;
+        loop {
+            if WINDOW_GLIDE_GEN.load(Ordering::Acquire) != my_gen {
+                break;
+            }
+            if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                break;
+            }
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let progress = (elapsed_ms / duration_f).min(1.0);
+            let next_x = interpolate_glide_x(from_x, to_x, progress);
+            if next_x != last_x || progress >= 1.0 {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    next_x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                last_x = next_x;
+            }
+            if progress >= 1.0 {
+                break;
+            }
+            if DwmFlush().is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        }
+    });
+}
+
+/// Toggles click-through hit-transparency (`WS_EX_TRANSPARENT`) on an overlay window
+/// ONLY when the bit actually changes and explicitly WITHOUT calling `SetWindowPos(..., SWP_FRAMECHANGED)`
+/// so transparent Win11 WebView2 windows never flicker borders (AD-1 compliant).
+pub fn set_window_hit_transparent(hwnd_raw: isize, transparent: bool) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let bit = WS_EX_TRANSPARENT.0 as isize;
+        let next = if transparent {
+            current | bit
+        } else {
+            current & !bit
+        };
+        if next != current {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
         }
     }
 }
@@ -927,11 +1222,35 @@ pub fn ensure_native_taskbar_hidden_if_needed() {
     }
 }
 
+/// Re-hides Windows 11 native taskbar(s) across staggered delays after `TaskbarCreated`
+/// because Explorer often finishes initializing `Shell_TrayWnd` / `Shell_SecondaryTrayWnd`
+/// hundreds of milliseconds after broadcasting `TaskbarCreated`.
+pub fn schedule_staggered_native_rehide() {
+    if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let mut elapsed = 0u64;
+        for &target_ms in &TASKBAR_CREATED_REHIDE_DELAYS_MS {
+            let wait_ms = target_ms.saturating_sub(elapsed);
+            if wait_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+            elapsed = target_ms;
+            if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) {
+                return;
+            }
+            ensure_native_taskbar_hidden_if_needed();
+        }
+    });
+}
+
 trait AppBarShellOps: Send {
     fn primary_monitor_rect(&self) -> PixelRect;
     fn primary_monitor_dpi(&self) -> u32;
     fn text_scale_factor(&self) -> f64;
     fn hide_native_taskbar(&self);
+    fn schedule_staggered_rehide(&self) {}
     fn abm_new(&self, hwnd: HWND, abd: &mut APPBARDATA) -> bool;
     fn abm_querypos(&self, hwnd: HWND, abd: &mut APPBARDATA);
     fn abm_setpos(&self, hwnd: HWND, abd: &mut APPBARDATA);
@@ -957,6 +1276,10 @@ impl AppBarShellOps for Win32AppBarShellOps {
 
     fn hide_native_taskbar(&self) {
         hide_native_taskbar();
+    }
+
+    fn schedule_staggered_rehide(&self) {
+        schedule_staggered_native_rehide();
     }
 
     fn abm_new(&self, _hwnd: HWND, abd: &mut APPBARDATA) -> bool {
@@ -1006,6 +1329,7 @@ struct AppBarWindowContext {
     bar_mode: Cell<BarMode>,
     taskbar_created_msg: u32,
     last_appbar_rect: Cell<Option<PixelRect>>,
+    last_text_scale_pct: Cell<u32>,
     on_event: Box<dyn Fn(ShellAppBarEvent) + Send + Sync>,
 }
 
@@ -1123,6 +1447,7 @@ unsafe extern "system" fn appbar_msg_wnd_proc(
 
         if ctx.taskbar_created_msg != 0 && msg == ctx.taskbar_created_msg {
             ctx.shell_ops.hide_native_taskbar();
+            ctx.shell_ops.schedule_staggered_rehide();
             ctx.appbar_registered.set(false);
             apply_appbar_on_hwnd(hwnd, ctx, true, false, None);
             (ctx.on_event)(ShellAppBarEvent::TaskbarCreated);
@@ -1169,6 +1494,15 @@ unsafe extern "system" fn appbar_msg_wnd_proc(
                 };
                 apply_appbar_on_hwnd(hwnd, ctx, false, false, Some(dpi));
                 (ctx.on_event)(ShellAppBarEvent::DpiChanged(dpi));
+                Some(LRESULT(0))
+            }
+            WM_SETTINGCHANGE => {
+                let current_pct = (ctx.shell_ops.text_scale_factor() * 100.0).round() as u32;
+                if current_pct != ctx.last_text_scale_pct.get() {
+                    ctx.last_text_scale_pct.set(current_pct);
+                    apply_appbar_on_hwnd(hwnd, ctx, false, false, None);
+                    (ctx.on_event)(ShellAppBarEvent::PositionChanged);
+                }
                 Some(LRESULT(0))
             }
             WM_CLOSE => {
@@ -1225,12 +1559,14 @@ impl AppBarMessageWindow {
 
             let taskbar_created_msg =
                 RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr()));
+            let initial_text_scale_pct = (shell_ops.text_scale_factor() * 100.0).round() as u32;
             let ctx = Box::new(AppBarWindowContext {
                 shell_ops,
                 appbar_registered: Cell::new(false),
                 bar_mode: Cell::new(initial_mode),
                 taskbar_created_msg,
                 last_appbar_rect: Cell::new(None),
+                last_text_scale_pct: Cell::new(initial_text_scale_pct),
                 on_event: Box::new(on_event),
             });
             let ctx_ptr = Box::into_raw(ctx);
@@ -1489,7 +1825,16 @@ fn restore_native_taskbar_internal(explicit_workarea: Option<PixelRect>, flush_o
 }
 
 /// Guaranteed restoration of Windows 11 native taskbar(s) + AppBar removal + exact HiDPI workarea refresh.
+/// Signals the process clean-exit event so any companion `--watchdog` exits silently without double-restoring.
 pub fn restore_native_taskbar() {
+    let pid = unsafe { GetCurrentProcessId() };
+    let signaled = {
+        let guard = CLEAN_EXIT_EVENT.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(CleanExitEventGuard::signal).unwrap_or(false)
+    };
+    if !signaled {
+        let _ = signal_clean_exit_event(pid);
+    }
     restore_native_taskbar_internal(None, false);
 }
 
@@ -1508,10 +1853,15 @@ pub fn unregister_appbar() {
 }
 
 /// Spawns lightweight companion watchdog: `testbar.exe --watchdog <pid> [--workarea <l,t,r,b>]`.
-/// If main process is killed via Task Manager or crashes, watchdog flushes orphaned AppBars and restores native taskbar.
+/// Creates the named clean-exit event `Local\TestBar_CleanExit_<pid>` first so clean shutdowns
+/// let the watchdog exit silently, while Task Manager kills or crashes trigger full restoration.
 pub fn spawn_watchdog(work_area: Option<PixelRect>) {
     if let Ok(exe) = std::env::current_exe() {
         let pid = unsafe { GetCurrentProcessId() };
+        if let Ok(ev) = create_clean_exit_event(pid) {
+            let mut slot = CLEAN_EXIT_EVENT.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(ev);
+        }
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--watchdog").arg(pid.to_string());
         if let Some(rect) = work_area.filter(|r| is_valid_rect(*r)) {
@@ -1523,11 +1873,21 @@ pub fn spawn_watchdog(work_area: Option<PixelRect>) {
 
 pub fn run_watchdog(args: WatchdogArgs) {
     ensure_process_dpi_aware();
+    // Hold our own handle to the named clean-exit event BEFORE waiting on the parent so the
+    // kernel object outlives parent termination if the parent signaled it during clean shutdown.
+    let clean_exit_guard = create_clean_exit_event(args.parent_pid).ok();
     unsafe {
         if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, args.parent_pid) {
             let _ = WaitForSingleObject(handle, INFINITE);
             let _ = CloseHandle(handle);
         }
+    }
+    if clean_exit_guard
+        .as_ref()
+        .map(CleanExitEventGuard::is_signaled)
+        .unwrap_or_else(|| is_clean_exit_signaled(args.parent_pid))
+    {
+        return;
     }
     // Avoid clobbering a newly restarted TestBar instance on quick restart.
     let _guard = match SingleInstanceGuard::acquire() {
@@ -1545,10 +1905,17 @@ pub struct FullscreenSnapshot {
     pub primary_monitor: PixelRect,
 }
 
-/// Captures the Win32 inputs required by `coordinator::classify_fullscreen`.
-pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerMonitorFullscreenSnapshot {
+    pub notification_state: NotificationState,
+    pub foreground: Option<DetailedForegroundWindow>,
+    pub primary_monitor: PixelRect,
+    pub secondary_monitor: Option<PixelRect>,
+}
+
+fn query_user_notification_state() -> NotificationState {
     unsafe {
-        let notification_state = match SHQueryUserNotificationState() {
+        match SHQueryUserNotificationState() {
             Ok(state) if state == QUNS_NOT_PRESENT => NotificationState::NotPresent,
             Ok(state) if state == QUNS_BUSY => NotificationState::Busy,
             Ok(state) if state == QUNS_RUNNING_D3D_FULL_SCREEN => {
@@ -1561,8 +1928,42 @@ pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
             Ok(state) if state == QUNS_QUIET_TIME => NotificationState::QuietTime,
             Ok(state) if state == QUNS_APP => NotificationState::App,
             _ => NotificationState::Unknown,
-        };
+        }
+    }
+}
 
+unsafe fn query_window_and_extended_rect(hwnd: HWND) -> Option<(PixelRect, PixelRect)> {
+    let mut win_rect = RECT::default();
+    GetWindowRect(hwnd, &mut win_rect).ok()?;
+    let win_px = PixelRect::new(win_rect.left, win_rect.top, win_rect.right, win_rect.bottom);
+    let mut ext_rect = RECT::default();
+    let ext_px = if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut ext_rect as *mut RECT as *mut c_void,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_ok()
+    {
+        let candidate =
+            PixelRect::new(ext_rect.left, ext_rect.top, ext_rect.right, ext_rect.bottom);
+        if is_valid_rect(candidate) {
+            candidate
+        } else {
+            win_px
+        }
+    } else {
+        win_px
+    };
+    Some((win_px, ext_px))
+}
+
+/// Captures the Win32 inputs required by `coordinator::classify_fullscreen`, using
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` (falling back to `GetWindowRect`) so invisible DWM
+/// shadow frames never cause false positives on maximized apps.
+pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
+    unsafe {
+        let notification_state = query_user_notification_state();
         let primary_monitor = primary_monitor_rect().to_pixel_rect();
 
         let fg = GetForegroundWindow();
@@ -1583,18 +1984,13 @@ pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
             };
 
             let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
-            let mut rect = RECT::default();
-            if GetWindowRect(fg, &mut rect).is_ok() {
-                Some(ForegroundWindowInfo {
-                    visible,
-                    is_own_process,
-                    class_name,
-                    style,
-                    rect: PixelRect::new(rect.left, rect.top, rect.right, rect.bottom),
-                })
-            } else {
-                None
-            }
+            query_window_and_extended_rect(fg).map(|(_win_px, ext_px)| ForegroundWindowInfo {
+                visible,
+                is_own_process,
+                class_name,
+                style,
+                rect: ext_px,
+            })
         };
 
         FullscreenSnapshot {
@@ -1603,6 +1999,109 @@ pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
             primary_monitor,
         }
     }
+}
+
+/// Captures per-monitor fullscreen state inputs using `MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)`,
+/// `DWMWA_EXTENDED_FRAME_BOUNDS`, and `IsZoomed` so fullscreen suppression is attributed strictly
+/// to the display hosting the fullscreen foreground window.
+pub fn query_per_monitor_fullscreen_snapshot() -> PerMonitorFullscreenSnapshot {
+    unsafe {
+        let notification_state = query_user_notification_state();
+        let primary_monitor = primary_monitor_rect().to_pixel_rect();
+        let secondary_monitor = secondary_monitor_rects()
+            .into_iter()
+            .next()
+            .map(MonitorRect::to_pixel_rect);
+
+        let fg = GetForegroundWindow();
+        let foreground = if fg.0.is_null() {
+            None
+        } else {
+            let visible = IsWindowVisible(fg).as_bool() && !IsIconic(fg).as_bool();
+            let is_maximized = IsZoomed(fg).as_bool();
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            let is_own_process = pid == GetCurrentProcessId();
+
+            let mut cls_buf = [0u16; 256];
+            let len = GetClassNameW(fg, &mut cls_buf);
+            let class_name = if len > 0 {
+                String::from_utf16_lossy(&cls_buf[..len as usize])
+            } else {
+                String::new()
+            };
+
+            let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
+            let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let (monitor_rect, work_area_rect) = if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                (
+                    PixelRect::new(
+                        info.rcMonitor.left,
+                        info.rcMonitor.top,
+                        info.rcMonitor.right,
+                        info.rcMonitor.bottom,
+                    ),
+                    PixelRect::new(
+                        info.rcWork.left,
+                        info.rcWork.top,
+                        info.rcWork.right,
+                        info.rcWork.bottom,
+                    ),
+                )
+            } else {
+                (primary_monitor, primary_monitor)
+            };
+
+            query_window_and_extended_rect(fg).map(|(window_rect, extended_rect)| {
+                DetailedForegroundWindow {
+                    visible,
+                    is_own_process,
+                    is_maximized,
+                    class_name,
+                    style,
+                    window_rect,
+                    extended_rect,
+                    monitor_rect,
+                    work_area_rect,
+                }
+            })
+        };
+
+        PerMonitorFullscreenSnapshot {
+            notification_state,
+            foreground,
+            primary_monitor,
+            secondary_monitor,
+        }
+    }
+}
+
+/// Detects fullscreen games / video players independently for primary and secondary monitors
+/// via `MonitorFromWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS` + `coordinator::classify_fullscreen_for_monitor`.
+pub fn detect_fullscreen_per_monitor() -> MonitorFullscreenState {
+    let snap = query_per_monitor_fullscreen_snapshot();
+    let primary = classify_fullscreen_for_monitor(
+        snap.notification_state,
+        snap.foreground.as_ref(),
+        snap.primary_monitor,
+        true,
+    );
+    let secondary = snap
+        .secondary_monitor
+        .map(|sec| {
+            classify_fullscreen_for_monitor(
+                snap.notification_state,
+                snap.foreground.as_ref(),
+                sec,
+                false,
+            )
+        })
+        .unwrap_or(false);
+    MonitorFullscreenState { primary, secondary }
 }
 
 /// Detects fullscreen games / video players on primary monitor so taskbar can auto-hide.
@@ -1977,6 +2476,15 @@ fn dispatch_ll_mouse_event(msg: u32, x: i32, y: i32, overlay_open: bool) {
     if msg != WM_LBUTTONDOWN && msg != WM_RBUTTONDOWN && msg != WM_MBUTTONDOWN {
         return;
     }
+    // Any mouse click while Win is held (even when no TestBar overlay is open) marks
+    // combo_used = true so Win+Click never falsely pops Start on Win release.
+    let _ = HOOK_WIN_KEY_STATE.try_with(|cell| {
+        let mut state = cell.get();
+        if state.is_any_win_down() {
+            state.mark_combo_used();
+            cell.set(state);
+        }
+    });
     if !overlay_open {
         return;
     }
@@ -2004,7 +2512,11 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-fn send_masked_win_keyup(vk: u16) {
+/// Injects `[0xE8 DOWN, 0xE8 UP, vk KEYUP]` in one atomic batch.
+/// Returns `true` ONLY when Windows accepted every event (`sent as usize == inputs.len()`);
+/// returns `false` if UIPI blocked `SendInput` (e.g. elevated Admin foreground window) so callers
+/// never swallow physical `Win KEYUP` and never leave the `Win` modifier permanently stuck.
+fn send_masked_win_keyup(vk: u16) -> bool {
     unsafe {
         // Inject [0xE8 DOWN, 0xE8 UP, vk KEYUP] in one atomic batch while swallowing the
         // physical Win KEYUP via LRESULT(1). This guarantees the mask key strictly precedes
@@ -2041,13 +2553,14 @@ fn send_masked_win_keyup(vk: u16) {
                 },
             },
         ];
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        sent as usize == inputs.len()
     }
 }
 
 /// Processes a single low-level keyboard event. Returns `true` ONLY when a lone physical
-/// Win `KEYUP` triggered `ToggleStart` and was successfully enqueued + replaced with a
-/// masked `[0xE8 down, 0xE8 up, Win up]` sequence, telling `ll_keyboard_proc` to return
+/// Win `KEYUP` triggered `ToggleStart`, `send_mask(vk)` succeeded (was NOT blocked by UIPI),
+/// AND `ToggleStart` was successfully enqueued — telling `ll_keyboard_proc` to return
 /// `LRESULT(1)` and swallow the physical `KEYUP`.
 fn dispatch_ll_keyboard_event<FQuery, FMask>(
     msg: u32,
@@ -2058,7 +2571,7 @@ fn dispatch_ll_keyboard_event<FQuery, FMask>(
 ) -> bool
 where
     FQuery: FnOnce() -> PhysicalKeySnapshot,
-    FMask: FnOnce(u16),
+    FMask: FnOnce(u16) -> bool,
 {
     let transition = match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN => KeyTransition::Down,
@@ -2096,7 +2609,18 @@ where
         .unwrap_or(WinKeyAction::None);
 
     if action == WinKeyAction::ToggleStart {
-        // Enqueue ToggleStart first; only mask and swallow physical Win KEYUP if enqueued.
+        let has_sender = HOOK_EVENT_SENDER
+            .try_with(|slot| slot.try_borrow().ok().is_some_and(|g| g.is_some()))
+            .unwrap_or(false);
+        if !has_sender {
+            return false;
+        }
+        // Verify SendInput succeeds BEFORE enqueuing ToggleStart or swallowing physical Win KEYUP:
+        // when an elevated window has focus, UIPI blocks SendInput (returns 0), so returning false
+        // passes physical KEYUP through and prevents a permanently stuck Win modifier.
+        if !send_mask(vk) {
+            return false;
+        }
         let result = HOOK_EVENT_SENDER
             .try_with(|slot| {
                 slot.try_borrow()
@@ -2110,7 +2634,6 @@ where
             })
             .unwrap_or(HookEnqueueResult::Disconnected);
         if result == HookEnqueueResult::Sent {
-            send_mask(vk);
             return true;
         }
     }
@@ -3233,7 +3756,14 @@ mod tests {
 
         let idle_phys = || PhysicalKeySnapshot::default();
         let masked_vks: RefCell<Vec<u16>> = RefCell::new(Vec::new());
-        let record_mask = |vk: u16| masked_vks.borrow_mut().push(vk);
+        let record_mask = |vk: u16| -> bool {
+            masked_vks.borrow_mut().push(vk);
+            true
+        };
+        let uipi_blocked_mask = |vk: u16| -> bool {
+            masked_vks.borrow_mut().push(vk);
+            false
+        };
 
         // 1. Lone LWin tap: Down passes through (false), Up enqueues ToggleStart, injects mask+keyup, and swallows physical KEYUP (true)
         assert!(
@@ -3320,7 +3850,7 @@ mod tests {
         assert_eq!(masked_vks.borrow().len(), 2);
         assert!(rx.try_recv().is_err());
 
-        // 6. When channel is full, try_send returns DroppedFull -> mask key NOT invoked and KEYUP NOT swallowed
+        // 6. When channel is full, try_send returns DroppedFull -> KEYUP NOT swallowed and dropped_count increments
         assert_eq!(
             sender.try_send(ShellHookEvent::GlobalMouseDown(1, 1)),
             HookEnqueueResult::Sent
@@ -3334,14 +3864,34 @@ mod tests {
             !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
             "physical Win KEYUP must NOT be swallowed when ToggleStart was dropped on full channel"
         );
-        assert_eq!(
-            masked_vks.borrow().len(),
-            2,
-            "send_masked_win_keyup must NOT run when ToggleStart was dropped on full channel"
-        );
         assert_eq!(sender.dropped_count(), 1);
         let _ = rx.try_recv().unwrap();
         let _ = rx.try_recv().unwrap();
+        let mask_count_before_uipi = masked_vks.borrow().len();
+
+        // 6b. UIPI elevated foreground blocks SendInput (send_mask -> false):
+        //     physical Win KEYUP must NOT be swallowed and ToggleStart must NOT be enqueued!
+        assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, uipi_blocked_mask));
+        assert!(
+            !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, uipi_blocked_mask),
+            "physical Win KEYUP must NOT be swallowed when SendInput is blocked by UIPI"
+        );
+        assert_eq!(masked_vks.borrow().len(), mask_count_before_uipi + 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "ToggleStart must NOT be enqueued when SendInput fails under UIPI"
+        );
+
+        // 6c. Win + Mouse Click (even when overlay_open == false) marks combo_used so Win release never pops Start
+        for mouse_msg in [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN] {
+            assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask));
+            dispatch_ll_mouse_event(mouse_msg, 123, 456, false);
+            assert!(
+                !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
+                "Win+Click must suppress lone Win ToggleStart"
+            );
+            assert!(rx.try_recv().is_err());
+        }
 
         // 7. Mouse dispatch is gated by overlay_open across L/R/M button downs
         dispatch_ll_mouse_event(WM_LBUTTONDOWN, 10, 20, false);
@@ -3420,7 +3970,122 @@ mod tests {
             fake_state.lock().unwrap().ops,
             vec![FakeOp::AbmQueryPos(expected_edge), FakeOp::AbmSetPos(expected_edge)]
         );
+        fake_state.lock().unwrap().ops.clear();
+
+        // Unrelated WM_SETTINGCHANGE (TextScaleFactor unchanged at 1.4) does nothing
+        unsafe {
+            let hwnd = HWND(wnd.hwnd() as *mut _);
+            let _ = SendMessageW(hwnd, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0));
+            assert!(fake_state.lock().unwrap().ops.is_empty());
+            assert!(ev_rx.try_recv().is_err());
+
+            // Live TextScaleFactor change (1.4 -> 1.75): Edge 52 * 1.75 = 91px
+            fake_state.lock().unwrap().text_scale = 1.75;
+            let _ = SendMessageW(hwnd, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0));
+            assert_eq!(
+                ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                ShellAppBarEvent::PositionChanged
+            );
+            let expected_edge_175 = PixelRect::new(0, 1440 - 91, 2560, 1440);
+            assert_eq!(
+                fake_state.lock().unwrap().ops,
+                vec![
+                    FakeOp::AbmQueryPos(expected_edge_175),
+                    FakeOp::AbmSetPos(expected_edge_175),
+                ]
+            );
+        }
 
         wnd.stop();
+    }
+
+    #[test]
+    fn clean_exit_event_roundtrip_and_zero_pid_rejection() {
+        assert!(create_clean_exit_event(0).is_err());
+        assert!(!signal_clean_exit_event(0));
+        assert!(!is_clean_exit_signaled(0));
+
+        let fake_pid = 900_000 + TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed) as u32;
+        assert!(!is_clean_exit_signaled(fake_pid));
+
+        let guard = create_clean_exit_event(fake_pid).expect("create_clean_exit_event failed");
+        assert_eq!(guard.pid(), fake_pid);
+        assert!(!guard.is_signaled());
+        assert!(!is_clean_exit_signaled(fake_pid));
+
+        assert!(signal_clean_exit_event(fake_pid));
+        assert!(guard.is_signaled());
+        assert!(is_clean_exit_signaled(fake_pid));
+
+        drop(guard);
+        assert!(!is_clean_exit_signaled(fake_pid));
+    }
+
+    #[test]
+    fn recovery_workarea_rejects_shrunk_monitor_cli_and_stale_dpi_snapshot() {
+        let dir = unique_test_dir("recovery_expanded");
+        let path = dir.join("recovery-workarea.json");
+
+        let mon_1440 = PixelRect::new(0, 0, 2560, 1440);
+        let stale_1080_wa = PixelRect::new(0, 0, 1920, 1032);
+
+        // Stale 1080p CLI --workarea on an expanded 1440p monitor MUST be rejected (only 2 edges match!)
+        assert!(!is_workarea_compatible_with_monitor(stale_1080_wa, mon_1440));
+        assert_eq!(
+            resolve_recovery_workarea(Some(stale_1080_wa), None, &path, mon_1440, 96),
+            None
+        );
+
+        // Same 1440p resolution, but DPI changed from 96 -> 144: explicit CLI matching stale 96-DPI disk snapshot is rejected!
+        let stale_96_dpi_wa = PixelRect::new(0, 0, 2560, 1392);
+        let disk_snap_96 = WorkAreaSnapshot {
+            work_area: stale_96_dpi_wa,
+            primary_monitor: mon_1440,
+            dpi: 96,
+        };
+        save_workarea_snapshot_to(&path, &disk_snap_96).unwrap();
+        assert_eq!(
+            resolve_recovery_workarea(Some(stale_96_dpi_wa), None, &path, mon_1440, 144),
+            None
+        );
+        // Matching DPI accepts it cleanly
+        assert_eq!(
+            resolve_recovery_workarea(Some(stale_96_dpi_wa), None, &path, mon_1440, 96),
+            Some(stale_96_dpi_wa)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_bounds_hit_transparent_and_glide_interpolation() {
+        assert_eq!(interpolate_glide_x(100, 300, 0.0), 100);
+        assert_eq!(interpolate_glide_x(100, 300, 1.0), 300);
+        assert_eq!(interpolate_glide_x(100, 300, 0.5), 275); // cubic ease-out: 1 - 0.5^3 = 0.875 -> 100 + 175
+        assert_eq!(interpolate_glide_x(300, 100, 1.5), 100);
+        assert_eq!(interpolate_glide_x(300, 100, f64::NAN), 100);
+
+        let hwnd = create_hidden_static_window();
+        let _guard = TestWindowGuard {
+            hwnd,
+            reset_subclass_statics: false,
+        };
+        let raw = hwnd.0 as isize;
+
+        set_window_bounds_atomic(raw, 200, 180, 420, 260, true);
+        unsafe {
+            assert!(!IsWindowVisible(hwnd).as_bool());
+            let mut r = RECT::default();
+            GetWindowRect(hwnd, &mut r).unwrap();
+            assert_eq!((r.left, r.top, r.right, r.bottom), (200, 180, 620, 440));
+
+            set_window_hit_transparent(raw, true);
+            let ex_on = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            assert_ne!(ex_on & WS_EX_TRANSPARENT.0, 0);
+
+            set_window_hit_transparent(raw, false);
+            let ex_off = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            assert_eq!(ex_off & WS_EX_TRANSPARENT.0, 0);
+        }
     }
 }

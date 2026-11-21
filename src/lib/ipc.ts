@@ -9,6 +9,7 @@ export interface PinItem {
   target: string;
   args?: string | null;
   altAction: string;
+  altLabel?: string | null;
   accentRgb: string;
   iconKey: string;
   iconData?: string | null;
@@ -17,15 +18,29 @@ export interface PinItem {
   comboTargets?: string[] | null;
 }
 
+export type WidgetPreset =
+  | 'media_clipboard'
+  | 'telemetry_processes'
+  | 'audio_mic'
+  | 'full_grid';
+
 export interface CustomSpace {
   id: string;
   name: string;
   accentHex: string;
   accentRgb: string;
+  widgetPreset?: WidgetPreset;
   items: PinItem[];
 }
 
 export type SecondaryTaskbarMode = 'testbar' | 'native' | 'hidden';
+export type GlassDepth = 'crystal' | 'obsidian' | 'matte';
+export type SnapZone = 'left' | 'right' | 'maximize' | 'restore' | 'center';
+
+export interface FrecencyEntry {
+  count: number;
+  lastUsedMs: number;
+}
 
 export interface TestBarConfig {
   schemaVersion: number;
@@ -33,6 +48,12 @@ export interface TestBarConfig {
   barMode: 'dock' | 'edge';
   secondaryTaskbarMode: SecondaryTaskbarMode;
   autostart: boolean;
+  glassDepth?: GlassDepth;
+  clockShowSeconds?: boolean;
+  clockShowWeekday?: boolean;
+  startRememberSpace?: boolean;
+  hiddenTrayKeys?: string[];
+  frecency?: Record<string, FrecencyEntry>;
   taskbarPins: PinItem[];
   personalPins: PinItem[];
   personalLinks: PinItem[];
@@ -55,6 +76,7 @@ export interface OpenWindowInfo {
   aumid?: string | null;
   isActive: boolean;
   isMinimized: boolean;
+  isTopmost?: boolean;
 }
 
 export interface AppWindowGroup {
@@ -93,6 +115,7 @@ export interface SteamGame {
   launcher: string;
   target: string;
   coverData?: string | null;
+  coverPath?: string | null;
   lastUpdated: number;
 }
 
@@ -111,6 +134,8 @@ export interface AudioSessionInfo {
   volume: number;
   muted: boolean;
   isActive: boolean;
+  peak?: number;
+  iconKey?: string | null;
 }
 
 export interface AudioMasterState {
@@ -126,8 +151,26 @@ export interface AudioState {
   masterVolume: number;
   masterMuted: boolean;
   micMuted: boolean;
+  masterPeak?: number;
+  micPeak?: number;
   devices: AudioDeviceInfo[];
+  inputDevices?: AudioDeviceInfo[];
   sessions: AudioSessionInfo[];
+}
+
+export interface AudioPeaksSnapshot {
+  masterPeak: number;
+  micPeak: number;
+  sessionPeaks: Array<[string, number]>;
+}
+
+export interface MediaSessionSummary {
+  id: string;
+  appName: string;
+  title: string;
+  artist: string;
+  isPlaying: boolean;
+  isCurrent: boolean;
 }
 
 export interface MediaState {
@@ -138,6 +181,20 @@ export interface MediaState {
   isPlaying: boolean;
   positionSec: number;
   durationSec: number;
+  canSeek?: boolean;
+  lastUpdatedMs?: number;
+  thumbnail?: string | null;
+  sessions?: MediaSessionSummary[];
+  activeSessionId?: string;
+}
+
+export interface DiskHeadroomInfo {
+  mount: string;
+  name: string;
+  usedGb: number;
+  totalGb: number;
+  freeGb: number;
+  usedPct: number;
 }
 
 export interface TopProcessInfo {
@@ -148,6 +205,8 @@ export interface TopProcessInfo {
   vramGb: number;
   usesGpu: boolean;
   cpuPct: number;
+  iconKey?: string | null;
+  hwnd?: number | null;
   iconData?: string | null;
 }
 
@@ -166,12 +225,19 @@ export interface TelemetryState {
   vramPct: number;
   topProcesses: TopProcessInfo[];
   gpuProcesses: TopProcessInfo[];
+  disks?: DiskHeadroomInfo[];
 }
+
+export type ClipboardKind = 'url' | 'path' | 'hex' | 'code' | 'text';
 
 export interface ClipboardEntry {
   id: string;
   tag: string;
   text: string;
+  preview?: string;
+  lineCount?: number;
+  charCount?: number;
+  kind?: ClipboardKind | string;
   color?: string | null;
   pinned: boolean;
 }
@@ -235,6 +301,31 @@ export interface FlyoutRequest {
   noActivate: boolean;
   monitor?: 'primary' | 'secondary';
   payload: unknown;
+  gen?: number;
+  anchorOriginX?: number | null;
+}
+
+export interface StartStateEvent {
+  open: boolean;
+  gen: number;
+  monitor?: 'primary' | 'secondary' | string | null;
+  immediate?: boolean;
+}
+
+export interface FlyoutHideEvent {
+  gen: number;
+}
+
+export function normalizeStartStatePayload(payload: boolean | StartStateEvent): StartStateEvent {
+  if (typeof payload === 'boolean') {
+    return { open: payload, gen: 0, monitor: null, immediate: false };
+  }
+  return {
+    open: Boolean(payload?.open),
+    gen: typeof payload?.gen === 'number' && Number.isFinite(payload.gen) ? payload.gen : 0,
+    monitor: payload?.monitor ?? null,
+    immediate: Boolean(payload?.immediate),
+  };
 }
 
 export interface MergedBarItem {
@@ -252,9 +343,42 @@ export interface MergedBarItem {
   group?: AppWindowGroup;
 }
 
+export const ICON_CACHE_MAX_ENTRIES = 384;
+
+export class LruIconCache extends Map<string, string> {
+  readonly maxEntries: number;
+
+  constructor(maxEntries: number = ICON_CACHE_MAX_ENTRIES) {
+    super();
+    this.maxEntries = Math.max(1, Math.floor(maxEntries));
+  }
+
+  override get(key: string): string | undefined {
+    const val = super.get(key);
+    if (val !== undefined) {
+      super.delete(key);
+      super.set(key, val);
+    }
+    return val;
+  }
+
+  override set(key: string, value: string): this {
+    if (super.has(key)) {
+      super.delete(key);
+    }
+    super.set(key, value);
+    while (this.size > this.maxEntries) {
+      const oldest = this.keys().next().value;
+      if (oldest === undefined) break;
+      super.delete(oldest);
+    }
+    return this;
+  }
+}
+
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
-export const iconCache = new Map<string, string>();
+export const iconCache: Map<string, string> = new LruIconCache(ICON_CACHE_MAX_ENTRIES);
 const inFlightIconRequests = new Map<string, Promise<string | undefined>>();
 
 export function isCacheIconKey(key: string | null | undefined): key is string {
@@ -547,4 +671,238 @@ export async function ipc<T>(cmd: string, args?: Record<string, unknown>): Promi
 export async function onEvent<T>(event: string, cb: (payload: T) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => {};
   return listen<T>(event, (e) => cb(e.payload));
+}
+
+// ======================= TYPED IPC COMMAND WRAPPERS =======================
+
+export function surfaceCommitAck(
+  surface: 'start' | 'flyout',
+  gen: number,
+  measuredHeight?: number,
+): Promise<void> {
+  return ipc<void>('surface_commit_ack', {
+    surface,
+    gen,
+    measuredHeight: measuredHeight ?? null,
+  });
+}
+
+export function surfaceExitAck(surface: 'start' | 'flyout', gen: number): Promise<void> {
+  return ipc<void>('surface_exit_ack', { surface, gen });
+}
+
+export function dismissOverlays(): Promise<void> {
+  return ipc<void>('dismiss_overlays');
+}
+
+export function toggleStart(
+  force?: boolean,
+  monitor?: 'primary' | 'secondary',
+): Promise<void> {
+  return ipc<void>('toggle_start', {
+    force: force ?? null,
+    monitor: monitor ?? null,
+  });
+}
+
+export function getAudioPeaks(): Promise<AudioPeaksSnapshot> {
+  return ipc<AudioPeaksSnapshot>('get_audio_peaks');
+}
+
+export function setInputDevice(deviceId: string): Promise<AudioState> {
+  return ipc<AudioState>('set_input_device', { deviceId });
+}
+
+export function setSessionState(params: {
+  appKey: string;
+  volume?: number;
+  muted?: boolean;
+  pid?: number;
+  pids?: number[];
+}): Promise<AudioState> {
+  return ipc<AudioState>('set_session_state', {
+    appKey: params.appKey,
+    volume: params.volume ?? null,
+    muted: params.muted ?? null,
+    pid: params.pid ?? null,
+    pids: params.pids ?? null,
+  });
+}
+
+export function seekMedia(positionSec: number): Promise<MediaState> {
+  return ipc<MediaState>('seek_media', { positionSec });
+}
+
+export function selectMediaSession(sessionId: string): Promise<MediaState> {
+  return ipc<MediaState>('select_media_session', { sessionId });
+}
+
+export function snapWindow(hwnd: number, zone: SnapZone): Promise<void> {
+  return ipc<void>('snap_window', { hwnd, zone });
+}
+
+export function toggleWindowTopmost(hwnd: number): Promise<boolean> {
+  return ipc<boolean>('toggle_window_topmost', { hwnd });
+}
+
+export function minimizeOtherWindows(keepHwnd: number): Promise<number> {
+  return ipc<number>('minimize_other_windows', { keepHwnd });
+}
+
+export function launchNewWindow(
+  exePath: string,
+  args?: string | null,
+  closeStart?: boolean,
+): Promise<void> {
+  return ipc<void>('launch_new_window', {
+    exePath,
+    args: args ?? null,
+    closeStart: closeStart ?? false,
+  });
+}
+
+export function deleteClipboardEntry(id: string): Promise<ClipboardEntry[]> {
+  return ipc<ClipboardEntry[]>('delete_clipboard_entry', { id });
+}
+
+export function setClipboardPaused(paused: boolean): Promise<boolean> {
+  return ipc<boolean>('set_clipboard_paused', { paused });
+}
+
+export function getClipboardPaused(): Promise<boolean> {
+  return ipc<boolean>('get_clipboard_paused');
+}
+
+export function pasteClipboardEntry(text: string): Promise<void> {
+  return ipc<void>('paste_clipboard_entry', { text });
+}
+
+export function emptyRecycleBin(): Promise<void> {
+  return ipc<void>('empty_recycle_bin');
+}
+
+export function openScreenSnip(): Promise<void> {
+  return ipc<void>('open_screen_snip');
+}
+
+export function loadGameCover(coverPath: string): Promise<string | null> {
+  return ipc<string | null>('load_game_cover', { coverPath });
+}
+
+export function refreshIndexes(): Promise<void> {
+  return ipc<void>('refresh_indexes');
+}
+
+export function updateCustomSpace(params: {
+  id: string;
+  name?: string;
+  accent?: string;
+  accentHex?: string;
+  accentRgb?: string;
+  widgetPreset?: WidgetPreset;
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('update_custom_space', {
+    id: params.id,
+    name: params.name ?? null,
+    accent: params.accent ?? null,
+    accentHex: params.accentHex ?? null,
+    accentRgb: params.accentRgb ?? null,
+    widgetPreset: params.widgetPreset ?? null,
+  });
+}
+
+export function deleteCustomSpace(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('delete_custom_space', { id });
+}
+
+export function updatePin(params: {
+  space: string;
+  pinId: string;
+  title?: string;
+  target?: string;
+  args?: string;
+  altAction?: string;
+  altLabel?: string;
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('update_pin', {
+    space: params.space,
+    pinId: params.pinId,
+    title: params.title ?? null,
+    target: params.target ?? null,
+    args: params.args ?? null,
+    altAction: params.altAction ?? null,
+    altLabel: params.altLabel ?? null,
+  });
+}
+
+export function addGameCombo(params: {
+  name: string;
+  subtitle?: string;
+  accent?: string;
+  steps: string[];
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('add_game_combo', {
+    name: params.name,
+    subtitle: params.subtitle ?? null,
+    accent: params.accent ?? null,
+    steps: params.steps,
+  });
+}
+
+export function updateGameCombo(params: {
+  id: string;
+  name?: string;
+  subtitle?: string;
+  accent?: string;
+  steps?: string[];
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('update_game_combo', {
+    id: params.id,
+    name: params.name ?? null,
+    subtitle: params.subtitle ?? null,
+    accent: params.accent ?? null,
+    steps: params.steps ?? null,
+  });
+}
+
+export function deleteGameCombo(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('delete_game_combo', { id });
+}
+
+export function setAppearanceSettings(params: {
+  glassDepth?: GlassDepth;
+  clockShowSeconds?: boolean;
+  clockShowWeekday?: boolean;
+  startRememberSpace?: boolean;
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('set_appearance_settings', {
+    glassDepth: params.glassDepth ?? null,
+    clockShowSeconds: params.clockShowSeconds ?? null,
+    clockShowWeekday: params.clockShowWeekday ?? null,
+    startRememberSpace: params.startRememberSpace ?? null,
+  });
+}
+
+export function hideTrayApp(key: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('hide_tray_app', { key });
+}
+
+export function restoreTrayApp(key: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('restore_tray_app', { key });
+}
+
+export function restoreAllTrayApps(): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('restore_all_tray_apps');
+}
+
+export function recordFrecency(itemId: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('record_frecency', { itemId });
+}
+
+export function exportConfigDialog(): Promise<string | null> {
+  return ipc<string | null>('export_config_dialog');
+}
+
+export function importConfigDialog(): Promise<TestBarConfig | null> {
+  return ipc<TestBarConfig | null>('import_config_dialog');
 }

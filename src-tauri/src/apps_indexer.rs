@@ -2,16 +2,18 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use windows::core::{Interface, GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM,
 };
 use windows::Win32::System::Registry::{
-    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
+    HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::UI::Shell::{
@@ -30,8 +32,12 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
     pid: 5,
 };
 
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+const MAX_GAME_COVER_BYTES: usize = 1_800_000;
+
 pub const DEFAULT_USER_FILE_MAX_DEPTH: usize = 2;
 pub const DEFAULT_USER_FILE_CAP: usize = 400;
+pub const DEFAULT_USER_FILE_MAX_VISITED: usize = 4_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +72,8 @@ pub struct SteamGame {
     pub launcher: String,
     pub target: String,
     pub cover_data: Option<String>,
+    #[serde(default)]
+    pub cover_path: Option<String>,
     pub last_updated: u64,
 }
 
@@ -90,41 +98,56 @@ fn pwstr_to_string_and_free(raw: PWSTR) -> Option<String> {
     }
 }
 
-fn resolve_lnk_target_and_args(lnk_path: &Path) -> Option<(String, String)> {
-    unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let pf: IPersistFile = link.cast().ok()?;
-        let w = wide(&lnk_path.to_string_lossy());
-        pf.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
+/// Reusable `IShellLinkW` + `IPersistFile` COM pair so Start Menu indexing creates one COM object
+/// per scan instead of calling `CoCreateInstance` hundreds of times.
+struct LnkResolver {
+    link: IShellLinkW,
+    persist: IPersistFile,
+}
 
-        let mut path_buf = [0u16; 1024];
-        let mut fd = std::mem::zeroed();
-        link.GetPath(&mut path_buf, &mut fd, 0).ok()?;
-        let path_len = path_buf
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(path_buf.len());
-        let resolved = String::from_utf16_lossy(&path_buf[..path_len])
-            .trim()
-            .to_string();
-        if resolved.is_empty() {
-            return None;
+impl LnkResolver {
+    fn new() -> Option<Self> {
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+            let persist: IPersistFile = link.cast().ok()?;
+            Some(Self { link, persist })
         }
+    }
 
-        let mut args_buf = [0u16; 512];
-        let args = if link.GetArguments(&mut args_buf).is_ok() {
-            let args_len = args_buf
+    fn resolve_target_and_args(&self, lnk_path: &Path) -> Option<(String, String)> {
+        unsafe {
+            let w = wide(&lnk_path.to_string_lossy());
+            self.persist.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
+
+            let mut path_buf = [0u16; 1024];
+            let mut fd = std::mem::zeroed();
+            self.link.GetPath(&mut path_buf, &mut fd, 0).ok()?;
+            let path_len = path_buf
                 .iter()
                 .position(|&c| c == 0)
-                .unwrap_or(args_buf.len());
-            String::from_utf16_lossy(&args_buf[..args_len])
+                .unwrap_or(path_buf.len());
+            let resolved = String::from_utf16_lossy(&path_buf[..path_len])
                 .trim()
-                .to_string()
-        } else {
-            String::new()
-        };
+                .to_string();
+            if resolved.is_empty() {
+                return None;
+            }
 
-        Some((resolved, args))
+            let mut args_buf = [0u16; 512];
+            let args = if self.link.GetArguments(&mut args_buf).is_ok() {
+                let args_len = args_buf
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(args_buf.len());
+                String::from_utf16_lossy(&args_buf[..args_len])
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+
+            Some((resolved, args))
+        }
     }
 }
 
@@ -493,6 +516,11 @@ pub fn scan_installed_apps_cached(
 
     {
         let com = ComGuard::init_sta();
+        let lnk_resolver = if com.is_usable() {
+            LnkResolver::new()
+        } else {
+            None
+        };
         for lnk in lnks {
             let name = match lnk.file_stem().map(|s| s.to_string_lossy().to_string()) {
                 Some(n) if !n.trim().is_empty() => n.trim().to_string(),
@@ -503,11 +531,9 @@ pub fn scan_installed_apps_cached(
             }
 
             let lnk_str = lnk.to_string_lossy().to_string();
-            let resolved = if com.is_usable() {
-                resolve_lnk_target_and_args(&lnk)
-            } else {
-                None
-            };
+            let resolved = lnk_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.resolve_target_and_args(&lnk));
 
             let (target, icon_source) = match resolved {
                 Some((exe, args))
@@ -642,21 +668,41 @@ fn file_modified_ts(meta: &fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+fn is_reparse_point_or_symlink(entry: &fs::DirEntry, path: &Path) -> Option<(bool, Option<fs::Metadata>)> {
+    let ft = entry.file_type().ok()?;
+    if ft.is_symlink() {
+        return None;
+    }
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return None;
+    }
+    Some((ft.is_dir(), Some(meta)))
+}
+
 fn walk_user_files(
     dir: &Path,
     location: &str,
     depth: usize,
     max_depth: usize,
+    max_visited: usize,
+    visited: &mut usize,
     out: &mut Vec<IndexedFile>,
     seen_targets: &mut HashSet<String>,
 ) {
-    if depth > max_depth || !dir.exists() {
+    if depth > max_depth || *visited >= max_visited || !dir.exists() {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if *visited >= max_visited {
+            return;
+        }
+        *visited += 1;
+
         let path = entry.path();
         let Some(name_os) = path.file_name() else {
             continue;
@@ -665,10 +711,11 @@ fn walk_user_files(
         if name.is_empty() {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
+        // Use `entry.file_type()` + `symlink_metadata` (never `entry.metadata()` which follows links)
+        // so Windows NTFS directory junctions (My Music / My Pictures / My Videos) & symlinks are skipped.
+        let Some((is_dir, meta_opt)) = is_reparse_point_or_symlink(&entry, &path) else {
             continue;
         };
-        let is_dir = meta.is_dir();
         if is_dir {
             if is_excluded_user_dir_name(&name) {
                 continue;
@@ -679,6 +726,7 @@ fn walk_user_files(
 
         let target = path.to_string_lossy().to_string();
         let target_key = target.replace('/', "\\").to_lowercase();
+        let modified_ts = meta_opt.as_ref().map(file_modified_ts).unwrap_or(0);
         if seen_targets.insert(target_key) {
             out.push(IndexedFile {
                 id: String::new(),
@@ -690,30 +738,51 @@ fn walk_user_files(
                 },
                 location: location.to_string(),
                 target,
-                modified_ts: file_modified_ts(&meta),
+                modified_ts,
             });
         }
 
-        if is_dir && depth < max_depth {
-            walk_user_files(&path, location, depth + 1, max_depth, out, seen_targets);
+        if is_dir && depth < max_depth && *visited < max_visited {
+            walk_user_files(
+                &path,
+                location,
+                depth + 1,
+                max_depth,
+                max_visited,
+                visited,
+                out,
+                seen_targets,
+            );
         }
     }
 }
 
-/// Pure, testable user-files scanner across caller-specified root folders.
-/// Respects `max_depth`, excludes `node_modules`/`.git`/`target`/hidden/temp entries,
-/// sorts newest-modified first, and caps at `max_items`.
-pub fn scan_user_files_in_roots(
+/// Pure, testable user-files scanner across caller-specified root folders with a hard traversal cap.
+pub fn scan_user_files_in_roots_bounded(
     roots: &[(&str, PathBuf)],
     max_depth: usize,
     max_items: usize,
+    max_visited: usize,
 ) -> Vec<IndexedFile> {
     let mut out = Vec::new();
     let mut seen_targets = HashSet::new();
+    let mut visited = 0usize;
 
     for (location, root) in roots {
+        if visited >= max_visited {
+            break;
+        }
         if root.is_dir() {
-            walk_user_files(root, location, 0, max_depth, &mut out, &mut seen_targets);
+            walk_user_files(
+                root,
+                location,
+                0,
+                max_depth,
+                max_visited,
+                &mut visited,
+                &mut out,
+                &mut seen_targets,
+            );
         }
     }
 
@@ -729,6 +798,17 @@ pub fn scan_user_files_in_roots(
         item.id = format!("ufile-{idx}");
     }
     out
+}
+
+/// Pure, testable user-files scanner across caller-specified root folders.
+/// Respects `max_depth`, excludes `node_modules`/`.git`/`target`/hidden/temp/junction entries,
+/// enforces a 4,000-entry traversal cap, sorts newest-modified first, and caps at `max_items`.
+pub fn scan_user_files_in_roots(
+    roots: &[(&str, PathBuf)],
+    max_depth: usize,
+    max_items: usize,
+) -> Vec<IndexedFile> {
+    scan_user_files_in_roots_bounded(roots, max_depth, max_items, DEFAULT_USER_FILE_MAX_VISITED)
 }
 
 /// Scans `Desktop`, `Documents`, and `Downloads` (depth <= 2, capped at 400 recent items)
@@ -1041,19 +1121,59 @@ pub fn parse_appmanifest_acf(content: &str) -> Option<(String, String, u64)> {
     Some((id, title, last_updated.max(last_played)))
 }
 
-fn read_jpeg_data_uri(path: &Path) -> Option<String> {
+fn detect_cover_image_mime(bytes: &[u8], path: &Path) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Safely reads an on-disk game cover image up to 1.8 MB and returns a `data:image/...;base64,...` URI.
+/// Checks file size BEFORE allocating memory and validates magic bytes / image extension.
+pub fn load_game_cover_data(cover_path: &str) -> Option<String> {
+    let trimmed = cover_path.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\0')
+        || trimmed.contains('\r')
+        || trimmed.contains('\n')
+    {
+        return None;
+    }
+    let path = Path::new(trimmed);
     if !path.is_file() {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
-    if bytes.is_empty() || bytes.len() > 1_800_000 {
+    let meta = fs::metadata(path).ok()?;
+    let size = meta.len();
+    if size == 0 || size > MAX_GAME_COVER_BYTES as u64 {
         return None;
     }
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_GAME_COVER_BYTES {
+        return None;
+    }
+    let mime = detect_cover_image_mime(&bytes, path)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(format!("data:image/jpeg;base64,{b64}"))
+    Some(format!("data:{mime};base64,{b64}"))
 }
 
-fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
+/// Locates the best cached Steam cover image path on disk without reading any image bytes.
+pub fn find_steam_cover_path(steam_root: &Path, app_id: &str) -> Option<PathBuf> {
     let cache_dir = steam_root.join("appcache").join("librarycache");
     let candidates = [
         cache_dir.join(app_id).join("library_hero.jpg"),
@@ -1064,8 +1184,8 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
         cache_dir.join(format!("{app_id}_library_600x900.jpg")),
     ];
     for p in candidates {
-        if let Some(uri) = read_jpeg_data_uri(&p) {
-            return Some(uri);
+        if p.is_file() {
+            return Some(p);
         }
     }
     // Also scan nested hashed subfolders inside appcache/librarycache/<appid>/
@@ -1077,8 +1197,8 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
                 if sub.is_dir() {
                     for fname in ["library_hero.jpg", "header.jpg", "library_600x900.jpg"] {
                         let cand = sub.join(fname);
-                        if let Some(uri) = read_jpeg_data_uri(&cand) {
-                            return Some(uri);
+                        if cand.is_file() {
+                            return Some(cand);
                         }
                     }
                 }
@@ -1088,8 +1208,7 @@ fn load_steam_cover_data(steam_root: &Path, app_id: &str) -> Option<String> {
     None
 }
 
-/// Pure, testable multi-library Steam scanner given candidate Steam roots.
-pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
+fn scan_steam_games_in_roots_mode(steam_roots: &[PathBuf], inline_covers: bool) -> Vec<SteamGame> {
     let mut primary_steam: Option<PathBuf> = None;
     let mut library_dirs: Vec<PathBuf> = Vec::new();
     let mut seen_libs: HashSet<String> = HashSet::new();
@@ -1148,10 +1267,16 @@ pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
                     if !seen_app_ids.insert(app_id.clone()) {
                         continue;
                     }
-                    let cover_data = primary_steam
+                    let cover_path = primary_steam
                         .as_deref()
-                        .and_then(|sr| load_steam_cover_data(sr, &app_id))
-                        .or_else(|| load_steam_cover_data(lib, &app_id));
+                        .and_then(|sr| find_steam_cover_path(sr, &app_id))
+                        .or_else(|| find_steam_cover_path(lib, &app_id))
+                        .map(|cp| cp.to_string_lossy().to_string());
+                    let cover_data = if inline_covers {
+                        cover_path.as_deref().and_then(load_game_cover_data)
+                    } else {
+                        None
+                    };
 
                     games.push(SteamGame {
                         app_id: app_id.clone(),
@@ -1159,6 +1284,7 @@ pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
                         launcher: "Steam".to_string(),
                         target: format!("steam://rungameid/{app_id}"),
                         cover_data,
+                        cover_path,
                         last_updated,
                     });
                 }
@@ -1174,9 +1300,300 @@ pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
     games
 }
 
+/// Pure, testable multi-library Steam scanner given candidate Steam roots (legacy inline cover mode).
+pub fn scan_steam_games_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
+    scan_steam_games_in_roots_mode(steam_roots, true)
+}
+
+/// Pure, testable multi-library Steam scanner populating `cover_path` only (`cover_data: None`).
+pub fn scan_steam_games_lightweight_in_roots(steam_roots: &[PathBuf]) -> Vec<SteamGame> {
+    scan_steam_games_in_roots_mode(steam_roots, false)
+}
+
 pub fn scan_steam_games() -> Vec<SteamGame> {
     let candidates = all_steam_root_candidates();
     scan_steam_games_in_roots(&candidates)
+}
+
+/// Parses an Epic Games Launcher `.item` manifest JSON into a `SteamGame` entry.
+/// Skips incomplete installs (`bIsIncompleteInstall == true`) and DLCs (`MainGameAppName != AppName`).
+pub fn parse_epic_manifest_item(content: &str, fallback_ts: u64) -> Option<SteamGame> {
+    let json: serde_json::Value = serde_json::from_str(content).ok()?;
+    if json
+        .get("bIsIncompleteInstall")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let app_name = json
+        .get("AppName")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let display_name = json
+        .get("DisplayName")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    if let Some(main_app) = json
+        .get("MainGameAppName")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !main_app.eq_ignore_ascii_case(app_name) {
+            return None;
+        }
+    }
+
+    let ns = json
+        .get("CatalogNamespace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let item_id = json
+        .get("CatalogItemId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let target = match (ns, item_id) {
+        (Some(n), Some(i)) => {
+            format!("com.epicgames.launcher://apps/{n}%3A{i}%3A{app_name}?action=launch&silent=true")
+        }
+        _ => format!("com.epicgames.launcher://apps/{app_name}?action=launch&silent=true"),
+    };
+
+    Some(SteamGame {
+        app_id: format!("epic:{app_name}"),
+        name: display_name.to_string(),
+        launcher: "Epic Games".to_string(),
+        target,
+        cover_data: None,
+        cover_path: None,
+        last_updated: fallback_ts,
+    })
+}
+
+/// Scans an Epic Games manifests folder (`*.item`) gracefully, returning empty if absent.
+pub fn scan_epic_games_in_dir(dir: &Path) -> Vec<SteamGame> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut games = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let is_item = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("item"))
+            .unwrap_or(false);
+        if !is_item || !p.is_file() {
+            continue;
+        }
+        let fallback_ts = fs::metadata(&p).ok().map(|m| file_modified_ts(&m)).unwrap_or(0);
+        if let Ok(content) = fs::read_to_string(&p) {
+            if let Some(game) = parse_epic_manifest_item(&content, fallback_ts) {
+                let key = game.app_id.to_ascii_lowercase();
+                if seen.insert(key) {
+                    games.push(game);
+                }
+            }
+        }
+    }
+    games
+}
+
+struct RegKeyGuard(HKEY);
+
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+/// Pure builder turning GOG Galaxy registry string values into a `SteamGame` entry.
+/// Skips DLC entries where `depends_on` is populated.
+pub fn build_gog_game_entry(
+    subkey_name: &str,
+    game_id: Option<&str>,
+    game_name: Option<&str>,
+    exe: Option<&str>,
+    install_path: Option<&str>,
+    depends_on: Option<&str>,
+) -> Option<SteamGame> {
+    if depends_on
+        .map(str::trim)
+        .is_some_and(|dep| !dep.is_empty())
+    {
+        return None;
+    }
+
+    let id = game_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let s = subkey_name.trim();
+            (!s.is_empty()).then_some(s)
+        })?;
+    let name = game_name.map(str::trim).filter(|s| !s.is_empty())?;
+
+    let direct_exe = exe
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else if let Some(base) = install_path.map(str::trim).filter(|s| !s.is_empty()) {
+                Path::new(base).join(p)
+            } else {
+                p
+            }
+        })
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let target = direct_exe.unwrap_or_else(|| format!("goggalaxy://openGameView/{id}"));
+
+    Some(SteamGame {
+        app_id: format!("gog:{id}"),
+        name: name.to_string(),
+        launcher: "GOG".to_string(),
+        target,
+        cover_data: None,
+        cover_path: None,
+        last_updated: 0,
+    })
+}
+
+fn scan_gog_registry_branch(root: HKEY, base_subkey: &str) -> Vec<SteamGame> {
+    let mut hkey = HKEY::default();
+    let subkey_w = wide(base_subkey);
+    let open_status = unsafe {
+        RegOpenKeyExW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if open_status != ERROR_SUCCESS || hkey.is_invalid() {
+        return Vec::new();
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    let mut games = Vec::new();
+    let mut index = 0u32;
+    let mut name_buf = [0u16; 256];
+
+    loop {
+        let mut name_len = name_buf.len() as u32;
+        let status = unsafe {
+            RegEnumKeyExW(
+                hkey,
+                index,
+                PWSTR(name_buf.as_mut_ptr()),
+                &mut name_len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            )
+        };
+        index = index.saturating_add(1);
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        let sub_name = String::from_utf16_lossy(&name_buf[..(name_len as usize).min(name_buf.len())])
+            .trim()
+            .to_string();
+        if sub_name.is_empty() {
+            continue;
+        }
+        let full_subkey = format!("{base_subkey}\\{sub_name}");
+        let game_id = read_registry_sz(root, &full_subkey, "gameID");
+        let game_name = read_registry_sz(root, &full_subkey, "gameName")
+            .or_else(|| read_registry_sz(root, &full_subkey, "GAMENAME"));
+        let exe = read_registry_sz(root, &full_subkey, "exe");
+        let install_path = read_registry_sz(root, &full_subkey, "path");
+        let depends_on = read_registry_sz(root, &full_subkey, "dependsOn");
+
+        if let Some(game) = build_gog_game_entry(
+            &sub_name,
+            game_id.as_deref(),
+            game_name.as_deref(),
+            exe.as_deref(),
+            install_path.as_deref(),
+            depends_on.as_deref(),
+        ) {
+            games.push(game);
+        }
+    }
+
+    games
+}
+
+fn scan_gog_games() -> Vec<SteamGame> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for branch in [
+        r"SOFTWARE\WOW6432Node\GOG.com\Games",
+        r"SOFTWARE\GOG.com\Games",
+    ] {
+        for g in scan_gog_registry_branch(HKEY_LOCAL_MACHINE, branch) {
+            let key = g.app_id.to_ascii_lowercase();
+            if seen.insert(key) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
+/// Lightweight multi-launcher game discovery (Steam + Epic Games + GOG Galaxy).
+/// Leaves `cover_data: None` and populates `cover_path` so IPC payloads stay ~15 KB
+/// while UI hydrates covers lazily via `load_game_cover_data`.
+pub fn scan_games_lightweight() -> Vec<SteamGame> {
+    let mut combined = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push_unique = |list: Vec<SteamGame>| {
+        for game in list {
+            let key = game.app_id.to_ascii_lowercase();
+            if seen.insert(key) {
+                combined.push(game);
+            }
+        }
+    };
+
+    push_unique(scan_steam_games_lightweight_in_roots(&all_steam_root_candidates()));
+    push_unique(scan_epic_games_in_dir(Path::new(
+        r"C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests",
+    )));
+    push_unique(scan_gog_games());
+
+    combined.sort_by(|a, b| {
+        b.last_updated
+            .cmp(&a.last_updated)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    combined
 }
 
 pub fn pick_folder_dialog() -> Option<String> {
@@ -1585,7 +2002,155 @@ mod tests {
             .cover_data
             .as_deref()
             .is_some_and(|u| u.starts_with("data:image/jpeg;base64,")));
+        assert!(games[1].cover_path.is_some());
+
+        // 3. Lightweight scan populates cover_path ONLY (cover_data == None), and load_game_cover_data hydrates lazily
+        let light = scan_steam_games_lightweight_in_roots(&[primary]);
+        assert_eq!(light.len(), 2);
+        assert!(light.iter().all(|g| g.cover_data.is_none()));
+        assert!(light.iter().all(|g| g.cover_path.is_some()));
+
+        let hydrated = load_game_cover_data(light[0].cover_path.as_deref().unwrap());
+        assert!(hydrated
+            .as_deref()
+            .is_some_and(|u| u.starts_with("data:image/jpeg;base64,")));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_files_traversal_cap_bounds_large_directories() {
+        let root = make_temp_dir("user-files-cap");
+        for i in 0..35 {
+            fs::write(root.join(format!("file_{i:02}.txt")), b"data").unwrap();
+        }
+        // Hard cap of 10 visited entries must stop traversal cleanly well below 35
+        let bounded = scan_user_files_in_roots_bounded(&[("Документы", root.clone())], 2, 400, 10);
+        assert_eq!(bounded.len(), 10);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn epic_and_gog_discovery_parses_games_and_skips_dlcs_and_incomplete_installs() {
+        let dir = make_temp_dir("epic-gog");
+
+        // Valid Epic game manifest
+        let epic_ok = r#"{
+            "DisplayName": "Alan Wake 2",
+            "AppName": "AlanWake2App",
+            "MainGameAppName": "AlanWake2App",
+            "CatalogNamespace": "ns123",
+            "CatalogItemId": "item456",
+            "bIsIncompleteInstall": false
+        }"#;
+        // Epic DLC (MainGameAppName != AppName) -> must skip
+        let epic_dlc = r#"{
+            "DisplayName": "Alan Wake 2 Night Springs DLC",
+            "AppName": "AlanWake2Dlc1",
+            "MainGameAppName": "AlanWake2App",
+            "CatalogNamespace": "ns123",
+            "CatalogItemId": "item789",
+            "bIsIncompleteInstall": false
+        }"#;
+        // Epic incomplete install -> must skip
+        let epic_incomplete = r#"{
+            "DisplayName": "Broken Game",
+            "AppName": "BrokenApp",
+            "bIsIncompleteInstall": true
+        }"#;
+
+        fs::write(dir.join("ok.item"), epic_ok).unwrap();
+        fs::write(dir.join("dlc.item"), epic_dlc).unwrap();
+        fs::write(dir.join("inc.item"), epic_incomplete).unwrap();
+        fs::write(dir.join("ignore.txt"), b"not a manifest").unwrap();
+
+        let epic_games = scan_epic_games_in_dir(&dir);
+        assert_eq!(epic_games.len(), 1);
+        assert_eq!(epic_games[0].app_id, "epic:AlanWake2App");
+        assert_eq!(epic_games[0].name, "Alan Wake 2");
+        assert_eq!(epic_games[0].launcher, "Epic Games");
+        assert_eq!(
+            epic_games[0].target,
+            "com.epicgames.launcher://apps/ns123%3Aitem456%3AAlanWake2App?action=launch&silent=true"
+        );
+        assert!(epic_games[0].cover_data.is_none());
+
+        // Missing Epic dir degrades gracefully to empty Vec
+        assert!(scan_epic_games_in_dir(&dir.join("missing_dir")).is_empty());
+
+        // GOG entry builder: direct exe if file exists, protocol fallback otherwise, skip DLC
+        let fake_exe = dir.join("Cyberpunk2077.exe");
+        fs::write(&fake_exe, b"MZ").unwrap();
+        let gog_direct = build_gog_game_entry(
+            "1423049311",
+            Some("1423049311"),
+            Some("Cyberpunk 2077"),
+            Some(&fake_exe.to_string_lossy()),
+            Some(&dir.to_string_lossy()),
+            None,
+        )
+        .expect("valid GOG game");
+        assert_eq!(gog_direct.app_id, "gog:1423049311");
+        assert_eq!(gog_direct.launcher, "GOG");
+        assert_eq!(gog_direct.target, fake_exe.to_string_lossy());
+
+        let gog_proto = build_gog_game_entry(
+            "1207658924",
+            Some("1207658924"),
+            Some("The Witcher 3"),
+            Some(r"Z:\Nonexistent\witcher3.exe"),
+            None,
+            None,
+        )
+        .expect("GOG fallback target");
+        assert_eq!(gog_proto.target, "goggalaxy://openGameView/1207658924");
+
+        let gog_dlc = build_gog_game_entry(
+            "1207658999",
+            Some("1207658999"),
+            Some("Blood and Wine DLC"),
+            None,
+            None,
+            Some("1207658924"),
+        );
+        assert!(gog_dlc.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_game_cover_data_validates_magic_bytes_size_and_paths() {
+        let dir = make_temp_dir("cover-loader");
+
+        let png_path = dir.join("cover.png");
+        fs::write(&png_path, b"\x89PNG\r\n\x1a\nfake-png-body").unwrap();
+        let png_uri = load_game_cover_data(&png_path.to_string_lossy()).expect("valid png");
+        assert!(png_uri.starts_with("data:image/png;base64,"));
+
+        let webp_path = dir.join("cover.webp");
+        fs::write(&webp_path, b"RIFF1234WEBPbody").unwrap();
+        let webp_uri = load_game_cover_data(&webp_path.to_string_lossy()).expect("valid webp");
+        assert!(webp_uri.starts_with("data:image/webp;base64,"));
+
+        // Non-image file must be rejected
+        let txt_path = dir.join("notes.txt");
+        fs::write(&txt_path, b"hello world").unwrap();
+        assert!(load_game_cover_data(&txt_path.to_string_lossy()).is_none());
+
+        // Oversized (> 1.8 MB) file must be rejected without loading
+        let huge_path = dir.join("huge.jpg");
+        let mut huge = vec![0u8; MAX_GAME_COVER_BYTES + 16];
+        huge[0] = 0xFF;
+        huge[1] = 0xD8;
+        huge[2] = 0xFF;
+        fs::write(&huge_path, huge).unwrap();
+        assert!(load_game_cover_data(&huge_path.to_string_lossy()).is_none());
+
+        // Missing or control-char paths rejected
+        assert!(load_game_cover_data("").is_none());
+        assert!(load_game_cover_data("C:\\bad\0path.jpg").is_none());
+        assert!(load_game_cover_data(&dir.join("missing.jpg").to_string_lossy()).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

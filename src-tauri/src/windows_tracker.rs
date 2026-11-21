@@ -4,17 +4,21 @@ use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
     ERROR_SUCCESS, HWND, LPARAM, RECT, RPC_E_CHANGED_MODE, SIZE, STILL_ACTIVE, S_FALSE, S_OK,
     WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    GetDC, GetDIBits, GetObjectW, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAP,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HBITMAP, SRCCOPY,
+    GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromWindow, ReleaseDC, SelectObject,
+    SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    HALFTONE, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
@@ -35,20 +39,38 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DrawIconEx, EnumChildWindows, EnumWindows, GetClassLongPtrW, GetClassNameW,
     GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindow, DI_NORMAL, GCLP_HICON,
-    GCLP_HICONSM, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2,
-    SMTO_ABORTIFHUNG, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_GETICON, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, ShowWindowAsync, DI_NORMAL, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, HICON, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, ICON_SMALL2,
+    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_GETICON, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_VISIBLE,
 };
 
+use crate::coordinator::PixelRect;
 use crate::icon_cache::{self, IconCache};
 use crate::win_shell::wide;
 
+const PID_META_CACHE_TTL: Duration = Duration::from_secs(30);
+const PID_META_CACHE_MAX_ENTRIES: usize = 512;
+
+#[derive(Debug, Clone)]
+struct PidMetaEntry {
+    exe_path: String,
+    aumid: Option<String>,
+    cached_at: Instant,
+}
+
 static FALLBACK_ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+static PID_META_CACHE: OnceLock<Mutex<HashMap<u32, PidMetaEntry>>> = OnceLock::new();
 
 fn fallback_icon_cache() -> &'static Mutex<IconCache> {
     FALLBACK_ICON_CACHE.get_or_init(|| Mutex::new(IconCache::default()))
+}
+
+fn pid_meta_cache() -> &'static Mutex<HashMap<u32, PidMetaEntry>> {
+    PID_META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -119,7 +141,49 @@ impl Drop for HBitmapGuard {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WindowDcGuard {
+    hwnd: HWND,
+    hdc: HDC,
+}
+
+impl Drop for WindowDcGuard {
+    fn drop(&mut self) {
+        if !self.hdc.is_invalid() {
+            unsafe {
+                ReleaseDC(self.hwnd, self.hdc);
+            }
+        }
+    }
+}
+
+struct MemDcGuard(HDC);
+
+impl Drop for MemDcGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(self.0);
+            }
+        }
+    }
+}
+
+struct SelectedObjGuard {
+    hdc: HDC,
+    prev: HGDIOBJ,
+}
+
+impl Drop for SelectedObjGuard {
+    fn drop(&mut self) {
+        if !self.hdc.is_invalid() && !self.prev.0.is_null() {
+            unsafe {
+                SelectObject(self.hdc, self.prev);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenWindowInfo {
     pub hwnd: isize,
@@ -130,6 +194,8 @@ pub struct OpenWindowInfo {
     pub aumid: Option<String>,
     pub is_active: bool,
     pub is_minimized: bool,
+    #[serde(default)]
+    pub is_topmost: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,24 +223,110 @@ pub fn is_application_frame_host(exe_path: &str) -> bool {
     file_name.eq_ignore_ascii_case("applicationframehost.exe")
 }
 
-pub fn process_exe_path(pid: u32) -> Option<String> {
+/// Queries both the full Win32 image path and packaged AUMID (if any) using a single
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` handle.
+fn query_process_exe_and_aumid_raw(pid: u32) -> (String, Option<String>) {
+    if pid == 0 {
+        return (String::new(), None);
+    }
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = vec![0u16; 1024];
-        let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return (String::new(), None);
+        };
+
+        let mut exe_buf = vec![0u16; 1024];
+        let mut exe_size = exe_buf.len() as u32;
+        let exe_path = if QueryFullProcessImageNameW(
             handle,
             PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
+            PWSTR(exe_buf.as_mut_ptr()),
+            &mut exe_size,
+        )
+        .is_ok()
+            && exe_size > 0
+        {
+            String::from_utf16_lossy(&exe_buf[..exe_size as usize])
+        } else {
+            String::new()
+        };
+
+        let mut aumid_len: u32 = 256;
+        let mut aumid_buf = vec![0u16; aumid_len as usize];
+        let mut err = GetApplicationUserModelId(
+            handle,
+            &mut aumid_len,
+            PWSTR(aumid_buf.as_mut_ptr()),
         );
+        if err == ERROR_INSUFFICIENT_BUFFER && aumid_len > 0 {
+            aumid_buf.resize(aumid_len as usize, 0);
+            err = GetApplicationUserModelId(
+                handle,
+                &mut aumid_len,
+                PWSTR(aumid_buf.as_mut_ptr()),
+            );
+        }
         let _ = CloseHandle(handle);
-        if ok.is_ok() && size > 0 {
-            Some(String::from_utf16_lossy(&buf[..size as usize]))
+
+        let aumid = if err == ERROR_SUCCESS && aumid_len > 1 {
+            let actual = (aumid_len as usize).min(aumid_buf.len());
+            let end = aumid_buf[..actual]
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(actual);
+            let s = String::from_utf16_lossy(&aumid_buf[..end]).trim().to_string();
+            (!s.is_empty()).then_some(s)
         } else {
             None
+        };
+
+        (exe_path, aumid)
+    }
+}
+
+/// Returns cached `(exe_path, aumid)` for `pid`, performing a single `OpenProcess` query on miss
+/// or TTL expiry. Active PID pruning is performed at the end of each `EnumWindows` scan.
+fn cached_process_exe_and_aumid(pid: u32) -> (String, Option<String>) {
+    if pid == 0 {
+        return (String::new(), None);
+    }
+    let now = Instant::now();
+    {
+        let cache = lock_unpoisoned(pid_meta_cache());
+        if let Some(entry) = cache.get(&pid) {
+            if now.saturating_duration_since(entry.cached_at) < PID_META_CACHE_TTL {
+                return (entry.exe_path.clone(), entry.aumid.clone());
+            }
         }
     }
+    let (exe_path, aumid) = query_process_exe_and_aumid_raw(pid);
+    {
+        let mut cache = lock_unpoisoned(pid_meta_cache());
+        if cache.len() >= PID_META_CACHE_MAX_ENTRIES && !cache.contains_key(&pid) {
+            cache.retain(|_, v| now.saturating_duration_since(v.cached_at) < PID_META_CACHE_TTL);
+            if cache.len() >= PID_META_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            pid,
+            PidMetaEntry {
+                exe_path: exe_path.clone(),
+                aumid: aumid.clone(),
+                cached_at: now,
+            },
+        );
+    }
+    (exe_path, aumid)
+}
+
+fn prune_pid_meta_cache(active_pids: &HashSet<u32>) {
+    let mut cache = lock_unpoisoned(pid_meta_cache());
+    cache.retain(|pid, _| active_pids.contains(pid));
+}
+
+pub fn process_exe_path(pid: u32) -> Option<String> {
+    let (exe, _) = query_process_exe_and_aumid_raw(pid);
+    (!exe.is_empty()).then_some(exe)
 }
 
 /// Checks whether a Win32 process `pid` is still alive (`STILL_ACTIVE`).
@@ -200,29 +352,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// Queries the packaged Application User Model ID (AUMID) for a process, if it is a
 /// packaged UWP / MSIX / WinUI3 app. Returns `None` for classic unpackaged Win32 processes.
 pub fn process_aumid(pid: u32) -> Option<String> {
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut len: u32 = 256;
-        let mut buf = vec![0u16; len as usize];
-        let mut err = GetApplicationUserModelId(handle, &mut len, PWSTR(buf.as_mut_ptr()));
-        if err == ERROR_INSUFFICIENT_BUFFER && len > 0 {
-            buf.resize(len as usize, 0);
-            err = GetApplicationUserModelId(handle, &mut len, PWSTR(buf.as_mut_ptr()));
-        }
-        let _ = CloseHandle(handle);
-        if err == ERROR_SUCCESS && len > 1 {
-            let actual = (len as usize).min(buf.len());
-            let end = buf[..actual]
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(actual);
-            let aumid = String::from_utf16_lossy(&buf[..end]).trim().to_string();
-            if !aumid.is_empty() {
-                return Some(aumid);
-            }
-        }
-        None
-    }
+    query_process_exe_and_aumid_raw(pid).1
 }
 
 /// Enumerates child windows of an `ApplicationFrameHost.exe` top-level window to locate
@@ -402,7 +532,7 @@ pub fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
 }
 
 pub fn hicon_to_data_url(hicon: HICON, size: i32) -> Option<String> {
-    if hicon.0.is_null() || size <= 0 {
+    if hicon.0.is_null() || size <= 0 || size > 512 {
         return None;
     }
     unsafe {
@@ -418,7 +548,19 @@ pub fn hicon_to_data_url(hicon: HICON, size: i32) -> Option<String> {
         }
 
         let screen_dc = GetDC(HWND::default());
+        if screen_dc.is_invalid() {
+            return None;
+        }
+        let _screen_guard = WindowDcGuard {
+            hwnd: HWND::default(),
+            hdc: screen_dc,
+        };
         let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_invalid() {
+            return None;
+        }
+        let _mem_guard = MemDcGuard(mem_dc);
+
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = size;
@@ -428,28 +570,26 @@ pub fn hicon_to_data_url(hicon: HICON, size: i32) -> Option<String> {
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
         let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbm = match CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = DeleteDC(mem_dc);
-                ReleaseDC(HWND::default(), screen_dc);
-                return None;
+        let hbm = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?;
+        if hbm.is_invalid() || bits_ptr.is_null() {
+            if !hbm.is_invalid() {
+                let _ = DeleteObject(hbm);
             }
-        };
+            return None;
+        }
+        let _hbm_guard = HBitmapGuard(hbm);
         let old = SelectObject(mem_dc, hbm);
+        let _sel_guard = SelectedObjGuard {
+            hdc: mem_dc,
+            prev: old,
+        };
 
-        let total_bytes = (size * size * 4) as usize;
+        let total_bytes = (size as usize).checked_mul(size as usize)?.checked_mul(4)?;
         std::ptr::write_bytes(bits_ptr as *mut u8, 0, total_bytes);
         let _ = DrawIconEx(mem_dc, 0, 0, hicon, size, size, 0, None, DI_NORMAL);
 
         let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, total_bytes);
         let rgba = bgra_to_rgba(bgra);
-
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(hbm);
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(HWND::default(), screen_dc);
-
         encode_rgba_png(size as u32, size as u32, &rgba)
     }
 }
@@ -565,6 +705,9 @@ fn extract_live_window_hicon(hwnd: HWND) -> Option<String> {
         return None;
     }
     unsafe {
+        if !IsWindow(hwnd).as_bool() || IsHungAppWindow(hwnd).as_bool() {
+            return None;
+        }
         for kind in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
             let mut result: usize = 0;
             let ok = SendMessageTimeoutW(
@@ -604,21 +747,47 @@ pub fn extract_icon_for_path_cached(path: &str, cache: &Mutex<IconCache>) -> Opt
         .starts_with("shell:appsfolder\\")
     {
         let key = icon_cache::aumid_key(trimmed);
-        if let Some(hit) = lock_unpoisoned(cache).get(&key) {
-            return Some(hit);
+        {
+            let mut guard = lock_unpoisoned(cache);
+            if let Some(hit) = guard.get(&key) {
+                return Some(hit);
+            }
+            if guard.is_negative_cached(&key) {
+                return None;
+            }
         }
-        let extracted = extract_uwp_icon_by_aumid(trimmed)?;
-        lock_unpoisoned(cache).put(key, extracted.clone());
-        return Some(extracted);
+        match extract_uwp_icon_by_aumid(trimmed) {
+            Some(extracted) => {
+                lock_unpoisoned(cache).put(key, extracted.clone());
+                return Some(extracted);
+            }
+            None => {
+                lock_unpoisoned(cache).mark_negative_miss(key);
+                return None;
+            }
+        }
     }
 
     let key = icon_cache::path_icon_key(trimmed);
-    if let Some(hit) = lock_unpoisoned(cache).get(&key) {
-        return Some(hit);
+    {
+        let mut guard = lock_unpoisoned(cache);
+        if let Some(hit) = guard.get(&key) {
+            return Some(hit);
+        }
+        if guard.is_negative_cached(&key) {
+            return None;
+        }
     }
-    let extracted = extract_path_icon_raw(trimmed)?;
-    lock_unpoisoned(cache).put(key, extracted.clone());
-    Some(extracted)
+    match extract_path_icon_raw(trimmed) {
+        Some(extracted) => {
+            lock_unpoisoned(cache).put(key, extracted.clone());
+            Some(extracted)
+        }
+        None => {
+            lock_unpoisoned(cache).mark_negative_miss(key);
+            None
+        }
+    }
 }
 
 pub fn extract_icon_for_path(path: &str) -> Option<String> {
@@ -627,7 +796,8 @@ pub fn extract_icon_for_path(path: &str) -> Option<String> {
 
 /// Resolves an icon into the unified `IconCache` for an executable path (preferring
 /// `exe:<hash>` via `SHGetFileInfoW`, falling back to `WM_GETICON`/`GCLP_HICON` on `hwnd`,
-/// then `hwnd:<hwnd>:0`). Used by Tray Overflow so every background app gets its crisp cached icon.
+/// then `hwnd:<hwnd>:0`). Uses bounded TTL negative caching so iconless/elevated apps
+/// never spam `SHGetFileInfoW` or `SendMessageTimeoutW` on every poller tick.
 pub fn resolve_exe_or_hwnd_icon_key(
     exe_path: &str,
     hwnd_raw: Option<isize>,
@@ -641,25 +811,45 @@ pub fn resolve_exe_or_hwnd_icon_key(
 
     if !trimmed.is_empty() && !is_application_frame_host(trimmed) {
         let key = icon_cache::path_icon_key(trimmed);
-        if lock_unpoisoned(cache).get(&key).is_some() {
-            return Some(key);
-        }
-        let extracted =
-            extract_path_icon_raw(trimmed).or_else(|| extract_live_window_hicon(hwnd));
-        if let Some(uri) = extracted {
-            lock_unpoisoned(cache).put(key.clone(), uri);
-            return Some(key);
+        let neg_hit = {
+            let mut guard = lock_unpoisoned(cache);
+            if guard.get(&key).is_some() {
+                return Some(key);
+            }
+            guard.is_negative_cached(&key)
+        };
+        if !neg_hit {
+            let extracted =
+                extract_path_icon_raw(trimmed).or_else(|| extract_live_window_hicon(hwnd));
+            if let Some(uri) = extracted {
+                lock_unpoisoned(cache).put(key.clone(), uri);
+                return Some(key);
+            }
+            lock_unpoisoned(cache).mark_negative_miss(key);
         }
     }
 
     if let Some(raw) = hwnd_raw.filter(|&h| h != 0) {
         let key = icon_cache::hwnd_key(raw, 0);
-        if lock_unpoisoned(cache).get(&key).is_some() {
-            return Some(key);
+        {
+            let mut guard = lock_unpoisoned(cache);
+            if guard.get(&key).is_some() {
+                return Some(key);
+            }
+            if guard.is_negative_cached(&key) {
+                return None;
+            }
         }
-        let extracted = extract_live_window_hicon(HWND(raw as *mut _))?;
-        lock_unpoisoned(cache).put(key.clone(), extracted);
-        return Some(key);
+        match extract_live_window_hicon(HWND(raw as *mut _)) {
+            Some(extracted) => {
+                lock_unpoisoned(cache).put(key.clone(), extracted);
+                return Some(key);
+            }
+            None => {
+                lock_unpoisoned(cache).mark_negative_miss(key);
+                return None;
+            }
+        }
     }
 
     None
@@ -670,44 +860,87 @@ fn resolve_window_icon_key(win: &OpenWindowInfo, cache: &Mutex<IconCache>) -> Op
 
     if let Some(ref aumid) = win.aumid {
         let key = icon_cache::aumid_key(aumid);
-        if lock_unpoisoned(cache).get(&key).is_some() {
-            return Some(key);
-        }
-        let extracted = extract_uwp_icon_by_aumid(aumid)
-            .or_else(|| {
-                if !win.exe_path.is_empty() && !is_application_frame_host(&win.exe_path) {
-                    extract_path_icon_raw(&win.exe_path)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| extract_live_window_hicon(hwnd));
-        if let Some(uri) = extracted {
-            lock_unpoisoned(cache).put(key.clone(), uri);
-            return Some(key);
+        let neg_hit = {
+            let mut guard = lock_unpoisoned(cache);
+            if guard.get(&key).is_some() {
+                return Some(key);
+            }
+            guard.is_negative_cached(&key)
+        };
+        if !neg_hit {
+            let extracted = extract_uwp_icon_by_aumid(aumid)
+                .or_else(|| {
+                    if !win.exe_path.is_empty() && !is_application_frame_host(&win.exe_path) {
+                        extract_path_icon_raw(&win.exe_path)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| extract_live_window_hicon(hwnd));
+            if let Some(uri) = extracted {
+                lock_unpoisoned(cache).put(key.clone(), uri);
+                return Some(key);
+            }
+            lock_unpoisoned(cache).mark_negative_miss(key);
         }
     }
 
     if !win.exe_path.is_empty() && !is_application_frame_host(&win.exe_path) {
         let key = icon_cache::path_icon_key(&win.exe_path);
-        if lock_unpoisoned(cache).get(&key).is_some() {
-            return Some(key);
-        }
-        let extracted =
-            extract_path_icon_raw(&win.exe_path).or_else(|| extract_live_window_hicon(hwnd));
-        if let Some(uri) = extracted {
-            lock_unpoisoned(cache).put(key.clone(), uri);
-            return Some(key);
+        let neg_hit = {
+            let mut guard = lock_unpoisoned(cache);
+            if guard.get(&key).is_some() {
+                return Some(key);
+            }
+            guard.is_negative_cached(&key)
+        };
+        if !neg_hit {
+            let extracted =
+                extract_path_icon_raw(&win.exe_path).or_else(|| extract_live_window_hicon(hwnd));
+            if let Some(uri) = extracted {
+                lock_unpoisoned(cache).put(key.clone(), uri);
+                return Some(key);
+            }
+            lock_unpoisoned(cache).mark_negative_miss(key);
         }
     }
 
     let key = icon_cache::hwnd_key(win.hwnd, 0);
-    if lock_unpoisoned(cache).get(&key).is_some() {
-        return Some(key);
+    {
+        let mut guard = lock_unpoisoned(cache);
+        if guard.get(&key).is_some() {
+            return Some(key);
+        }
+        if guard.is_negative_cached(&key) {
+            return None;
+        }
     }
-    let extracted = extract_live_window_hicon(hwnd)?;
-    lock_unpoisoned(cache).put(key.clone(), extracted);
-    Some(key)
+    match extract_live_window_hicon(hwnd) {
+        Some(extracted) => {
+            lock_unpoisoned(cache).put(key.clone(), extracted);
+            Some(key)
+        }
+        None => {
+            lock_unpoisoned(cache).mark_negative_miss(key);
+            None
+        }
+    }
+}
+
+/// Computes a reloadable icon source path (`shell:AppsFolder\<AUMID>` or `exe_path`)
+/// for an open window so `icon_sources` can seamlessly re-extract icons after LRU eviction.
+pub fn icon_source_for_window(win: &OpenWindowInfo) -> Option<String> {
+    if let Some(aumid) = win.aumid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if aumid.to_ascii_lowercase().starts_with("shell:appsfolder\\") {
+            return Some(aumid.to_string());
+        }
+        return Some(format!("shell:AppsFolder\\{aumid}"));
+    }
+    let exe = win.exe_path.trim();
+    if !exe.is_empty() && !is_application_frame_host(exe) {
+        return Some(exe.to_string());
+    }
+    None
 }
 
 /// Computes the canonical grouping key for an open window so packaged UWP apps hosted
@@ -782,11 +1015,17 @@ where
     groups
 }
 
-pub fn list_open_window_groups_cached(cache: &Mutex<IconCache>) -> Vec<AppWindowGroup> {
+/// Enumerates open user windows grouped by application and also returns unique
+/// `(icon_key, source_path)` pairs so the host can register every window icon into `icon_sources`
+/// and cleanly recover icons after LRU eviction.
+pub fn list_open_window_groups_cached_with_sources(
+    cache: &Mutex<IconCache>,
+) -> (Vec<AppWindowGroup>, Vec<(String, String)>) {
     struct Ctx {
         own_pid: u32,
         fg_hwnd: HWND,
         items: Vec<OpenWindowInfo>,
+        active_pids: HashSet<u32>,
     }
 
     extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -857,21 +1096,26 @@ pub fn list_open_window_groups_cached(cache: &Mutex<IconCache>) -> Vec<AppWindow
             if host_pid == 0 || host_pid == ctx.own_pid {
                 return BOOL(1);
             }
+            ctx.active_pids.insert(host_pid);
 
-            let host_exe = process_exe_path(host_pid).unwrap_or_default();
+            let (host_exe, host_aumid) = cached_process_exe_and_aumid(host_pid);
             let is_uwp_host = is_application_frame_host(&host_exe);
 
             let (effective_pid, exe_path, aumid) = if is_uwp_host {
                 if let Some(child_pid) = resolve_uwp_child_pid(hwnd, host_pid) {
-                    let child_exe = process_exe_path(child_pid).unwrap_or_else(|| host_exe.clone());
-                    let child_aumid = process_aumid(child_pid);
+                    ctx.active_pids.insert(child_pid);
+                    let (child_exe_raw, child_aumid) = cached_process_exe_and_aumid(child_pid);
+                    let child_exe = if child_exe_raw.is_empty() {
+                        host_exe.clone()
+                    } else {
+                        child_exe_raw
+                    };
                     (child_pid, child_exe, child_aumid)
                 } else {
                     (host_pid, host_exe, None)
                 }
             } else {
-                let pkg_aumid = process_aumid(host_pid);
-                (host_pid, host_exe, pkg_aumid)
+                (host_pid, host_exe, host_aumid)
             };
 
             let exe_name = display_name_for_window(&exe_path, is_uwp_host, &title);
@@ -885,6 +1129,7 @@ pub fn list_open_window_groups_cached(cache: &Mutex<IconCache>) -> Vec<AppWindow
                 aumid,
                 is_active: hwnd == ctx.fg_hwnd,
                 is_minimized: IsIconic(hwnd).as_bool(),
+                is_topmost: (ex & WS_EX_TOPMOST.0) != 0,
             });
         }
         BOOL(1)
@@ -894,12 +1139,30 @@ pub fn list_open_window_groups_cached(cache: &Mutex<IconCache>) -> Vec<AppWindow
         own_pid: unsafe { GetCurrentProcessId() },
         fg_hwnd: unsafe { GetForegroundWindow() },
         items: Vec::new(),
+        active_pids: HashSet::new(),
     };
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
+    prune_pid_meta_cache(&ctx.active_pids);
 
-    group_open_windows(ctx.items, |win| resolve_window_icon_key(win, cache))
+    let mut icon_sources: Vec<(String, String)> = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let groups = group_open_windows(ctx.items, |win| {
+        let resolved = resolve_window_icon_key(win, cache)?;
+        if let Some(source) = icon_source_for_window(win) {
+            if seen_keys.insert(resolved.clone()) {
+                icon_sources.push((resolved.clone(), source));
+            }
+        }
+        Some(resolved)
+    });
+
+    (groups, icon_sources)
+}
+
+pub fn list_open_window_groups_cached(cache: &Mutex<IconCache>) -> Vec<AppWindowGroup> {
+    list_open_window_groups_cached_with_sources(cache).0
 }
 
 pub fn list_open_window_groups() -> Vec<AppWindowGroup> {
@@ -907,41 +1170,433 @@ pub fn list_open_window_groups() -> Vec<AppWindowGroup> {
 }
 
 pub fn focus_or_toggle_window(hwnd_raw: isize, toggle_minimize: bool) {
+    if hwnd_raw == 0 {
+        return;
+    }
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
         let fg = GetForegroundWindow();
         if toggle_minimize && fg == hwnd && !IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            let _ = ShowWindowAsync(hwnd, SW_MINIMIZE);
             return;
         }
         if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         } else {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindowAsync(hwnd, SW_SHOW);
         }
-        let fg_tid = GetWindowThreadProcessId(fg, None);
+
         let cur_tid = GetCurrentThreadId();
-        let target_tid = GetWindowThreadProcessId(hwnd, None);
-        if fg_tid != cur_tid {
-            let _ = AttachThreadInput(cur_tid, fg_tid, true);
-        }
-        if target_tid != cur_tid {
-            let _ = AttachThreadInput(cur_tid, target_tid, true);
-        }
+        let fg_tid = if !fg.0.is_null()
+            && IsWindow(fg).as_bool()
+            && !IsHungAppWindow(fg).as_bool()
+        {
+            GetWindowThreadProcessId(fg, None)
+        } else {
+            0
+        };
+        let target_tid = if !IsHungAppWindow(hwnd).as_bool() {
+            GetWindowThreadProcessId(hwnd, None)
+        } else {
+            0
+        };
+
+        let attach_fg = fg_tid != 0 && fg_tid != cur_tid;
+        let attach_target = target_tid != 0 && target_tid != cur_tid && target_tid != fg_tid;
+        let fg_attached = attach_fg && AttachThreadInput(cur_tid, fg_tid, true).as_bool();
+        let target_attached =
+            attach_target && AttachThreadInput(cur_tid, target_tid, true).as_bool();
+
         let _ = SetForegroundWindow(hwnd);
-        if target_tid != cur_tid {
+
+        if target_attached {
             let _ = AttachThreadInput(cur_tid, target_tid, false);
         }
-        if fg_tid != cur_tid {
+        if fg_attached {
             let _ = AttachThreadInput(cur_tid, fg_tid, false);
         }
     }
 }
 
 pub fn close_window(hwnd_raw: isize) {
-    unsafe {
-        let _ = PostMessageW(HWND(hwnd_raw as *mut _), WM_CLOSE, WPARAM(0), LPARAM(0));
+    if hwnd_raw == 0 {
+        return;
     }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if IsWindow(hwnd).as_bool() {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Pure, DWM-frame-compensated snap target geometry computation for `"left"`, `"right"`,
+/// and `"center"` zones inside a monitor's physical `work_area`.
+/// `frame_inset` is `(left, top, right, bottom)` invisible DWM shadow padding (`ext - win`).
+pub fn compute_snap_rect(
+    work_area: PixelRect,
+    current_visible: Option<PixelRect>,
+    frame_inset: (i32, i32, i32, i32),
+    zone: &str,
+) -> Result<PixelRect, String> {
+    if work_area.width() <= 0 || work_area.height() <= 0 {
+        return Err("Некорректная рабочая область монитора".to_string());
+    }
+    let (inset_l, inset_t, inset_r, inset_b) = (
+        frame_inset.0.max(0),
+        frame_inset.1.max(0),
+        frame_inset.2.max(0),
+        frame_inset.3.max(0),
+    );
+    let visible = match zone.trim().to_ascii_lowercase().as_str() {
+        "left" => {
+            let mid_x = work_area.left + (work_area.width() / 2);
+            PixelRect::new(work_area.left, work_area.top, mid_x, work_area.bottom)
+        }
+        "right" => {
+            let mid_x = work_area.left + (work_area.width() / 2);
+            PixelRect::new(mid_x, work_area.top, work_area.right, work_area.bottom)
+        }
+        "center" => {
+            let default_w = ((work_area.width() as f64) * 0.72).round() as i32;
+            let default_h = ((work_area.height() as f64) * 0.78).round() as i32;
+            let max_w = ((work_area.width() as f64) * 0.90).round() as i32;
+            let max_h = ((work_area.height() as f64) * 0.90).round() as i32;
+            let (target_w, target_h) = match current_visible {
+                Some(cur)
+                    if cur.width() >= 320
+                        && cur.height() >= 240
+                        && cur.width() <= max_w
+                        && cur.height() <= max_h =>
+                {
+                    (cur.width(), cur.height())
+                }
+                _ => (
+                    default_w.clamp(320.min(work_area.width()), work_area.width()),
+                    default_h.clamp(240.min(work_area.height()), work_area.height()),
+                ),
+            };
+            let left = work_area.left + (work_area.width() - target_w) / 2;
+            let top = work_area.top + (work_area.height() - target_h) / 2;
+            PixelRect::new(left, top, left + target_w, top + target_h)
+        }
+        other => return Err(format!("Неизвестная зона привязки окна: {other}")),
+    };
+
+    Ok(PixelRect::new(
+        visible.left - inset_l,
+        visible.top - inset_t,
+        visible.right + inset_r,
+        visible.bottom + inset_b,
+    ))
+}
+
+unsafe fn query_window_dwm_frame_insets(hwnd: HWND) -> (Option<PixelRect>, (i32, i32, i32, i32)) {
+    let mut win_rect = RECT::default();
+    if GetWindowRect(hwnd, &mut win_rect).is_err() {
+        return (None, (0, 0, 0, 0));
+    }
+    let mut ext_rect = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut ext_rect as *mut RECT as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_ok()
+        && ext_rect.right > ext_rect.left
+        && ext_rect.bottom > ext_rect.top
+    {
+        let inset_l = (ext_rect.left - win_rect.left).clamp(0, 48);
+        let inset_t = (ext_rect.top - win_rect.top).clamp(0, 48);
+        let inset_r = (win_rect.right - ext_rect.right).clamp(0, 48);
+        let inset_b = (win_rect.bottom - ext_rect.bottom).clamp(0, 48);
+        let ext_px = PixelRect::new(ext_rect.left, ext_rect.top, ext_rect.right, ext_rect.bottom);
+        (Some(ext_px), (inset_l, inset_t, inset_r, inset_b))
+    } else {
+        let win_px = PixelRect::new(win_rect.left, win_rect.top, win_rect.right, win_rect.bottom);
+        (Some(win_px), (0, 0, 0, 0))
+    }
+}
+
+/// DPI/work-area/DWM-frame-aware pure-Win32 window snapping (`"left" | "right" | "maximize" | "restore" | "center"`).
+pub fn snap_window(hwnd_raw: isize, zone: &str) -> Result<(), String> {
+    if hwnd_raw == 0 {
+        return Err("Некорректный дескриптор окна".to_string());
+    }
+    let norm_zone = zone.trim().to_ascii_lowercase();
+    if !matches!(
+        norm_zone.as_str(),
+        "left" | "right" | "maximize" | "restore" | "center"
+    ) {
+        return Err(format!("Неизвестная зона привязки окна: {zone}"));
+    }
+
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return Err("Окно уже закрыто".to_string());
+        }
+        if IsHungAppWindow(hwnd).as_bool() {
+            return Err("Окно не отвечает".to_string());
+        }
+
+        if norm_zone == "maximize" {
+            let _ = ShowWindowAsync(hwnd, SW_MAXIMIZE);
+            focus_or_toggle_window(hwnd_raw, false);
+            return Ok(());
+        }
+        if norm_zone == "restore" {
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+            focus_or_toggle_window(hwnd_raw, false);
+            return Ok(());
+        }
+
+        if IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mon_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mon_info).as_bool() {
+            return Err("Не удалось определить рабочую область монитора".to_string());
+        }
+        let work_area = PixelRect::new(
+            mon_info.rcWork.left,
+            mon_info.rcWork.top,
+            mon_info.rcWork.right,
+            mon_info.rcWork.bottom,
+        );
+        let (current_visible, insets) = query_window_dwm_frame_insets(hwnd);
+        let target = compute_snap_rect(work_area, current_visible, insets, &norm_zone)?;
+
+        SetWindowPos(
+            hwnd,
+            HWND::default(),
+            target.left,
+            target.top,
+            target.width(),
+            target.height(),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .map_err(|err| {
+            if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                "Окно запущено от имени администратора — перемещение заблокировано UIPI".to_string()
+            } else {
+                format!("Не удалось разместить окно: {err}")
+            }
+        })?;
+        focus_or_toggle_window(hwnd_raw, false);
+        Ok(())
+    }
+}
+
+/// Toggles `WS_EX_TOPMOST` (Always on Top) for a window, returning the new topmost state
+/// or a clear UIPI error if the target belongs to an elevated process.
+pub fn toggle_window_topmost(hwnd_raw: isize) -> Result<bool, String> {
+    if hwnd_raw == 0 {
+        return Err("Некорректный дескриптор окна".to_string());
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() {
+            return Err("Окно уже закрыто".to_string());
+        }
+        if IsHungAppWindow(hwnd).as_bool() {
+            return Err("Окно не отвечает".to_string());
+        }
+        let was_topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+        let next_topmost = !was_topmost;
+        let insert_after = if next_topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .map_err(|err| {
+            if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                "Окно запущено от имени администратора — «Поверх всех окон» заблокировано UIPI"
+                    .to_string()
+            } else {
+                format!("Не удалось изменить закрепление окна поверх всех: {err}")
+            }
+        })?;
+
+        let actual_topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+        if actual_topmost != next_topmost {
+            return Err(
+                "Не удалось изменить «Поверх всех окон» (окно защищено правами администратора / UIPI)"
+                    .to_string(),
+            );
+        }
+        Ok(actual_topmost)
+    }
+}
+
+/// Minimizes all visible non-minimized user windows except `keep_hwnd_raw`, returning
+/// the number of windows minimized.
+pub fn minimize_other_windows(keep_hwnd_raw: isize) -> Result<u32, String> {
+    if keep_hwnd_raw == 0 {
+        return Err("Некорректный дескриптор окна".to_string());
+    }
+    let keep_hwnd = HWND(keep_hwnd_raw as *mut _);
+    unsafe {
+        if !IsWindow(keep_hwnd).as_bool() {
+            return Err("Целевое окно уже закрыто".to_string());
+        }
+    }
+
+    struct MinCtx {
+        own_pid: u32,
+        keep_hwnd: HWND,
+        minimized: u32,
+    }
+
+    extern "system" fn min_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut MinCtx);
+            if hwnd == ctx.keep_hwnd {
+                return BOOL(1);
+            }
+            if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            if (style & WS_VISIBLE.0) == 0 {
+                return BOOL(1);
+            }
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if (ex & WS_EX_TOOLWINDOW.0) != 0 {
+                return BOOL(1);
+            }
+            let owner = GetWindow(hwnd, GW_OWNER).unwrap_or_default();
+            if !owner.0.is_null() && (ex & WS_EX_APPWINDOW.0) == 0 {
+                return BOOL(1);
+            }
+            let mut cloaked: u32 = 0;
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut _ as *mut _,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+            {
+                return BOOL(1);
+            }
+            if GetWindowTextLengthW(hwnd) <= 0 {
+                return BOOL(1);
+            }
+            let mut cls_buf = [0u16; 64];
+            let cls_len = GetClassNameW(hwnd, &mut cls_buf);
+            if cls_len > 0 {
+                let cls = String::from_utf16_lossy(&cls_buf[..cls_len as usize]);
+                if matches!(
+                    cls.as_str(),
+                    "Progman"
+                        | "WorkerW"
+                        | "Shell_TrayWnd"
+                        | "Shell_SecondaryTrayWnd"
+                        | "Windows.UI.Core.CoreWindow"
+                ) {
+                    return BOOL(1);
+                }
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 || pid == ctx.own_pid {
+                return BOOL(1);
+            }
+            if IsHungAppWindow(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            if ShowWindowAsync(hwnd, SW_MINIMIZE).as_bool() {
+                ctx.minimized = ctx.minimized.saturating_add(1);
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = MinCtx {
+        own_pid: unsafe { GetCurrentProcessId() },
+        keep_hwnd,
+        minimized: 0,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(min_proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    focus_or_toggle_window(keep_hwnd_raw, false);
+    Ok(ctx.minimized)
+}
+
+/// Pure helper selecting smart new-window CLI arguments for Chromium/Gecko browsers,
+/// Electron editors, Windows Terminal, and Explorer while preserving caller-provided args.
+pub fn build_new_window_launch_args(exe_path: &str, args: Option<&str>) -> Option<String> {
+    let user_args = args.map(str::trim).filter(|s| !s.is_empty());
+    let base = normalized_exe_basename(exe_path);
+    let smart_flag = match base.as_str() {
+        "chrome.exe"
+        | "msedge.exe"
+        | "brave.exe"
+        | "browser.exe"
+        | "vivaldi.exe"
+        | "opera.exe"
+        | "code.exe"
+        | "cursor.exe"
+        | "antigravity.exe" => Some("--new-window"),
+        "firefox.exe" | "zen.exe" => Some("-new-window"),
+        "explorer.exe" => Some("/n"),
+        "wt.exe" | "windowsterminal.exe" => Some("-w new"),
+        _ => None,
+    };
+
+    match (smart_flag, user_args) {
+        (Some(flag), Some(existing)) => {
+            let low = existing.to_ascii_lowercase();
+            if low.contains("--new-window")
+                || low.contains("-new-window")
+                || low.contains("--incognito")
+                || low.contains("--inprivate")
+                || low.contains("-private-window")
+                || low.contains("-w ")
+                || low == "/n"
+                || low.starts_with("/n ")
+            {
+                Some(existing.to_string())
+            } else {
+                Some(format!("{flag} {existing}"))
+            }
+        }
+        (Some(flag), None) => Some(flag.to_string()),
+        (None, Some(existing)) => Some(existing.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Launches a fresh window instance for `exe_path`, injecting smart `--new-window` / `-new-window`
+/// flags for Chromium/Gecko/VS Code/Terminal/Explorer apps where appropriate.
+pub fn launch_new_window_instance(exe_path: &str, args: Option<&str>) -> Result<(), String> {
+    let trimmed = exe_path.trim();
+    if trimmed.is_empty() {
+        return Err("Пустой путь запуска".to_string());
+    }
+    let effective_args = build_new_window_launch_args(trimmed, args);
+    launch_target_with_args(trimmed, effective_args.as_deref(), false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1518,10 +2173,12 @@ pub fn match_recent_entries_for_app(
     out
 }
 
-fn resolve_recent_lnk_target(lnk_path: &Path) -> Option<String> {
+fn resolve_recent_lnk_target_with(
+    link: &IShellLinkW,
+    pf: &IPersistFile,
+    lnk_path: &Path,
+) -> Option<String> {
     unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let pf: IPersistFile = link.cast().ok()?;
         let w = wide(&lnk_path.to_string_lossy());
         pf.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
         let mut buf = [0u16; 1024];
@@ -1573,9 +2230,21 @@ fn collect_windows_recent_targets(max_scan: usize) -> Vec<(String, String)> {
         return Vec::new();
     }
 
+    // Reuse a single IShellLinkW + IPersistFile instance across the entire Recent directory scan.
+    let (link, pf) = unsafe {
+        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER)
+        else {
+            return Vec::new();
+        };
+        let Ok(pf) = link.cast::<IPersistFile>() else {
+            return Vec::new();
+        };
+        (link, pf)
+    };
+
     let mut resolved = Vec::new();
     for (_, lnk_path) in lnk_files.into_iter().take(max_scan) {
-        let Some(target) = resolve_recent_lnk_target(&lnk_path) else {
+        let Some(target) = resolve_recent_lnk_target_with(&link, &pf, &lnk_path) else {
             continue;
         };
         if !Path::new(&target).exists() {
@@ -1615,12 +2284,41 @@ pub fn get_jump_list(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
     items
 }
 
-/// Captures a live visual thumbnail of an open window (using PrintWindow PW_RENDERFULLCONTENT)
-/// downscaled cleanly for hover preview cards.
+/// Computes the visible source crop `(crop_x, crop_y, crop_w, crop_h)` inside `win_rect`
+/// using `DWMWA_EXTENDED_FRAME_BOUNDS` so invisible Windows 11 DWM drop-shadow borders are
+/// trimmed cleanly off hover preview thumbnails.
+pub fn compute_dwm_thumbnail_crop(win_rect: RECT, ext_rect: Option<RECT>) -> (i32, i32, i32, i32) {
+    let src_w = (win_rect.right - win_rect.left).max(1);
+    let src_h = (win_rect.bottom - win_rect.top).max(1);
+    let Some(ext) = ext_rect else {
+        return (0, 0, src_w, src_h);
+    };
+    if ext.right <= ext.left || ext.bottom <= ext.top {
+        return (0, 0, src_w, src_h);
+    }
+    let crop_x = (ext.left - win_rect.left).clamp(0, src_w - 1);
+    let crop_y = (ext.top - win_rect.top).clamp(0, src_h - 1);
+    let crop_right = (ext.right - win_rect.left).clamp(crop_x + 1, src_w);
+    let crop_bottom = (ext.bottom - win_rect.top).clamp(crop_y + 1, src_h);
+    let crop_w = crop_right - crop_x;
+    let crop_h = crop_bottom - crop_y;
+    if crop_w < 16 || crop_h < 16 {
+        return (0, 0, src_w, src_h);
+    }
+    (crop_x, crop_y, crop_w, crop_h)
+}
+
+/// Captures a live visual thumbnail of an open window (using PrintWindow PW_RENDERFULLCONTENT),
+/// cropping invisible DWM shadow borders via `DWMWA_EXTENDED_FRAME_BOUNDS` and guarding every
+/// GDI handle/pointer with RAII cleanup.
 pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Option<String> {
+    if hwnd_raw == 0 || max_w <= 0 || max_h <= 0 {
+        return None;
+    }
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut _);
-        if IsIconic(hwnd).as_bool() {
+        if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() || IsHungAppWindow(hwnd).as_bool()
+        {
             return None;
         }
         let mut rect = RECT::default();
@@ -1631,16 +2329,48 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
             return None;
         }
 
-        let scale = (max_w as f32 / src_w as f32)
-            .min(max_h as f32 / src_h as f32)
+        let mut ext_rect = RECT::default();
+        let ext_opt = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut ext_rect as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()
+        .map(|()| ext_rect);
+        let (crop_x, crop_y, crop_w, crop_h) = compute_dwm_thumbnail_crop(rect, ext_opt);
+
+        let scale = (max_w as f32 / crop_w as f32)
+            .min(max_h as f32 / crop_h as f32)
             .min(1.0);
-        let dst_w = ((src_w as f32 * scale).round() as i32).max(16);
-        let dst_h = ((src_h as f32 * scale).round() as i32).max(16);
+        let dst_w = ((crop_w as f32 * scale).round() as i32).max(16);
+        let dst_h = ((crop_h as f32 * scale).round() as i32).max(16);
 
         let screen_dc = GetDC(HWND::default());
+        if screen_dc.is_invalid() {
+            return None;
+        }
+        let _screen_guard = WindowDcGuard {
+            hwnd: HWND::default(),
+            hdc: screen_dc,
+        };
+
         let src_dc = CreateCompatibleDC(screen_dc);
+        if src_dc.is_invalid() {
+            return None;
+        }
+        let _src_dc_guard = MemDcGuard(src_dc);
+
         let src_bmp = CreateCompatibleBitmap(screen_dc, src_w, src_h);
+        if src_bmp.is_invalid() {
+            return None;
+        }
+        let _src_bmp_guard = HBitmapGuard(src_bmp);
         let old_src = SelectObject(src_dc, src_bmp);
+        let _src_sel_guard = SelectedObjGuard {
+            hdc: src_dc,
+            prev: old_src,
+        };
 
         // PW_RENDERFULLCONTENT = 2
         let printed = windows::Win32::Storage::Xps::PrintWindow(
@@ -1651,11 +2381,20 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
         .as_bool();
         if !printed {
             let win_dc = GetDC(hwnd);
-            let _ = BitBlt(src_dc, 0, 0, src_w, src_h, win_dc, 0, 0, SRCCOPY);
-            ReleaseDC(hwnd, win_dc);
+            if !win_dc.is_invalid() {
+                let _win_dc_guard = WindowDcGuard { hwnd, hdc: win_dc };
+                let _ = BitBlt(src_dc, 0, 0, src_w, src_h, win_dc, 0, 0, SRCCOPY);
+            } else {
+                return None;
+            }
         }
 
         let dst_dc = CreateCompatibleDC(screen_dc);
+        if dst_dc.is_invalid() {
+            return None;
+        }
+        let _dst_dc_guard = MemDcGuard(dst_dc);
+
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = dst_w;
@@ -1665,36 +2404,34 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
         let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dst_bmp = CreateDIBSection(dst_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok();
-
-        let mut encoded = None;
-        if let Some(dst_bmp) = dst_bmp {
-            let old_dst = SelectObject(dst_dc, dst_bmp);
-            SetStretchBltMode(dst_dc, HALFTONE);
-            let _ = StretchBlt(
-                dst_dc, 0, 0, dst_w, dst_h, src_dc, 0, 0, src_w, src_h, SRCCOPY,
-            );
-            let total = (dst_w * dst_h * 4) as usize;
-            let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, total);
-            let mut rgba = vec![0u8; total];
-            for i in (0..total).step_by(4) {
-                rgba[i] = bgra[i + 2];
-                rgba[i + 1] = bgra[i + 1];
-                rgba[i + 2] = bgra[i];
-                rgba[i + 3] = 255;
+        let dst_bmp = CreateDIBSection(dst_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?;
+        if dst_bmp.is_invalid() || bits_ptr.is_null() {
+            if !dst_bmp.is_invalid() {
+                let _ = DeleteObject(dst_bmp);
             }
-            encoded = encode_rgba_png(dst_w as u32, dst_h as u32, &rgba);
-            SelectObject(dst_dc, old_dst);
-            let _ = DeleteObject(dst_bmp);
+            return None;
         }
+        let _dst_bmp_guard = HBitmapGuard(dst_bmp);
+        let old_dst = SelectObject(dst_dc, dst_bmp);
+        let _dst_sel_guard = SelectedObjGuard {
+            hdc: dst_dc,
+            prev: old_dst,
+        };
 
-        SelectObject(src_dc, old_src);
-        let _ = DeleteObject(src_bmp);
-        let _ = DeleteDC(src_dc);
-        let _ = DeleteDC(dst_dc);
-        ReleaseDC(HWND::default(), screen_dc);
-
-        encoded
+        SetStretchBltMode(dst_dc, HALFTONE);
+        let _ = StretchBlt(
+            dst_dc, 0, 0, dst_w, dst_h, src_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY,
+        );
+        let total = (dst_w as usize).checked_mul(dst_h as usize)?.checked_mul(4)?;
+        let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, total);
+        let mut rgba = vec![0u8; total];
+        for i in (0..total).step_by(4) {
+            rgba[i] = bgra[i + 2];
+            rgba[i + 1] = bgra[i + 1];
+            rgba[i + 2] = bgra[i];
+            rgba[i + 3] = 255;
+        }
+        encode_rgba_png(dst_w as u32, dst_h as u32, &rgba)
     }
 }
 
@@ -1794,6 +2531,7 @@ mod tests {
                 ),
                 is_active: false,
                 is_minimized: false,
+                is_topmost: false,
             },
             OpenWindowInfo {
                 hwnd: 102,
@@ -1805,6 +2543,7 @@ mod tests {
                 aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string()),
                 is_active: false,
                 is_minimized: false,
+                is_topmost: false,
             },
             OpenWindowInfo {
                 hwnd: 103,
@@ -1816,6 +2555,7 @@ mod tests {
                 aumid: Some("microsoft.windowscalculator_8wekyb3d8bbwe!app".to_string()),
                 is_active: true,
                 is_minimized: false,
+                is_topmost: true,
             },
             OpenWindowInfo {
                 hwnd: 104,
@@ -1827,6 +2567,7 @@ mod tests {
                 aumid: None,
                 is_active: false,
                 is_minimized: false,
+                is_topmost: false,
             },
             OpenWindowInfo {
                 hwnd: 105,
@@ -1838,6 +2579,7 @@ mod tests {
                 aumid: None,
                 is_active: false,
                 is_minimized: true,
+                is_topmost: false,
             },
         ];
 
@@ -2069,5 +2811,168 @@ mod tests {
         )])
         .unwrap_err();
         assert!(failed.contains("OS error"));
+    }
+
+    #[test]
+    fn dwm_thumbnail_crop_strips_invisible_shadow_borders_and_clamps_safely() {
+        // Typical Win11 window with 7px left/right/bottom invisible DWM resize shadow
+        let win = RECT {
+            left: 93,
+            top: 100,
+            right: 1107,
+            bottom: 807,
+        };
+        let ext = RECT {
+            left: 100,
+            top: 100,
+            right: 1100,
+            bottom: 800,
+        };
+        assert_eq!(compute_dwm_thumbnail_crop(win, Some(ext)), (7, 0, 1000, 700));
+
+        // Missing or invalid extended rect falls back to full window rect
+        assert_eq!(compute_dwm_thumbnail_crop(win, None), (0, 0, 1014, 707));
+        assert_eq!(
+            compute_dwm_thumbnail_crop(
+                win,
+                Some(RECT {
+                    left: 500,
+                    top: 500,
+                    right: 500,
+                    bottom: 400,
+                })
+            ),
+            (0, 0, 1014, 707)
+        );
+    }
+
+    #[test]
+    fn snap_rect_geometry_compensates_dwm_frame_insets_and_rejects_invalid_zone() {
+        let wa = PixelRect::new(0, 0, 1920, 1016);
+        let inset = (7, 0, 7, 7);
+
+        let left = compute_snap_rect(wa, None, inset, "left").unwrap();
+        assert_eq!(left, PixelRect::new(-7, 0, 960 + 7, 1016 + 7));
+
+        let right = compute_snap_rect(wa, None, inset, "right").unwrap();
+        assert_eq!(right, PixelRect::new(960 - 7, 0, 1920 + 7, 1016 + 7));
+
+        // Center preserves comfortable current window size and centers it inside work_area
+        let cur = PixelRect::new(50, 50, 1050, 750); // 1000x700
+        let center_keep = compute_snap_rect(wa, Some(cur), inset, "center").unwrap();
+        assert_eq!(
+            center_keep,
+            PixelRect::new(460 - 7, 158, 1460 + 7, 858 + 7)
+        );
+
+        // Oversized current window falls back to 72% x 78% centered
+        let huge = PixelRect::new(0, 0, 1920, 1016);
+        let center_default = compute_snap_rect(wa, Some(huge), (0, 0, 0, 0), "center").unwrap();
+        assert_eq!(center_default.width(), 1382);
+        assert_eq!(center_default.height(), 792);
+
+        assert!(compute_snap_rect(wa, None, inset, "diagonal").is_err());
+        assert!(snap_window(0, "left").is_err());
+        assert!(snap_window(123, "bogus").is_err());
+        assert!(toggle_window_topmost(0).is_err());
+        assert!(minimize_other_windows(0).is_err());
+    }
+
+    #[test]
+    fn build_new_window_launch_args_handles_chromium_gecko_editors_terminal_and_custom_args() {
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Program Files\Google\Chrome\chrome.exe", None)
+                .as_deref(),
+            Some("--new-window")
+        );
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Program Files\VS Code\Code.exe", Some("--profile Dev"))
+                .as_deref(),
+            Some("--new-window --profile Dev")
+        );
+        // Existing new-window/incognito flag is not duplicated
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Program Files\Google\Chrome\chrome.exe", Some("--incognito"))
+                .as_deref(),
+            Some("--incognito")
+        );
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Program Files\Zen Browser\zen.exe", None).as_deref(),
+            Some("-new-window")
+        );
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Windows\explorer.exe", None).as_deref(),
+            Some("/n")
+        );
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\wt.exe", None)
+                .as_deref(),
+            Some("-w new")
+        );
+        assert_eq!(
+            build_new_window_launch_args(r"C:\Windows\notepad.exe", None),
+            None
+        );
+        assert!(launch_new_window_instance("   ", None).is_err());
+    }
+
+    #[test]
+    fn open_window_info_is_topmost_serde_default_icon_source_and_negative_cache() {
+        // Legacy JSON payload without isTopmost deserializes cleanly with is_topmost = false
+        let raw = r#"{"hwnd":1,"pid":2,"title":"T","exePath":"C:\\Windows\\notepad.exe","exeName":"Блокнот","aumid":null,"isActive":false,"isMinimized":false}"#;
+        let parsed: OpenWindowInfo = serde_json::from_str(raw).unwrap();
+        assert!(!parsed.is_topmost);
+        assert_eq!(
+            icon_source_for_window(&parsed).as_deref(),
+            Some(r"C:\Windows\notepad.exe")
+        );
+
+        let uwp_win = OpenWindowInfo {
+            aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+            exe_path: r"C:\Windows\System32\ApplicationFrameHost.exe".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            icon_source_for_window(&uwp_win).as_deref(),
+            Some(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+        );
+
+        // Missing file path marks negative miss in IconCache so subsequent ticks short-circuit
+        let cache = Mutex::new(IconCache::new(16));
+        let bogus = r"C:\NonExistent_TestBar_Path_99999\missing_app.exe";
+        assert!(extract_icon_for_path_cached(bogus, &cache).is_none());
+        let key = icon_cache::path_icon_key(bogus);
+        assert!(cache.lock().unwrap().is_negative_cached(&key));
+        assert!(resolve_exe_or_hwnd_icon_key(bogus, None, &cache).is_none());
+    }
+
+    #[test]
+    fn toggle_window_topmost_flips_flag_on_own_window() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+
+        unsafe {
+            let cls = wide("STATIC");
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                PCWSTR(cls.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                HWND::default(),
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW STATIC failed");
+            let raw = hwnd.0 as isize;
+            let on = toggle_window_topmost(raw).expect("toggle topmost on failed");
+            assert!(on);
+            let off = toggle_window_topmost(raw).expect("toggle topmost off failed");
+            assert!(!off);
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }

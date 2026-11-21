@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
@@ -16,6 +17,20 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const SECONDARY_TASKBAR_MODE_TESTBAR: &str = "testbar";
 pub const SECONDARY_TASKBAR_MODE_NATIVE: &str = "native";
 pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
+
+pub const GLASS_DEPTH_CRYSTAL: &str = "crystal";
+pub const GLASS_DEPTH_OBSIDIAN: &str = "obsidian";
+pub const GLASS_DEPTH_MATTE: &str = "matte";
+
+pub const WIDGET_PRESET_MEDIA_CLIPBOARD: &str = "media_clipboard";
+pub const WIDGET_PRESET_TELEMETRY_PROCESSES: &str = "telemetry_processes";
+pub const WIDGET_PRESET_AUDIO_MIC: &str = "audio_mic";
+pub const WIDGET_PRESET_FULL_GRID: &str = "full_grid";
+
+pub const MAX_FRECENCY_ENTRIES: usize = 200;
+const SAVE_RENAME_RETRIES: usize = 3;
+const SAVE_RENAME_RETRY_DELAY_MS: u64 = 15;
+const MAX_IMPORT_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn default_secondary_taskbar_mode() -> String {
     SECONDARY_TASKBAR_MODE_TESTBAR.to_string()
@@ -40,6 +55,90 @@ pub fn validate_secondary_taskbar_mode(mode: &str) -> Result<&'static str, Strin
     }
 }
 
+pub fn default_glass_depth() -> String {
+    GLASS_DEPTH_OBSIDIAN.to_string()
+}
+
+pub fn normalize_glass_depth(depth: &str) -> &'static str {
+    match depth.trim().to_ascii_lowercase().as_str() {
+        "crystal" => GLASS_DEPTH_CRYSTAL,
+        "matte" => GLASS_DEPTH_MATTE,
+        _ => GLASS_DEPTH_OBSIDIAN,
+    }
+}
+
+pub fn validate_glass_depth(depth: &str) -> Result<&'static str, String> {
+    match depth.trim().to_ascii_lowercase().as_str() {
+        "crystal" => Ok(GLASS_DEPTH_CRYSTAL),
+        "obsidian" => Ok(GLASS_DEPTH_OBSIDIAN),
+        "matte" => Ok(GLASS_DEPTH_MATTE),
+        other => Err(format!(
+            "Недопустимая глубина стекла: '{other}' (допустимы: crystal, obsidian, matte)"
+        )),
+    }
+}
+
+pub fn default_widget_preset() -> String {
+    WIDGET_PRESET_MEDIA_CLIPBOARD.to_string()
+}
+
+pub fn normalize_widget_preset(preset: &str) -> &'static str {
+    match preset.trim().to_ascii_lowercase().as_str() {
+        "telemetry_processes" => WIDGET_PRESET_TELEMETRY_PROCESSES,
+        "audio_mic" => WIDGET_PRESET_AUDIO_MIC,
+        "full_grid" => WIDGET_PRESET_FULL_GRID,
+        _ => WIDGET_PRESET_MEDIA_CLIPBOARD,
+    }
+}
+
+pub fn validate_widget_preset(preset: &str) -> Result<&'static str, String> {
+    match preset.trim().to_ascii_lowercase().as_str() {
+        "media_clipboard" => Ok(WIDGET_PRESET_MEDIA_CLIPBOARD),
+        "telemetry_processes" => Ok(WIDGET_PRESET_TELEMETRY_PROCESSES),
+        "audio_mic" => Ok(WIDGET_PRESET_AUDIO_MIC),
+        "full_grid" => Ok(WIDGET_PRESET_FULL_GRID),
+        other => Err(format!(
+            "Недопустимый набор виджетов: '{other}' (допустимы: media_clipboard, telemetry_processes, audio_mic, full_grid)"
+        )),
+    }
+}
+
+pub fn sanitize_accent_hex_rgb(
+    accent_hex: Option<&str>,
+    accent_rgb: Option<&str>,
+) -> (String, String) {
+    let hex = accent_hex
+        .map(str::trim)
+        .filter(|h| {
+            h.len() == 7 && h.starts_with('#') && h[1..].chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .unwrap_or("#A78BFA");
+    let rgb = accent_rgb
+        .map(str::trim)
+        .filter(|r| {
+            let parts: Vec<&str> = r.split(',').collect();
+            parts.len() == 3 && parts.iter().all(|p| p.trim().parse::<u8>().is_ok())
+        })
+        .map(|r| {
+            r.split(',')
+                .map(|p| p.trim())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[1..3], 16),
+                u8::from_str_radix(&hex[3..5], 16),
+                u8::from_str_radix(&hex[5..7], 16),
+            ) {
+                format!("{r},{g},{b}")
+            } else {
+                "167,139,250".to_string()
+            }
+        });
+    (hex.to_uppercase(), rgb)
+}
+
 const AUTOSTART_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE_NAME: &str = "TestBar";
 
@@ -60,6 +159,8 @@ pub struct PinItem {
     pub args: Option<String>,
     #[serde(default)]
     pub alt_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_label: Option<String>,
     #[serde(default)]
     pub accent_rgb: String,
     #[serde(default)]
@@ -83,8 +184,19 @@ pub struct CustomSpace {
     pub accent_hex: String,
     #[serde(default)]
     pub accent_rgb: String,
+    #[serde(default = "default_widget_preset")]
+    pub widget_preset: String,
     #[serde(default)]
     pub items: Vec<PinItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FrecencyEntry {
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub last_used_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +212,18 @@ pub struct TestBarConfig {
     pub secondary_taskbar_mode: String, // "testbar" | "native" | "hidden"
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default = "default_glass_depth")]
+    pub glass_depth: String, // "crystal" | "obsidian" | "matte"
+    #[serde(default)]
+    pub clock_show_seconds: bool,
+    #[serde(default)]
+    pub clock_show_weekday: bool,
+    #[serde(default)]
+    pub start_remember_space: bool,
+    #[serde(default)]
+    pub hidden_tray_keys: Vec<String>,
+    #[serde(default)]
+    pub frecency: HashMap<String, FrecencyEntry>,
     #[serde(default)]
     pub taskbar_pins: Vec<PinItem>,
     #[serde(default)]
@@ -349,6 +473,7 @@ fn pin(
         target,
         args,
         alt_action: alt_action.to_string(),
+        alt_label: None,
         accent_rgb: accent_rgb.to_string(),
         icon_key: icon_key.to_string(),
         icon_data: None,
@@ -373,6 +498,7 @@ fn combo_pin(
         target: String::new(),
         args: None,
         alt_action: String::new(),
+        alt_label: None,
         accent_rgb: accent_rgb.to_string(),
         icon_key: String::new(),
         icon_data: None,
@@ -380,6 +506,21 @@ fn combo_pin(
         match_aumid: None,
         combo_targets: Some(targets),
     }
+}
+
+fn retain_resolved_pins(items: Vec<PinItem>) -> Vec<PinItem> {
+    items
+        .into_iter()
+        .filter(|p| {
+            if p.kind == "combo" {
+                p.combo_targets
+                    .as_ref()
+                    .is_some_and(|t| t.iter().any(|s| !s.trim().is_empty()))
+            } else {
+                !p.target.trim().is_empty()
+            }
+        })
+        .collect()
 }
 
 pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
@@ -498,6 +639,12 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         changed = true;
     }
 
+    let desired_glass = normalize_glass_depth(&cfg.glass_depth);
+    if cfg.glass_depth != desired_glass {
+        cfg.glass_depth = desired_glass.to_string();
+        changed = true;
+    }
+
     for list in [
         &mut cfg.taskbar_pins,
         &mut cfg.personal_pins,
@@ -522,6 +669,11 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
     }
 
     for space in cfg.custom_spaces.iter_mut() {
+        let desired_preset = normalize_widget_preset(&space.widget_preset);
+        if space.widget_preset != desired_preset {
+            space.widget_preset = desired_preset.to_string();
+            changed = true;
+        }
         for item in space.items.iter_mut() {
             if normalize_pin(item, false) {
                 changed = true;
@@ -543,6 +695,48 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         changed = true;
     }
 
+    // Deduplicate and normalize hidden_tray_keys (case-insensitive)
+    let mut seen_tray = HashSet::new();
+    let mut cleaned_tray = Vec::with_capacity(cfg.hidden_tray_keys.len());
+    for entry in &cfg.hidden_tray_keys {
+        let norm = entry.trim().to_ascii_lowercase();
+        if !norm.is_empty() && seen_tray.insert(norm.clone()) {
+            cleaned_tray.push(norm);
+        }
+    }
+    if cleaned_tray != cfg.hidden_tray_keys {
+        cfg.hidden_tray_keys = cleaned_tray;
+        changed = true;
+    }
+
+    if trim_frecency_map(&mut cfg.frecency) {
+        changed = true;
+    }
+
+    changed
+}
+
+fn trim_frecency_map(map: &mut HashMap<String, FrecencyEntry>) -> bool {
+    let mut changed = false;
+    let before = map.len();
+    map.retain(|k, v| !k.trim().is_empty() && (v.count > 0 || v.last_used_ms > 0));
+    if map.len() != before {
+        changed = true;
+    }
+    if map.len() > MAX_FRECENCY_ENTRIES {
+        let mut ranked: Vec<(String, u64, u32)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.last_used_ms, v.count))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
+        let keep: HashSet<String> = ranked
+            .into_iter()
+            .take(MAX_FRECENCY_ENTRIES)
+            .map(|(k, _, _)| k)
+            .collect();
+        map.retain(|k, _| keep.contains(k));
+        changed = true;
+    }
     changed
 }
 
@@ -565,10 +759,12 @@ impl Default for TestBarConfig {
             .unwrap_or_else(|| home.join("Pictures"))
             .to_string_lossy()
             .to_string();
-        let testbar_dir = PathBuf::from(&documents)
-            .join("testbar")
-            .to_string_lossy()
-            .to_string();
+        let testbar_dir_path = PathBuf::from(&documents).join("testbar");
+        let testbar_dir = if testbar_dir_path.exists() {
+            testbar_dir_path.to_string_lossy().to_string()
+        } else {
+            String::new()
+        };
 
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -576,73 +772,79 @@ impl Default for TestBarConfig {
             bar_mode: "dock".to_string(),
             secondary_taskbar_mode: default_secondary_taskbar_mode(),
             autostart: false,
-            taskbar_pins: vec![
+            glass_depth: default_glass_depth(),
+            clock_show_seconds: false,
+            clock_show_weekday: false,
+            start_remember_space: false,
+            hidden_tray_keys: vec![],
+            frecency: HashMap::new(),
+            taskbar_pins: retain_resolved_pins(vec![
                 pin("explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
                 pin("zen", "app", "Zen Browser", "Браузер", detect_app_target("zen"), "Новое окно", "249,115,22", "zen"),
-                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "Избранное", "56,189,248", "telegram"),
-                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "Новое письмо", "59,130,246", "spark"),
-                pin("antigravity", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новый проект", "56,189,248", "antigravity"),
+                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
+                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "", "59,130,246", "spark"),
+                pin("antigravity", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
                 pin("vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-                pin("ymusic", "app", "Яндекс Музыка", "Плеер", detect_app_target("ymusic"), "Моя волна", "250,204,21", "ymusic"),
-            ],
-            personal_pins: vec![
+                pin("ymusic", "app", "Яндекс Музыка", "Плеер", detect_app_target("ymusic"), "", "250,204,21", "ymusic"),
+            ]),
+            personal_pins: retain_resolved_pins(vec![
                 pin("zen", "app", "Zen Browser", "Основной браузер", detect_app_target("zen"), "Приватное окно", "249,115,22", "zen"),
-                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "Избранное", "56,189,248", "telegram"),
-                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "Новое письмо", "59,130,246", "spark"),
+                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
+                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "", "59,130,246", "spark"),
                 pin("explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
-                pin("obsidian", "app", "Второй мозг", "Obsidian", detect_app_target("obsidian"), "Новая заметка", "139,92,246", "obsidian"),
-                pin("claude", "app", "Claude", "Ассистент", detect_app_target("claude"), "Новый чат", "217,119,87", "claude"),
+                pin("obsidian", "app", "Второй мозг", "Obsidian", detect_app_target("obsidian"), "", "139,92,246", "obsidian"),
+                pin("claude", "app", "Claude", "Ассистент", detect_app_target("claude"), "", "217,119,87", "claude"),
                 pin("yandex", "app", "Яндекс", "Браузер", detect_app_target("yandex"), "Инкогнито", "239,68,68", "yandex"),
-                pin("discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "Каналы", "99,102,241", "discord"),
-                pin("ymusic", "app", "Я.Музыка", "Плеер", detect_app_target("ymusic"), "Моя волна", "250,204,21", "ymusic"),
+                pin("discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
+                pin("ymusic", "app", "Я.Музыка", "Плеер", detect_app_target("ymusic"), "", "250,204,21", "ymusic"),
                 pin("obs", "app", "OBS Studio", "Запись экрана", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
                 pin("wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
-            ],
-            personal_links: vec![
+            ]),
+            personal_links: retain_resolved_pins(vec![
                 pin("lnk-downloads", "folder", "Загрузки", "Папка", downloads.clone(), "Скопировать путь", "56,189,248", "folder"),
                 pin("lnk-docs", "folder", "Документы", "Папка", documents.clone(), "Скопировать путь", "245,158,11", "folder"),
                 pin("lnk-pics", "folder", "Изображения", "Скриншоты", pictures.clone(), "Скопировать путь", "139,92,246", "image"),
                 pin("lnk-desktop", "folder", "Рабочий стол", "Файлы", desktop.clone(), "Скопировать путь", "52,211,153", "folder"),
-            ],
-            work_folders: vec![
+            ]),
+            work_folders: retain_resolved_pins(vec![
                 pin("wf-dl", "folder", "Загрузки", "Свежие файлы", downloads, "Открыть в терминале", "245,158,11", "folder"),
                 pin("wf-docs", "folder", "Документы", "Основная папка", documents.clone(), "Открыть в терминале", "245,158,11", "folder"),
                 pin("wf-testbar", "folder", "testbar", "Проект · сейчас", testbar_dir, "Открыть в терминале", "56,189,248", "folder"),
                 pin("wf-desktop", "folder", "Рабочий стол", "Файлы и ярлыки", desktop, "Открыть в терминале", "56,189,248", "folder"),
                 pin("wf-pics", "folder", "Скриншоты", "Изображения", pictures, "Открыть в терминале", "139,92,246", "folder"),
                 pin("wf-home", "folder", "Профиль", "Домашняя папка", home.to_string_lossy().to_string(), "Открыть в терминале", "52,211,153", "folder"),
-            ],
-            work_apps: vec![
+            ]),
+            work_apps: retain_resolved_pins(vec![
                 pin("wa-ag", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
                 pin("wa-cur", "app", "Cursor", "Код", detect_app_target("cursor"), "Новое окно", "226,232,240", "cursor"),
                 pin("wa-vsc", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
                 pin("wa-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
-            ],
-            studio_pins: vec![
+            ]),
+            studio_pins: retain_resolved_pins(vec![
                 pin("photoshop", "app", "Photoshop 2025", "Графика и ретушь", detect_app_target("photoshop"), "От админа", "49,168,255", "photoshop"),
-                pin("obsidian-s", "app", "Obsidian", "База знаний", detect_app_target("obsidian"), "Новая заметка", "139,92,246", "obsidian"),
-                pin("figma", "app", "Figma", "Интерфейсы", detect_app_target("figma"), "Открыть", "168,85,247", "figma"),
-                pin("lightroom", "app", "Lightroom", "Classic", detect_app_target("lightroom"), "Каталог", "56,189,248", "lightroom"),
-                pin("unity", "app", "Unity Hub", "Проекты 3D", detect_app_target("unity"), "Открыть", "226,232,240", "unity"),
+                pin("obsidian-s", "app", "Obsidian", "База знаний", detect_app_target("obsidian"), "", "139,92,246", "obsidian"),
+                pin("figma", "app", "Figma", "Интерфейсы", detect_app_target("figma"), "", "168,85,247", "figma"),
+                pin("lightroom", "app", "Lightroom", "Classic", detect_app_target("lightroom"), "", "56,189,248", "lightroom"),
+                pin("unity", "app", "Unity Hub", "Проекты 3D", detect_app_target("unity"), "", "226,232,240", "unity"),
                 pin("obs-s", "app", "OBS Studio", "Захват видео", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
-                pin("antigravity-s", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новый проект", "56,189,248", "antigravity"),
+                pin("antigravity-s", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
                 pin("cursor-s", "app", "Cursor", "Редактор кода", detect_app_target("cursor"), "Новое окно", "226,232,240", "cursor"),
                 pin("vscode-s", "app", "VS Code", "Workspace", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-                pin("claude-s", "app", "Claude", "AI-ассистент", detect_app_target("claude"), "Новый чат", "217,119,87", "claude"),
+                pin("claude-s", "app", "Claude", "AI-ассистент", detect_app_target("claude"), "", "217,119,87", "claude"),
                 pin("warp-s", "app", "Warp", "Терминал", detect_app_target("warp"), "От админа", "52,211,153", "warp"),
-            ],
-            studio_tools: vec![
-                pin("st-snip", "app", "Ножницы", "Скриншот", "ms-screenclip:".to_string(), "Открыть", "52,211,153", "scissors"),
+            ]),
+            studio_tools: retain_resolved_pins(vec![
+                pin("st-snip", "app", "Ножницы", "Скриншот", "ms-screenclip:".to_string(), "", "52,211,153", "scissors"),
                 pin("st-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
                 pin("st-wiz", "app", "WizTree", "Диски", detect_app_target("wiztree"), "От админа", "56,189,248", "disk"),
                 pin("st-tm", "app", "Диспетчер", "Процессы", r"C:\Windows\System32\Taskmgr.exe".to_string(), "От админа", "129,140,248", "cpu"),
-            ],
-            game_launchers: vec![
-                pin("gl-steam", "app", "Steam", "Библиотека", detect_app_target("steam"), "Открыть", "56,189,248", "steam"),
-                pin("gl-bnet", "app", "Battle.net", "Лаунчер", detect_app_target("battlenet"), "Открыть", "14,165,233", "battlenet"),
-                pin("gl-discord", "app", "Discord", "Голос", detect_app_target("discord"), "Открыть", "99,102,241", "discord"),
-                pin("gl-obs", "app", "OBS Studio", "Запись", detect_app_target("obs"), "Открыть", "148,163,184", "obs"),
-            ],
+            ]),
+            game_launchers: retain_resolved_pins(vec![
+                pin("gl-steam", "app", "Steam", "Библиотека", detect_app_target("steam"), "", "56,189,248", "steam"),
+                pin("gl-bnet", "app", "Battle.net", "Лаунчер", detect_app_target("battlenet"), "", "14,165,233", "battlenet"),
+                pin("gl-discord", "app", "Discord", "Голос", detect_app_target("discord"), "", "99,102,241", "discord"),
+                pin("gl-obs", "app", "OBS Studio", "Запись", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
+            ]),
             game_combos: vec![
                 combo_pin(
                     "combo-poe2",
@@ -682,6 +884,14 @@ pub fn config_path() -> PathBuf {
     roaming_appdata().join("TestBar").join("config.json")
 }
 
+pub fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.json".to_string());
+    path.with_file_name(format!("{file_name}.corrupt.bak"))
+}
+
 fn sibling_tmp_path(path: &Path) -> PathBuf {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -703,6 +913,10 @@ pub fn load_config_from(path: &Path) -> TestBarConfig {
                 }
                 return cfg;
             }
+            // Never silently destroy a corrupt user config: preserve an exact `.corrupt.bak` copy.
+            if path.is_file() {
+                let _ = fs::copy(path, corrupt_backup_path(path));
+            }
         }
         return TestBarConfig::default();
     }
@@ -713,6 +927,14 @@ pub fn load_config_from(path: &Path) -> TestBarConfig {
 
 pub fn load_config() -> TestBarConfig {
     load_config_from(&config_path())
+}
+
+fn is_retryable_rename_error(err: &std::io::Error) -> bool {
+    if err.kind() == ErrorKind::PermissionDenied {
+        return true;
+    }
+    // Windows ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32) from AV / Search Indexer
+    matches!(err.raw_os_error(), Some(5) | Some(32))
 }
 
 pub fn save_config_to(path: &Path, cfg: &TestBarConfig) -> Result<(), String> {
@@ -733,12 +955,29 @@ pub fn save_config_to(path: &Path, cfg: &TestBarConfig) -> Result<(), String> {
         return Err(err);
     }
 
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("rename tmp: {err}"));
+    let mut last_err = None;
+    for attempt in 0..=SAVE_RENAME_RETRIES {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let retryable = is_retryable_rename_error(&err) && !path.is_dir();
+                last_err = Some(err);
+                if retryable && attempt < SAVE_RENAME_RETRIES {
+                    std::thread::sleep(Duration::from_millis(SAVE_RENAME_RETRY_DELAY_MS));
+                    continue;
+                }
+                break;
+            }
+        }
     }
 
-    Ok(())
+    let _ = fs::remove_file(&tmp);
+    Err(format!(
+        "rename tmp: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 pub fn set_pinned_clipboard(cfg: &mut TestBarConfig, text: &str, pinned: bool) -> bool {
@@ -913,6 +1152,424 @@ pub fn reorder_pins_in_space(
         }
     }
     false
+}
+
+pub fn update_custom_space(
+    cfg: &mut TestBarConfig,
+    id: &str,
+    name: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    widget_preset: Option<String>,
+) -> Result<bool, String> {
+    let Some(space) = cfg.custom_spaces.iter_mut().find(|s| s.id == id) else {
+        return Err(format!("Пространство '{id}' не найдено"));
+    };
+    let mut changed = false;
+
+    if let Some(raw_name) = name {
+        let clean = raw_name.trim().to_string();
+        if clean.is_empty() {
+            return Err("Пустое название пространства".to_string());
+        }
+        if space.name != clean {
+            space.name = clean;
+            changed = true;
+        }
+    }
+
+    if accent_hex.is_some() || accent_rgb.is_some() {
+        let (hex, rgb) = sanitize_accent_hex_rgb(
+            accent_hex.as_deref().or(Some(&space.accent_hex)),
+            accent_rgb.as_deref(),
+        );
+        if space.accent_hex != hex {
+            space.accent_hex = hex;
+            changed = true;
+        }
+        if space.accent_rgb != rgb {
+            space.accent_rgb = rgb;
+            changed = true;
+        }
+    }
+
+    if let Some(preset) = widget_preset {
+        let valid = validate_widget_preset(&preset)?;
+        if space.widget_preset != valid {
+            space.widget_preset = valid.to_string();
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+pub fn delete_custom_space(cfg: &mut TestBarConfig, id: &str) -> bool {
+    let Some(pos) = cfg.custom_spaces.iter().position(|s| s.id == id) else {
+        return false;
+    };
+    let removed = cfg.custom_spaces.remove(pos);
+    cfg.frecency.remove(id);
+    for item in &removed.items {
+        cfg.frecency.remove(&item.id);
+        cfg.frecency.remove(&format!("pin:{}", item.id));
+    }
+    true
+}
+
+fn find_pin_mut<'a>(
+    cfg: &'a mut TestBarConfig,
+    space: &str,
+    pin_id: &str,
+) -> Option<(&'a mut PinItem, bool)> {
+    match space {
+        "personal" | "personal_pins" => cfg
+            .personal_pins
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "personal_links" => cfg
+            .personal_links
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "work" => {
+            if let Some(p) = cfg.work_folders.iter_mut().find(|p| p.id == pin_id) {
+                Some((p, false))
+            } else {
+                cfg.work_apps
+                    .iter_mut()
+                    .find(|p| p.id == pin_id)
+                    .map(|p| (p, false))
+            }
+        }
+        "work_folders" => cfg
+            .work_folders
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "work_apps" => cfg
+            .work_apps
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "studio" | "studio_pins" => cfg
+            .studio_pins
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "studio_tools" => cfg
+            .studio_tools
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "games" => {
+            if let Some(p) = cfg.game_combos.iter_mut().find(|p| p.id == pin_id) {
+                Some((p, true))
+            } else {
+                cfg.game_launchers
+                    .iter_mut()
+                    .find(|p| p.id == pin_id)
+                    .map(|p| (p, false))
+            }
+        }
+        "game_combos" => cfg
+            .game_combos
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, true)),
+        "game_launchers" => cfg
+            .game_launchers
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "taskbar" | "taskbar_pins" => cfg
+            .taskbar_pins
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        custom_id => cfg
+            .custom_spaces
+            .iter_mut()
+            .find(|s| s.id == custom_id)
+            .and_then(|s| s.items.iter_mut().find(|p| p.id == pin_id))
+            .map(|p| (p, false)),
+    }
+}
+
+pub fn update_pin(
+    cfg: &mut TestBarConfig,
+    space: &str,
+    pin_id: &str,
+    title: Option<String>,
+    target: Option<String>,
+    args: Option<String>,
+    alt_action: Option<String>,
+    alt_label: Option<String>,
+) -> Result<bool, String> {
+    let Some((pin_item, force_combo)) = find_pin_mut(cfg, space, pin_id) else {
+        return Err(format!("Элемент '{pin_id}' не найден в '{space}'"));
+    };
+    let mut changed = false;
+
+    if let Some(raw_title) = title {
+        let clean = raw_title.trim().to_string();
+        if clean.is_empty() {
+            return Err("Название элемента не может быть пустым".to_string());
+        }
+        if pin_item.title != clean {
+            pin_item.title = clean;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_target) = target {
+        let clean = raw_target.trim().to_string();
+        if pin_item.target != clean {
+            pin_item.target = clean;
+            // Re-derive match_exe on target update for app pins
+            if pin_item.kind == "app" {
+                pin_item.match_exe = None;
+            }
+            changed = true;
+        }
+    }
+
+    if let Some(raw_args) = args {
+        let trimmed = raw_args.trim();
+        let next_args = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if pin_item.args != next_args {
+            pin_item.args = next_args;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_alt) = alt_action {
+        let clean = raw_alt.trim().to_string();
+        if pin_item.alt_action != clean {
+            pin_item.alt_action = clean;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_label) = alt_label {
+        let trimmed = raw_label.trim();
+        let next_label = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if pin_item.alt_label != next_label {
+            pin_item.alt_label = next_label;
+            changed = true;
+        }
+    }
+
+    if normalize_pin(pin_item, force_combo) {
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+pub fn add_game_combo(
+    cfg: &mut TestBarConfig,
+    id: String,
+    name: String,
+    subtitle: String,
+    accent: Option<String>,
+    steps: Vec<String>,
+) -> Result<bool, String> {
+    let clean_name = name.trim().to_string();
+    if clean_name.is_empty() {
+        return Err("Название игровой связки не может быть пустым".to_string());
+    }
+    let clean_steps: Vec<String> = steps
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_steps.is_empty() {
+        return Err("Добавьте хотя бы один шаг для запуска связки".to_string());
+    }
+    let (_, accent_rgb) = match accent.as_deref().map(str::trim) {
+        Some(a) if a.starts_with('#') => sanitize_accent_hex_rgb(Some(a), None),
+        Some(a) if !a.is_empty() => sanitize_accent_hex_rgb(None, Some(a)),
+        _ => sanitize_accent_hex_rgb(Some("#38BDF8"), None),
+    };
+    let clean_sub = subtitle.trim().to_string();
+    let mut item = combo_pin(&id, &clean_name, &clean_sub, clean_steps, &accent_rgb);
+    normalize_pin(&mut item, true);
+    cfg.game_combos.push(item);
+    Ok(true)
+}
+
+pub fn update_game_combo(
+    cfg: &mut TestBarConfig,
+    id: &str,
+    name: Option<String>,
+    subtitle: Option<String>,
+    accent: Option<String>,
+    steps: Option<Vec<String>>,
+) -> Result<bool, String> {
+    let Some(combo) = cfg.game_combos.iter_mut().find(|c| c.id == id) else {
+        return Err(format!("Игровая связка '{id}' не найдена"));
+    };
+    let mut changed = false;
+
+    if let Some(raw_name) = name {
+        let clean = raw_name.trim().to_string();
+        if clean.is_empty() {
+            return Err("Название игровой связки не может быть пустым".to_string());
+        }
+        if combo.title != clean {
+            combo.title = clean;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_sub) = subtitle {
+        let clean = raw_sub.trim().to_string();
+        if combo.subtitle != clean {
+            combo.subtitle = clean;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_acc) = accent {
+        let trimmed = raw_acc.trim();
+        let (_, rgb) = if trimmed.starts_with('#') {
+            sanitize_accent_hex_rgb(Some(trimmed), None)
+        } else {
+            sanitize_accent_hex_rgb(None, Some(trimmed))
+        };
+        if combo.accent_rgb != rgb {
+            combo.accent_rgb = rgb;
+            changed = true;
+        }
+    }
+
+    if let Some(raw_steps) = steps {
+        let clean_steps: Vec<String> = raw_steps
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if clean_steps.is_empty() {
+            return Err("Добавьте хотя бы один шаг для запуска связки".to_string());
+        }
+        if combo.combo_targets.as_ref() != Some(&clean_steps) {
+            combo.combo_targets = Some(clean_steps);
+            changed = true;
+        }
+    }
+
+    if normalize_pin(combo, true) {
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+pub fn delete_game_combo(cfg: &mut TestBarConfig, id: &str) -> bool {
+    remove_by_id(&mut cfg.game_combos, id)
+}
+
+pub fn set_appearance_settings(
+    cfg: &mut TestBarConfig,
+    glass_depth: Option<String>,
+    clock_show_seconds: Option<bool>,
+    clock_show_weekday: Option<bool>,
+    start_remember_space: Option<bool>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    if let Some(depth) = glass_depth {
+        let valid = validate_glass_depth(&depth)?;
+        if cfg.glass_depth != valid {
+            cfg.glass_depth = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(sec) = clock_show_seconds {
+        if cfg.clock_show_seconds != sec {
+            cfg.clock_show_seconds = sec;
+            changed = true;
+        }
+    }
+    if let Some(wd) = clock_show_weekday {
+        if cfg.clock_show_weekday != wd {
+            cfg.clock_show_weekday = wd;
+            changed = true;
+        }
+    }
+    if let Some(rem) = start_remember_space {
+        if cfg.start_remember_space != rem {
+            cfg.start_remember_space = rem;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+pub fn hide_tray_key(cfg: &mut TestBarConfig, key: &str) -> bool {
+    let norm = key.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    if cfg.hidden_tray_keys.iter().any(|k| k.eq_ignore_ascii_case(&norm)) {
+        return false;
+    }
+    cfg.hidden_tray_keys.push(norm);
+    true
+}
+
+pub fn restore_tray_key(cfg: &mut TestBarConfig, key: &str) -> bool {
+    let norm = key.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    let before = cfg.hidden_tray_keys.len();
+    cfg.hidden_tray_keys.retain(|k| !k.eq_ignore_ascii_case(&norm));
+    cfg.hidden_tray_keys.len() != before
+}
+
+pub fn restore_all_tray_keys(cfg: &mut TestBarConfig) -> bool {
+    if cfg.hidden_tray_keys.is_empty() {
+        return false;
+    }
+    cfg.hidden_tray_keys.clear();
+    true
+}
+
+pub fn record_frecency(cfg: &mut TestBarConfig, item_id: &str, now_ms: u64) -> bool {
+    let key = item_id.trim();
+    if key.is_empty() {
+        return false;
+    }
+    let entry = cfg.frecency.entry(key.to_string()).or_default();
+    entry.count = entry.count.saturating_add(1);
+    entry.last_used_ms = now_ms.max(entry.last_used_ms);
+    trim_frecency_map(&mut cfg.frecency);
+    true
+}
+
+pub fn export_config_json(cfg: &TestBarConfig) -> Result<String, String> {
+    serde_json::to_string_pretty(cfg).map_err(|e| format!("Не удалось сериализовать конфиг: {e}"))
+}
+
+pub fn import_config_json(raw: &str) -> Result<TestBarConfig, String> {
+    if raw.len() > MAX_IMPORT_CONFIG_BYTES {
+        return Err("Файл конфигурации слишком большой (максимум 4 МБ)".to_string());
+    }
+    let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
+    if trimmed.is_empty() {
+        return Err("Файл конфигурации пуст".to_string());
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Некорректный JSON конфигурации: {e}"))?;
+    if !val.is_object() {
+        return Err("Конфигурация должна быть JSON-объектом".to_string());
+    }
+    let mut parsed: TestBarConfig = serde_json::from_value(val)
+        .map_err(|e| format!("Несовместимый формат конфигурации TestBar: {e}"))?;
+    normalize_and_migrate(&mut parsed);
+    Ok(parsed)
 }
 
 pub fn format_autostart_command(exe_path: &Path) -> Result<String, String> {
@@ -1255,6 +1912,7 @@ mod tests {
                 target: r"C:\Slack\Update.exe".to_string(),
                 args: Some("   ".to_string()),
                 alt_action: String::new(),
+                alt_label: None,
                 accent_rgb: String::new(),
                 icon_key: String::new(),
                 icon_data: None,
@@ -1271,6 +1929,7 @@ mod tests {
                 target: "  steam://rungameid/570  ".to_string(),
                 args: None,
                 alt_action: String::new(),
+                alt_label: None,
                 accent_rgb: String::new(),
                 icon_key: String::new(),
                 icon_data: None,
@@ -1287,6 +1946,7 @@ mod tests {
                 target: r"C:\Work".to_string(),
                 args: None,
                 alt_action: String::new(),
+                alt_label: None,
                 accent_rgb: String::new(),
                 icon_key: String::new(),
                 icon_data: None,
@@ -1305,6 +1965,7 @@ mod tests {
             target: String::new(),
             args: None,
             alt_action: String::new(),
+            alt_label: None,
             accent_rgb: String::new(),
             icon_key: String::new(),
             icon_data: None,
@@ -1506,15 +2167,20 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_unreadable_config_falls_back_to_default_without_panicking() {
+    fn corrupt_or_unreadable_config_falls_back_to_default_and_writes_corrupt_backup() {
         let dir = make_temp_dir("corrupt");
         let corrupt_path = dir.join("config.json");
-        fs::write(&corrupt_path, "{ not valid json !!!").expect("write corrupt");
+        let raw_corrupt = "{ not valid json !!!";
+        fs::write(&corrupt_path, raw_corrupt).expect("write corrupt");
 
         let cfg = load_config_from(&corrupt_path);
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.bar_mode, "dock");
         assert!(!cfg.taskbar_pins.is_empty());
+
+        let bak_path = corrupt_backup_path(&corrupt_path);
+        assert!(bak_path.exists(), "corrupt config must be backed up to .corrupt.bak");
+        assert_eq!(fs::read_to_string(&bak_path).unwrap(), raw_corrupt);
 
         // Passing a directory path (unreadable as file) also falls back cleanly
         let cfg_dir = load_config_from(&dir);
@@ -1586,6 +2252,7 @@ mod tests {
             name: "Lab".to_string(),
             accent_hex: "#A78BFA".to_string(),
             accent_rgb: "167,139,250".to_string(),
+            widget_preset: default_widget_preset(),
             items: vec![],
         });
 
@@ -1832,23 +2499,21 @@ mod tests {
         let _read_guard = RegKeyGuard(hkey);
 
         let mut reg_type = REG_VALUE_TYPE(0);
-        let mut buf = vec![0u8; 512];
-        let mut buf_len = buf.len() as u32;
+        let mut buf = vec![0u16; 256];
+        let mut buf_len = (buf.len() * std::mem::size_of::<u16>()) as u32;
         let query_err = unsafe {
             RegQueryValueExW(
                 hkey,
                 PCWSTR(w_val.as_ptr()),
                 None,
                 Some(&mut reg_type),
-                Some(buf.as_mut_ptr()),
+                Some(buf.as_mut_ptr() as *mut u8),
                 Some(&mut buf_len),
             )
         };
         assert_eq!(query_err, ERROR_SUCCESS);
         assert_eq!(reg_type, REG_SZ);
-        let u16_slice = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u16, (buf_len as usize) / 2)
-        };
+        let u16_slice = &buf[..(buf_len as usize) / 2];
         let trimmed_u16 = u16_slice.strip_suffix(&[0]).unwrap_or(u16_slice);
         let read_back = String::from_utf16(trimmed_u16).expect("valid utf16");
         assert_eq!(read_back, r#""C:\Program Files\TestBar\testbar.exe""#);
@@ -1856,14 +2521,14 @@ mod tests {
         // 4. Disable deletes the value
         set_windows_autostart_at(&subkey, val_name, exe_path, false)
             .expect("disable must delete value");
-        let mut check_len = buf.len() as u32;
+        let mut check_len = (buf.len() * std::mem::size_of::<u16>()) as u32;
         let after_del = unsafe {
             RegQueryValueExW(
                 hkey,
                 PCWSTR(w_val.as_ptr()),
                 None,
                 None,
-                Some(buf.as_mut_ptr()),
+                Some(buf.as_mut_ptr() as *mut u8),
                 Some(&mut check_len),
             )
         };
@@ -1940,6 +2605,7 @@ mod tests {
             target,
             args: None,
             alt_action: "Каналы".to_string(),
+            alt_label: None,
             accent_rgb: "99,102,241".to_string(),
             icon_key: "discord".to_string(),
             icon_data: None,
@@ -1963,5 +2629,173 @@ mod tests {
         assert!(normalize_pin(&mut other, false));
         assert_eq!(other.args, None);
         assert_eq!(other.match_exe.as_deref(), Some("update.exe"));
+    }
+
+    #[test]
+    fn honest_defaults_omit_empty_targets_and_fake_alt_labels() {
+        let cfg = TestBarConfig::default();
+        let all_non_combo = [
+            &cfg.taskbar_pins,
+            &cfg.personal_pins,
+            &cfg.personal_links,
+            &cfg.work_folders,
+            &cfg.work_apps,
+            &cfg.studio_pins,
+            &cfg.studio_tools,
+            &cfg.game_launchers,
+        ];
+        let banned_fake_alts = [
+            "Избранное",
+            "Новое письмо",
+            "Моя волна",
+            "Новая заметка",
+            "Новый чат",
+            "Каналы",
+            "Каталог",
+            "Открыть",
+        ];
+        for list in all_non_combo {
+            for p in list {
+                assert!(
+                    !p.target.trim().is_empty(),
+                    "default pin '{}' must never have empty target",
+                    p.id
+                );
+                assert!(
+                    !banned_fake_alts.contains(&p.alt_action.as_str()),
+                    "default pin '{}' must not carry unimplemented fake alt_action '{}'",
+                    p.id,
+                    p.alt_action
+                );
+            }
+        }
+        assert_eq!(cfg.glass_depth, GLASS_DEPTH_OBSIDIAN);
+        assert!(!cfg.clock_show_seconds);
+        assert!(!cfg.clock_show_weekday);
+        assert!(!cfg.start_remember_space);
+        assert!(cfg.hidden_tray_keys.is_empty());
+        assert!(cfg.frecency.is_empty());
+    }
+
+    #[test]
+    fn premium_mutations_spaces_pins_combos_appearance_tray_frecency_and_import_export() {
+        let mut cfg = TestBarConfig::default();
+
+        // 1. Custom space CRUD + widget_preset validation
+        cfg.custom_spaces.push(CustomSpace {
+            id: "custom-1".to_string(),
+            name: "Музыка".to_string(),
+            accent_hex: "#A78BFA".to_string(),
+            accent_rgb: "167,139,250".to_string(),
+            widget_preset: default_widget_preset(),
+            items: vec![pin(
+                "cp-1",
+                "app",
+                "App",
+                "",
+                r"C:\Apps\app.exe".to_string(),
+                "",
+                "167,139,250",
+                "app",
+            )],
+        });
+        assert!(update_custom_space(
+            &mut cfg,
+            "custom-1",
+            Some("Медиа".to_string()),
+            Some("#38bdf8".to_string()),
+            None,
+            Some("audio_mic".to_string()),
+        )
+        .unwrap());
+        assert_eq!(cfg.custom_spaces[0].name, "Медиа");
+        assert_eq!(cfg.custom_spaces[0].accent_hex, "#38BDF8");
+        assert_eq!(cfg.custom_spaces[0].accent_rgb, "56,189,248");
+        assert_eq!(cfg.custom_spaces[0].widget_preset, WIDGET_PRESET_AUDIO_MIC);
+        assert!(update_custom_space(&mut cfg, "custom-1", None, None, None, Some("bogus".into())).is_err());
+
+        // 2. Pin edit mutation
+        assert!(update_pin(
+            &mut cfg,
+            "custom-1",
+            "cp-1",
+            Some("Renamed App".to_string()),
+            Some(r"C:\Apps\Renamed.exe".to_string()),
+            Some("--flag".to_string()),
+            Some("От админа".to_string()),
+            Some("Запуск от админа".to_string()),
+        )
+        .unwrap());
+        assert_eq!(cfg.custom_spaces[0].items[0].title, "Renamed App");
+        assert_eq!(cfg.custom_spaces[0].items[0].match_exe.as_deref(), Some("renamed.exe"));
+        assert_eq!(cfg.custom_spaces[0].items[0].args.as_deref(), Some("--flag"));
+        assert_eq!(cfg.custom_spaces[0].items[0].alt_label.as_deref(), Some("Запуск от админа"));
+        assert!(update_pin(&mut cfg, "custom-1", "missing", Some("X".into()), None, None, None, None).is_err());
+
+        // 3. Delete custom space cleans up its frecency entries
+        assert!(record_frecency(&mut cfg, "cp-1", 1000));
+        assert!(cfg.frecency.contains_key("cp-1"));
+        assert!(delete_custom_space(&mut cfg, "custom-1"));
+        assert!(cfg.custom_spaces.is_empty());
+        assert!(!cfg.frecency.contains_key("cp-1"));
+
+        // 4. Game combo CRUD
+        assert!(add_game_combo(
+            &mut cfg,
+            "combo-test".to_string(),
+            "CS2 Stack".to_string(),
+            "Steam + Discord".to_string(),
+            Some("#F97316".to_string()),
+            vec!["steam://rungameid/730".to_string()],
+        )
+        .unwrap());
+        assert!(cfg.game_combos.iter().any(|c| c.id == "combo-test" && c.accent_rgb == "249,115,22"));
+        assert!(update_game_combo(
+            &mut cfg,
+            "combo-test",
+            Some("CS2 Pro".to_string()),
+            None,
+            None,
+            Some(vec!["steam://rungameid/730".to_string(), r"C:\Apps\Faceit.exe".to_string()]),
+        )
+        .unwrap());
+        let updated_combo = cfg.game_combos.iter().find(|c| c.id == "combo-test").unwrap();
+        assert_eq!(updated_combo.title, "CS2 Pro");
+        assert_eq!(updated_combo.combo_targets.as_ref().unwrap().len(), 2);
+        assert!(delete_game_combo(&mut cfg, "combo-test"));
+        assert!(!cfg.game_combos.iter().any(|c| c.id == "combo-test"));
+
+        // 5. Appearance settings
+        assert!(set_appearance_settings(&mut cfg, Some("crystal".into()), Some(true), Some(true), Some(true)).unwrap());
+        assert_eq!(cfg.glass_depth, GLASS_DEPTH_CRYSTAL);
+        assert!(cfg.clock_show_seconds && cfg.clock_show_weekday && cfg.start_remember_space);
+        assert!(set_appearance_settings(&mut cfg, Some("light".into()), None, None, None).is_err());
+
+        // 6. Hidden tray keys
+        assert!(hide_tray_key(&mut cfg, "Steam.EXE"));
+        assert!(!hide_tray_key(&mut cfg, "steam.exe"));
+        assert!(hide_tray_key(&mut cfg, "discord.exe"));
+        assert_eq!(cfg.hidden_tray_keys, vec!["steam.exe", "discord.exe"]);
+        assert!(restore_tray_key(&mut cfg, "STEAM.exe"));
+        assert_eq!(cfg.hidden_tray_keys, vec!["discord.exe"]);
+        assert!(restore_all_tray_keys(&mut cfg));
+        assert!(cfg.hidden_tray_keys.is_empty());
+
+        // 7. Frecency cap at MAX_FRECENCY_ENTRIES (200)
+        for i in 0..240u64 {
+            assert!(record_frecency(&mut cfg, &format!("item-{i}"), 10_000 + i));
+        }
+        assert_eq!(cfg.frecency.len(), MAX_FRECENCY_ENTRIES);
+        assert!(cfg.frecency.contains_key("item-239"));
+        assert!(!cfg.frecency.contains_key("item-0"));
+
+        // 8. Export & import roundtrip + invalid rejection
+        let exported = export_config_json(&cfg).expect("export json");
+        let imported = import_config_json(&exported).expect("import json");
+        assert_eq!(imported.glass_depth, GLASS_DEPTH_CRYSTAL);
+        assert_eq!(imported.frecency.len(), MAX_FRECENCY_ENTRIES);
+        assert!(import_config_json("").is_err());
+        assert!(import_config_json("[]").is_err());
+        assert!(import_config_json("{broken").is_err());
     }
 }

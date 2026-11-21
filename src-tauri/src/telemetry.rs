@@ -2,21 +2,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
-use sysinfo::{ProcessesToUpdate, System};
-use windows::core::PCSTR;
+use std::time::{Duration, Instant};
+use sysinfo::{
+    CpuRefreshKind, Disks, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
+    System, UpdateKind,
+};
+use windows::core::{PCSTR, PCWSTR};
+use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 
-use crate::icon_cache::IconCache;
+use crate::icon_cache::{self, IconCache};
 use crate::win_shell::wide;
 use crate::windows_tracker::{
-    extract_icon_for_path, extract_icon_for_path_cached, friendly_exe_name, terminate_process_pids,
+    extract_icon_for_path, extract_icon_for_path_cached, friendly_exe_name, hicon_to_data_url,
+    terminate_process_pids,
 };
 
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 const NVML_SUCCESS: i32 = 0;
+const NVML_ERROR_UNINITIALIZED: i32 = 1;
 const NVML_ERROR_INSUFFICIENT_SIZE: i32 = 7;
+const NVML_ERROR_GPU_IS_LOST: i32 = 15;
+const NVML_ERROR_RESET_REQUIRED: i32 = 18;
 const NVML_VALUE_NOT_AVAILABLE_U64: u64 = u64::MAX;
+const NVML_TDR_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
+const DISK_CACHE_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_PROCESS_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskHeadroomInfo {
+    pub mount: String,
+    pub name: String,
+    pub used_gb: f32,
+    pub total_gb: f32,
+    pub free_gb: f32,
+    pub used_pct: u8,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +54,10 @@ pub struct TopProcessInfo {
     pub uses_gpu: bool,
     pub cpu_pct: u32,
     pub icon_data: Option<String>,
+    #[serde(default)]
+    pub icon_key: Option<String>,
+    #[serde(default)]
+    pub hwnd: Option<isize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,6 +77,19 @@ pub struct TelemetryState {
     pub vram_pct: u32,
     pub top_processes: Vec<TopProcessInfo>,
     pub gpu_processes: Vec<TopProcessInfo>,
+    #[serde(default)]
+    pub disks: Vec<DiskHeadroomInfo>,
+}
+
+/// Alias matching Wave 1B naming while preserving full compatibility with `TelemetryState`.
+pub type TelemetrySnapshot = TelemetryState;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDiskSample {
+    pub mount: String,
+    pub name: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +166,7 @@ struct NvmlProcessInfoV2 {
 
 type NvmlDevice = *mut std::ffi::c_void;
 type FnInit = unsafe extern "C" fn() -> i32;
+type FnShutdown = unsafe extern "C" fn() -> i32;
 type FnGetHandle = unsafe extern "C" fn(u32, *mut NvmlDevice) -> i32;
 type FnGetName = unsafe extern "C" fn(NvmlDevice, *mut u8, u32) -> i32;
 type FnGetUtil = unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> i32;
@@ -139,6 +182,8 @@ enum NvmlProcQueryFn {
 }
 
 struct NvmlApi {
+    hmod: HMODULE,
+    shutdown: Option<FnShutdown>,
     device: NvmlDevice,
     gpu_name: String,
     get_util: FnGetUtil,
@@ -148,14 +193,168 @@ struct NvmlApi {
     get_compute_procs: Option<NvmlProcQueryFn>,
 }
 
+impl NvmlApi {
+    fn teardown(self) {
+        unsafe {
+            if let Some(shutdown) = self.shutdown {
+                let _ = shutdown();
+            }
+            if !self.hmod.is_invalid() {
+                let _ = FreeLibrary(self.hmod);
+            }
+        }
+    }
+}
+
 unsafe impl Send for NvmlApi {}
 unsafe impl Sync for NvmlApi {}
 
-static NVML_API: OnceLock<Option<NvmlApi>> = OnceLock::new();
+#[derive(Default)]
+struct NvmlHolder {
+    api: Option<NvmlApi>,
+    last_init_attempt: Option<Instant>,
+    permanently_unavailable: bool,
+}
+
+enum NvmlInitOutcome {
+    Ready(NvmlApi),
+    NotInstalled,
+    TransientFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvmlQueryHealth {
+    Healthy,
+    PartialDegraded,
+    LostNeedsReset,
+}
+
+/// Returns `true` when an NVML status code indicates driver TDR/reset or lost GPU context.
+pub fn is_nvml_fatal_code(rc: i32) -> bool {
+    matches!(
+        rc,
+        NVML_ERROR_UNINITIALIZED | NVML_ERROR_GPU_IS_LOST | NVML_ERROR_RESET_REQUIRED
+    )
+}
+
+/// Classifies the trio of primary NVML polling return codes (`util`, `temp`, `mem`).
+pub fn classify_nvml_query_codes(rc_util: i32, rc_temp: i32, rc_mem: i32) -> NvmlQueryHealth {
+    if is_nvml_fatal_code(rc_util) || is_nvml_fatal_code(rc_temp) || is_nvml_fatal_code(rc_mem) {
+        return NvmlQueryHealth::LostNeedsReset;
+    }
+    if rc_util != NVML_SUCCESS && rc_temp != NVML_SUCCESS && rc_mem != NVML_SUCCESS {
+        return NvmlQueryHealth::LostNeedsReset;
+    }
+    if rc_util == NVML_SUCCESS && rc_temp == NVML_SUCCESS && rc_mem == NVML_SUCCESS {
+        NvmlQueryHealth::Healthy
+    } else {
+        NvmlQueryHealth::PartialDegraded
+    }
+}
+
+struct CachedDiskHeadroom {
+    disks: Vec<DiskHeadroomInfo>,
+    refreshed_at: Instant,
+}
+
+static NVML_STATE: OnceLock<Mutex<NvmlHolder>> = OnceLock::new();
 static SYS_STATE: OnceLock<Mutex<System>> = OnceLock::new();
+static DISK_CACHE: OnceLock<Mutex<Option<CachedDiskHeadroom>>> = OnceLock::new();
 
 fn round_gb_1(bytes: u64) -> f32 {
     (((bytes as f64 / BYTES_PER_GIB) * 10.0).round() / 10.0) as f32
+}
+
+fn normalize_disk_mount(raw: &str) -> String {
+    let trimmed = raw.trim().replace('/', "\\");
+    if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+        trimmed.chars().take(2).collect::<String>().to_ascii_uppercase()
+    } else {
+        trimmed
+    }
+}
+
+/// Pure storage-headroom builder turning raw mounted-volume samples into sorted `DiskHeadroomInfo`
+/// entries (`C:` first, then alphabetical), skipping zero-byte pseudo-volumes and deduplicating mounts.
+pub fn build_disk_headroom_list(raw: &[RawDiskSample]) -> Vec<DiskHeadroomInfo> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<DiskHeadroomInfo> = Vec::new();
+
+    for sample in raw {
+        if sample.total_bytes == 0 {
+            continue;
+        }
+        let mount = normalize_disk_mount(&sample.mount);
+        if mount.is_empty() {
+            continue;
+        }
+        let key = mount.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let free_bytes = sample.available_bytes.min(sample.total_bytes);
+        let used_bytes = sample.total_bytes.saturating_sub(free_bytes);
+        let used_pct = ((used_bytes as f64 / sample.total_bytes as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let label = sample.name.trim();
+        let name = if label.is_empty() {
+            mount.clone()
+        } else {
+            label.to_string()
+        };
+
+        out.push(DiskHeadroomInfo {
+            mount,
+            name,
+            used_gb: round_gb_1(used_bytes),
+            total_gb: round_gb_1(sample.total_bytes),
+            free_gb: round_gb_1(free_bytes),
+            used_pct,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        let a_is_c = a.mount.eq_ignore_ascii_case("C:");
+        let b_is_c = b.mount.eq_ignore_ascii_case("C:");
+        b_is_c
+            .cmp(&a_is_c)
+            .then_with(|| a.mount.to_ascii_lowercase().cmp(&b.mount.to_ascii_lowercase()))
+    });
+    out
+}
+
+/// Returns mounted disk headroom refreshed at most once every 30 seconds so telemetry polling causes zero disk thrash.
+pub fn get_disks_headroom_cached() -> Vec<DiskHeadroomInfo> {
+    let cache = DISK_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.as_ref() {
+            if entry.refreshed_at.elapsed() < DISK_CACHE_TTL {
+                return entry.disks.clone();
+            }
+        }
+    }
+
+    let disks = Disks::new_with_refreshed_list();
+    let samples: Vec<RawDiskSample> = disks
+        .iter()
+        .map(|d| RawDiskSample {
+            mount: d.mount_point().to_string_lossy().to_string(),
+            name: d.name().to_string_lossy().to_string(),
+            total_bytes: d.total_space(),
+            available_bytes: d.available_space(),
+        })
+        .collect();
+    let built = build_disk_headroom_list(&samples);
+
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(CachedDiskHeadroom {
+        disks: built.clone(),
+        refreshed_at: Instant::now(),
+    });
+    built
 }
 
 fn sanitize_nvml_vram_bytes(raw: u64) -> u64 {
@@ -314,6 +513,8 @@ where
                     uses_gpu: acc.uses_gpu,
                     cpu_pct: acc.total_cpu.round().clamp(0.0, 100.0) as u32,
                     icon_data: None,
+                    icon_key: None,
+                    hwnd: None,
                 },
                 mem_bytes: acc.total_mem,
                 vram_bytes: acc.total_vram,
@@ -372,6 +573,81 @@ where
     (top_processes, gpu_processes)
 }
 
+fn resolve_group_hwnd(primary_pid: u32, pids: &[u32], pid_to_hwnd: &HashMap<u32, isize>) -> Option<isize> {
+    if let Some(&hwnd) = pid_to_hwnd.get(&primary_pid) {
+        if hwnd != 0 {
+            return Some(hwnd);
+        }
+    }
+    pids.iter()
+        .find_map(|pid| pid_to_hwnd.get(pid).copied().filter(|&h| h != 0))
+}
+
+/// Pure multi-PID process-group aggregator for Wave 1B icon-key IPC (`AD-6`):
+/// populates `icon_key` (leaving `icon_data: None`), maps focusable `hwnd` via `pid_to_hwnd`,
+/// and returns deduplicated `(icon_key, exe_path)` source registrations for cache reload on LRU eviction.
+pub fn aggregate_process_groups_with_icons<FKey>(
+    samples: &[RawProcessSample],
+    gpu_by_pid: &HashMap<u32, GpuProcessSample>,
+    pid_to_hwnd: &HashMap<u32, isize>,
+    limit: usize,
+    mut resolve_icon_key: FKey,
+) -> (Vec<TopProcessInfo>, Vec<TopProcessInfo>, Vec<(String, String)>)
+where
+    FKey: FnMut(&str) -> Option<String>,
+{
+    let mut exe_by_name_lower: HashMap<String, String> = HashMap::new();
+    for s in samples {
+        if s.pid == 0 || is_excluded_telemetry_process(&s.raw_name) {
+            continue;
+        }
+        if let Some(exe) = s.exe_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            let key = friendly_exe_name(exe).to_lowercase();
+            exe_by_name_lower
+                .entry(key)
+                .or_insert_with(|| exe.trim().to_string());
+        }
+    }
+
+    let (mut top_processes, mut gpu_processes) =
+        aggregate_process_groups(samples, gpu_by_pid, limit, |_| None);
+
+    let mut memo: HashMap<String, Option<String>> = HashMap::new();
+    let mut seen_sources: HashSet<String> = HashSet::new();
+    let mut icon_sources: Vec<(String, String)> = Vec::new();
+
+    let mut enrich = |item: &mut TopProcessInfo| {
+        item.icon_data = None;
+        item.hwnd = resolve_group_hwnd(item.pid, &item.pids, pid_to_hwnd);
+        let group_key = item.name.to_lowercase();
+        let Some(exe_path) = exe_by_name_lower.get(&group_key) else {
+            return;
+        };
+        let resolved_key = if let Some(cached) = memo.get(exe_path) {
+            cached.clone()
+        } else {
+            let k = resolve_icon_key(exe_path);
+            memo.insert(exe_path.clone(), k.clone());
+            k
+        };
+        if let Some(k) = resolved_key {
+            if seen_sources.insert(k.clone()) {
+                icon_sources.push((k.clone(), exe_path.clone()));
+            }
+            item.icon_key = Some(k);
+        }
+    };
+
+    for item in &mut top_processes {
+        enrich(item);
+    }
+    for item in &mut gpu_processes {
+        enrich(item);
+    }
+
+    (top_processes, gpu_processes, icon_sources)
+}
+
 /// Pure assembler turning CPU/RAM metrics, optional NVML snapshot, and process samples into `TelemetryState`.
 /// Gracefully handles `gpu == None` (NVML absent) without crashing or fabricating GPU data.
 pub fn build_telemetry_state<FIcon>(
@@ -416,10 +692,64 @@ where
         vram_pct: gpu_snap.vram_pct.min(100),
         top_processes,
         gpu_processes,
+        disks: Vec::new(),
     }
 }
 
-fn init_nvml() -> Option<NvmlApi> {
+/// Pure assembler for icon-key + HWND + disk headroom telemetry snapshots.
+pub fn build_telemetry_snapshot_with_icons<FKey>(
+    cpu_name: String,
+    cpu_pct: u32,
+    ram_used_bytes: u64,
+    ram_total_bytes: u64,
+    gpu: Option<GpuTelemetrySnapshot>,
+    samples: &[RawProcessSample],
+    disks: Vec<DiskHeadroomInfo>,
+    pid_to_hwnd: &HashMap<u32, isize>,
+    resolve_icon_key: FKey,
+) -> (TelemetrySnapshot, Vec<(String, String)>)
+where
+    FKey: FnMut(&str) -> Option<String>,
+{
+    let total_ram = ram_total_bytes.max(1);
+    let ram_total_gb = (total_ram as f64 / BYTES_PER_GIB).round() as f32;
+    let ram_used_gb = round_gb_1(ram_used_bytes);
+    let ram_pct = ((ram_used_bytes as f64 / total_ram as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u32;
+
+    let gpu_snap = gpu.unwrap_or_else(GpuTelemetrySnapshot::unavailable);
+    let (top_processes, gpu_processes, icon_sources) = aggregate_process_groups_with_icons(
+        samples,
+        &gpu_snap.per_pid_gpu,
+        pid_to_hwnd,
+        DEFAULT_PROCESS_LIMIT,
+        resolve_icon_key,
+    );
+
+    (
+        TelemetrySnapshot {
+            cpu_name,
+            cpu_pct: cpu_pct.min(100),
+            ram_used_gb,
+            ram_total_gb,
+            ram_pct,
+            gpu_available: gpu_snap.available,
+            gpu_name: gpu_snap.name,
+            gpu_pct: gpu_snap.gpu_pct.min(100),
+            gpu_temp_c: gpu_snap.temp_c,
+            vram_used_gb: gpu_snap.vram_used_gb,
+            vram_total_gb: gpu_snap.vram_total_gb,
+            vram_pct: gpu_snap.vram_pct.min(100),
+            top_processes,
+            gpu_processes,
+            disks,
+        },
+        icon_sources,
+    )
+}
+
+fn init_nvml() -> NvmlInitOutcome {
     unsafe {
         let candidates = [
             "nvml.dll",
@@ -429,33 +759,71 @@ fn init_nvml() -> Option<NvmlApi> {
         let mut hmod = None;
         for c in candidates {
             let w = wide(c);
-            if let Ok(m) = LoadLibraryW(windows::core::PCWSTR(w.as_ptr())) {
+            if let Ok(m) = LoadLibraryW(PCWSTR(w.as_ptr())) {
                 if !m.is_invalid() {
                     hmod = Some(m);
                     break;
                 }
             }
         }
-        let hmod = hmod?;
+        let Some(hmod) = hmod else {
+            return NvmlInitOutcome::NotInstalled;
+        };
 
         let get_fn = |name: &str| -> Option<*const ()> {
             let cs = CString::new(name).ok()?;
             GetProcAddress(hmod, PCSTR(cs.as_ptr() as *const u8)).map(|f| f as *const ())
         };
 
-        let init: FnInit =
-            std::mem::transmute(get_fn("nvmlInit_v2").or_else(|| get_fn("nvmlInit"))?);
+        let shutdown: Option<FnShutdown> = get_fn("nvmlShutdown").map(|p| std::mem::transmute(p));
+
+        let cleanup = |initialized: bool| {
+            if initialized {
+                if let Some(f) = shutdown {
+                    let _ = f();
+                }
+            }
+            let _ = FreeLibrary(hmod);
+        };
+
+        let Some(init_ptr) = get_fn("nvmlInit_v2").or_else(|| get_fn("nvmlInit")) else {
+            cleanup(false);
+            return NvmlInitOutcome::NotInstalled;
+        };
+        let init: FnInit = std::mem::transmute(init_ptr);
         if init() != NVML_SUCCESS {
-            return None;
+            cleanup(false);
+            return NvmlInitOutcome::TransientFailure;
         }
-        let get_handle: FnGetHandle = std::mem::transmute(
-            get_fn("nvmlDeviceGetHandleByIndex_v2")
-                .or_else(|| get_fn("nvmlDeviceGetHandleByIndex"))?,
-        );
-        let get_name: FnGetName = std::mem::transmute(get_fn("nvmlDeviceGetName")?);
-        let get_util: FnGetUtil = std::mem::transmute(get_fn("nvmlDeviceGetUtilizationRates")?);
-        let get_temp: FnGetTemp = std::mem::transmute(get_fn("nvmlDeviceGetTemperature")?);
-        let get_mem: FnGetMem = std::mem::transmute(get_fn("nvmlDeviceGetMemoryInfo")?);
+
+        let Some(handle_ptr) = get_fn("nvmlDeviceGetHandleByIndex_v2")
+            .or_else(|| get_fn("nvmlDeviceGetHandleByIndex"))
+        else {
+            cleanup(true);
+            return NvmlInitOutcome::NotInstalled;
+        };
+        let Some(name_ptr) = get_fn("nvmlDeviceGetName") else {
+            cleanup(true);
+            return NvmlInitOutcome::NotInstalled;
+        };
+        let Some(util_ptr) = get_fn("nvmlDeviceGetUtilizationRates") else {
+            cleanup(true);
+            return NvmlInitOutcome::NotInstalled;
+        };
+        let Some(temp_ptr) = get_fn("nvmlDeviceGetTemperature") else {
+            cleanup(true);
+            return NvmlInitOutcome::NotInstalled;
+        };
+        let Some(mem_ptr) = get_fn("nvmlDeviceGetMemoryInfo") else {
+            cleanup(true);
+            return NvmlInitOutcome::NotInstalled;
+        };
+
+        let get_handle: FnGetHandle = std::mem::transmute(handle_ptr);
+        let get_name: FnGetName = std::mem::transmute(name_ptr);
+        let get_util: FnGetUtil = std::mem::transmute(util_ptr);
+        let get_temp: FnGetTemp = std::mem::transmute(temp_ptr);
+        let get_mem: FnGetMem = std::mem::transmute(mem_ptr);
 
         let get_graphics_procs = get_fn("nvmlDeviceGetGraphicsRunningProcesses_v3")
             .or_else(|| get_fn("nvmlDeviceGetGraphicsRunningProcesses_v2"))
@@ -475,7 +843,8 @@ fn init_nvml() -> Option<NvmlApi> {
 
         let mut dev: NvmlDevice = std::ptr::null_mut();
         if get_handle(0, &mut dev) != NVML_SUCCESS || dev.is_null() {
-            return None;
+            cleanup(true);
+            return NvmlInitOutcome::TransientFailure;
         }
 
         let mut name_buf = [0u8; 96];
@@ -491,7 +860,9 @@ fn init_nvml() -> Option<NvmlApi> {
                 "GPU".to_string()
             };
 
-        Some(NvmlApi {
+        NvmlInitOutcome::Ready(NvmlApi {
+            hmod,
+            shutdown,
             device: dev,
             gpu_name,
             get_util,
@@ -506,7 +877,7 @@ fn init_nvml() -> Option<NvmlApi> {
 unsafe fn query_nvml_running_procs(
     device: NvmlDevice,
     func: NvmlProcQueryFn,
-) -> Vec<(u32, u64)> {
+) -> (Vec<(u32, u64)>, bool) {
     match func {
         NvmlProcQueryFn::V2(f) => {
             let mut count: u32 = 64;
@@ -517,14 +888,17 @@ unsafe fn query_nvml_running_procs(
                 rc = f(device, &mut count, buf.as_mut_ptr());
             }
             if rc != NVML_SUCCESS {
-                return Vec::new();
+                return (Vec::new(), is_nvml_fatal_code(rc));
             }
             let n = (count as usize).min(buf.len());
-            buf[..n]
-                .iter()
-                .filter(|p| p.pid != 0)
-                .map(|p| (p.pid, p.used_gpu_memory))
-                .collect()
+            (
+                buf[..n]
+                    .iter()
+                    .filter(|p| p.pid != 0)
+                    .map(|p| (p.pid, p.used_gpu_memory))
+                    .collect(),
+                false,
+            )
         }
         NvmlProcQueryFn::V1(f) => {
             let mut count: u32 = 64;
@@ -535,120 +909,266 @@ unsafe fn query_nvml_running_procs(
                 rc = f(device, &mut count, buf.as_mut_ptr());
             }
             if rc != NVML_SUCCESS {
-                return Vec::new();
+                return (Vec::new(), is_nvml_fatal_code(rc));
             }
             let n = (count as usize).min(buf.len());
-            buf[..n]
-                .iter()
-                .filter(|p| p.pid != 0)
-                .map(|p| (p.pid, p.used_gpu_memory))
-                .collect()
+            (
+                buf[..n]
+                    .iter()
+                    .filter(|p| p.pid != 0)
+                    .map(|p| (p.pid, p.used_gpu_memory))
+                    .collect(),
+                false,
+            )
         }
     }
 }
 
 fn query_gpu() -> Option<GpuTelemetrySnapshot> {
-    let api = NVML_API.get_or_init(init_nvml).as_ref()?;
-    unsafe {
-        let mut util = NvmlUtilization { gpu: 0, memory: 0 };
-        let mut temp = 0u32;
-        let mut mem = NvmlMemory {
-            total: 0,
-            free: 0,
-            used: 0,
-        };
-        let _ = (api.get_util)(api.device, &mut util);
-        let _ = (api.get_temp)(api.device, 0, &mut temp);
-        let _ = (api.get_mem)(api.device, &mut mem);
-
-        let graphics = api
-            .get_graphics_procs
-            .map(|f| query_nvml_running_procs(api.device, f))
-            .unwrap_or_default();
-        let compute = api
-            .get_compute_procs
-            .map(|f| query_nvml_running_procs(api.device, f))
-            .unwrap_or_default();
-        let per_pid_gpu = merge_nvml_process_lists(&graphics, &compute);
-
-        let used_gb = round_gb_1(mem.used);
-        let total_gb = (mem.total as f64 / BYTES_PER_GIB).round() as f32;
-        let pct = if mem.total > 0 {
-            ((mem.used as f64 / mem.total as f64) * 100.0)
-                .round()
-                .clamp(0.0, 100.0) as u32
-        } else {
-            0
-        };
-
-        Some(GpuTelemetrySnapshot {
-            available: true,
-            name: api.gpu_name.clone(),
-            gpu_pct: util.gpu.min(100),
-            temp_c: temp,
-            vram_used_gb: used_gb,
-            vram_total_gb: total_gb,
-            vram_pct: pct,
-            per_pid_gpu,
-        })
+    let lock = NVML_STATE.get_or_init(|| Mutex::new(NvmlHolder::default()));
+    let mut holder = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if holder.permanently_unavailable {
+        return None;
     }
+
+    if holder.api.is_none() {
+        if let Some(last) = holder.last_init_attempt {
+            if last.elapsed() < NVML_TDR_RETRY_COOLDOWN {
+                return None;
+            }
+        }
+        holder.last_init_attempt = Some(Instant::now());
+        match init_nvml() {
+            NvmlInitOutcome::Ready(api) => {
+                holder.api = Some(api);
+            }
+            NvmlInitOutcome::NotInstalled => {
+                holder.permanently_unavailable = true;
+                return None;
+            }
+            NvmlInitOutcome::TransientFailure => {
+                return None;
+            }
+        }
+    }
+
+    let (snapshot, needs_reset) = {
+        let api = holder.api.as_ref()?;
+        unsafe {
+            let mut util = NvmlUtilization { gpu: 0, memory: 0 };
+            let mut temp = 0u32;
+            let mut mem = NvmlMemory {
+                total: 0,
+                free: 0,
+                used: 0,
+            };
+            let rc_util = (api.get_util)(api.device, &mut util);
+            let rc_temp = (api.get_temp)(api.device, 0, &mut temp);
+            let rc_mem = (api.get_mem)(api.device, &mut mem);
+
+            if classify_nvml_query_codes(rc_util, rc_temp, rc_mem) == NvmlQueryHealth::LostNeedsReset
+            {
+                (None, true)
+            } else {
+                let (graphics, gfx_lost) = api
+                    .get_graphics_procs
+                    .map(|f| query_nvml_running_procs(api.device, f))
+                    .unwrap_or_else(|| (Vec::new(), false));
+                let (compute, cmp_lost) = api
+                    .get_compute_procs
+                    .map(|f| query_nvml_running_procs(api.device, f))
+                    .unwrap_or_else(|| (Vec::new(), false));
+
+                if gfx_lost || cmp_lost {
+                    (None, true)
+                } else {
+                    let per_pid_gpu = merge_nvml_process_lists(&graphics, &compute);
+                    let (used_gb, total_gb, pct) = if rc_mem == NVML_SUCCESS {
+                        let used_gb = round_gb_1(mem.used);
+                        let total_gb = (mem.total as f64 / BYTES_PER_GIB).round() as f32;
+                        let pct = if mem.total > 0 {
+                            ((mem.used as f64 / mem.total as f64) * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0) as u32
+                        } else {
+                            0
+                        };
+                        (used_gb, total_gb, pct)
+                    } else {
+                        (0.0, 0.0, 0)
+                    };
+
+                    (
+                        Some(GpuTelemetrySnapshot {
+                            available: true,
+                            name: api.gpu_name.clone(),
+                            gpu_pct: if rc_util == NVML_SUCCESS {
+                                util.gpu.min(100)
+                            } else {
+                                0
+                            },
+                            temp_c: if rc_temp == NVML_SUCCESS { temp } else { 0 },
+                            vram_used_gb: used_gb,
+                            vram_total_gb: total_gb,
+                            vram_pct: pct,
+                            per_pid_gpu,
+                        }),
+                        false,
+                    )
+                }
+            }
+        }
+    };
+
+    if needs_reset {
+        if let Some(old) = holder.api.take() {
+            old.teardown();
+        }
+        holder.last_init_attempt = Some(Instant::now());
+        return None;
+    }
+
+    snapshot
+}
+
+fn lean_process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_cpu()
+        .with_exe(UpdateKind::OnlyIfNotSet)
+}
+
+fn collect_cpu_ram_and_processes() -> (String, u32, u64, u64, Vec<RawProcessSample>) {
+    let sys_mutex = SYS_STATE.get_or_init(|| {
+        let specifics = RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything())
+            .with_processes(lean_process_refresh_kind());
+        Mutex::new(System::new_with_specifics(specifics))
+    });
+
+    let mut sys = sys_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, lean_process_refresh_kind());
+
+    let cpu_name = sys
+        .cpus()
+        .first()
+        .map(|c| {
+            let b = c.brand().trim();
+            if b.contains("Ryzen 9") {
+                "Ryzen 9".to_string()
+            } else if b.contains("Ryzen 7") {
+                "Ryzen 7".to_string()
+            } else if b.contains("Core") {
+                b.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+            } else {
+                b.chars().take(18).collect()
+            }
+        })
+        .unwrap_or_else(|| "CPU".to_string());
+
+    let cpu_pct = sys.global_cpu_usage().round().clamp(0.0, 100.0) as u32;
+    let total_ram_bytes = sys.total_memory().max(1);
+    let used_ram_bytes = sys.used_memory();
+    let cpu_count = sys.cpus().len().max(1) as f32;
+
+    let samples: Vec<RawProcessSample> = sys
+        .processes()
+        .iter()
+        .map(|(pid, proc_)| RawProcessSample {
+            pid: pid.as_u32(),
+            raw_name: proc_.name().to_string_lossy().to_string(),
+            exe_path: proc_.exe().map(|p| p.to_string_lossy().to_string()),
+            mem_bytes: proc_.memory(),
+            cpu_pct_normalized: proc_.cpu_usage() / cpu_count,
+        })
+        .collect();
+
+    (cpu_name, cpu_pct, used_ram_bytes, total_ram_bytes, samples)
+}
+
+fn extract_shell_icon_png(exe_path: &str) -> Option<String> {
+    let trimmed = exe_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    unsafe {
+        let mut sfi = SHFILEINFOW::default();
+        let w = wide(trimmed);
+        let res = SHGetFileInfoW(
+            PCWSTR(w.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if res == 0 || sfi.hIcon.is_invalid() {
+            return None;
+        }
+        let data_url = hicon_to_data_url(sfi.hIcon, 32);
+        let _ = DestroyIcon(sfi.hIcon);
+        data_url
+    }
+}
+
+fn resolve_exe_icon_key_into_cache(exe_path: &str, cache: &mut IconCache) -> Option<String> {
+    let trimmed = exe_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let key = icon_cache::path_icon_key(trimmed);
+    if cache.get(&key).is_some() {
+        return Some(key);
+    }
+    if cache.is_negative_cached(&key) {
+        return None;
+    }
+    match extract_shell_icon_png(trimmed) {
+        Some(data_uri) => {
+            cache.put(key.clone(), data_uri);
+            Some(key)
+        }
+        None => {
+            cache.mark_negative_miss(key);
+            None
+        }
+    }
+}
+
+/// Samples lean telemetry with disk headroom, process-to-HWND mapping, and `icon_key`-only entries (`AD-6`).
+/// Returns `(snapshot, icon_sources)` so Wave 1B registers `(icon_key, exe_path)` for LRU reload.
+pub fn sample_telemetry_with_icons(
+    cache: &mut IconCache,
+    pid_to_hwnd: &HashMap<u32, isize>,
+) -> (TelemetrySnapshot, Vec<(String, String)>) {
+    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
+        collect_cpu_ram_and_processes();
+    let gpu = query_gpu();
+    let disks = get_disks_headroom_cached();
+
+    build_telemetry_snapshot_with_icons(
+        cpu_name,
+        cpu_pct,
+        ram_used_bytes,
+        ram_total_bytes,
+        gpu,
+        &samples,
+        disks,
+        pid_to_hwnd,
+        |exe| resolve_exe_icon_key_into_cache(exe, cache),
+    )
 }
 
 fn collect_telemetry_with_icon_resolver<FIcon>(resolve_icon: FIcon) -> TelemetryState
 where
     FIcon: FnMut(&str) -> Option<String>,
 {
-    let sys_mutex = SYS_STATE.get_or_init(|| {
-        let mut s = System::new_all();
-        s.refresh_all();
-        Mutex::new(s)
-    });
-
-    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) = {
-        let mut sys = sys_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        sys.refresh_cpu_usage();
-        sys.refresh_memory();
-        sys.refresh_processes(ProcessesToUpdate::All, true);
-
-        let cpu_name = sys
-            .cpus()
-            .first()
-            .map(|c| {
-                let b = c.brand().trim();
-                if b.contains("Ryzen 9") {
-                    "Ryzen 9".to_string()
-                } else if b.contains("Ryzen 7") {
-                    "Ryzen 7".to_string()
-                } else if b.contains("Core") {
-                    b.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
-                } else {
-                    b.chars().take(18).collect()
-                }
-            })
-            .unwrap_or_else(|| "CPU".to_string());
-
-        let cpu_pct = sys.global_cpu_usage().round().clamp(0.0, 100.0) as u32;
-        let total_ram_bytes = sys.total_memory().max(1);
-        let used_ram_bytes = sys.used_memory();
-        let cpu_count = sys.cpus().len().max(1) as f32;
-
-        let samples: Vec<RawProcessSample> = sys
-            .processes()
-            .iter()
-            .map(|(pid, proc_)| RawProcessSample {
-                pid: pid.as_u32(),
-                raw_name: proc_.name().to_string_lossy().to_string(),
-                exe_path: proc_.exe().map(|p| p.to_string_lossy().to_string()),
-                mem_bytes: proc_.memory(),
-                cpu_pct_normalized: proc_.cpu_usage() / cpu_count,
-            })
-            .collect();
-
-        (cpu_name, cpu_pct, used_ram_bytes, total_ram_bytes, samples)
-    };
-
+    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
+        collect_cpu_ram_and_processes();
     let gpu = query_gpu();
-    build_telemetry_state(
+    let mut state = build_telemetry_state(
         cpu_name,
         cpu_pct,
         ram_used_bytes,
@@ -656,7 +1176,9 @@ where
         gpu,
         &samples,
         resolve_icon,
-    )
+    );
+    state.disks = get_disks_headroom_cached();
+    state
 }
 
 pub fn get_telemetry_cached(cache: &Mutex<IconCache>) -> TelemetryState {
@@ -665,6 +1187,11 @@ pub fn get_telemetry_cached(cache: &Mutex<IconCache>) -> TelemetryState {
 
 pub fn get_telemetry() -> TelemetryState {
     collect_telemetry_with_icon_resolver(extract_icon_for_path)
+}
+
+/// Backward-compatible alias for legacy telemetry callers.
+pub fn sample_telemetry() -> TelemetrySnapshot {
+    get_telemetry()
 }
 
 /// Terminates ALL PIDs belonging to a multi-process app group and propagates OS permission errors.
@@ -794,5 +1321,139 @@ mod tests {
         // Studio gpu_processes still degrades gracefully to RAM-ranked processes
         assert_eq!(state.gpu_processes.len(), 2);
         assert_eq!(state.gpu_processes[0].name, "Zen Browser");
+    }
+
+    #[test]
+    fn disk_headroom_builder_sorts_c_first_deduplicates_and_skips_zero_volumes() {
+        let raw = vec![
+            RawDiskSample {
+                mount: r"E:\".into(),
+                name: "Games".into(),
+                total_bytes: 1000 * GIB,
+                available_bytes: 250 * GIB,
+            },
+            RawDiskSample {
+                mount: r"C:\".into(),
+                name: "Windows".into(),
+                total_bytes: 500 * GIB,
+                available_bytes: 100 * GIB,
+            },
+            RawDiskSample {
+                mount: r"c:/".into(), // duplicate of C: must be skipped
+                name: "Duplicate".into(),
+                total_bytes: 500 * GIB,
+                available_bytes: 50 * GIB,
+            },
+            RawDiskSample {
+                mount: r"D:\".into(),
+                name: "".into(),
+                total_bytes: 200 * GIB,
+                available_bytes: 150 * GIB,
+            },
+            RawDiskSample {
+                mount: r"Z:\".into(),
+                name: "Empty Optical".into(),
+                total_bytes: 0,
+                available_bytes: 0,
+            },
+        ];
+
+        let disks = build_disk_headroom_list(&raw);
+        assert_eq!(disks.len(), 3);
+        assert_eq!(disks[0].mount, "C:");
+        assert_eq!(disks[0].name, "Windows");
+        assert_eq!(disks[0].used_gb, 400.0);
+        assert_eq!(disks[0].free_gb, 100.0);
+        assert_eq!(disks[0].total_gb, 500.0);
+        assert_eq!(disks[0].used_pct, 80);
+
+        assert_eq!(disks[1].mount, "D:");
+        assert_eq!(disks[1].name, "D:");
+        assert_eq!(disks[1].used_pct, 25);
+
+        assert_eq!(disks[2].mount, "E:");
+        assert_eq!(disks[2].used_pct, 75);
+    }
+
+    #[test]
+    fn nvml_return_code_classifier_detects_tdr_reset_and_partial_degradation() {
+        assert_eq!(
+            classify_nvml_query_codes(NVML_SUCCESS, NVML_SUCCESS, NVML_SUCCESS),
+            NvmlQueryHealth::Healthy
+        );
+        assert_eq!(
+            classify_nvml_query_codes(NVML_SUCCESS, 3, NVML_SUCCESS),
+            NvmlQueryHealth::PartialDegraded
+        );
+        assert_eq!(
+            classify_nvml_query_codes(NVML_ERROR_GPU_IS_LOST, NVML_SUCCESS, NVML_SUCCESS),
+            NvmlQueryHealth::LostNeedsReset
+        );
+        assert_eq!(
+            classify_nvml_query_codes(NVML_SUCCESS, NVML_ERROR_RESET_REQUIRED, NVML_SUCCESS),
+            NvmlQueryHealth::LostNeedsReset
+        );
+        assert_eq!(
+            classify_nvml_query_codes(NVML_SUCCESS, NVML_SUCCESS, NVML_ERROR_UNINITIALIZED),
+            NvmlQueryHealth::LostNeedsReset
+        );
+        assert_eq!(
+            classify_nvml_query_codes(99, 99, 99),
+            NvmlQueryHealth::LostNeedsReset
+        );
+    }
+
+    #[test]
+    fn telemetry_snapshot_with_icons_populates_icon_key_hwnd_disks_and_omits_inline_base64() {
+        let samples = vec![
+            sample(101, "chrome.exe", Some(r"C:\Apps\Chrome\chrome.exe"), 1.0, 2.0),
+            sample(102, "chrome.exe", Some(r"C:\Apps\Chrome\chrome.exe"), 3.0, 4.0),
+            sample(201, "Code.exe", Some(r"C:\Apps\VS Code\Code.exe"), 2.0, 5.0),
+        ];
+
+        // Notice Chrome's primary PID is 102 (highest RAM), while its visible window belongs to PID 101!
+        let mut pid_to_hwnd = HashMap::new();
+        pid_to_hwnd.insert(101, 0x1234_isize);
+        pid_to_hwnd.insert(201, 0x5678_isize);
+
+        let disks = vec![DiskHeadroomInfo {
+            mount: "C:".into(),
+            name: "OS".into(),
+            used_gb: 200.0,
+            total_gb: 500.0,
+            free_gb: 300.0,
+            used_pct: 40,
+        }];
+
+        let (snap, sources) = build_telemetry_snapshot_with_icons(
+            "Ryzen 9".into(),
+            22,
+            16 * GIB,
+            64 * GIB,
+            None,
+            &samples,
+            disks,
+            &pid_to_hwnd,
+            |exe| Some(icon_cache::path_icon_key(exe)),
+        );
+
+        assert_eq!(snap.disks.len(), 1);
+        assert_eq!(snap.disks[0].mount, "C:");
+        assert_eq!(snap.top_processes.len(), 2);
+        assert_eq!(snap.top_processes[0].name, "Chrome");
+        assert_eq!(snap.top_processes[0].pid, 102);
+        assert_eq!(snap.top_processes[0].hwnd, Some(0x1234));
+        assert!(snap.top_processes[0].icon_data.is_none());
+        assert_eq!(
+            snap.top_processes[0].icon_key.as_deref(),
+            Some(icon_cache::path_icon_key(r"C:\Apps\Chrome\chrome.exe").as_str())
+        );
+
+        assert_eq!(snap.top_processes[1].name, "VS Code");
+        assert_eq!(snap.top_processes[1].hwnd, Some(0x5678));
+        assert!(snap.top_processes[1].icon_data.is_none());
+
+        // Deduplicated across top_processes and gpu_processes: exactly 2 unique icon_sources
+        assert_eq!(sources.len(), 2);
     }
 }
