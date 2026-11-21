@@ -13,6 +13,7 @@ import {
   fsOpenInExplorer,
   getPeripheralBatteries,
   getWeather,
+  hideBatteryDevice,
   iconCache,
   importConfigDialog,
   ipc,
@@ -54,6 +55,9 @@ import {
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
+  type TileSection,
+  type TileSize,
+  type WeatherCityOption,
   type WeatherSnapshot,
 } from '../lib/ipc';
 import {
@@ -67,9 +71,11 @@ import {
   type SearchCorpusItem,
 } from '../lib/searchLogic';
 import {
+  applyOptimisticMovePinInSpace,
   applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
   completeStartClosing,
+  EXPLORER_RESUME_TTL_MS,
   findMatchingInstalledAppForPin,
   getStartChassisAnimClass,
   INITIAL_START_ANIM_STATE,
@@ -81,11 +87,14 @@ import {
   resolveCustomColorRgb,
   resolvePinAction,
   settleStartOpen,
+  shouldResetExplorerOnReopen,
   START_ENTER_ANIM_MS,
   START_EXIT_ANIM_MS,
   START_OPACITY_ANIM_MS,
   TILE_COLOR_PALETTE,
   type ArmedPowerKind,
+  type ExplorerSessionSnapshot,
+  type MovePinInSpaceParams,
   type PowerActionKind,
   type SpaceTemplateId,
   type StartAnimState,
@@ -93,15 +102,24 @@ import {
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CloseWindowIcon,
   CopyIcon,
   EditIcon,
   ExternalWindowIcon,
   FallbackAppIcon,
   FolderSvg,
   KillIcon,
+  LayersIcon,
+  MaximizeIcon,
   PinIcon,
+  PlusIcon,
   renderCustomTileIcon,
+  RestoreIcon,
+  SettingsGearIcon,
   ShieldIcon,
+  SlidersIcon,
   TerminalIcon,
   TILE_ICON_CATALOG,
   UnpinIcon,
@@ -144,10 +162,13 @@ interface TileCtxState {
 }
 
 interface TileEditState {
-  x: number;
-  y: number;
   item: PinItem;
   spaceKey: string;
+}
+
+interface EmptyCtxState {
+  x: number;
+  y: number;
 }
 
 interface TileCtxAction {
@@ -227,6 +248,7 @@ export const StartView: React.FC = () => {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [periphOpen, setPeriphOpen] = useState(false);
+  const [weatherOpen, setWeatherOpen] = useState(false);
   const [powerOpen, setPowerOpen] = useState(false);
   const [armedPower, setArmedPower] = useState<ArmedPowerKind>(null);
   const [addingSpace, setAddingSpace] = useState(false);
@@ -247,7 +269,14 @@ export const StartView: React.FC = () => {
   if (tileCtx) lastTileCtxRef.current = tileCtx;
   const tileCtxPresence = useAnimatedPresence(Boolean(tileCtx), 95);
 
-  // Tile Edit Popover (rendered outside .start-chassis!)
+  // Empty-Space Context Menu (rendered outside .start-chassis!)
+  const [emptyCtx, setEmptyCtx] = useState<EmptyCtxState | null>(null);
+  const [emptyCtxIdx, setEmptyCtxIdx] = useState<number>(0);
+  const lastEmptyCtxRef = useRef<EmptyCtxState | null>(null);
+  if (emptyCtx) lastEmptyCtxRef.current = emptyCtx;
+  const emptyCtxPresence = useAnimatedPresence(Boolean(emptyCtx), 95);
+
+  // Centered Tile Edit Modal (rendered inside .start-chassis!)
   const [tileEdit, setTileEdit] = useState<TileEditState | null>(null);
   const lastTileEditRef = useRef<TileEditState | null>(null);
   if (tileEdit) lastTileEditRef.current = tileEdit;
@@ -259,9 +288,18 @@ export const StartView: React.FC = () => {
   const [editCustomColor, setEditCustomColor] = useState<string | null>(null);
   const [editCustomIcon, setEditCustomIcon] = useState<string | null>(null);
   const [editIconData, setEditIconData] = useState<string | null>(null);
+  const [editTileSize, setEditTileSize] = useState<TileSize>('compact');
+  const [editSection, setEditSection] = useState<TileSection>('main');
+  const [editRunAsAdmin, setEditRunAsAdmin] = useState<boolean>(false);
   const [pickingCustomImg, setPickingCustomImg] = useState(false);
   const [savingPinEdit, setSavingPinEdit] = useState(false);
   const editTitleInputRef = useRef<HTMLInputElement>(null);
+
+  // Explorer 3-minute resume tracking
+  const lastStartClosedAtRef = useRef<number | null>(null);
+  const explorerSessionRef = useRef<ExplorerSessionSnapshot | null>(null);
+  const activeExplorerPathRef = useRef<string | null>(activeExplorerPath);
+  activeExplorerPathRef.current = activeExplorerPath;
 
   // Command Palette & Search Context Menu
   const [searchOpen, setSearchOpen] = useState(false);
@@ -458,6 +496,23 @@ export const StartView: React.FC = () => {
     [],
   );
 
+  const handleOptimisticMovePin = useCallback((params: MovePinInSpaceParams) => {
+    setConfig((prev) => applyOptimisticMovePinInSpace(prev, params) ?? prev);
+  }, []);
+
+  const handleHideBatteryDevice = useCallback(
+    async (id: string) => {
+      try {
+        const updated = await hideBatteryDevice(id);
+        handleApplyConfig(updated);
+        showToast('Устройство скрыто; вернуть можно в Настройках');
+      } catch (err) {
+        showToast(formatIpcError(err));
+      }
+    },
+    [handleApplyConfig, showToast],
+  );
+
   const resetTransientOverlays = useCallback(() => {
     setSearchOpen(false);
     setQuery('');
@@ -465,13 +520,14 @@ export const StartView: React.FC = () => {
     setPowerOpen(false);
     setArmedPower(null);
     setPeriphOpen(false);
+    setWeatherOpen(false);
     setAddingSpace(false);
     setManagingSpaceId(null);
     setWidgetBuilderOpen(false);
-    setActiveExplorerPath(null);
     setSettingsOpen(false);
     setDrawerOpen(false);
     setTileCtx(null);
+    setEmptyCtx(null);
     setTileEdit(null);
     setShiftHeld(false);
   }, []);
@@ -627,15 +683,28 @@ export const StartView: React.FC = () => {
           flushPendingHiddenState();
           cancelChassisAnims();
           setShiftHeld((prev) => (prev ? false : prev));
+          const closedAt = lastStartClosedAtRef.current;
+          lastStartClosedAtRef.current = null;
+          const explorerExpired = shouldResetExplorerOnReopen(
+            closedAt,
+            Date.now(),
+            EXPLORER_RESUME_TTL_MS,
+          );
+          if (activeExplorerPathRef.current !== null && explorerExpired) {
+            setActiveExplorerPath(null);
+            explorerSessionRef.current = null;
+          }
+          const explorerResuming = activeExplorerPathRef.current !== null && !explorerExpired;
           const remember = configRef.current?.startRememberSpace ?? false;
           const configured = resolveConfiguredSpaces(configRef.current);
           const defaultSpaceId = configured[0]?.id ?? 'personal';
-          if (!remember && spaceRef.current !== defaultSpaceId) {
+          if (!remember && spaceRef.current !== defaultSpaceId && !explorerResuming) {
             setSpaceDir(0);
             setRapidSwitch(false);
             setSpace(defaultSpaceId);
             setWidgetBuilderOpen(false);
             setActiveExplorerPath(null);
+            explorerSessionRef.current = null;
           }
           setAnim((prev) => reduceStartState(prev, ev));
 
@@ -749,6 +818,7 @@ export const StartView: React.FC = () => {
             typeof document !== 'undefined' && document.visibilityState === 'visible' ? 12 : 32;
           fallbackTimer = window.setTimeout(launchSpring, waitMs);
         } else {
+          lastStartClosedAtRef.current = Date.now();
           if (ev.immediate) {
             startActiveRef.current = false;
             cancelChassisAnims();
@@ -814,11 +884,14 @@ export const StartView: React.FC = () => {
         setPowerOpen(false);
         setArmedPower(null);
         setPeriphOpen(false);
+        setWeatherOpen(false);
         setAddingSpace(false);
         setManagingSpaceId(null);
         setWidgetBuilderOpen(false);
         setActiveExplorerPath(null);
+        explorerSessionRef.current = null;
         setTileCtx(null);
+        setEmptyCtx(null);
         setTileEdit(null);
         setSettingsOpen(true);
       }),
@@ -898,8 +971,8 @@ export const StartView: React.FC = () => {
     }
   }, [showToast]);
 
-  // Lazy weather hydration when Start opens on a space containing the weather widget
-  const needsWeather = anim.phase !== 'hidden' && (activeSpace?.widgets ?? []).includes('weather');
+  // Always keep header weather fresh while Start is open
+  const needsWeather = anim.phase !== 'hidden';
   useEffect(() => {
     if (!needsWeather) return;
     const keyChanged = lastWeatherKeyRef.current !== weatherKey;
@@ -913,6 +986,67 @@ export const StartView: React.FC = () => {
       })
       .catch(() => {});
   }, [needsWeather, weatherKey, weather]);
+
+  const handleSelectWeatherCity = useCallback(
+    async (city: WeatherCityOption) => {
+      try {
+        const next = await setTaskbarWidgets({
+          weatherCity: city.name,
+          weatherLat: city.lat,
+          weatherLon: city.lon,
+        });
+        handleApplyConfig(next);
+        lastWeatherKeyRef.current = '';
+        const fresh = await getWeather({ force: true });
+        if (mountedRef.current) {
+          lastWeatherFetchMsRef.current = Date.now();
+          setWeather(fresh);
+        }
+        showToast(`Город погоды: ${city.name}`);
+      } catch (err) {
+        showToast(formatIpcError(err));
+      }
+    },
+    [handleApplyConfig, showToast],
+  );
+
+  const handleResetWeatherCity = useCallback(async () => {
+    try {
+      const next = await setTaskbarWidgets({
+        weatherCity: '',
+        weatherLat: null,
+        weatherLon: null,
+      });
+      handleApplyConfig(next);
+      lastWeatherKeyRef.current = '';
+      const fresh = await getWeather({ force: true });
+      if (mountedRef.current) {
+        lastWeatherFetchMsRef.current = Date.now();
+        setWeather(fresh);
+      }
+      showToast('Автоопределение города включено');
+    } catch (err) {
+      showToast(formatIpcError(err));
+    }
+  }, [handleApplyConfig, showToast]);
+
+  const handleChangeWeatherUnits = useCallback(
+    async (units: 'c' | 'f') => {
+      try {
+        const next = await setTaskbarWidgets({ weatherUnits: units });
+        handleApplyConfig(next);
+        lastWeatherKeyRef.current = '';
+        const fresh = await getWeather({ force: true });
+        if (mountedRef.current) {
+          lastWeatherFetchMsRef.current = Date.now();
+          setWeather(fresh);
+        }
+      } catch (err) {
+        showToast(formatIpcError(err));
+      }
+    },
+    [handleApplyConfig, showToast],
+  );
 
   // Shared batch icon hydration callback passed down to StartSpaces
   const handleResolveIconKeys = useCallback((keys: string[]) => {
@@ -1092,10 +1226,13 @@ export const StartView: React.FC = () => {
       setManagingSpaceId(null);
       setWidgetBuilderOpen(false);
       setActiveExplorerPath(null);
+      explorerSessionRef.current = null;
       setPeriphOpen(false);
+      setWeatherOpen(false);
       setPowerOpen(false);
       setArmedPower(null);
       setTileCtx(null);
+      setEmptyCtx(null);
       setTileEdit(null);
     },
     [allSpaceIds],
@@ -1324,7 +1461,7 @@ export const StartView: React.FC = () => {
         ipc('launch_item', {
           target: action.target,
           args: action.args,
-          asAdmin: action.asAdmin,
+          asAdmin: Boolean(action.asAdmin || item.runAsAdmin),
           closeStart: action.closeStart,
         })
           .then(() => {
@@ -1337,16 +1474,11 @@ export const StartView: React.FC = () => {
     [editMode, shiftHeld, showToast, handleApplyConfig],
   );
 
-  // Tile Edit Popover handlers
+  // Centered Tile Edit Modal handlers
   const openTileEditPopover = useCallback(
-    (item: PinItem, spaceKey: string, coords?: { x: number; y: number }) => {
-      const vw = typeof window !== 'undefined' ? window.innerWidth : 1172;
-      const vh = typeof window !== 'undefined' ? window.innerHeight : 712;
-      const rawX = coords ? coords.x : Math.round((vw - 348) / 2);
-      const rawY = coords ? coords.y : Math.round((vh - 540) / 2);
-      const pos = clampPopoverPos(rawX, rawY, 348, 540);
-
+    (item: PinItem, spaceKey: string, _coords?: { x: number; y: number }) => {
       setTileCtx(null);
+      setEmptyCtx(null);
       setEditPinTitle(item.title);
       setEditPinArgs(item.args ?? '');
       setEditPinAltAction(item.altAction ?? '');
@@ -1354,9 +1486,12 @@ export const StartView: React.FC = () => {
       setEditCustomColor(item.customColor ?? null);
       setEditCustomIcon(item.customIcon ?? null);
       setEditIconData(item.customIcon === 'custom_image' ? (item.iconData ?? null) : null);
+      setEditTileSize(item.tileSize === 'hero' ? 'hero' : 'compact');
+      setEditSection(item.section === 'bottom' ? 'bottom' : 'main');
+      setEditRunAsAdmin(Boolean(item.runAsAdmin));
       setPickingCustomImg(false);
       setSavingPinEdit(false);
-      setTileEdit({ x: pos.x, y: pos.y, item, spaceKey });
+      setTileEdit({ item, spaceKey });
       requestAnimationFrame(() => editTitleInputRef.current?.focus());
     },
     [],
@@ -1385,6 +1520,9 @@ export const StartView: React.FC = () => {
         customIcon: editCustomIcon,
         customColor: editCustomColor,
         iconData: nextIconData,
+        tileSize: editTileSize,
+        section: editSection,
+        runAsAdmin: tileEdit.item.kind === 'app' ? editRunAsAdmin : undefined,
       });
       handleApplyConfig(updated);
       setTileEdit(null);
@@ -1409,6 +1547,7 @@ export const StartView: React.FC = () => {
         icon: <FolderSvg className="ic14" />,
         run: () => {
           setWidgetBuilderOpen(false);
+          explorerSessionRef.current = null;
           setActiveExplorerPath(item.target);
           setTileCtx(null);
         },
@@ -1499,7 +1638,51 @@ export const StartView: React.FC = () => {
         label: 'Настроить вид / изменить',
         icon: <EditIcon className="ic14" />,
         run: () => {
-          openTileEditPopover(item, spaceKey, { x: activeCtxSource.x, y: activeCtxSource.y });
+          openTileEditPopover(item, spaceKey);
+        },
+      });
+    }
+
+    if (spaceKey !== 'game_combos' && item.kind !== 'combo') {
+      const isHeroTile = item.tileSize === 'hero';
+      actions.push({
+        id: 'toggle-size',
+        label: isHeroTile ? 'Сделать обычной' : 'Сделать крупной',
+        icon: isHeroTile ? <RestoreIcon className="ic14" /> : <MaximizeIcon className="ic14" />,
+        run: () => {
+          updatePin({
+            space: spaceKey,
+            pinId: item.id,
+            tileSize: isHeroTile ? 'compact' : 'hero',
+          })
+            .then((next) => {
+              handleApplyConfig(next);
+              showToast(isHeroTile ? 'Обычный размер плитки' : 'Крупная плитка');
+            })
+            .catch((err) => showToast(formatIpcError(err)));
+          setTileCtx(null);
+        },
+      });
+
+      const isBottomTile = item.section === 'bottom';
+      actions.push({
+        id: 'toggle-section',
+        label: isBottomTile ? 'Перенести в верхний блок' : 'Перенести в нижний блок',
+        icon: isBottomTile ? <ArrowUpIcon size={14} /> : <ArrowDownIcon size={14} />,
+        run: () => {
+          updatePin({
+            space: spaceKey,
+            pinId: item.id,
+            section: isBottomTile ? 'main' : 'bottom',
+          })
+            .then((next) => {
+              handleApplyConfig(next);
+              showToast(
+                isBottomTile ? 'Перенесено в верхний блок' : 'Перенесено в нижний блок',
+              );
+            })
+            .catch((err) => showToast(formatIpcError(err)));
+          setTileCtx(null);
         },
       });
     }
@@ -1560,6 +1743,68 @@ export const StartView: React.FC = () => {
 
     return actions;
   }, [activeCtxSource, config?.taskbarPins, handleApplyConfig, launchPin, openTileEditPopover, showToast]);
+
+  const emptyCtxActions = useMemo<TileCtxAction[]>(() => {
+    const currentSpaceName = activeSpace?.name ?? 'Пространство';
+    return [
+      {
+        id: 'add-pin',
+        label: 'Добавить программу или папку',
+        icon: <PlusIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setDrawerOpen(true);
+        },
+      },
+      {
+        id: 'toggle-edit',
+        label: editMode ? 'Выключить режим редактирования' : 'Режим редактирования',
+        icon: <EditIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setEditMode((v) => !v);
+        },
+      },
+      {
+        id: 'widgets',
+        label: 'Настроить виджеты',
+        icon: <SlidersIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setWidgetBuilderOpen((v) => !v);
+        },
+      },
+      {
+        id: 'manage-space',
+        label: `Настроить пространство «${currentSpaceName}»`,
+        icon: <LayersIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setAddingSpace(false);
+          setManagingSpaceId(space);
+        },
+      },
+      {
+        id: 'create-space',
+        label: 'Создать пространство',
+        icon: <PlusIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setManagingSpaceId(null);
+          setAddingSpace(true);
+        },
+      },
+      {
+        id: 'settings',
+        label: 'Настройки TestBar',
+        icon: <SettingsGearIcon className="ic14" />,
+        run: () => {
+          setEmptyCtx(null);
+          setSettingsOpen(true);
+        },
+      },
+    ];
+  }, [activeSpace?.name, editMode, space]);
 
   // Dismiss Search Context Menu when clicking anywhere outside it
   useEffect(() => {
@@ -1858,9 +2103,39 @@ export const StartView: React.FC = () => {
         }
       }
 
+      // Empty-Space Context Menu keyboard navigation
+      if (emptyCtx) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setEmptyCtxIdx((i) => (emptyCtxActions.length > 0 ? (i + 1) % emptyCtxActions.length : 0));
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setEmptyCtxIdx((i) =>
+            emptyCtxActions.length > 0
+              ? (i - 1 + emptyCtxActions.length) % emptyCtxActions.length
+              : 0,
+          );
+          return;
+        }
+        if (e.key === 'Enter' && emptyCtxActions[emptyCtxIdx]) {
+          e.preventDefault();
+          emptyCtxActions[emptyCtxIdx].run();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setEmptyCtx(null);
+          return;
+        }
+      }
+
       if (e.key === 'Escape') {
         if (tileEdit) {
           setTileEdit(null);
+        } else if (emptyCtx) {
+          setEmptyCtx(null);
         } else if (searchCtx) {
           setSearchCtx(null);
         } else if (searchOpen) {
@@ -1876,12 +2151,15 @@ export const StartView: React.FC = () => {
           setDrawerOpen(false);
         } else if (settingsOpen) {
           setSettingsOpen(false);
+        } else if (weatherOpen) {
+          setWeatherOpen(false);
         } else if (periphOpen) {
           setPeriphOpen(false);
         } else if (powerOpen) {
           setPowerOpen(false);
           setArmedPower(null);
         } else if (activeExplorerPath !== null) {
+          explorerSessionRef.current = null;
           setActiveExplorerPath(null);
         } else {
           toggleStart(false).catch(() => {});
@@ -1903,8 +2181,10 @@ export const StartView: React.FC = () => {
         !widgetBuilderOpen &&
         activeExplorerPath === null &&
         !periphOpen &&
+        !weatherOpen &&
         !powerOpen &&
         !tileCtx &&
+        !emptyCtx &&
         !tileEdit &&
         !insideDialog
       ) {
@@ -1939,6 +2219,8 @@ export const StartView: React.FC = () => {
         !addingSpace &&
         !managingSpaceId &&
         !widgetBuilderOpen &&
+        !weatherOpen &&
+        !emptyCtx &&
         activeExplorerPath === null &&
         !tileEdit &&
         !insideDialog &&
@@ -1946,7 +2228,9 @@ export const StartView: React.FC = () => {
       ) {
         e.preventDefault();
         setTileCtx(null);
+        setEmptyCtx(null);
         setPeriphOpen(false);
+        setWeatherOpen(false);
         setPowerOpen(false);
         setArmedPower(null);
         setSearchTrigger('keyboard');
@@ -1980,12 +2264,16 @@ export const StartView: React.FC = () => {
     drawerOpen,
     settingsOpen,
     periphOpen,
+    weatherOpen,
     searchCtx,
     searchCtxIdx,
     searchCtxActions,
     tileCtx,
     tileCtxIdx,
     tileCtxActions,
+    emptyCtx,
+    emptyCtxIdx,
+    emptyCtxActions,
     tileEdit,
     powerOpen,
     space,
@@ -2149,6 +2437,7 @@ export const StartView: React.FC = () => {
     accentRgb?: string;
     layoutKind?: SpaceLayoutKind;
     showHeroRow?: boolean;
+    bottomSectionTitle?: string | null;
   }) => {
     const updated = await updateSpace(params);
     handleApplyConfig(updated);
@@ -2190,6 +2479,7 @@ export const StartView: React.FC = () => {
         selectSpace(spaceId);
       }
       setActiveExplorerPath(null);
+      explorerSessionRef.current = null;
       setManagingSpaceId(null);
       setAddingSpace(false);
       setWidgetBuilderOpen(true);
@@ -2212,8 +2502,9 @@ export const StartView: React.FC = () => {
     (e: React.MouseEvent, item: PinItem, spaceKey: string) => {
       e.preventDefault();
       e.stopPropagation();
-      const pos = clampPopoverPos(e.clientX, e.clientY, 244, 300);
+      const pos = clampPopoverPos(e.clientX, e.clientY, 252, 380);
       setTileEdit(null);
+      setEmptyCtx(null);
       setTileCtxIdx(0);
       setTileCtx({
         x: pos.x,
@@ -2231,6 +2522,7 @@ export const StartView: React.FC = () => {
       e.stopPropagation();
       const pos = clampPopoverPos(e.clientX, e.clientY, 244, 320);
       setTileCtx(null);
+      setEmptyCtx(null);
       setTileEdit(null);
       setSearchCtxIdx(0);
       setSearchCtx({
@@ -2265,11 +2557,40 @@ export const StartView: React.FC = () => {
       onClick={() => {
         if (searchCtx) setSearchCtx(null);
         if (tileCtx) setTileCtx(null);
+        if (emptyCtx) setEmptyCtx(null);
         if (tileEdit) setTileEdit(null);
         if (powerOpen) {
           setPowerOpen(false);
           setArmedPower(null);
         }
+      }}
+      onContextMenu={(e) => {
+        if (e.defaultPrevented) return;
+        const target = e.target as HTMLElement | null;
+        if (
+          target?.closest(
+            'input, textarea, select, [contenteditable="true"], [contenteditable=""]',
+          )
+        ) {
+          return;
+        }
+        e.preventDefault();
+        if (
+          target?.closest(
+            '.app-tile, .qlink, .game-card, .combo-row, .space-tab, .v3-explorer-slot, .search-backdrop, .settings-backdrop, .tile-edit-backdrop, .ctx-card, .tile-ctx-menu, .periph-pop, .weather-hdr-pop, .power-pop, .space-pop, .drawer-sheet, .widget-builder-sheet, .combo-builder-sheet',
+          )
+        ) {
+          return;
+        }
+        const pos = clampPopoverPos(e.clientX, e.clientY, 248, 250);
+        setTileCtx(null);
+        setSearchCtx(null);
+        setPeriphOpen(false);
+        setWeatherOpen(false);
+        setPowerOpen(false);
+        setArmedPower(null);
+        setEmptyCtxIdx(0);
+        setEmptyCtx({ x: pos.x, y: pos.y });
       }}
     >
       {/* NON-REMOUNTING START CHASSIS — WAAPI-driven spring synced with DComp underlay */}
@@ -2295,8 +2616,18 @@ export const StartView: React.FC = () => {
           spaces={resolvedSpaces}
           periphs={periphs}
           periphsRefreshing={periphsRefreshing}
+          hiddenBatteryIds={config?.hiddenBatteryIds}
           audio={audio}
           periphOpen={periphOpen}
+          weather={weather}
+          weatherRefreshing={weatherRefreshing}
+          weatherUnits={config?.taskbarWidgets?.weatherUnits ?? 'c'}
+          weatherCityConfig={{
+            city: config?.taskbarWidgets?.weatherCity ?? '',
+            lat: config?.taskbarWidgets?.weatherLat ?? null,
+            lon: config?.taskbarWidgets?.weatherLon ?? null,
+          }}
+          weatherOpen={weatherOpen}
           editMode={editMode}
           drawerOpen={drawerOpen}
           settingsOpen={settingsOpen}
@@ -2306,9 +2637,22 @@ export const StartView: React.FC = () => {
           addingSpace={addingSpace}
           managingSpaceId={managingSpaceId}
           onSelectSpace={selectSpace}
-          onTogglePeriph={() => setPeriphOpen((v) => !v)}
+          onTogglePeriph={() => {
+            setPeriphOpen((v) => !v);
+            setWeatherOpen(false);
+          }}
           onClosePeriph={() => setPeriphOpen(false)}
           onRefreshPeriphs={handleRefreshPeriphs}
+          onHideBatteryDevice={handleHideBatteryDevice}
+          onToggleWeather={() => {
+            setWeatherOpen((v) => !v);
+            setPeriphOpen(false);
+          }}
+          onCloseWeather={() => setWeatherOpen(false)}
+          onRefreshWeather={handleRefreshWeather}
+          onSelectWeatherCity={handleSelectWeatherCity}
+          onResetWeatherCity={handleResetWeatherCity}
+          onChangeWeatherUnits={handleChangeWeatherUnits}
           onSelectAudioDevice={(deviceId) => {
             ipc<AudioState>('set_audio_device', { deviceId })
               .then(setAudio)
@@ -2322,7 +2666,10 @@ export const StartView: React.FC = () => {
             setAddingSpace(false);
             setManagingSpaceId(null);
             setWidgetBuilderOpen(false);
+            setWeatherOpen(false);
+            setPeriphOpen(false);
             setTileCtx(null);
+            setEmptyCtx(null);
             setTileEdit(null);
             setQuery('');
             setCmdIdx(0);
@@ -2335,7 +2682,10 @@ export const StartView: React.FC = () => {
             setAddingSpace(false);
             setManagingSpaceId(null);
             setWidgetBuilderOpen(false);
+            setWeatherOpen(false);
+            setPeriphOpen(false);
             setTileCtx(null);
+            setEmptyCtx(null);
             setTileEdit(null);
           }}
           onToggleSettings={() => {
@@ -2345,12 +2695,17 @@ export const StartView: React.FC = () => {
             setAddingSpace(false);
             setManagingSpaceId(null);
             setWidgetBuilderOpen(false);
+            setWeatherOpen(false);
+            setPeriphOpen(false);
             setTileCtx(null);
+            setEmptyCtx(null);
             setTileEdit(null);
           }}
           onTogglePower={() => {
             setPowerOpen((v) => !v);
             setArmedPower(null);
+            setWeatherOpen(false);
+            setPeriphOpen(false);
           }}
           onClosePower={() => {
             setPowerOpen(false);
@@ -2362,7 +2717,9 @@ export const StartView: React.FC = () => {
             if (open) {
               setManagingSpaceId(null);
               setPeriphOpen(false);
+              setWeatherOpen(false);
               setTileCtx(null);
+              setEmptyCtx(null);
               setTileEdit(null);
             }
           }}
@@ -2371,7 +2728,9 @@ export const StartView: React.FC = () => {
             if (id) {
               setAddingSpace(false);
               setPeriphOpen(false);
+              setWeatherOpen(false);
               setTileCtx(null);
+              setEmptyCtx(null);
               setTileEdit(null);
             }
           }}
@@ -2386,11 +2745,13 @@ export const StartView: React.FC = () => {
           className="space-stage"
           onClick={() => {
             if (periphOpen) setPeriphOpen(false);
+            if (weatherOpen) setWeatherOpen(false);
             if (powerOpen) {
               setPowerOpen(false);
               setArmedPower(null);
             }
             if (tileCtx) setTileCtx(null);
+            if (emptyCtx) setEmptyCtx(null);
             if (tileEdit) setTileEdit(null);
           }}
         >
@@ -2398,8 +2759,15 @@ export const StartView: React.FC = () => {
             <div className="v3-explorer-slot" data-explorer-path={activeExplorerPath}>
               <StartFileExplorer
                 initialPath={activeExplorerPath}
+                initialSession={explorerSessionRef.current}
+                onSessionChange={(snap) => {
+                  explorerSessionRef.current = snap;
+                }}
                 activeSpaceId={space}
-                onClose={() => setActiveExplorerPath(null)}
+                onClose={() => {
+                  explorerSessionRef.current = null;
+                  setActiveExplorerPath(null);
+                }}
                 onPinFolder={async (folderPath, folderName) => {
                   try {
                     const next = await ipc<TestBarConfig>('add_pin', {
@@ -2447,6 +2815,7 @@ export const StartView: React.FC = () => {
               onLaunchPin={launchPin}
               onOpenFolder={(path) => {
                 setWidgetBuilderOpen(false);
+                explorerSessionRef.current = null;
                 setActiveExplorerPath(path);
               }}
               onOpenFolderInExplorer={(path) => {
@@ -2473,6 +2842,8 @@ export const StartView: React.FC = () => {
               onResolveIconKeys={handleResolveIconKeys}
               onSetConfig={handleApplyConfig}
               onOptimisticReorder={handleOptimisticReorder}
+              onOptimisticMovePin={handleOptimisticMovePin}
+              onHideBatteryDevice={handleHideBatteryDevice}
               onEditPin={(item, spaceKey) => openTileEditPopover(item, spaceKey)}
             />
           ) : null}
@@ -2570,6 +2941,369 @@ export const StartView: React.FC = () => {
           }}
         />
 
+        {/* CENTERED TILE EDIT MODAL — Rendered INSIDE .start-chassis, fixed header + scrollable body + sticky footer! */}
+        {tileEditPresence.mounted && (tileEdit ?? lastTileEditRef.current) && (
+          <div
+            className="tile-edit-backdrop"
+            data-phase={tileEditPresence.phase}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (e.target === e.currentTarget) setTileEdit(null);
+            }}
+          >
+            <div
+              className="tile-edit-modal"
+              data-phase={tileEditPresence.phase}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Настроить плитку"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="tile-edit-head">
+                <span className="tile-edit-head-title">Настроить плитку</span>
+                <button
+                  type="button"
+                  className="tile-edit-close-btn"
+                  aria-label="Закрыть"
+                  onClick={() => setTileEdit(null)}
+                >
+                  <CloseWindowIcon className="ic14" />
+                </button>
+              </div>
+
+              <div className="tile-edit-body">
+                {(() => {
+                  const editCtx = (tileEdit ?? lastTileEditRef.current)!;
+                  const previewRgb = resolveCustomColorRgb(editCustomColor);
+                  const isFolder = editCtx.item.kind === 'folder';
+                  const isFile = editCtx.item.kind === 'file';
+                  const isCustomImg = editCustomIcon === 'custom_image' && Boolean(editIconData);
+                  const previewIcCls = [
+                    'tile-edit-preview-ic',
+                    isFolder && !isCustomImg ? 'is-folder-ic' : '',
+                    isFile && !isCustomImg ? 'is-file-ic' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ');
+                  const fallbackIconSrc =
+                    editCustomIcon === 'custom_image' || editCustomIcon
+                      ? null
+                      : resolveIconForPin(editCtx.item);
+                  return (
+                    <div
+                      className={`tile-edit-preview ${previewRgb ? 'has-custom-color' : ''}`}
+                      style={
+                        previewRgb
+                          ? ({ ['--tile-custom-rgb' as string]: previewRgb } as React.CSSProperties)
+                          : undefined
+                      }
+                    >
+                      <div className={previewIcCls}>
+                        {isCustomImg && editIconData ? (
+                          <img className="custom-tile-img" src={editIconData} alt="" />
+                        ) : editCustomIcon && TILE_ICON_CATALOG.some((c) => c.id === editCustomIcon) ? (
+                          renderCustomTileIcon(editCustomIcon, 'ic18')
+                        ) : fallbackIconSrc ? (
+                          <img src={fallbackIconSrc} alt="" />
+                        ) : (
+                          <FallbackAppIcon
+                            iconKey={editCtx.item.iconKey}
+                            kind={editCtx.item.kind}
+                            target={editCtx.item.target}
+                            size={18}
+                            color={editCustomColor ?? undefined}
+                          />
+                        )}
+                      </div>
+                      <div className="tile-edit-preview-meta">
+                        <span className="tile-edit-preview-name">
+                          {editPinTitle.trim() || editCtx.item.title}
+                        </span>
+                        <span className="tile-edit-preview-sub">
+                          {editTileSize === 'hero' ? 'Крупная' : 'Обычная'} ·{' '}
+                          {editSection === 'bottom' ? 'Нижний блок' : 'Верхний блок'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                <div className="tile-edit-field">
+                  <label className="tile-edit-lbl" htmlFor="tb-edit-pin-title">
+                    Название
+                  </label>
+                  <input
+                    id="tb-edit-pin-title"
+                    ref={editTitleInputRef}
+                    className="space-create-input"
+                    maxLength={40}
+                    value={editPinTitle}
+                    onChange={(e) => setEditPinTitle(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void handleSaveTileEdit();
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setTileEdit(null);
+                      }
+                    }}
+                  />
+                </div>
+
+                <div className="tile-edit-row-2">
+                  <div className="tile-edit-field">
+                    <span className="tile-edit-lbl">Размер плитки</span>
+                    <div className="space-seg" role="radiogroup" aria-label="Размер плитки">
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={editTileSize === 'compact'}
+                        className={`space-seg-btn ${editTileSize === 'compact' ? 'active' : ''}`}
+                        onClick={() => setEditTileSize('compact')}
+                      >
+                        Обычная
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={editTileSize === 'hero'}
+                        className={`space-seg-btn ${editTileSize === 'hero' ? 'active' : ''}`}
+                        onClick={() => setEditTileSize('hero')}
+                      >
+                        Крупная
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="tile-edit-field">
+                    <span className="tile-edit-lbl">Расположение</span>
+                    <div className="space-seg" role="radiogroup" aria-label="Расположение">
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={editSection === 'main'}
+                        className={`space-seg-btn ${editSection === 'main' ? 'active' : ''}`}
+                        onClick={() => setEditSection('main')}
+                      >
+                        Верхний блок
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={editSection === 'bottom'}
+                        className={`space-seg-btn ${editSection === 'bottom' ? 'active' : ''}`}
+                        onClick={() => setEditSection('bottom')}
+                      >
+                        Нижний блок
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="tile-edit-field">
+                  <div className="tile-edit-lbl-row">
+                    <span className="tile-edit-lbl">Цвет плитки и иконки</span>
+                    <button
+                      type="button"
+                      className="tile-reset-mini-btn"
+                      onClick={() => setEditCustomColor(null)}
+                    >
+                      По умолчанию
+                    </button>
+                  </div>
+                  <div className="tile-color-grid">
+                    {TILE_COLOR_PALETTE.map((swatch) => {
+                      const selected = editCustomColor?.toLowerCase() === swatch.hex.toLowerCase();
+                      return (
+                        <button
+                          key={swatch.id}
+                          type="button"
+                          className={`tile-color-swatch ${selected ? 'selected' : ''}`}
+                          style={{ background: swatch.hex }}
+                          title={swatch.label}
+                          aria-label={swatch.label}
+                          onClick={() => setEditCustomColor(selected ? null : swatch.hex)}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="tile-edit-field">
+                  <div className="tile-edit-lbl-row">
+                    <span className="tile-edit-lbl">Иконка</span>
+                    <button
+                      type="button"
+                      className="tile-reset-mini-btn"
+                      onClick={() => {
+                        setEditCustomIcon(null);
+                        setEditIconData(null);
+                      }}
+                    >
+                      Сбросить иконку
+                    </button>
+                  </div>
+                  <div className="tile-icon-grid">
+                    {TILE_ICON_CATALOG.map((opt) => {
+                      const selected = editCustomIcon === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          className={`tile-icon-opt ${selected ? 'selected' : ''}`}
+                          title={opt.label}
+                          aria-label={opt.label}
+                          onClick={() => {
+                            setEditCustomIcon(selected ? null : opt.id);
+                            if (!selected) setEditIconData(null);
+                          }}
+                        >
+                          {renderCustomTileIcon(opt.id, 'ic16')}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="tile-icon-actions">
+                    <button
+                      type="button"
+                      className="pin-any-btn"
+                      disabled={pickingCustomImg}
+                      onClick={() => {
+                        setPickingCustomImg(true);
+                        pickCustomIconImage()
+                          .then((dataUrl) => {
+                            if (dataUrl && mountedRef.current) {
+                              setEditCustomIcon('custom_image');
+                              setEditIconData(dataUrl);
+                            }
+                          })
+                          .catch((err) => showToast(formatIpcError(err)))
+                          .finally(() => {
+                            if (mountedRef.current) setPickingCustomImg(false);
+                          });
+                      }}
+                    >
+                      {pickingCustomImg ? 'Выбор файла…' : 'Своя картинка…'}
+                    </button>
+                  </div>
+                </div>
+
+                {(tileEdit ?? lastTileEditRef.current)!.item.kind === 'app' && (
+                  <>
+                    <div className="tile-edit-field">
+                      <label className="tile-edit-lbl" htmlFor="tb-edit-pin-args">
+                        Аргументы запуска
+                      </label>
+                      <input
+                        id="tb-edit-pin-args"
+                        className="space-create-input"
+                        placeholder="Например, --new-window"
+                        value={editPinArgs}
+                        onChange={(e) => setEditPinArgs(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            void handleSaveTileEdit();
+                          } else if (e.key === 'Escape') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setTileEdit(null);
+                          }
+                        }}
+                      />
+                    </div>
+
+                    <div className="tile-edit-switch-row">
+                      <div className="tile-edit-switch-meta">
+                        <span className="tile-edit-switch-title">
+                          Запускать от имени администратора
+                        </span>
+                        <span className="tile-edit-switch-sub">
+                          Повышенные права Windows при открытии
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={editRunAsAdmin}
+                        aria-label="Запускать от имени администратора"
+                        className={`glass-switch ${editRunAsAdmin ? 'on' : ''}`}
+                        onClick={() => setEditRunAsAdmin((v) => !v)}
+                      >
+                        <span className="glass-switch-thumb" />
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                <div className="tile-edit-field">
+                  <label className="tile-edit-lbl" htmlFor="tb-edit-pin-alt">
+                    Второе действие (Shift)
+                  </label>
+                  <select
+                    id="tb-edit-pin-alt"
+                    className="space-create-input"
+                    value={editPinAltAction}
+                    onChange={(e) => setEditPinAltAction(e.target.value)}
+                  >
+                    {ALT_ACTION_OPTIONS.map((opt) => (
+                      <option key={opt.value || 'none'} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {editPinAltAction && (
+                  <div className="tile-edit-field">
+                    <label className="tile-edit-lbl" htmlFor="tb-edit-pin-alt-label">
+                      Подпись действия (необязательно)
+                    </label>
+                    <input
+                      id="tb-edit-pin-alt-label"
+                      className="space-create-input"
+                      maxLength={28}
+                      placeholder={editPinAltAction}
+                      value={editPinAltLabel}
+                      onChange={(e) => setEditPinAltLabel(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleSaveTileEdit();
+                        } else if (e.key === 'Escape') {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setTileEdit(null);
+                        }
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="tile-edit-foot">
+                <button
+                  type="button"
+                  className="space-create-cancel"
+                  onClick={() => setTileEdit(null)}
+                >
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  className="space-create-submit"
+                  disabled={savingPinEdit}
+                  onClick={() => void handleSaveTileEdit()}
+                >
+                  Сохранить
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {toastPresence.mounted && (
           <div
             className="start-toast"
@@ -2613,6 +3347,40 @@ export const StartView: React.FC = () => {
         </div>
       )}
 
+      {/* EMPTY-SPACE CONTEXT MENU — Rendered OUTSIDE .start-chassis overflow: hidden! */}
+      {emptyCtxPresence.mounted && (emptyCtx ?? lastEmptyCtxRef.current) && (
+        <div
+          className="flyout-card ctx-card tile-ctx-menu empty-ctx-menu"
+          data-phase={emptyCtxPresence.phase}
+          role="menu"
+          aria-label={activeSpace?.name ?? 'Start'}
+          style={{
+            left: (emptyCtx ?? lastEmptyCtxRef.current)!.x,
+            top: (emptyCtx ?? lastEmptyCtxRef.current)!.y,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="ctx-sec">{activeSpace?.name ?? 'Пространство'}</div>
+          <div className="ctx-scroll">
+            {emptyCtxActions.map((act, idx) => (
+              <React.Fragment key={act.id}>
+                {act.id === 'settings' && <div className="ctx-sep" />}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={`ctx-item ${idx === emptyCtxIdx ? 'focused' : ''}`}
+                  onMouseEnter={() => setEmptyCtxIdx(idx)}
+                  onClick={act.run}
+                >
+                  {act.icon}
+                  <span className="ctx-item-label">{act.label}</span>
+                </button>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* SEARCH CONTEXT MENU — Rendered OUTSIDE .start-chassis overflow: hidden above .search-backdrop */}
       {searchCtxPresence.mounted && activeSearchCtxSource && (
         <div
@@ -2640,264 +3408,6 @@ export const StartView: React.FC = () => {
                 </button>
               </React.Fragment>
             ))}
-          </div>
-        </div>
-      )}
-
-      {/* TILE EDIT POPOVER — Rendered OUTSIDE .start-chassis overflow: hidden! */}
-      {tileEditPresence.mounted && (tileEdit ?? lastTileEditRef.current) && (
-        <div
-          className="tile-edit-pop v3-tile-edit"
-          data-phase={tileEditPresence.phase}
-          role="dialog"
-          aria-label="Настроить плитку"
-          style={{
-            left: (tileEdit ?? lastTileEditRef.current)!.x,
-            top: (tileEdit ?? lastTileEditRef.current)!.y,
-          }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="space-create-head">Настроить плитку</div>
-
-          {(() => {
-            const editCtx = (tileEdit ?? lastTileEditRef.current)!;
-            const previewRgb = resolveCustomColorRgb(editCustomColor);
-            const fallbackIconSrc =
-              editCustomIcon === 'custom_image' || editCustomIcon
-                ? null
-                : resolveIconForPin(editCtx.item);
-            return (
-              <div
-                className={`tile-edit-preview ${previewRgb ? 'has-custom-color' : ''}`}
-                style={
-                  previewRgb
-                    ? ({ ['--tile-custom-rgb' as string]: previewRgb } as React.CSSProperties)
-                    : undefined
-                }
-              >
-                <div className="tile-edit-preview-ic">
-                  {editCustomIcon === 'custom_image' && editIconData ? (
-                    <img className="custom-tile-img" src={editIconData} alt="" />
-                  ) : editCustomIcon && TILE_ICON_CATALOG.some((c) => c.id === editCustomIcon) ? (
-                    renderCustomTileIcon(editCustomIcon, 'ic18')
-                  ) : fallbackIconSrc ? (
-                    <img src={fallbackIconSrc} alt="" />
-                  ) : editCtx.item.kind === 'folder' ? (
-                    <FolderSvg className="ic18" />
-                  ) : (
-                    <FallbackAppIcon
-                      iconKey={editCtx.item.iconKey}
-                      kind={editCtx.item.kind}
-                      target={editCtx.item.target}
-                      size={18}
-                    />
-                  )}
-                </div>
-                <span className="tile-edit-preview-name">
-                  {editPinTitle.trim() || editCtx.item.title}
-                </span>
-              </div>
-            );
-          })()}
-
-          <div className="tile-edit-field">
-            <label className="tile-edit-lbl" htmlFor="tb-edit-pin-title">
-              Название
-            </label>
-            <input
-              id="tb-edit-pin-title"
-              ref={editTitleInputRef}
-              className="space-create-input"
-              maxLength={40}
-              value={editPinTitle}
-              onChange={(e) => setEditPinTitle(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  void handleSaveTileEdit();
-                } else if (e.key === 'Escape') {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setTileEdit(null);
-                }
-              }}
-            />
-          </div>
-
-          <div className="tile-edit-field">
-            <div className="tile-edit-lbl-row">
-              <span className="tile-edit-lbl">Цвет плитки</span>
-              <button
-                type="button"
-                className="tile-reset-mini-btn"
-                onClick={() => setEditCustomColor(null)}
-              >
-                По умолчанию
-              </button>
-            </div>
-            <div className="tile-color-grid">
-              {TILE_COLOR_PALETTE.map((swatch) => {
-                const selected = editCustomColor?.toLowerCase() === swatch.hex.toLowerCase();
-                return (
-                  <button
-                    key={swatch.id}
-                    type="button"
-                    className={`tile-color-swatch ${selected ? 'selected' : ''}`}
-                    style={{ background: swatch.hex }}
-                    title={swatch.label}
-                    aria-label={swatch.label}
-                    onClick={() => setEditCustomColor(selected ? null : swatch.hex)}
-                  />
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="tile-edit-field">
-            <div className="tile-edit-lbl-row">
-              <span className="tile-edit-lbl">Иконка плитки</span>
-              <button
-                type="button"
-                className="tile-reset-mini-btn"
-                onClick={() => {
-                  setEditCustomColor(null);
-                  setEditCustomIcon(null);
-                  setEditIconData(null);
-                }}
-              >
-                Сбросить вид
-              </button>
-            </div>
-            <div className="tile-icon-grid">
-              {TILE_ICON_CATALOG.map((opt) => {
-                const selected = editCustomIcon === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    className={`tile-icon-opt ${selected ? 'selected' : ''}`}
-                    title={opt.label}
-                    aria-label={opt.label}
-                    onClick={() => {
-                      setEditCustomIcon(selected ? null : opt.id);
-                      if (!selected) setEditIconData(null);
-                    }}
-                  >
-                    {renderCustomTileIcon(opt.id, 'ic16')}
-                  </button>
-                );
-              })}
-            </div>
-            <div className="tile-icon-actions">
-              <button
-                type="button"
-                className="pin-any-btn"
-                disabled={pickingCustomImg}
-                onClick={() => {
-                  setPickingCustomImg(true);
-                  pickCustomIconImage()
-                    .then((dataUrl) => {
-                      if (dataUrl && mountedRef.current) {
-                        setEditCustomIcon('custom_image');
-                        setEditIconData(dataUrl);
-                      }
-                    })
-                    .catch((err) => showToast(formatIpcError(err)))
-                    .finally(() => {
-                      if (mountedRef.current) setPickingCustomImg(false);
-                    });
-                }}
-              >
-                {pickingCustomImg ? 'Выбор файла…' : 'Своя картинка…'}
-              </button>
-            </div>
-          </div>
-
-          {(tileEdit ?? lastTileEditRef.current)!.item.kind === 'app' && (
-            <div className="tile-edit-field">
-              <label className="tile-edit-lbl" htmlFor="tb-edit-pin-args">
-                Аргументы запуска
-              </label>
-              <input
-                id="tb-edit-pin-args"
-                className="space-create-input"
-                placeholder="Например, --new-window"
-                value={editPinArgs}
-                onChange={(e) => setEditPinArgs(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    void handleSaveTileEdit();
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setTileEdit(null);
-                  }
-                }}
-              />
-            </div>
-          )}
-
-          <div className="tile-edit-field">
-            <label className="tile-edit-lbl" htmlFor="tb-edit-pin-alt">
-              Действие при удержании Shift
-            </label>
-            <select
-              id="tb-edit-pin-alt"
-              className="space-create-input"
-              value={editPinAltAction}
-              onChange={(e) => setEditPinAltAction(e.target.value)}
-            >
-              {ALT_ACTION_OPTIONS.map((opt) => (
-                <option key={opt.value || 'none'} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {editPinAltAction && (
-            <div className="tile-edit-field">
-              <label className="tile-edit-lbl" htmlFor="tb-edit-pin-alt-label">
-                Подпись действия (необязательно)
-              </label>
-              <input
-                id="tb-edit-pin-alt-label"
-                className="space-create-input"
-                maxLength={28}
-                placeholder={editPinAltAction}
-                value={editPinAltLabel}
-                onChange={(e) => setEditPinAltLabel(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    void handleSaveTileEdit();
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setTileEdit(null);
-                  }
-                }}
-              />
-            </div>
-          )}
-
-          <div className="space-create-actions">
-            <button
-              type="button"
-              className="space-create-cancel"
-              onClick={() => setTileEdit(null)}
-            >
-              Отмена
-            </button>
-            <button
-              type="button"
-              className="space-create-submit"
-              disabled={savingPinEdit}
-              onClick={() => void handleSaveTileEdit()}
-            >
-              Сохранить
-            </button>
           </div>
         </div>
       )}

@@ -6,12 +6,14 @@ import type {
   DiskHeadroomInfo,
   IndexedApp,
   MediaState,
+  PeripheralBattery,
   PinItem,
   SpaceConfig,
   SpaceLayoutKind,
   SpaceWidgetId,
   TelemetryState,
   TestBarConfig,
+  TileSection,
   TopProcessInfo,
   WidgetPreset,
 } from './ipc';
@@ -467,6 +469,26 @@ export function partitionHeroAndCompact(pins: PinItem[]): {
   };
 }
 
+/**
+ * Splits a Space's items into Upper Main Grid (`section !== 'bottom'`) and Lower Docked
+ * Section (`section === 'bottom'`) preserving relative order within each section.
+ */
+export function partitionSpaceItemsBySection(items: readonly PinItem[]): {
+  mainItems: PinItem[];
+  bottomItems: PinItem[];
+} {
+  const mainItems: PinItem[] = [];
+  const bottomItems: PinItem[] = [];
+  for (const item of items) {
+    if (item.section === 'bottom') {
+      bottomItems.push(item);
+    } else {
+      mainItems.push(item);
+    }
+  }
+  return { mainItems, bottomItems };
+}
+
 function normTarget(value: string | null | undefined): string {
   return (value ?? '').trim().replace(/\//g, '\\').toLowerCase();
 }
@@ -632,6 +654,113 @@ export function applyOptimisticPinReorder(
   }
 }
 
+export interface MovePinInSpaceParams {
+  space: string;
+  fromId: string;
+  toId?: string | null;
+  targetSection?: TileSection | null;
+}
+
+function movePinByIdInList(
+  list: readonly PinItem[],
+  fromId: string,
+  toId: string | null | undefined,
+  targetSection: TileSection | null | undefined,
+): PinItem[] | null {
+  const fromIdx = list.findIndex((p) => p.id === fromId);
+  if (fromIdx < 0) return null;
+
+  const normSec: TileSection | undefined =
+    targetSection === 'main' || targetSection === 'bottom' ? targetSection : undefined;
+
+  if (toId) {
+    const toIdx = list.findIndex((p) => p.id === toId);
+    if (toIdx < 0) return null;
+    const next = list.slice();
+    const [moved] = next.splice(fromIdx, 1);
+    const updatedItem: PinItem =
+      normSec && moved.section !== normSec ? { ...moved, section: normSec } : moved;
+    if (fromIdx === toIdx && updatedItem === moved) return null;
+    next.splice(toIdx, 0, updatedItem);
+    return next;
+  }
+
+  const next = list.slice();
+  const [moved] = next.splice(fromIdx, 1);
+  const updatedItem: PinItem =
+    normSec && moved.section !== normSec ? { ...moved, section: normSec } : moved;
+
+  let insertIdx = next.length;
+  if (normSec === 'main') {
+    let lastMain = -1;
+    for (let i = 0; i < next.length; i++) {
+      if (next[i].section !== 'bottom') lastMain = i;
+    }
+    insertIdx = lastMain >= 0 ? lastMain + 1 : 0;
+  } else if (normSec === 'bottom') {
+    let lastBottom = -1;
+    for (let i = 0; i < next.length; i++) {
+      if (next[i].section === 'bottom') lastBottom = i;
+    }
+    insertIdx = lastBottom >= 0 ? lastBottom + 1 : next.length;
+  }
+  next.splice(insertIdx, 0, updatedItem);
+
+  const unchanged =
+    next.length === list.length &&
+    next.every((it, idx) => it.id === list[idx].id && it.section === list[idx].section);
+  return unchanged ? null : next;
+}
+
+/**
+ * Optimistically moves/reorders a pin by ID across Main <-> Bottom sections
+ * (mirroring Rust `reorder_pins_by_id` semantics).
+ */
+export function applyOptimisticMovePinInSpace(
+  config: TestBarConfig | null,
+  params: MovePinInSpaceParams,
+): TestBarConfig | null {
+  if (!config || !params.fromId) return null;
+  if (config.spaces && config.spaces.length > 0) {
+    const spIdx = config.spaces.findIndex((s) => s.id === params.space);
+    if (spIdx >= 0) {
+      const nextItems = movePinByIdInList(
+        config.spaces[spIdx].items,
+        params.fromId,
+        params.toId,
+        params.targetSection,
+      );
+      if (!nextItems) return null;
+      const nextSpaces = config.spaces.slice();
+      nextSpaces[spIdx] = { ...config.spaces[spIdx], items: nextItems };
+      return { ...config, spaces: nextSpaces };
+    }
+  }
+  if (params.space === 'game_combos') {
+    const next = movePinByIdInList(
+      config.gameCombos,
+      params.fromId,
+      params.toId,
+      params.targetSection,
+    );
+    return next ? { ...config, gameCombos: next } : null;
+  }
+  const csIdx = config.customSpaces.findIndex((s) => s.id === params.space);
+  if (csIdx >= 0) {
+    const nextItems = movePinByIdInList(
+      config.customSpaces[csIdx].items,
+      params.fromId,
+      params.toId,
+      params.targetSection,
+    );
+    if (!nextItems) return null;
+    const nextSpaces = config.customSpaces.slice();
+    nextSpaces[csIdx] = { ...config.customSpaces[csIdx], items: nextItems };
+    return { ...config, customSpaces: nextSpaces };
+  }
+  return null;
+}
+
 export function findMatchingInstalledAppForPin(
   pin: PinItem,
   apps: readonly IndexedApp[],
@@ -706,13 +835,14 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
   }
 
   const baseArgs = item.args?.trim() || null;
+  const baseAsAdmin = item.kind === 'app' && Boolean(item.runAsAdmin) && canRunAsAdmin(item.target);
 
   if (!shiftHeld) {
     return {
       type: 'launch',
       target: item.target,
       args: baseArgs,
-      asAdmin: false,
+      asAdmin: baseAsAdmin,
       closeStart: true,
     };
   }
@@ -750,7 +880,7 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
       type: 'launch',
       target: item.target,
       args: mergeArgs(baseArgs, flag),
-      asAdmin: false,
+      asAdmin: baseAsAdmin,
       closeStart: true,
     };
   }
@@ -776,7 +906,7 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
       type: 'launch',
       target: item.target,
       args: flag ? mergeArgs(baseArgs, flag) : baseArgs,
-      asAdmin: false,
+      asAdmin: baseAsAdmin,
       closeStart: true,
     };
   }
@@ -797,7 +927,7 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
     type: 'launch',
     target: item.target,
     args: baseArgs,
-    asAdmin: false,
+    asAdmin: baseAsAdmin,
     closeStart: true,
   };
 }
@@ -1512,4 +1642,50 @@ export function formatHardwareSummaryLine(
     parts.push(`${telem.gpuName.trim()}${vramPart}`);
   }
   return parts.length > 0 ? parts.join(' · ') : 'Система';
+}
+
+// ===================== WAVE 5B: BATTERY HIDING & EXPLORER 3-MIN RESUME =====================
+
+export function filterVisibleBatteries<T extends Pick<PeripheralBattery, 'id'>>(
+  periphs: readonly T[],
+  hiddenBatteryIds?: readonly string[] | null,
+): T[] {
+  if (!Array.isArray(periphs) || periphs.length === 0) {
+    return [];
+  }
+  if (!Array.isArray(hiddenBatteryIds) || hiddenBatteryIds.length === 0) {
+    return [...periphs];
+  }
+  const hiddenSet = new Set(
+    hiddenBatteryIds.map((id) => id.trim().toLowerCase()).filter(Boolean),
+  );
+  if (hiddenSet.size === 0) {
+    return [...periphs];
+  }
+  return periphs.filter((p) => !hiddenSet.has(p.id.trim().toLowerCase()));
+}
+
+export const EXPLORER_RESUME_TTL_MS = 180_000;
+
+export interface ExplorerSessionSnapshot {
+  path: string;
+  viewMode: 'grid' | 'list';
+  sortBy: 'name' | 'date' | 'size' | 'type';
+  sortDir: 'asc' | 'desc';
+  scrollTop: number;
+  selectedPath: string | null;
+}
+
+export function shouldResetExplorerOnReopen(
+  closedAtMs: number | null | undefined,
+  nowMs: number,
+  ttlMs: number = EXPLORER_RESUME_TTL_MS,
+): boolean {
+  if (closedAtMs === null || closedAtMs === undefined || !Number.isFinite(closedAtMs)) {
+    return false;
+  }
+  if (!Number.isFinite(nowMs) || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+    return true;
+  }
+  return nowMs - closedAtMs >= ttlMs;
 }

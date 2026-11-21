@@ -633,14 +633,21 @@ export const FallbackAppIcon: React.FC<{
   kind?: string;
   target?: string;
   size?: number;
+  color?: string;
 }> = ({
   iconKey = '',
   kind = 'app',
   target = '',
   size = 22,
+  color,
 }) => {
-  if (kind === 'folder') return <FolderSvg className="ic18" color="#F2B44B" />;
-  if (kind === 'file') return <FileSvg className="ic18" color="#52B8F2" />;
+  const resolvedColor = color?.trim()
+    ? /^\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}$/.test(color.trim())
+      ? `rgb(${color.trim()})`
+      : color.trim()
+    : 'currentColor';
+  if (kind === 'folder') return <FolderSvg className="ic18" color={resolvedColor} />;
+  if (kind === 'file') return <FileSvg className="ic18" color={resolvedColor} />;
 
   const k = iconKey.toLowerCase();
   const t = target.trim().toLowerCase();
