@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getActiveDeviceIndex } from '../../lib/flyoutLogic';
 import {
   addGameCombo,
@@ -33,6 +34,7 @@ import {
   buildSparklinePath,
   computeGameCardTilt,
   computeInterpolatedMediaSec,
+  computePointerReorderRequest,
   EMPTY_TELEMETRY_HISTORY,
   filterClipboardEntries,
   formatDiskSummary,
@@ -46,6 +48,7 @@ import {
   getHonestShiftBadge,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
+  hasExceededDragThreshold,
   hexColorToRgbString,
   normalizeSessionVolumeScalar,
   partitionHeroAndCompact,
@@ -91,9 +94,11 @@ import { SpotCard, trackTilePointer, type SpotCardProps } from './SpotCard';
 type BentoSpotCardProps = SpotCardProps & { bentoIndex?: number };
 const BentoSpotCard = SpotCard as React.ComponentType<BentoSpotCardProps>;
 
-interface DragOrigin {
+interface ActivePointerDrag {
   spaceKey: string;
-  idx: number;
+  fromIdx: number;
+  overIdx: number | null;
+  label: string;
 }
 
 interface LivePeaksState {
@@ -101,12 +106,6 @@ interface LivePeaksState {
   micPeak: number;
   sessionPeaks: Record<string, number>;
 }
-
-const EMPTY_PEAKS: LivePeaksState = {
-  masterPeak: 0,
-  micPeak: 0,
-  sessionPeaks: {},
-};
 
 interface ComboDraftStep {
   id: string;
@@ -225,19 +224,22 @@ export interface StartSpacesProps {
   onLaunchPin: (item: PinItem) => void;
   onOpenDrawer: () => void;
   onOpenTileContext: (e: React.MouseEvent, item: PinItem, spaceKey: string) => void;
-  onSetAudio: (audio: AudioState) => void;
+  onSetAudio: (audio: AudioState, fromServer?: boolean) => void;
   onSetMedia: (media: MediaState) => void;
   onSetTelem: (telem: TelemetryState) => void;
   onSetClips: (clips: ClipboardEntry[]) => void;
   onShowToast: (msg: string) => void;
   // Shared Wave 2B optional props
   startVisible?: boolean;
+  startAnimSettled?: boolean;
+  onAudioDragStateChange?: (sliderKey: string, dragging: boolean) => void;
   spaceDir?: number;
   rapidSwitch?: boolean;
   iconMap?: Record<string, string>;
   apps?: IndexedApp[];
   onResolveIconKeys?: (keys: string[]) => void;
   onSetConfig?: (config: TestBarConfig) => void;
+  onOptimisticReorder?: (spaceKey: string, fromIdx: number, toIdx: number) => void;
   onEditPin?: (item: PinItem, spaceKey: string) => void;
 }
 
@@ -263,18 +265,24 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   onSetClips,
   onShowToast,
   startVisible = true,
+  startAnimSettled = true,
+  onAudioDragStateChange,
   spaceDir = 0,
   rapidSwitch = false,
   iconMap,
   apps = [],
   onResolveIconKeys,
   onSetConfig,
+  onOptimisticReorder,
 }) => {
   const reducedMotion = useReducedMotion();
 
   const [gameFilter, setGameFilter] = useState<GameLibraryFilter>('recent');
   const [copiedClipId, setCopiedClipId] = useState<string | null>(null);
-  const [dragOrigin, setDragOrigin] = useState<DragOrigin | null>(null);
+  const [activeDrag, setActiveDrag] = useState<ActivePointerDrag | null>(null);
+  const pointerDragCleanupRef = useRef<(() => void) | null>(null);
+  const suppressClickUntilRef = useRef<number>(0);
+  const dragGhostRef = useRef<HTMLDivElement | null>(null);
   const [killError, setKillError] = useState<{ space: string; message: string } | null>(null);
 
   // Safe 2-click armed process kill & combo delete
@@ -283,12 +291,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   const [armedComboDeleteId, setArmedComboDeleteId] = useState<string | null>(null);
   const armedComboTimerRef = useRef<number | null>(null);
 
-  // Audio switcher overflow & initial no-anim gate + live WASAPI peaks
+  // Audio switcher overflow, initial no-anim gate, drag coalescing & live WASAPI peaks
   const [devOverflowOpen, setDevOverflowOpen] = useState(false);
   const devDropdownPresence = useAnimatedPresence(devOverflowOpen, 95);
   const devRowRef = useRef<HTMLDivElement>(null);
   const [segReady, setSegReady] = useState(false);
-  const [peaks, setPeaks] = useState<LivePeaksState>(EMPTY_PEAKS);
+  const [sliderAnimReady, setSliderAnimReady] = useState(false);
+  const [peaks, setPeaks] = useState<LivePeaksState | null>(null);
+  const draggingAudioKeysRef = useRef<Set<string>>(new Set());
+  const audioReqSeqRef = useRef<Map<string, number>>(new Map());
+  const audioThrottleTimersRef = useRef<Map<string, number>>(new Map());
+  const audioPendingSendRef = useRef<Map<string, () => void>>(new Map());
 
   // Album-art ambient RGB & smooth 500ms media timeline interpolation
   const [mediaAmbientRgb, setMediaAmbientRgb] = useState<string | null>(null);
@@ -329,30 +342,66 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   const customPreset: WidgetPreset = activeCustomSpace?.widgetPreset ?? 'media_clipboard';
 
-  // Reset transient space-local states on space switch
+  const hasAudioDevices = (audio?.devices.length ?? 0) > 0;
+  const hasAudioHydrated = audio !== null;
+
+  // Reset transient space-local states on space switch or hide
   useEffect(() => {
     setKillError(null);
     setArmedKillKey(null);
     setArmedComboDeleteId(null);
     setDevOverflowOpen(false);
     setComboBuilderOpen(false);
+    if (pointerDragCleanupRef.current) {
+      pointerDragCleanupRef.current();
+      pointerDragCleanupRef.current = null;
+    }
+    setActiveDrag(null);
+  }, [space, startVisible]);
+
+  // Suppress segmented-pill & slider mount/hydration glide on space switch, Start open, or first audio hydration
+  useEffect(() => {
     setSegReady(false);
-    const raf = typeof requestAnimationFrame === 'function'
-      ? requestAnimationFrame(() => setSegReady(true))
-      : null;
-    if (raf === null) setSegReady(true);
+    setSliderAnimReady(false);
+    if (!startVisible || !startAnimSettled || !hasAudioHydrated) {
+      return;
+    }
+    let raf2 = 0;
+    const raf1 =
+      typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame(() => {
+            raf2 = requestAnimationFrame(() => {
+              setSegReady(true);
+              setSliderAnimReady(true);
+            });
+          })
+        : null;
+    if (raf1 === null) {
+      setSegReady(true);
+      setSliderAnimReady(true);
+    }
     return () => {
-      if (raf !== null && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(raf);
+      if (raf1 !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(raf1);
+      }
+      if (raf2 && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(raf2);
       }
     };
-  }, [space]);
+  }, [space, startVisible, startAnimSettled, hasAudioDevices, hasAudioHydrated]);
 
-  // Cleanup arming timers on unmount
+  // Cleanup arming, drag & audio throttle timers on unmount
   useEffect(() => {
     return () => {
       if (armedKillTimerRef.current !== null) window.clearTimeout(armedKillTimerRef.current);
       if (armedComboTimerRef.current !== null) window.clearTimeout(armedComboTimerRef.current);
+      if (pointerDragCleanupRef.current) {
+        pointerDragCleanupRef.current();
+        pointerDragCleanupRef.current = null;
+      }
+      audioThrottleTimersRef.current.forEach((id) => window.clearTimeout(id));
+      audioThrottleTimersRef.current.clear();
+      audioPendingSendRef.current.clear();
     };
   }, []);
 
@@ -405,9 +454,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     };
   }, [startVisible]);
 
-  // Append telemetry sample to 60s rolling history
+  // Append telemetry sample to 60s rolling history ONLY while Start is visible
   useEffect(() => {
-    if (!telem) return;
+    if (!telem || !startVisible) return;
     setTelemHistory((prev) =>
       pushTelemetryHistory(prev, {
         cpuPct: telem.cpuPct,
@@ -417,7 +466,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         gpuAvailable: telem.gpuAvailable,
       }),
     );
-  }, [telem]);
+  }, [telem, startVisible]);
 
   // Sample tasteful ambient RGB from album art thumbnail (cached per data URI)
   useEffect(() => {
@@ -444,9 +493,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     return () => window.clearInterval(id);
   }, [startVisible, media?.hasSession, media?.isPlaying, media?.positionSec, media?.lastUpdatedMs]);
 
-  // Visibility-gated 140ms live WASAPI peak poller (0% hidden CPU!)
+  // Visibility-gated 140ms live WASAPI peak poller (waits until Start spring settles, 0% hidden CPU!)
   const needsAudioPeaks = Boolean(
     startVisible &&
+      startAnimSettled &&
       (space === 'personal' ||
         space === 'studio' ||
         space === 'games' ||
@@ -455,7 +505,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   useEffect(() => {
     if (!needsAudioPeaks) {
-      setPeaks(EMPTY_PEAKS);
+      setPeaks(null);
       return;
     }
     let cancelled = false;
@@ -535,7 +585,33 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     [clips, clipQuery],
   );
 
-  // Lazy load game covers when Games space is active (component-lifetime mountedRef avoids self-cancel)
+  // Idle pre-warm top 6 recent Steam covers after boot so the VERY FIRST switch to Games has zero decode hitch
+  useEffect(() => {
+    if (games.length === 0) return;
+    const timer = window.setTimeout(() => {
+      if (!mountedRef.current) return;
+      const topRecent = selectDisplayedGames(games, 'recent').slice(0, 6);
+      for (const g of topRecent) {
+        if (g.coverData || !g.coverPath || requestedCoversRef.current.has(g.coverPath)) continue;
+        const path = g.coverPath;
+        requestedCoversRef.current.add(path);
+        loadGameCover(path)
+          .then((uri) => {
+            if (!uri || !mountedRef.current) {
+              requestedCoversRef.current.delete(path);
+              return;
+            }
+            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
+          })
+          .catch(() => {
+            requestedCoversRef.current.delete(path);
+          });
+      }
+    }, 2200);
+    return () => window.clearTimeout(timer);
+  }, [games]);
+
+  // Lazy load remaining game covers AFTER the 190ms space slide finishes so first tab transition never hitches
   useEffect(() => {
     if (!startVisible || space !== 'games') return;
     const toLoad = displayedGames.filter(
@@ -546,21 +622,27 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
     if (toLoad.length === 0) return;
 
-    toLoad.forEach((g) => {
-      const path = g.coverPath!;
-      requestedCoversRef.current.add(path);
-      loadGameCover(path)
-        .then((uri) => {
-          if (!uri || !mountedRef.current) {
+    const deferTimer = window.setTimeout(() => {
+      if (!mountedRef.current) return;
+      toLoad.forEach((g) => {
+        const path = g.coverPath!;
+        if (requestedCoversRef.current.has(path)) return;
+        requestedCoversRef.current.add(path);
+        loadGameCover(path)
+          .then((uri) => {
+            if (!uri || !mountedRef.current) {
+              requestedCoversRef.current.delete(path);
+              return;
+            }
+            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
+          })
+          .catch(() => {
             requestedCoversRef.current.delete(path);
-            return;
-          }
-          setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
-        })
-        .catch(() => {
-          requestedCoversRef.current.delete(path);
-        });
-    });
+          });
+      });
+    }, 210);
+
+    return () => window.clearTimeout(deferTimer);
   }, [startVisible, space, displayedGames]);
 
   // Combo picker catalog (installed apps + games)
@@ -681,31 +763,142 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
   };
 
-  const makeDragProps = (spaceKey: string, idx: number) => ({
-    draggable: editMode,
-    onDragStart: () => {
-      if (editMode) setDragOrigin({ spaceKey, idx });
-    },
-    onDragOver: (e: React.DragEvent<HTMLElement>) => {
-      if (editMode && dragOrigin?.spaceKey === spaceKey) {
-        e.preventDefault();
-        e.currentTarget.classList.add('drag-over');
+  const handlePinTileClick = useCallback(
+    (item: PinItem) => {
+      if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
+        return;
       }
+      onLaunchPin(item);
     },
-    onDragLeave: (e: React.DragEvent<HTMLElement>) => {
-      e.currentTarget.classList.remove('drag-over');
-    },
-    onDrop: (e: React.DragEvent<HTMLElement>) => {
-      e.preventDefault();
-      e.currentTarget.classList.remove('drag-over');
-      if (editMode && dragOrigin && dragOrigin.spaceKey === spaceKey && dragOrigin.idx !== idx) {
-        ipc('reorder_pins', { space: spaceKey, fromIdx: dragOrigin.idx, toIdx: idx }).catch(() => {
-          onShowToast('Не удалось изменить порядок');
-        });
+    [onLaunchPin],
+  );
+
+  // Always-on pointer-based pin reordering (6px threshold, Hero <-> Compact, immune to Tauri v2 dragDropEnabled)
+  const handlePinPointerDown = (
+    e: React.PointerEvent<HTMLElement>,
+    spaceKey: string,
+    idx: number,
+    label: string,
+  ) => {
+    if (e.button !== 0 || typeof window === 'undefined') return;
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl && targetEl.closest('button, input, select, textarea, a')) {
+      return;
+    }
+    if (pointerDragCleanupRef.current) {
+      pointerDragCleanupRef.current();
+      pointerDragCleanupRef.current = null;
+    }
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+    let currentOverIdx: number | null = null;
+    let lastX = startX;
+    let lastY = startY;
+
+    const positionGhost = (x: number, y: number) => {
+      const ghost = dragGhostRef.current;
+      if (ghost) {
+        ghost.style.transform = `translate3d(${Math.round(x + 12)}px, ${Math.round(y + 12)}px, 0)`;
       }
-      setDragOrigin(null);
-    },
-    onDragEnd: () => setDragOrigin(null),
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      if (!active) {
+        if (!hasExceededDragThreshold(startX, startY, ev.clientX, ev.clientY)) {
+          return;
+        }
+        active = true;
+        if (typeof document !== 'undefined') {
+          document.body.classList.add('is-reordering-pins');
+        }
+        setActiveDrag({ spaceKey, fromIdx: idx, overIdx: null, label });
+        requestAnimationFrame(() => positionGhost(lastX, lastY));
+      } else {
+        positionGhost(ev.clientX, ev.clientY);
+      }
+
+      const hit =
+        typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
+      const dropTile = hit?.closest?.<HTMLElement>('[data-drag-space][data-drag-idx]');
+      let nextOver: number | null = null;
+      if (dropTile && dropTile.dataset.dragSpace === spaceKey) {
+        const parsed = Number.parseInt(dropTile.dataset.dragIdx ?? '', 10);
+        if (Number.isInteger(parsed) && parsed !== idx) {
+          nextOver = parsed;
+        }
+      }
+      if (nextOver !== currentOverIdx) {
+        currentOverIdx = nextOver;
+        setActiveDrag({ spaceKey, fromIdx: idx, overIdx: nextOver, label });
+      }
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      if (typeof document !== 'undefined') {
+        document.body.classList.remove('is-reordering-pins');
+      }
+      pointerDragCleanupRef.current = null;
+    };
+
+    const onCancel = () => {
+      cleanup();
+      if (active) {
+        setActiveDrag(null);
+      }
+    };
+
+    const onUp = () => {
+      cleanup();
+      if (!active) return;
+      suppressClickUntilRef.current =
+        typeof performance !== 'undefined' ? performance.now() + 260 : 0;
+      const req = computePointerReorderRequest(
+        { spaceKey, idx },
+        currentOverIdx !== null ? { spaceKey, idx: currentOverIdx } : null,
+      );
+      setActiveDrag(null);
+      if (req) {
+        onOptimisticReorder?.(req.space, req.fromIdx, req.toIdx);
+        ipc<TestBarConfig>('reorder_pins', req)
+          .then((updated) => {
+            if (updated) onSetConfig?.(updated);
+          })
+          .catch(() => {
+            ipc<TestBarConfig>('get_config')
+              .then((fresh) => {
+                if (fresh) onSetConfig?.(fresh);
+              })
+              .catch(() => {});
+            onShowToast('Не удалось изменить порядок');
+          });
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    pointerDragCleanupRef.current = cleanup;
+  };
+
+  const getDragClasses = (spaceKey: string, idx: number): string => {
+    if (!activeDrag || activeDrag.spaceKey !== spaceKey) return '';
+    if (activeDrag.fromIdx === idx) return ' is-dragging';
+    if (activeDrag.overIdx === idx) return ' drag-over';
+    return '';
+  };
+
+  const makeDragProps = (spaceKey: string, idx: number, label: string) => ({
+    'data-drag-space': spaceKey,
+    'data-drag-idx': idx,
+    onPointerDown: (e: React.PointerEvent<HTMLElement>) =>
+      handlePinPointerDown(e, spaceKey, idx, label),
   });
 
   const renderEmptyStrip = (message: string) => (
@@ -727,11 +920,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className={`app-tile ${isHero ? 'hero' : 'compact'}`}
+        className={`app-tile ${isHero ? 'hero' : 'compact'}${getDragClasses(spaceKey, idx)}`}
         style={{ ['--tile-rgb' as string]: item.accentRgb || '139,150,248' }}
         onMouseMove={trackTilePointer}
-        {...makeDragProps(spaceKey, idx)}
-        onClick={() => onLaunchPin(item)}
+        {...makeDragProps(spaceKey, idx, item.title)}
+        onClick={() => handlePinTileClick(item)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
             e.preventDefault();
@@ -760,7 +953,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           {nativeIc ? (
             <img src={nativeIc} alt="" className={isHero ? 'native-ic-lg' : 'native-ic'} draggable={false} />
           ) : (
-            <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} size={isHero ? 24 : 20} />
+            <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} target={item.target} size={isHero ? 24 : 20} />
           )}
           {running && <span className="run-pill" aria-hidden="true" />}
         </div>
@@ -782,9 +975,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className="qlink"
-        {...makeDragProps(spaceKey, idx)}
-        onClick={() => onLaunchPin(item)}
+        className={`qlink${getDragClasses(spaceKey, idx)}`}
+        {...makeDragProps(spaceKey, idx, item.title)}
+        onClick={() => handlePinTileClick(item)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
             e.preventDefault();
@@ -812,7 +1005,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         {nativeIc ? (
           <img src={nativeIc} alt="" className="native-ic-sm" draggable={false} />
         ) : (
-          <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} size={17} />
+          <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} target={item.target} size={17} />
         )}
         <div className="qlink-meta">
           <div className="qlink-name">{item.title}</div>
@@ -825,7 +1018,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   };
 
   const renderAudioDeviceBar = () => {
-    const allDevices = audio?.devices ?? [];
+    if (!audio) {
+      return <div className="qs-dev-placeholder" aria-hidden="true" />;
+    }
+    const allDevices = audio.devices ?? [];
     if (allDevices.length === 0) return null;
 
     let visibleDevs: AudioDeviceInfo[] = allDevices.slice(0, 3);
@@ -918,7 +1114,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   const renderMicToggleRow = (marginBottom = 0) => {
     const micMuted = audio?.micMuted ?? false;
-    const liveMicPeak = micMuted ? 0 : Math.max(0, Math.min(1, peaks.micPeak || audio?.micPeak || 0));
+    const liveMicPeak = micMuted || !peaks ? 0 : Math.max(0, Math.min(1, peaks.micPeak));
     const inputDevices = audio?.inputDevices ?? [];
     const activeInput = inputDevices.find((d) => d.isDefault);
 
@@ -985,25 +1181,78 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
   };
 
+  const scheduleThrottledAudioIpc = (key: string, fn: () => void, flushNow: boolean) => {
+    if (flushNow) {
+      const existing = audioThrottleTimersRef.current.get(key);
+      if (existing !== undefined) {
+        window.clearTimeout(existing);
+        audioThrottleTimersRef.current.delete(key);
+      }
+      audioPendingSendRef.current.delete(key);
+      fn();
+      return;
+    }
+    audioPendingSendRef.current.set(key, fn);
+    if (!audioThrottleTimersRef.current.has(key)) {
+      const id = window.setTimeout(() => {
+        audioThrottleTimersRef.current.delete(key);
+        const pending = audioPendingSendRef.current.get(key);
+        audioPendingSendRef.current.delete(key);
+        pending?.();
+      }, 36);
+      audioThrottleTimersRef.current.set(key, id);
+    }
+  };
+
+  const handleSliderDragToggle = (sliderKey: string, dragging: boolean) => {
+    if (dragging) {
+      draggingAudioKeysRef.current.add(sliderKey);
+    } else {
+      draggingAudioKeysRef.current.delete(sliderKey);
+    }
+    onAudioDragStateChange?.(sliderKey, dragging);
+  };
+
   const renderAudioMixerCard = (
     bentoIndex: number,
     options: { title: string; showDeviceSwitcher: boolean; showMicToggle: boolean; showSessions: boolean },
   ) => {
     const masterVol = audio?.masterVolume ?? 0;
     const masterMuted = audio?.masterMuted ?? false;
-    const liveMasterPeak = masterMuted ? 0 : (peaks.masterPeak || audio?.masterPeak || 0);
+    const liveMasterPeak = masterMuted || !peaks ? 0 : peaks.masterPeak;
     const sessions = audio?.sessions ?? [];
 
-    const updateMaster = (nextVol: number, nextMuted: boolean) => {
+    const updateMaster = (nextVol: number, nextMuted: boolean, commit = false) => {
+      const reqSeq = (audioReqSeqRef.current.get('__master__') ?? 0) + 1;
+      audioReqSeqRef.current.set('__master__', reqSeq);
       if (audio) {
         onSetAudio({ ...audio, masterVolume: nextVol, masterMuted: nextMuted });
       }
-      ipc<AudioState>('set_master_volume', { volume: nextVol, muted: nextMuted })
-        .then(onSetAudio)
-        .catch(() => onShowToast('Не удалось изменить громкость'));
+      scheduleThrottledAudioIpc(
+        '__master__',
+        () => {
+          ipc<AudioState>('set_master_volume', { volume: nextVol, muted: nextMuted })
+            .then((nextState) => {
+              if (
+                audioReqSeqRef.current.get('__master__') === reqSeq &&
+                !draggingAudioKeysRef.current.has('__master__')
+              ) {
+                onSetAudio(nextState, true);
+              }
+            })
+            .catch(() => onShowToast('Не удалось изменить громкость'));
+        },
+        commit,
+      );
     };
 
-    const updateSessionVolume = (s: AudioState['sessions'][number], nextVol: number) => {
+    const updateSessionVolume = (
+      s: AudioState['sessions'][number],
+      nextVol: number,
+      commit = false,
+    ) => {
+      const reqSeq = (audioReqSeqRef.current.get(s.id) ?? 0) + 1;
+      audioReqSeqRef.current.set(s.id, reqSeq);
       if (audio) {
         onSetAudio({
           ...audio,
@@ -1012,15 +1261,28 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           ),
         });
       }
-      setSessionState({
-        appKey: s.id,
-        pid: s.pid,
-        pids: s.pids,
-        volume: normalizeSessionVolumeScalar(nextVol),
-        muted: s.muted ? false : undefined,
-      })
-        .then(onSetAudio)
-        .catch(() => onShowToast(`Не удалось изменить громкость ${s.name}`));
+      scheduleThrottledAudioIpc(
+        s.id,
+        () => {
+          setSessionState({
+            appKey: s.id,
+            pid: s.pid,
+            pids: s.pids,
+            volume: normalizeSessionVolumeScalar(nextVol),
+            muted: s.muted ? false : undefined,
+          })
+            .then((nextState) => {
+              if (
+                audioReqSeqRef.current.get(s.id) === reqSeq &&
+                !draggingAudioKeysRef.current.has(s.id)
+              ) {
+                onSetAudio(nextState, true);
+              }
+            })
+            .catch(() => onShowToast(`Не удалось изменить громкость ${s.name}`));
+        },
+        commit,
+      );
     };
 
     const toggleSessionMute = (s: AudioState['sessions'][number]) => {
@@ -1039,7 +1301,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         pids: s.pids,
         muted: nextMuted,
       })
-        .then(onSetAudio)
+        .then((nextState) => onSetAudio(nextState, true))
         .catch(() => onShowToast(`Не удалось переключить звук ${s.name}`));
     };
 
@@ -1067,7 +1329,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 className="mix-mute"
                 title={masterMuted ? 'Включить общий звук' : 'Выключить общий звук'}
                 aria-label={masterMuted ? 'Включить общий звук' : 'Выключить общий звук'}
-                onClick={() => updateMaster(masterVol, !masterMuted)}
+                onClick={() => updateMaster(masterVol, !masterMuted, true)}
               >
                 <VolIcon muted={masterMuted} level={masterVol} />
               </button>
@@ -1078,8 +1340,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 value={masterVol}
                 muted={masterMuted}
                 peak={liveMasterPeak}
+                noTransition={!sliderAnimReady}
                 ariaLabel="Общий звук"
-                onChange={(next) => updateMaster(next, false)}
+                onDragStateChange={(d) => handleSliderDragToggle('__master__', d)}
+                onChange={(next) => updateMaster(next, false, false)}
+                onCommit={(next) => updateMaster(next, false, true)}
               />
               <span className="mix-val">{masterMuted ? '0%' : `${masterVol}%`}</span>
             </div>
@@ -1090,8 +1355,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               ) : (
                 sessions.map((s, idx) => {
                   const iconUri = resolveIconKeyUri(s.iconKey, null);
-                  const livePeak = s.muted ? 0 : (peaks.sessionPeaks[s.id] ?? s.peak ?? 0);
-                  const isEmitting = !s.muted && (s.isActive || livePeak > 0.02);
+                  const livePeak = s.muted || !peaks ? 0 : (peaks.sessionPeaks[s.id] ?? 0);
+                  const isEmitting = !s.muted && livePeak > 0.02;
                   return (
                     <div
                       key={s.id || `sess-${s.pid ?? idx}-${s.name}-${idx}`}
@@ -1116,8 +1381,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                         value={s.volume}
                         muted={s.muted}
                         peak={livePeak}
+                        noTransition={!sliderAnimReady}
                         ariaLabel={`Громкость ${s.name}`}
-                        onChange={(next) => updateSessionVolume(s, next)}
+                        onDragStateChange={(d) => handleSliderDragToggle(s.id, d)}
+                        onChange={(next) => updateSessionVolume(s, next, false)}
+                        onCommit={(next) => updateSessionVolume(s, next, true)}
                       />
                       <span className="mix-val">{s.muted ? '0%' : `${s.volume}%`}</span>
                     </div>
@@ -1876,6 +2144,16 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
   };
 
+  const dragGhost =
+    activeDrag && typeof document !== 'undefined'
+      ? createPortal(
+          <div ref={dragGhostRef} className="pin-drag-ghost" aria-hidden="true">
+            {activeDrag.label}
+          </div>,
+          document.body,
+        )
+      : null;
+
   const panelClass = `space-panel${rapidSwitch ? ' rapid' : ''}`;
   const panelStyle = { ['--space-dir' as string]: spaceDir } as React.CSSProperties;
 
@@ -1885,6 +2163,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const hasPersonalLinks = (config?.personalLinks.length ?? 0) > 0;
 
     return (
+      <>
       <div key={space} className={panelClass} style={panelStyle}>
         <div className="bento-col">
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
@@ -1947,6 +2226,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           {renderClipboardCard(3)}
         </div>
       </div>
+      {dragGhost}
+      </>
     );
   }
 
@@ -1956,6 +2237,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const workApps = config?.workApps ?? [];
 
     return (
+      <>
       <div key={space} className={panelClass} style={panelStyle}>
         <div className="bento-col">
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
@@ -1979,9 +2261,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                         key={f.id || `wf-${idx}`}
                         role="button"
                         tabIndex={0}
-                        className="folder-card"
-                        {...makeDragProps('work_folders', idx)}
-                        onClick={() => onLaunchPin(f)}
+                        className={`folder-card${getDragClasses('work_folders', idx)}`}
+                        {...makeDragProps('work_folders', idx, f.title)}
+                        onClick={() => handlePinTileClick(f)}
                         onKeyDown={(e) => {
                           if (e.target === e.currentTarget && isActivateKey(e)) {
                             e.preventDefault();
@@ -2094,6 +2376,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           {renderProcessConsumersCard(2, 'ram', 'work')}
         </div>
       </div>
+      {dragGhost}
+      </>
     );
   }
 
@@ -2103,6 +2387,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const studioTools = config?.studioTools ?? [];
 
     return (
+      <>
       <div key={space} className={panelClass} style={panelStyle}>
         <div className="bento-col">
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
@@ -2163,6 +2448,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           {renderProcessConsumersCard(3, 'gpu', 'studio')}
         </div>
       </div>
+      {dragGhost}
+      </>
     );
   }
 
@@ -2172,6 +2459,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const combos = config?.gameCombos ?? [];
 
     return (
+      <>
       <div key={space} className={panelClass} style={panelStyle}>
         <div className="bento-col">
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
@@ -2337,9 +2625,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                       key={cb.id || `combo-${idx}`}
                       role="button"
                       tabIndex={0}
-                      className="consumer-row combo-row"
-                      {...makeDragProps('game_combos', idx)}
-                      onClick={() => onLaunchPin(cb)}
+                      className={`consumer-row combo-row${getDragClasses('game_combos', idx)}`}
+                      {...makeDragProps('game_combos', idx, cb.title)}
+                      onClick={() => handlePinTileClick(cb)}
                       onKeyDown={(e) => {
                         if (e.target === e.currentTarget && isActivateKey(e)) {
                           e.preventDefault();
@@ -2564,6 +2852,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           </BentoSpotCard>
         </div>
       </div>
+      {dragGhost}
+      </>
     );
   }
 
@@ -2605,37 +2895,43 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
     if (isFullGrid) {
       return (
-        <div key={space} className={`${panelClass} space-panel-single`} style={panelStyle}>
-          {pinsCard}
-        </div>
+        <>
+          <div key={space} className={`${panelClass} space-panel-single`} style={panelStyle}>
+            {pinsCard}
+          </div>
+          {dragGhost}
+        </>
       );
     }
 
     return (
-      <div key={space} className={panelClass} style={panelStyle}>
-        <div className="bento-col">{pinsCard}</div>
-        <div className="bento-col">
-          {customPreset === 'media_clipboard' && (
-            <>
-              {renderMediaCard(1)}
-              {renderClipboardCard(2)}
-            </>
-          )}
-          {customPreset === 'telemetry_processes' && (
-            <>
-              {renderTelemetryCard(1, 'full')}
-              {renderProcessConsumersCard(2, 'ram', activeCustomSpace.id)}
-            </>
-          )}
-          {customPreset === 'audio_mic' &&
-            renderAudioMixerCard(1, {
-              title: 'Звук и микрофон',
-              showDeviceSwitcher: true,
-              showMicToggle: true,
-              showSessions: true,
-            })}
+      <>
+        <div key={space} className={panelClass} style={panelStyle}>
+          <div className="bento-col">{pinsCard}</div>
+          <div className="bento-col">
+            {customPreset === 'media_clipboard' && (
+              <>
+                {renderMediaCard(1)}
+                {renderClipboardCard(2)}
+              </>
+            )}
+            {customPreset === 'telemetry_processes' && (
+              <>
+                {renderTelemetryCard(1, 'full')}
+                {renderProcessConsumersCard(2, 'ram', activeCustomSpace.id)}
+              </>
+            )}
+            {customPreset === 'audio_mic' &&
+              renderAudioMixerCard(1, {
+                title: 'Звук и микрофон',
+                showDeviceSwitcher: true,
+                showMicToggle: true,
+                showSessions: true,
+              })}
+          </div>
         </div>
-      </div>
+        {dragGhost}
+      </>
     );
   }
 

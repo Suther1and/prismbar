@@ -9,16 +9,19 @@ import startSpacesSrc from '../components/start/StartSpaces.tsx?raw';
 import startViewSrc from '../components/StartView.tsx?raw';
 import type { ClipboardEntry, PinItem, TestBarConfig } from './ipc';
 import {
+  applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
   buildSparklinePath,
   completeStartClosing,
   computeGameCardTilt,
   computeInterpolatedMediaSec,
+  computePointerReorderRequest,
   computeSlidingPillRect,
   CUSTOM_SPACE_ACCENTS,
   EMPTY_TELEMETRY_HISTORY,
   filterClipboardEntries,
   findBannedStartArtifacts,
+  findMatchingInstalledAppForPin,
   formatDiskSummary,
   formatKillProcessError,
   formatMediaDuration,
@@ -32,10 +35,12 @@ import {
   getStartChassisAnimClass,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
+  hasExceededDragThreshold,
   hasHonestShiftAction,
   hexColorToRgbString,
   INITIAL_START_ANIM_STATE,
   isAppPinnedInSpace,
+  mergeAudioStateRespectingLocks,
   normalizeSessionVolumeScalar,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
@@ -49,7 +54,11 @@ import {
   resolvePinAction,
   resolveProcessKillPids,
   selectDisplayedGames,
+  settleStartOpen,
+  START_DRAG_THRESHOLD_PX,
+  START_ENTER_ANIM_MS,
   START_EXIT_ANIM_MS,
+  START_OPACITY_ANIM_MS,
   TELEMETRY_HISTORY_CAP,
   validateCustomSpaceName,
   validateGameComboInput,
@@ -72,7 +81,9 @@ function makePin(overrides: Partial<PinItem> & Pick<PinItem, 'id' | 'title' | 't
 }
 
 describe('startLogic animations, unlimited grids, Shift layer, Power & custom spaces', () => {
-  it('drives instant-open StartAnimState phases (hidden -> open -> closing -> hidden) & alternating open-a/open-b replay', () => {
+  it('drives WAAPI-ready StartAnimState phases (hidden -> arming -> open -> closing -> hidden) & generation guards', () => {
+    expect(START_ENTER_ANIM_MS).toBe(240);
+    expect(START_OPACITY_ANIM_MS).toBe(170);
     expect(START_EXIT_ANIM_MS).toBe(120);
     let st = INITIAL_START_ANIM_STATE;
     expect(st).toEqual({
@@ -84,15 +95,21 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     });
     expect(getStartChassisAnimClass(st)).toBe('');
 
-    // Opening enters 'open' immediately at frame 0 with incremented openSeq & synced gen
+    // Opening enters 'arming' first (hidden at translateY(20px) scale(0.96) for zero flash before WAAPI spring)
     st = reduceStartState(st, { open: true, gen: 1 });
     expect(st).toEqual({
-      phase: 'open',
+      phase: 'arming',
       open: true,
       closing: false,
       openSeq: 1,
       gen: 1,
     });
+    expect(getStartChassisAnimClass(st)).toBe('open-arming');
+
+    // Stale gen settle is ignored; matching gen settles to 'open'
+    expect(settleStartOpen(st, 999)).toBe(st);
+    st = settleStartOpen(st, 1);
+    expect(st.phase).toBe('open');
     expect(getStartChassisAnimClass(st)).toBe('open-anim open-a');
 
     // Normal close enters 'closing'
@@ -109,15 +126,16 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     // Stale gen exit completion is ignored
     expect(completeStartClosing(st, 999)).toBe(st);
 
-    // Reopening mid-close immediately cancels closing, bumps openSeq, and flips open-a -> open-b
+    // Reopening mid-close immediately cancels closing, bumps openSeq, and settles to open-b
     st = reduceStartState(st, true, { gen: 2 });
     expect(st).toEqual({
-      phase: 'open',
+      phase: 'arming',
       open: true,
       closing: false,
       openSeq: 2,
       gen: 2,
     });
+    st = settleStartOpen(st, 2);
     expect(getStartChassisAnimClass(st)).toBe('open-anim open-b');
 
     // Immediate preemption goes straight to hidden
@@ -130,13 +148,45 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       gen: 3,
     });
 
-    // Normal close -> completeStartClosing settles to hidden
+    // Normal close from arming or open -> completeStartClosing settles to hidden
     st = reduceStartState(st, { open: true, gen: 4 });
+    st = settleStartOpen(st, 4);
     expect(getStartChassisAnimClass(st)).toBe('open-anim open-a');
     st = reduceStartState(st, { open: false, gen: 4 });
     st = completeStartClosing(st, 4);
     expect(st.phase).toBe('hidden');
     expect(st.closing).toBe(false);
+
+    // Drag-echo guard preserves actively dragged slider values across incoming IPC pushes
+    const prevAudio = {
+      available: true,
+      masterVolume: 74,
+      masterMuted: false,
+      micMuted: false,
+      devices: [],
+      inputDevices: [],
+      sessions: [
+        { id: 'chrome.exe', pid: 1, pids: [1], name: 'Chrome', volume: 42, muted: false, isActive: true },
+        { id: 'discord.exe', pid: 2, pids: [2], name: 'Discord', volume: 80, muted: false, isActive: false },
+      ],
+    };
+    const incomingAudio = {
+      ...prevAudio,
+      masterVolume: 60,
+      sessions: [
+        { ...prevAudio.sessions[0], volume: 55 },
+        { ...prevAudio.sessions[1], volume: 65 },
+      ],
+    };
+    const locks = new Map<string, number>([
+      ['__master__', Infinity],
+      ['chrome.exe', 1200],
+      ['discord.exe', 900],
+    ]);
+    const merged = mergeAudioStateRespectingLocks(prevAudio, incomingAudio, locks, 1000);
+    expect(merged.masterVolume).toBe(74); // locked
+    expect(merged.sessions[0].volume).toBe(42); // within settle window
+    expect(merged.sessions[1].volume).toBe(65); // expired lock accepts incoming
   });
 
   it('partitions 15+ pins into 2 heroes + all remaining compact tiles with zero .slice() clipping', () => {
@@ -341,10 +391,10 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
   it('validates floating custom-space creation, curated obsidian space accents, sliding rect & URL input', () => {
     expect(CUSTOM_SPACE_ACCENTS).toHaveLength(5);
     expect(CUSTOM_SPACE_ACCENTS.map((c) => c.hex)).toEqual([
-      '#8B96F8',
-      '#52B8F2',
-      '#3ED598',
-      '#F26E84',
+      '#818CF8',
+      '#38BDF8',
+      '#34D399',
+      '#FB7185',
       '#A78BFA',
     ]);
 
@@ -681,5 +731,97 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       comboTargets: ['   '],
     });
     expect(buildGameComboLaunchPayload(emptyCombo)).toBeNull();
+  });
+
+  it('supports always-on pointer drag-and-drop pin reordering across Hero <-> Compact & custom spaces and matches installed app icons', () => {
+    expect(START_DRAG_THRESHOLD_PX).toBe(6);
+    expect(hasExceededDragThreshold(100, 100, 103, 104)).toBe(false); // dist = 5 < 6
+    expect(hasExceededDragThreshold(100, 100, 106, 100)).toBe(true); // dist = 6
+    expect(hasExceededDragThreshold(100, 100, 105, 105)).toBe(true);
+
+    // Same-space Hero <-> Compact reorder (e.g. Antigravity at idx 2 dragged onto Zen at idx 0)
+    expect(
+      computePointerReorderRequest({ spaceKey: 'personal', idx: 2 }, { spaceKey: 'personal', idx: 0 }),
+    ).toEqual({ space: 'personal', fromIdx: 2, toIdx: 0 });
+    // Compact <-> Compact reorder (e.g. Yandex Music idx 3 <-> Terminal idx 4)
+    expect(
+      computePointerReorderRequest({ spaceKey: 'personal', idx: 3 }, { spaceKey: 'personal', idx: 4 }),
+    ).toEqual({ space: 'personal', fromIdx: 3, toIdx: 4 });
+    // Cross-space or same-slot drops are ignored safely
+    expect(
+      computePointerReorderRequest({ spaceKey: 'personal', idx: 0 }, { spaceKey: 'personal_links', idx: 1 }),
+    ).toBeNull();
+    expect(
+      computePointerReorderRequest({ spaceKey: 'personal', idx: 2 }, { spaceKey: 'personal', idx: 2 }),
+    ).toBeNull();
+
+    const cfg: TestBarConfig = {
+      schemaVersion: 1,
+      revision: 12,
+      barMode: 'dock',
+      secondaryTaskbarMode: 'testbar',
+      autostart: false,
+      taskbarPins: [],
+      personalPins: [
+        makePin({ id: 'zen', title: 'Zen', target: 'C:\\Apps\\zen.exe' }),
+        makePin({ id: 'tg', title: 'Telegram', target: 'C:\\Apps\\Telegram.exe' }),
+        makePin({ id: 'agy', title: 'Antigravity', target: 'C:\\Apps\\Antigravity.exe' }),
+        makePin({ id: 'ym', title: 'Яндекс Музыка', target: 'C:\\Apps\\ym.exe' }),
+        makePin({ id: 'wt', title: 'Терминал', target: 'C:\\Apps\\wt.exe' }),
+      ],
+      personalLinks: [],
+      workFolders: [],
+      workApps: [],
+      studioPins: [],
+      studioTools: [],
+      gameLaunchers: [],
+      gameCombos: [],
+      customSpaces: [
+        {
+          id: 'cs-1',
+          name: 'Dev',
+          accentHex: '#A78BFA',
+          accentRgb: '167,139,250',
+          widgetPreset: 'full_grid',
+          items: [
+            makePin({ id: 'a', title: 'A', target: 'C:\\a.exe' }),
+            makePin({ id: 'b', title: 'B', target: 'C:\\b.exe' }),
+          ],
+        },
+      ],
+      pinnedClipboard: [],
+    };
+
+    const reorderedHero = applyOptimisticPinReorder(cfg, 'personal', 2, 0);
+    expect(reorderedHero?.personalPins.map((p) => p.id)).toEqual(['agy', 'zen', 'tg', 'ym', 'wt']);
+    expect(reorderedHero?.revision).toBe(12); // Keeps revision intact for authoritative Rust IPC response
+
+    const reorderedCompact = applyOptimisticPinReorder(reorderedHero, 'personal', 3, 4);
+    expect(reorderedCompact?.personalPins.map((p) => p.id)).toEqual(['agy', 'zen', 'tg', 'wt', 'ym']);
+
+    const reorderedCustom = applyOptimisticPinReorder(cfg, 'cs-1', 1, 0);
+    expect(reorderedCustom?.customSpaces[0].items.map((p) => p.id)).toEqual(['b', 'a']);
+
+    // Installed app icon matching fallback for Start tiles
+    const installed = [
+      {
+        id: 'app-wt',
+        name: 'Terminal',
+        target: 'shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+        aumid: 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+        category: 'Система',
+        iconKey: 'uwp:wt123',
+      },
+    ];
+    expect(
+      findMatchingInstalledAppForPin(
+        makePin({
+          id: 'wt',
+          title: 'Терминал',
+          target: 'shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App',
+        }),
+        installed,
+      )?.iconKey,
+    ).toBe('uwp:wt123');
   });
 });

@@ -16,16 +16,16 @@ pub const FLYOUT_OPEN_FOCUS_GRACE_MS: u64 = 160;
 
 /// Non-clipped logical shadow root padding for Start and Flyout transparent WebView2 windows (AD-1).
 pub const START_ROOT_PAD_LOGICAL: f64 = 24.0;
-pub const FLYOUT_ROOT_PAD_LOGICAL: f64 = 18.0;
+pub const FLYOUT_ROOT_PAD_LOGICAL: f64 = 16.0;
 
 /// Win32 `WS_CAPTION` (`WS_BORDER | WS_DLGFRAME`) bitmask.
 pub const WS_CAPTION_FLAG: u32 = 0x00C0_0000;
 /// Win32 `WS_THICKFRAME` bitmask.
 pub const WS_THICKFRAME_FLAG: u32 = 0x0004_0000;
 
-/// Logical reserved AppBar heights (AD-2).
-pub const DOCK_APPBAR_LOGICAL_HEIGHT: i32 = 64;
-pub const EDGE_APPBAR_LOGICAL_HEIGHT: i32 = 52;
+/// Logical reserved AppBar heights (AD-2): 58px taskbar + 9px bottom gap in Dock mode, 58px in Edge mode.
+pub const DOCK_APPBAR_LOGICAL_HEIGHT: i32 = 67;
+pub const EDGE_APPBAR_LOGICAL_HEIGHT: i32 = 58;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +380,8 @@ pub struct WindowCoordinator {
     fullscreen_suppressed: bool,
     primary_fullscreen: bool,
     secondary_fullscreen: bool,
+    fullscreen_overlay_active: bool,
+    secondary_fullscreen_overlay_active: bool,
     modal_picker_depth: u32,
     last_dismissed_ms: HashMap<TriggerId, u64>,
     last_start_opened_ms: Option<u64>,
@@ -491,23 +493,31 @@ impl WindowCoordinator {
         self.secondary_fullscreen
     }
 
+    pub fn is_fullscreen_overlay_active(&self) -> bool {
+        self.fullscreen_overlay_active
+    }
+
+    pub fn is_secondary_fullscreen_overlay_active(&self) -> bool {
+        self.secondary_fullscreen_overlay_active
+    }
+
     pub fn should_show_taskbar(&self) -> bool {
-        !self.primary_fullscreen
+        !self.primary_fullscreen || self.fullscreen_overlay_active
     }
 
     pub fn should_show_secondary_taskbar(&self) -> bool {
-        !self.secondary_fullscreen
+        !self.secondary_fullscreen || self.secondary_fullscreen_overlay_active
     }
 
     /// Returns `true` only when `taskbar` bounds updates (`SetWindowPos`) may be applied.
-    /// While fullscreen suppression is active, callers must record logical state without
-    /// touching Win32 window position, Z-order, or visibility.
+    /// While fullscreen suppression is active without an active fullscreen Start/Flyout overlay,
+    /// callers must record logical state without touching Win32 window position, Z-order, or visibility.
     pub fn should_apply_taskbar_bounds(&self) -> bool {
-        !self.primary_fullscreen
+        !self.primary_fullscreen || self.fullscreen_overlay_active
     }
 
     pub fn should_apply_secondary_taskbar_bounds(&self) -> bool {
-        !self.secondary_fullscreen
+        !self.secondary_fullscreen || self.secondary_fullscreen_overlay_active
     }
 
     pub fn is_modal_picker_active(&self) -> bool {
@@ -560,6 +570,25 @@ impl WindowCoordinator {
         Some(closed)
     }
 
+    /// Synchronously hides temporarily revealed fullscreen taskbar(s) when the last overlay
+    /// (Start or a Flyout opened from that revealed taskbar) closes.
+    fn reconcile_fullscreen_overlay_after_close(&mut self, actions: &mut CoordinatorActions) {
+        if !self.start_open && self.active_flyout.is_none() {
+            if self.fullscreen_overlay_active {
+                self.fullscreen_overlay_active = false;
+                if self.primary_fullscreen {
+                    actions.taskbar_visible = Some(false);
+                }
+            }
+            if self.secondary_fullscreen_overlay_active {
+                self.secondary_fullscreen_overlay_active = false;
+                if self.secondary_fullscreen {
+                    actions.secondary_taskbar_visible = Some(false);
+                }
+            }
+        }
+    }
+
     /// Immediately cancels any active or exiting flyout animation and instructs the host to `SW_HIDE`.
     pub fn hide_flyout_immediate(&mut self) -> CoordinatorActions {
         let mut actions = CoordinatorActions::default();
@@ -569,6 +598,7 @@ impl WindowCoordinator {
             actions.flyout_anim_gen = Some(gen);
         }
         actions.hide_flyout_immediate = true;
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
@@ -582,17 +612,19 @@ impl WindowCoordinator {
             actions.start_anim_gen = Some(gen);
         }
         actions.hide_start_immediate = true;
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
     /// Toggles Start Menu (explicitly overriding `fullscreen_suppressed` so pressing `Win`
-    /// inside fullscreen games/video opens Start cleanly instead of silently swallowing the key).
+    /// inside fullscreen games/video atomically reveals Start + Taskbar together).
     pub fn request_toggle_start(&mut self, force: Option<bool>, now_ms: u64) -> CoordinatorActions {
         self.request_toggle_start_on_monitor(force, None, now_ms)
     }
 
     /// Toggles Start Menu targeting an optional monitor (`"primary"` | `"secondary"`),
-    /// overriding fullscreen suppression and immediately cancelling any active/exiting flyout.
+    /// atomically revealing Start + that monitor's Taskbar together when fullscreen-suppressed
+    /// and synchronously hiding both together on close.
     pub fn request_toggle_start_on_monitor(
         &mut self,
         force: Option<bool>,
@@ -616,6 +648,31 @@ impl WindowCoordinator {
             }
             actions.hide_flyout_immediate = true;
 
+            let target_secondary = monitor.as_deref() == Some("secondary");
+            if !target_secondary {
+                if self.primary_fullscreen && !self.fullscreen_overlay_active {
+                    self.fullscreen_overlay_active = true;
+                    actions.taskbar_visible = Some(true);
+                }
+                if self.secondary_fullscreen_overlay_active {
+                    self.secondary_fullscreen_overlay_active = false;
+                    if self.secondary_fullscreen {
+                        actions.secondary_taskbar_visible = Some(false);
+                    }
+                }
+            } else {
+                if self.secondary_fullscreen && !self.secondary_fullscreen_overlay_active {
+                    self.secondary_fullscreen_overlay_active = true;
+                    actions.secondary_taskbar_visible = Some(true);
+                }
+                if self.fullscreen_overlay_active {
+                    self.fullscreen_overlay_active = false;
+                    if self.primary_fullscreen {
+                        actions.taskbar_visible = Some(false);
+                    }
+                }
+            }
+
             self.start_open = true;
             self.last_start_opened_ms = Some(now_ms);
             self.start_target_monitor = monitor;
@@ -626,6 +683,7 @@ impl WindowCoordinator {
             actions.start_target_monitor = self.start_target_monitor.clone();
         } else {
             self.close_start(&mut actions);
+            self.reconcile_fullscreen_overlay_after_close(&mut actions);
         }
         actions
     }
@@ -641,9 +699,9 @@ impl WindowCoordinator {
         now_ms: u64,
     ) -> CoordinatorActions {
         let monitor_suppressed = if monitor == Some("secondary") {
-            self.secondary_fullscreen
+            self.secondary_fullscreen && !self.secondary_fullscreen_overlay_active
         } else {
-            self.primary_fullscreen
+            self.primary_fullscreen && !self.fullscreen_overlay_active
         };
         if monitor_suppressed {
             return CoordinatorActions::default();
@@ -663,6 +721,7 @@ impl WindowCoordinator {
         } else {
             if self.active_flyout == Some(kind) && kind.toggles_on_reclick() {
                 let _ = self.close_flyout(&mut actions);
+                self.reconcile_fullscreen_overlay_after_close(&mut actions);
                 return actions;
             }
             if self.active_flyout.map_or(true, |a| a.is_non_activating())
@@ -691,6 +750,7 @@ impl WindowCoordinator {
     pub fn request_close_flyout(&mut self) -> CoordinatorActions {
         let mut actions = CoordinatorActions::default();
         let _ = self.close_flyout(&mut actions);
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
@@ -722,6 +782,7 @@ impl WindowCoordinator {
         let mut actions = CoordinatorActions::default();
         self.close_start(&mut actions);
         self.last_dismissed_ms.insert(TriggerId::Start, now_ms);
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
@@ -739,6 +800,7 @@ impl WindowCoordinator {
             self.last_dismissed_ms
                 .insert(TriggerId::Flyout(kind), now_ms);
         }
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
@@ -765,10 +827,13 @@ impl WindowCoordinator {
             self.last_dismissed_ms
                 .insert(TriggerId::Flyout(kind), now_ms);
         }
+        self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
 
     /// Updates per-monitor fullscreen suppression independently for primary and secondary displays.
+    /// Explicitly opened fullscreen overlays (`fullscreen_overlay_active`) are preserved rather
+    /// than force-closed when fullscreen remains/re-asserts active.
     pub fn set_monitor_fullscreen(
         &mut self,
         primary: bool,
@@ -785,30 +850,46 @@ impl WindowCoordinator {
             self.primary_fullscreen = primary;
             self.fullscreen_suppressed = primary;
             if primary {
-                actions.taskbar_visible = Some(false);
-                self.close_start(&mut actions);
-                let _ = self.close_flyout(&mut actions);
-                actions.hide_start_immediate = true;
-                if actions.start_anim_gen.is_none() {
-                    actions.start_anim_gen = Some(self.next_start_gen());
-                }
-                actions.hide_flyout_immediate = true;
-                if actions.flyout_anim_gen.is_none() {
-                    actions.flyout_anim_gen = Some(self.next_flyout_gen());
+                if !self.fullscreen_overlay_active {
+                    actions.taskbar_visible = Some(false);
+                    self.close_start(&mut actions);
+                    let _ = self.close_flyout(&mut actions);
+                    actions.hide_start_immediate = true;
+                    if actions.start_anim_gen.is_none() {
+                        actions.start_anim_gen = Some(self.next_start_gen());
+                    }
+                    actions.hide_flyout_immediate = true;
+                    if actions.flyout_anim_gen.is_none() {
+                        actions.flyout_anim_gen = Some(self.next_flyout_gen());
+                    }
                 }
             } else {
-                actions.taskbar_visible = Some(true);
+                let was_overlay = self.fullscreen_overlay_active;
+                self.fullscreen_overlay_active = false;
+                if !was_overlay {
+                    actions.taskbar_visible = Some(true);
+                }
             }
         }
 
         if secondary != self.secondary_fullscreen {
             self.secondary_fullscreen = secondary;
-            actions.secondary_taskbar_visible = Some(!secondary);
-            if secondary && self.start_target_monitor.as_deref() == Some("secondary") {
-                self.close_start(&mut actions);
-                actions.hide_start_immediate = true;
-                if actions.start_anim_gen.is_none() {
-                    actions.start_anim_gen = Some(self.next_start_gen());
+            if secondary {
+                if !self.secondary_fullscreen_overlay_active {
+                    actions.secondary_taskbar_visible = Some(false);
+                    if self.start_target_monitor.as_deref() == Some("secondary") {
+                        self.close_start(&mut actions);
+                        actions.hide_start_immediate = true;
+                        if actions.start_anim_gen.is_none() {
+                            actions.start_anim_gen = Some(self.next_start_gen());
+                        }
+                    }
+                }
+            } else {
+                let was_overlay = self.secondary_fullscreen_overlay_active;
+                self.secondary_fullscreen_overlay_active = false;
+                if !was_overlay {
+                    actions.secondary_taskbar_visible = Some(true);
                 }
             }
         }
@@ -822,6 +903,21 @@ impl WindowCoordinator {
         state: MonitorFullscreenState,
         now_ms: u64,
     ) -> CoordinatorActions {
+        self.set_monitor_fullscreen(state.primary, state.secondary, now_ms)
+    }
+
+    /// Single-authority per-monitor fullscreen re-evaluation that freezes underlying fullscreen
+    /// state while TestBar itself owns foreground focus (`fg_is_own_process == true`, e.g. Start
+    /// or Flyout open or mid-exit animation), eliminating 650ms poller desync over fullscreen games.
+    pub fn reevaluate_fullscreen_per_monitor_with_fg(
+        &mut self,
+        state: MonitorFullscreenState,
+        fg_is_own_process: bool,
+        now_ms: u64,
+    ) -> CoordinatorActions {
+        if fg_is_own_process {
+            return CoordinatorActions::default();
+        }
         self.set_monitor_fullscreen(state.primary, state.secondary, now_ms)
     }
 
@@ -1254,16 +1350,16 @@ mod tests {
         let mon = mon_1080p();
 
         let cases = [
-            (96, BarMode::Dock, 64),
-            (120, BarMode::Dock, 80),
-            (144, BarMode::Dock, 96),
-            (192, BarMode::Dock, 128),
-            (0, BarMode::Dock, 64),
-            (96, BarMode::Edge, 52),
-            (120, BarMode::Edge, 65),
-            (144, BarMode::Edge, 78),
-            (192, BarMode::Edge, 104),
-            (0, BarMode::Edge, 52),
+            (96, BarMode::Dock, 67),
+            (120, BarMode::Dock, 84),
+            (144, BarMode::Dock, 101),
+            (192, BarMode::Dock, 134),
+            (0, BarMode::Dock, 67),
+            (96, BarMode::Edge, 58),
+            (120, BarMode::Edge, 73),
+            (144, BarMode::Edge, 87),
+            (192, BarMode::Edge, 116),
+            (0, BarMode::Edge, 58),
         ];
 
         for (dpi, mode, expected_h) in cases {
@@ -1348,17 +1444,19 @@ mod tests {
         assert_eq!(forced.start_visible, Some(true));
         assert!(coord.is_start_open());
 
-        // Explicit Start toggle overrides fullscreen_suppressed so physical Win key works in fullscreen apps
+        // Explicit Start toggle overrides fullscreen_suppressed so physical Win key atomically reveals Start + Taskbar
         let _ = coord.on_fullscreen_changed(true);
         assert!(!coord.is_start_open());
         let fs_open = coord.request_toggle_start(None, 2000);
         assert_eq!(fs_open.start_visible, Some(true));
+        assert_eq!(fs_open.taskbar_visible, Some(true));
         assert_eq!(fs_open.emit_start_state, Some(true));
         assert!(fs_open.hide_flyout_immediate);
         assert!(coord.is_start_open());
 
         let fs_close = coord.request_toggle_start(Some(false), 2050);
         assert_eq!(fs_close.start_visible, Some(false));
+        assert_eq!(fs_close.taskbar_visible, Some(false));
         assert!(!coord.is_start_open());
     }
 
@@ -1676,20 +1774,20 @@ mod tests {
         assert!((compute_effective_scale(96, 3.0) - 2.25).abs() < 1e-9);
         assert!((compute_effective_scale(96, f64::NAN) - 1.0).abs() < 1e-9);
 
-        // 96 DPI + 140% TextScaleFactor -> Dock 64 * 1.4 = 89.6 -> 90px, Edge 52 * 1.4 = 72.8 -> 73px
+        // 96 DPI + 140% TextScaleFactor -> Dock 67 * 1.4 = 93.8 -> 94px, Edge 58 * 1.4 = 81.2 -> 81px
         let dock_140 = compute_appbar_rect_scaled(mon, compute_effective_scale(96, 1.4), BarMode::Dock);
-        assert_eq!(dock_140.height(), 90);
-        assert_eq!(dock_140.top, 1080 - 90);
+        assert_eq!(dock_140.height(), 94);
+        assert_eq!(dock_140.top, 1080 - 94);
         assert_eq!(dock_140.bottom, 1080);
 
         let edge_140 = compute_appbar_rect_scaled(mon, compute_effective_scale(96, 1.4), BarMode::Edge);
-        assert_eq!(edge_140.height(), 73);
-        assert_eq!(edge_140.top, 1080 - 73);
+        assert_eq!(edge_140.height(), 81);
+        assert_eq!(edge_140.top, 1080 - 81);
         assert_eq!(edge_140.bottom, 1080);
 
         // Invalid effective scale falls back safely to 1.0x
-        assert_eq!(compute_appbar_rect_scaled(mon, f64::NAN, BarMode::Dock).height(), 64);
-        assert_eq!(compute_appbar_rect_scaled(mon, -1.0, BarMode::Edge).height(), 52);
+        assert_eq!(compute_appbar_rect_scaled(mon, f64::NAN, BarMode::Dock).height(), 67);
+        assert_eq!(compute_appbar_rect_scaled(mon, -1.0, BarMode::Edge).height(), 58);
     }
 
     #[test]
@@ -1968,16 +2066,20 @@ mod tests {
         assert!(pri_enter.hide_flyout_immediate);
         assert!(pri_enter.hide_start_immediate);
 
-        // Pressing Win inside primary fullscreen overrides fullscreen_suppressed and opens Start!
+        // Pressing Win inside primary fullscreen atomically opens Start + Taskbar together (Option A)!
         let start_override =
             coord.request_toggle_start_on_monitor(None, Some("primary".into()), 300);
         assert_eq!(start_override.start_visible, Some(true));
+        assert_eq!(start_override.taskbar_visible, Some(true));
         assert_eq!(start_override.emit_start_state, Some(true));
         assert_eq!(start_override.start_target_monitor.as_deref(), Some("primary"));
         assert!(start_override.hide_flyout_immediate);
         assert!(coord.is_start_open());
+        assert!(coord.is_fullscreen_overlay_active());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
 
-        // Leaving secondary fullscreen restores only secondary taskbar
+        // Leaving secondary fullscreen restores only secondary taskbar; primary stays in fullscreen overlay
         let sec_exit = coord.reevaluate_fullscreen_per_monitor(
             MonitorFullscreenState {
                 primary: true,
@@ -1988,7 +2090,114 @@ mod tests {
         assert_eq!(sec_exit.taskbar_visible, None);
         assert_eq!(sec_exit.secondary_taskbar_visible, Some(true));
         assert!(coord.should_show_secondary_taskbar());
+        assert!(coord.should_show_taskbar());
+
+        // Closing Start atomically hides BOTH Start and primary Taskbar together!
+        let start_close = coord.request_toggle_start(Some(false), 450);
+        assert_eq!(start_close.start_visible, Some(false));
+        assert_eq!(start_close.taskbar_visible, Some(false));
+        assert!(!coord.is_start_open());
+        assert!(!coord.is_fullscreen_overlay_active());
         assert!(!coord.should_show_taskbar());
+    }
+
+    #[test]
+    fn fullscreen_option_a_atomic_open_quick_win_win_fg_freeze_and_flyout_handoff() {
+        let mut coord = WindowCoordinator::new();
+
+        // 1. Enter primary fullscreen game
+        let enter_fs = coord.set_monitor_fullscreen(true, false, 100);
+        assert_eq!(enter_fs.taskbar_visible, Some(false));
+        assert!(coord.is_primary_fullscreen());
+        assert!(!coord.should_show_taskbar());
+
+        // 2. Press Win -> Start + Taskbar open atomically in ONE CoordinatorActions
+        let open = coord.request_toggle_start(None, 200);
+        assert_eq!(open.start_visible, Some(true));
+        assert_eq!(open.taskbar_visible, Some(true));
+        assert!(coord.is_start_open());
+        assert!(coord.is_fullscreen_overlay_active());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.should_apply_taskbar_bounds());
+
+        // 3. 650ms poller sees TestBar Start as foreground (fg_is_own_process=true, primary=false) -> FROZEN!
+        let frozen = coord.reevaluate_fullscreen_per_monitor_with_fg(
+            MonitorFullscreenState {
+                primary: false,
+                secondary: false,
+            },
+            true,
+            300,
+        );
+        assert_eq!(frozen, CoordinatorActions::default());
+        assert!(coord.is_primary_fullscreen());
+        assert!(coord.is_fullscreen_overlay_active());
+
+        // 4. Quick Win-Win close: both Start and Taskbar hide atomically, and poller tick during exit stays frozen!
+        let quick_close = coord.request_toggle_start(None, 350);
+        assert_eq!(quick_close.start_visible, Some(false));
+        assert_eq!(quick_close.taskbar_visible, Some(false));
+        assert!(!coord.is_start_open());
+        assert!(!coord.is_fullscreen_overlay_active());
+        assert!(!coord.should_show_taskbar());
+
+        let mid_exit_poll = coord.reevaluate_fullscreen_per_monitor_with_fg(
+            MonitorFullscreenState {
+                primary: false,
+                secondary: false,
+            },
+            true,
+            400,
+        );
+        assert_eq!(mid_exit_poll, CoordinatorActions::default());
+        assert!(!coord.should_show_taskbar());
+
+        // 5. Re-open Start over fullscreen, then open Sound flyout from the revealed Taskbar:
+        //    Start closes, Flyout opens, Taskbar STAYS visible until Flyout closes!
+        let open2 = coord.request_toggle_start(None, 600);
+        assert_eq!(open2.start_visible, Some(true));
+        assert_eq!(open2.taskbar_visible, Some(true));
+
+        let open_osd = coord.request_open_flyout(FlyoutKind::Osd, 620);
+        assert_eq!(open_osd.flyout_visible, Some(true));
+        let close_osd = coord.request_close_osd();
+        assert_eq!(close_osd.flyout_visible, Some(false));
+        assert_eq!(close_osd.taskbar_visible, None, "closing OSD while Start is still open must keep taskbar visible");
+        assert!(coord.is_fullscreen_overlay_active());
+
+        let open_sound = coord.request_open_flyout(FlyoutKind::Sound, 650);
+        assert_eq!(open_sound.start_visible, Some(false));
+        assert_eq!(open_sound.flyout_visible, Some(true));
+        assert_eq!(open_sound.taskbar_visible, None, "switching Start -> Sound flyout keeps revealed taskbar");
+        assert!(coord.is_fullscreen_overlay_active());
+
+        // Closing Sound flyout (last overlay) atomically hides taskbar back into fullscreen game!
+        let close_sound = coord.request_open_flyout(FlyoutKind::Sound, 700);
+        assert_eq!(close_sound.flyout_visible, Some(false));
+        assert_eq!(close_sound.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+        assert!(!coord.should_show_taskbar());
+
+        // 6. Open Start over fullscreen, then user switches to a normal desktop app:
+        //    focus returns to non-fullscreen external app -> immediate re-eval restores Taskbar!
+        let open3 = coord.request_toggle_start(None, 900);
+        assert_eq!(open3.start_visible, Some(true));
+        assert_eq!(open3.taskbar_visible, Some(true));
+        let hide3 = coord.hide_start_immediate();
+        assert_eq!(hide3.start_visible, Some(false));
+        assert_eq!(hide3.taskbar_visible, Some(false));
+
+        let after_app_focus = coord.reevaluate_fullscreen_per_monitor_with_fg(
+            MonitorFullscreenState {
+                primary: false,
+                secondary: false,
+            },
+            false,
+            950,
+        );
+        assert_eq!(after_app_focus.taskbar_visible, Some(true));
+        assert!(!coord.is_primary_fullscreen());
+        assert!(coord.should_show_taskbar());
     }
 
     #[test]

@@ -1,11 +1,12 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows::core::{Interface, HRESULT};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
 use windows::Foundation::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation};
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
@@ -13,15 +14,25 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 };
 use windows::Storage::Streams::{DataReader, IInputStream};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_READ, REG_SZ, REG_VALUE_TYPE,
+};
 
+use crate::win_shell::wide;
 use crate::windows_tracker::ComGuard;
 
 const MEDIA_CHANNEL_CAPACITY: usize = 32;
 const MEDIA_DISPATCH_TIMEOUT: Duration = Duration::from_millis(650);
 const WINRT_OP_TIMEOUT: Duration = Duration::from_millis(450);
-const MAX_THUMBNAIL_BYTES: usize = 256 * 1024;
+const MEDIA_POLL_MIN_INTERVAL: Duration = Duration::from_millis(750);
+const MAX_THUMBNAIL_BYTES: usize = 4 * 1024 * 1024;
+const THUMBNAIL_DOWNSCALE_THRESHOLD_BYTES: usize = 160 * 1024;
+const THUMBNAIL_MAX_DOWNSCALE_DIM: u32 = 192;
+const THUMBNAIL_READ_CHUNK_BYTES: u32 = 64 * 1024;
 const MAX_THUMBNAIL_CACHE_ENTRIES: usize = 24;
-const MAX_THUMBNAIL_MISS_RETRIES: u8 = 2;
+const MAX_THUMBNAIL_MISS_RETRIES: u8 = 6;
+const THUMBNAIL_MISS_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 const MAX_ENUMERATED_SESSIONS: usize = 8;
 
 /// Number of 100-nanosecond ticks per second (`TimeSpan.Duration` / `DateTime.UniversalTime`).
@@ -176,13 +187,118 @@ pub fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Downscales oversized PNG thumbnails (e.g. Firefox/Zen decoding YouTube WebP/JPEG into
+/// 500KB-1.2MB 1280x720 PNGs in SMTC) to <= 256px max dimension so IPC & WebView2 memory stay lean.
+fn downscale_large_png_if_needed(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    let src_w = info.width;
+    let src_h = info.height;
+    if src_w == 0 || src_h == 0 || src_w > 4096 || src_h > 4096 {
+        return None;
+    }
+    if src_w <= THUMBNAIL_MAX_DOWNSCALE_DIM && src_h <= THUMBNAIL_MAX_DOWNSCALE_DIM {
+        return None;
+    }
+
+    let mut raw = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut raw).ok()?;
+    let pixels = &raw[..frame.buffer_size()];
+
+    let mut rgba = Vec::with_capacity((src_w as usize) * (src_h as usize) * 4);
+    match frame.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(pixels),
+        png::ColorType::Rgb => {
+            for px in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in pixels.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &g in pixels {
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        _ => return None,
+    }
+    if rgba.len() < (src_w as usize) * (src_h as usize) * 4 {
+        return None;
+    }
+
+    let scale = (THUMBNAIL_MAX_DOWNSCALE_DIM as f64) / (src_w.max(src_h) as f64);
+    let dst_w = ((src_w as f64 * scale).round() as u32).clamp(1, THUMBNAIL_MAX_DOWNSCALE_DIM);
+    let dst_h = ((src_h as f64 * scale).round() as u32).clamp(1, THUMBNAIL_MAX_DOWNSCALE_DIM);
+
+    let mut out_rgba = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for dy in 0..dst_h {
+        let sy0 = ((dy as u64) * (src_h as u64) / (dst_h as u64)) as u32;
+        let sy1 = ((((dy + 1) as u64) * (src_h as u64) / (dst_h as u64)) as u32)
+            .max(sy0 + 1)
+            .min(src_h);
+        for dx in 0..dst_w {
+            let sx0 = ((dx as u64) * (src_w as u64) / (dst_w as u64)) as u32;
+            let sx1 = ((((dx + 1) as u64) * (src_w as u64) / (dst_w as u64)) as u32)
+                .max(sx0 + 1)
+                .min(src_w);
+            let mut sum = [0u64; 4];
+            let mut count = 0u64;
+            for sy in sy0..sy1 {
+                let row_off = (sy as usize) * (src_w as usize) * 4;
+                for sx in sx0..sx1 {
+                    let off = row_off + (sx as usize) * 4;
+                    sum[0] += u64::from(rgba[off]);
+                    sum[1] += u64::from(rgba[off + 1]);
+                    sum[2] += u64::from(rgba[off + 2]);
+                    sum[3] += u64::from(rgba[off + 3]);
+                    count += 1;
+                }
+            }
+            let dst_off = ((dy as usize) * (dst_w as usize) + (dx as usize)) * 4;
+            let denom = count.max(1);
+            out_rgba[dst_off] = (sum[0] / denom) as u8;
+            out_rgba[dst_off + 1] = (sum[1] / denom) as u8;
+            out_rgba[dst_off + 2] = (sum[2] / denom) as u8;
+            out_rgba[dst_off + 3] = (sum[3] / denom) as u8;
+        }
+    }
+
+    let all_opaque = out_rgba.chunks_exact(4).all(|px| px[3] == 255);
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, dst_w, dst_h);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Default);
+        if all_opaque {
+            encoder.set_color(png::ColorType::Rgb);
+            let mut rgb = Vec::with_capacity((dst_w as usize) * (dst_h as usize) * 3);
+            for px in out_rgba.chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
+            let mut writer = encoder.write_header().ok()?;
+            writer.write_image_data(&rgb).ok()?;
+        } else {
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().ok()?;
+            writer.write_image_data(&out_rgba).ok()?;
+        }
+    }
+    (!encoded.is_empty()).then_some(encoded)
+}
+
 fn encode_thumbnail_data_uri(bytes: &[u8], fallback_content_type: &str) -> Option<String> {
     if bytes.is_empty() || bytes.len() > MAX_THUMBNAIL_BYTES {
         return None;
     }
     let mime = detect_image_mime(bytes).or_else(|| {
         let ct = fallback_content_type.trim().to_ascii_lowercase();
-        match ct.as_str() {
+        let base_ct = ct.split(';').next().unwrap_or(&ct).trim();
+        match base_ct {
             "image/jpeg" | "image/jpg" => Some("image/jpeg"),
             "image/png" => Some("image/png"),
             "image/webp" => Some("image/webp"),
@@ -191,6 +307,12 @@ fn encode_thumbnail_data_uri(bytes: &[u8], fallback_content_type: &str) -> Optio
             _ => None,
         }
     })?;
+    if mime == "image/png" && bytes.len() > THUMBNAIL_DOWNSCALE_THRESHOLD_BYTES {
+        if let Some(compact) = downscale_large_png_if_needed(bytes) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&compact);
+            return Some(format!("data:image/png;base64,{b64}"));
+        }
+    }
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     Some(format!("data:{mime};base64,{b64}"))
 }
@@ -357,6 +479,7 @@ struct ThumbnailCacheKey {
 struct ThumbnailCacheEntry {
     data_uri: Option<String>,
     miss_count: u8,
+    last_miss_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -366,22 +489,42 @@ struct BoundedThumbnailCache {
 }
 
 impl BoundedThumbnailCache {
-    fn get_cached(&self, key: &ThumbnailCacheKey) -> Option<Option<String>> {
+    fn get_cached_at(&self, key: &ThumbnailCacheKey, now: Instant) -> Option<Option<String>> {
         let entry = self.map.get(key)?;
-        if entry.data_uri.is_some() || entry.miss_count >= MAX_THUMBNAIL_MISS_RETRIES {
-            Some(entry.data_uri.clone())
-        } else {
-            None
+        if entry.data_uri.is_some() {
+            return Some(entry.data_uri.clone());
         }
+        if entry.miss_count >= MAX_THUMBNAIL_MISS_RETRIES {
+            return Some(None);
+        }
+        // Throttle retries on transient misses (e.g. YouTube still downloading cover art in Zen/Chrome)
+        // for 2s instead of permanently caching None after 2 quick polls.
+        if entry
+            .last_miss_at
+            .is_some_and(|t| now.saturating_duration_since(t) < THUMBNAIL_MISS_RETRY_COOLDOWN)
+        {
+            return Some(None);
+        }
+        None
     }
 
-    fn record(&mut self, key: ThumbnailCacheKey, data_uri: Option<String>) {
+    fn record_at(
+        &mut self,
+        key: ThumbnailCacheKey,
+        data_uri: Option<String>,
+        now: Instant,
+        count_failure: bool,
+    ) {
         if let Some(existing) = self.map.get_mut(&key) {
             if data_uri.is_some() {
                 existing.data_uri = data_uri;
                 existing.miss_count = 0;
+                existing.last_miss_at = None;
             } else {
-                existing.miss_count = existing.miss_count.saturating_add(1);
+                if count_failure {
+                    existing.miss_count = existing.miss_count.saturating_add(1);
+                }
+                existing.last_miss_at = Some(now);
             }
             return;
         }
@@ -394,13 +537,18 @@ impl BoundedThumbnailCache {
             }
         }
 
-        let miss_count = if data_uri.is_some() { 0 } else { 1 };
+        let (miss_count, last_miss_at) = if data_uri.is_some() {
+            (0, None)
+        } else {
+            (u8::from(count_failure), Some(now))
+        };
         self.order.push_back(key.clone());
         self.map.insert(
             key,
             ThumbnailCacheEntry {
                 data_uri,
                 miss_count,
+                last_miss_at,
             },
         );
     }
@@ -617,6 +765,119 @@ struct EnumeratedSession {
     app_name: String,
     session: GlobalSystemMediaTransportControlsSession,
     is_playing: bool,
+    controls_can_seek: bool,
+}
+
+struct MediaRegKeyGuard(HKEY);
+
+impl Drop for MediaRegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+fn is_gecko_hex_aumid(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() == 16 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolves Firefox/Zen 16-hex-char SMTC AUMID hashes (e.g. `F0DC299D809B9700`) via
+/// `HKCU\Software\Classes\AppUserModelId\*Toast-<HASH>` `DisplayName` (runs once per unique hash).
+fn lookup_hkcu_aumid_display_name(raw_aumid: &str) -> Option<String> {
+    let target = raw_aumid.trim().to_ascii_uppercase();
+    if target.is_empty() {
+        return None;
+    }
+    let suffix = format!("-{target}");
+    unsafe {
+        let root_w = wide(r"Software\Classes\AppUserModelId");
+        let mut root_key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(root_w.as_ptr()),
+            0,
+            KEY_READ,
+            &mut root_key,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let _root_guard = MediaRegKeyGuard(root_key);
+
+        let val_w = wide("DisplayName");
+        let mut idx = 0u32;
+        let mut name_buf = [0u16; 256];
+        while idx < 512 {
+            let mut len = name_buf.len() as u32;
+            let status = RegEnumKeyExW(
+                root_key,
+                idx,
+                PWSTR(name_buf.as_mut_ptr()),
+                &mut len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            );
+            idx += 1;
+            if status.is_err() {
+                break;
+            }
+            let subkey = String::from_utf16_lossy(&name_buf[..len as usize]);
+            let sub_upper = subkey.trim().to_ascii_uppercase();
+            if sub_upper != target && !sub_upper.ends_with(&suffix) {
+                continue;
+            }
+            let sub_w = wide(&subkey);
+            let mut sub_hkey = HKEY::default();
+            if RegOpenKeyExW(root_key, PCWSTR(sub_w.as_ptr()), 0, KEY_READ, &mut sub_hkey).is_err()
+            {
+                continue;
+            }
+            let _sub_guard = MediaRegKeyGuard(sub_hkey);
+            let mut value_type = REG_VALUE_TYPE(0);
+            let mut byte_len = 0u32;
+            if RegQueryValueExW(
+                sub_hkey,
+                PCWSTR(val_w.as_ptr()),
+                None,
+                Some(&mut value_type),
+                None,
+                Some(&mut byte_len),
+            )
+            .is_err()
+                || value_type != REG_SZ
+                || byte_len < 2
+                || byte_len > 1024
+            {
+                continue;
+            }
+            let mut buf = vec![0u16; (byte_len as usize).div_ceil(2)];
+            let mut read_bytes = byte_len;
+            if RegQueryValueExW(
+                sub_hkey,
+                PCWSTR(val_w.as_ptr()),
+                None,
+                Some(&mut value_type),
+                Some(buf.as_mut_ptr() as *mut u8),
+                Some(&mut read_bytes),
+            )
+            .is_ok()
+            {
+                let nul_pos = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let display = String::from_utf16_lossy(&buf[..nul_pos]).trim().to_string();
+                if !display.is_empty() && !display.starts_with('@') {
+                    return Some(display);
+                }
+            }
+        }
+    }
+    None
 }
 
 struct WinrtSmtcBackend {
@@ -624,6 +885,9 @@ struct WinrtSmtcBackend {
     manager: Option<GlobalSystemMediaTransportControlsSessionManager>,
     selected_session_id: Option<String>,
     thumbnails: BoundedThumbnailCache,
+    source_name_cache: HashMap<String, String>,
+    last_poll_at: Option<Instant>,
+    last_state: Option<MediaState>,
 }
 
 impl WinrtSmtcBackend {
@@ -633,7 +897,28 @@ impl WinrtSmtcBackend {
             manager: None,
             selected_session_id: None,
             thumbnails: BoundedThumbnailCache::default(),
+            source_name_cache: HashMap::new(),
+            last_poll_at: None,
+            last_state: None,
         }
+    }
+
+    fn resolve_source_display_name(&mut self, raw_app_id: &str) -> String {
+        let key = raw_app_id.trim().to_ascii_lowercase();
+        if let Some(cached) = self.source_name_cache.get(&key) {
+            return cached.clone();
+        }
+        let mut resolved = clean_source_name(raw_app_id);
+        if is_gecko_hex_aumid(&resolved) {
+            if let Some(display) = lookup_hkcu_aumid_display_name(raw_app_id) {
+                resolved = clean_source_name(&display);
+            }
+        }
+        if self.source_name_cache.len() >= 32 {
+            self.source_name_cache.clear();
+        }
+        self.source_name_cache.insert(key, resolved.clone());
+        resolved
     }
 
     fn invalidate_manager_if_needed(&mut self, err: &windows::core::Error) {
@@ -707,12 +992,18 @@ impl WinrtSmtcBackend {
         let mut os_current_idx: Option<usize> = None;
 
         for ((raw_app_id, session), id) in raw_sessions.into_iter().zip(ids.into_iter()) {
-            let is_playing = session
-                .GetPlaybackInfo()
-                .and_then(|i| i.PlaybackStatus())
+            let playback_info = session.GetPlaybackInfo().ok();
+            let is_playing = playback_info
+                .as_ref()
+                .and_then(|i| i.PlaybackStatus().ok())
                 .map(|st| st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
                 .unwrap_or(false);
-            let app_name = clean_source_name(&raw_app_id);
+            let controls_can_seek = playback_info
+                .as_ref()
+                .and_then(|i| i.Controls().ok())
+                .and_then(|c| c.IsPlaybackPositionEnabled().ok())
+                .unwrap_or(false);
+            let app_name = self.resolve_source_display_name(&raw_app_id);
 
             if os_current_idx.is_none() {
                 if let Some(ref cur_id) = current_app_id {
@@ -728,6 +1019,7 @@ impl WinrtSmtcBackend {
                 app_name,
                 session,
                 is_playing,
+                controls_can_seek,
             });
         }
 
@@ -766,23 +1058,32 @@ impl WinrtSmtcBackend {
             title: title.to_string(),
             artist: artist.to_string(),
         };
-        if let Some(cached) = self.thumbnails.get_cached(&key) {
+        let now = Instant::now();
+        if let Some(cached) = self.thumbnails.get_cached_at(&key, now) {
             return cached;
         }
 
-        let extracted = Self::extract_thumbnail_data_uri(props);
-        self.thumbnails.record(key, extracted.clone());
+        let Ok(thumb_ref) = props.Thumbnail() else {
+            // Browsers (Zen/Chrome on YouTube) often publish title/artist 0.5-2s BEFORE the
+            // thumbnail download completes. Throttle retry by 2s without exhausting retry budget.
+            self.thumbnails.record_at(key, None, now, false);
+            return None;
+        };
+
+        let extracted = Self::extract_thumbnail_data_uri_from_ref(&thumb_ref);
+        self.thumbnails.record_at(key, extracted.clone(), now, true);
         extracted
     }
 
-    fn extract_thumbnail_data_uri(
-        props: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+    fn extract_thumbnail_data_uri_from_ref(
+        thumb_ref: &windows::Storage::Streams::IRandomAccessStreamReference,
     ) -> Option<String> {
-        let thumb_ref = props.Thumbnail().ok()?;
         let open_op = thumb_ref.OpenReadAsync().ok()?;
         let stream = await_async_op(&open_op, WINRT_OP_TIMEOUT).ok()?;
-        let size = stream.Size().ok()?;
-        if size == 0 || size > MAX_THUMBNAIL_BYTES as u64 {
+        let _ = stream.Seek(0);
+        let declared_size = stream.Size().unwrap_or(0);
+        if declared_size > MAX_THUMBNAIL_BYTES as u64 {
+            let _ = stream.Close();
             return None;
         }
         let content_type = stream
@@ -790,19 +1091,60 @@ impl WinrtSmtcBackend {
             .ok()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let input_stream: IInputStream = stream.cast().ok()?;
-        let reader = DataReader::CreateDataReader(&input_stream).ok()?;
-        let load_op: IAsyncOperation<u32> = reader.LoadAsync(size as u32).ok()?.cast().ok()?;
-        let loaded = await_async_op(&load_op, WINRT_OP_TIMEOUT).ok()?;
-        let readable = (loaded as usize)
-            .min(reader.UnconsumedBufferLength().unwrap_or(0) as usize)
-            .min(MAX_THUMBNAIL_BYTES);
-        if readable == 0 {
+        let Ok(input_stream) = stream.cast::<IInputStream>() else {
+            let _ = stream.Close();
+            return None;
+        };
+        let Ok(reader) = DataReader::CreateDataReader(&input_stream) else {
+            let _ = stream.Close();
+            return None;
+        };
+
+        let mut buf = Vec::with_capacity(
+            (declared_size as usize).min(MAX_THUMBNAIL_BYTES).min(256 * 1024),
+        );
+        while buf.len() < MAX_THUMBNAIL_BYTES {
+            let remaining = MAX_THUMBNAIL_BYTES - buf.len();
+            let want = if declared_size > 0 && (buf.len() as u64) < declared_size {
+                ((declared_size - buf.len() as u64) as usize)
+                    .min(remaining)
+                    .min(THUMBNAIL_READ_CHUNK_BYTES as usize) as u32
+            } else {
+                remaining.min(THUMBNAIL_READ_CHUNK_BYTES as usize) as u32
+            };
+            if want == 0 {
+                break;
+            }
+            let Ok(load_raw) = reader.LoadAsync(want) else {
+                break;
+            };
+            let Ok(load_op) = load_raw.cast::<IAsyncOperation<u32>>() else {
+                break;
+            };
+            let Ok(loaded) = await_async_op(&load_op, WINRT_OP_TIMEOUT) else {
+                break;
+            };
+            let readable = (loaded as usize)
+                .min(reader.UnconsumedBufferLength().unwrap_or(0) as usize)
+                .min(remaining);
+            if readable == 0 {
+                break;
+            }
+            let start = buf.len();
+            buf.resize(start + readable, 0);
+            if reader.ReadBytes(&mut buf[start..]).is_err() {
+                buf.truncate(start);
+                break;
+            }
+            if declared_size > 0 && (buf.len() as u64) >= declared_size {
+                break;
+            }
+        }
+        let _ = reader.DetachStream();
+        let _ = stream.Close();
+        if buf.is_empty() {
             return None;
         }
-        let mut buf = vec![0u8; readable];
-        reader.ReadBytes(&mut buf).ok()?;
-        let _ = reader.DetachStream();
         encode_thumbnail_data_uri(&buf, &content_type)
     }
 
@@ -880,13 +1222,7 @@ impl WinrtSmtcBackend {
             })
             .unwrap_or((0.0, 0.0, if is_playing { now_unix_ms() } else { 0 }));
 
-        let controls_can_seek = active
-            .session
-            .GetPlaybackInfo()
-            .and_then(|info| info.Controls())
-            .and_then(|c| c.IsPlaybackPositionEnabled())
-            .unwrap_or(false);
-        let can_seek = controls_can_seek && duration_sec > 0.0;
+        let can_seek = active.controls_can_seek && duration_sec > 0.0;
 
         if active_title.is_empty() && active_artist.is_empty() && !is_playing {
             return MediaState {
@@ -943,7 +1279,17 @@ impl WinrtSmtcBackend {
 
     fn execute(&mut self, cmd: MediaCommand, prev: &MediaState) -> Result<MediaState, String> {
         match cmd {
-            MediaCommand::Poll => return Ok(self.read_state()),
+            MediaCommand::Poll => {
+                if let (Some(ts), Some(ref cached)) = (self.last_poll_at, &self.last_state) {
+                    if ts.elapsed() < MEDIA_POLL_MIN_INTERVAL {
+                        return Ok(cached.clone());
+                    }
+                }
+                let state = self.read_state();
+                self.last_poll_at = Some(Instant::now());
+                self.last_state = Some(state.clone());
+                return Ok(state);
+            }
             MediaCommand::SelectSession(session_id) => {
                 let trimmed = session_id.trim().to_ascii_lowercase();
                 if trimmed.is_empty() {
@@ -951,9 +1297,14 @@ impl WinrtSmtcBackend {
                 } else {
                     self.selected_session_id = Some(trimmed);
                 }
-                return Ok(self.read_state());
+                let state = self.read_state();
+                self.last_poll_at = Some(Instant::now());
+                self.last_state = Some(state.clone());
+                return Ok(state);
             }
-            _ => {}
+            _ => {
+                self.last_poll_at = None;
+            }
         }
 
         let session = self.resolve_target_session()?;
@@ -1185,43 +1536,110 @@ mod tests {
 
         let uri = encode_thumbnail_data_uri(&[0xFF, 0xD8, 0xFF, 0xDB], "").unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,"));
-        // Oversized (> 256KB) rejected safely
+        // WebP (YouTube in Chrome/Zen) with empty or non-standard content type detected cleanly by magic bytes
+        let mut webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ".to_vec();
+        webp.resize(300 * 1024, 0xAB); // 300KB (> old 256KB cap!) must now succeed!
+        let webp_uri = encode_thumbnail_data_uri(&webp, "application/octet-stream").unwrap();
+        assert!(webp_uri.starts_with("data:image/webp;base64,"));
+
+        // Oversized (> 2MB) rejected safely
         let oversized = vec![0xFFu8; MAX_THUMBNAIL_BYTES + 1];
         assert!(encode_thumbnail_data_uri(&oversized, "image/jpeg").is_none());
 
-        // Cache retries transient None up to MAX_THUMBNAIL_MISS_RETRIES, then caches None;
-        // caches Some immediately and enforces capacity bound.
+        // Oversized raw PNG (e.g. Firefox/Zen decoding YouTube thumbnail to large 512x512 PNG)
+        // is automatically downscaled to <= 256px compact PNG.
+        let mut big_png = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut big_png, 512, 512);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::Fast);
+            let mut w = enc.write_header().unwrap();
+            let mut pixels = vec![0u8; 512 * 512 * 4];
+            for (i, b) in pixels.iter_mut().enumerate() {
+                *b = ((i.wrapping_mul(31) ^ (i >> 3)) & 0xFF) as u8;
+            }
+            w.write_image_data(&pixels).unwrap();
+        }
+        assert!(big_png.len() > THUMBNAIL_DOWNSCALE_THRESHOLD_BYTES);
+        let compact_uri = encode_thumbnail_data_uri(&big_png, "").unwrap();
+        assert!(compact_uri.starts_with("data:image/png;base64,"));
+        let decoded_compact = base64::engine::general_purpose::STANDARD
+            .decode(compact_uri.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        assert!(
+            decoded_compact.len() < big_png.len(),
+            "downscaled PNG ({}) must be smaller than raw 512x512 PNG ({})",
+            decoded_compact.len(),
+            big_png.len()
+        );
+
+        // Cache throttles transient misses by 2s cooldown instead of permanently locking out
+        // late-loading YouTube thumbnails, caches Some immediately, and enforces capacity bound.
         let mut cache = BoundedThumbnailCache::default();
         let k1 = ThumbnailCacheKey {
-            app_id: "spotify.exe".into(),
-            title: "Track".into(),
+            app_id: "zen.exe".into(),
+            title: "YouTube Video".into(),
+            artist: "Channel".into(),
+        };
+        let t0 = Instant::now();
+        assert_eq!(cache.get_cached_at(&k1, t0), None);
+        // Browser hasn't downloaded thumbnail yet (count_failure = false): throttled for 2s, then retries!
+        cache.record_at(k1.clone(), None, t0, false);
+        assert_eq!(
+            cache.get_cached_at(&k1, t0 + Duration::from_millis(500)),
+            Some(None),
+            "within 2s cooldown returns throttled None"
+        );
+        assert_eq!(
+            cache.get_cached_at(&k1, t0 + THUMBNAIL_MISS_RETRY_COOLDOWN),
+            None,
+            "after 2s cooldown allows retry to pick up late-arriving YouTube cover art"
+        );
+        // Once thumbnail arrives, caches Some immediately
+        cache.record_at(k1.clone(), Some("data:image/webp;base64,YT".into()), t0 + Duration::from_secs(3), true);
+        assert_eq!(
+            cache.get_cached_at(&k1, t0 + Duration::from_secs(4)),
+            Some(Some("data:image/webp;base64,YT".into()))
+        );
+
+        // Hard extraction failures cap cleanly at MAX_THUMBNAIL_MISS_RETRIES
+        let k_fail = ThumbnailCacheKey {
+            app_id: "local.exe".into(),
+            title: "NoArt".into(),
             artist: "Artist".into(),
         };
-        assert_eq!(cache.get_cached(&k1), None);
-        cache.record(k1.clone(), None);
-        assert_eq!(cache.get_cached(&k1), None, "first miss allows retry");
-        cache.record(k1.clone(), None);
-        assert_eq!(cache.get_cached(&k1), Some(None), "second miss caches None");
+        for i in 0..MAX_THUMBNAIL_MISS_RETRIES {
+            let ti = t0 + Duration::from_secs((i as u64) * 5);
+            cache.record_at(k_fail.clone(), None, ti, true);
+        }
+        assert_eq!(
+            cache.get_cached_at(&k_fail, t0 + Duration::from_secs(120)),
+            Some(None),
+            "hard misses capped at MAX_THUMBNAIL_MISS_RETRIES"
+        );
 
         let k2 = ThumbnailCacheKey {
             app_id: "chrome.exe".into(),
             title: "Video".into(),
             artist: "Channel".into(),
         };
-        cache.record(k2.clone(), Some("data:image/png;base64,AAA".into()));
+        cache.record_at(k2.clone(), Some("data:image/png;base64,AAA".into()), t0, true);
         assert_eq!(
-            cache.get_cached(&k2),
+            cache.get_cached_at(&k2, t0),
             Some(Some("data:image/png;base64,AAA".into()))
         );
 
         for i in 0..40 {
-            cache.record(
+            cache.record_at(
                 ThumbnailCacheKey {
                     app_id: "app".into(),
                     title: format!("t{i}"),
                     artist: "a".into(),
                 },
                 Some(format!("data:image/png;base64,{i}")),
+                t0,
+                true,
             );
         }
         assert!(cache.map.len() <= MAX_THUMBNAIL_CACHE_ENTRIES);
@@ -1432,5 +1850,55 @@ mod tests {
         let refreshed = worker.poll_and_get(Duration::from_secs(1));
         assert!(started.load(Ordering::Acquire));
         assert_eq!(refreshed.title, "Loaded");
+    }
+
+    #[test]
+    fn live_smtc_sessions_probe_cleanly() {
+        let com = ComGuard::init_mta();
+        assert!(com.is_usable());
+        let mut backend = WinrtSmtcBackend::new(true);
+        let Ok((sessions, _)) = backend.collect_sessions() else {
+            return;
+        };
+        println!("LIVE SMTC sessions: {}", sessions.len());
+        for s in &sessions {
+            let props = backend.read_media_props(&s.session);
+            let title = props
+                .as_ref()
+                .and_then(|p| p.Title().ok())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let artist = props
+                .as_ref()
+                .and_then(|p| p.Artist().ok())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let thumb_diag = if let Some(ref p) = props {
+                match p.Thumbnail() {
+                    Ok(tref) => {
+                        let open = tref.OpenReadAsync().ok().and_then(|op| await_async_op(&op, WINRT_OP_TIMEOUT).ok());
+                        let raw_info = open.map(|st| {
+                            let sz = st.Size().ok();
+                            let pos = st.Position().ok();
+                            let ct = st.ContentType().ok().map(|v| v.to_string());
+                            let _ = st.Close();
+                            format!("size={sz:?} pos={pos:?} ct={ct:?}")
+                        });
+                        let extracted = WinrtSmtcBackend::extract_thumbnail_data_uri_from_ref(&tref);
+                        format!(
+                            "raw=({raw_info:?}) extracted={}",
+                            extracted.as_ref().map(|u| format!("ok(len={}, prefix={})", u.len(), &u[..u.len().min(32)])).unwrap_or_else(|| "NONE".into())
+                        )
+                    }
+                    Err(e) => format!("props.Thumbnail() Err({e})"),
+                }
+            } else {
+                "no props".into()
+            };
+            println!(
+                "  app={} clean={} playing={} title=[{}] artist=[{}] thumb={}",
+                s.raw_app_id, s.app_name, s.is_playing, title, artist, thumb_diag
+            );
+        }
     }
 }

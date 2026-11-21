@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
@@ -134,6 +135,20 @@ pub struct AudioSessionInfo {
     pub icon_key: Option<String>,
 }
 
+impl AudioSessionInfo {
+    /// Compares non-volatile mixer fields, ignoring live `peak` meters, transient `is_active`
+    /// playback toggles, and active-tab `pid` flips (sorted `pids` already captures the process
+    /// set) so steady-state audio never spams `audio-mixer-updated` pushes.
+    pub fn structurally_eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.pids == other.pids
+            && self.name == other.name
+            && self.volume == other.volume
+            && self.muted == other.muted
+            && self.icon_key == other.icon_key
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioMasterState {
@@ -190,6 +205,23 @@ impl Default for AudioState {
 }
 
 impl AudioState {
+    /// Compares structural mixer state (volumes, mutes, devices, session list) while ignoring
+    /// volatile peak meters (`master_peak`, `mic_peak`, per-session `peak`) and `is_active` blips.
+    pub fn structurally_eq(&self, other: &Self) -> bool {
+        self.available == other.available
+            && self.master_volume == other.master_volume
+            && self.master_muted == other.master_muted
+            && self.mic_muted == other.mic_muted
+            && self.devices == other.devices
+            && self.input_devices == other.input_devices
+            && self.sessions.len() == other.sessions.len()
+            && self
+                .sessions
+                .iter()
+                .zip(other.sessions.iter())
+                .all(|(a, b)| a.structurally_eq(b))
+    }
+
     pub fn to_master_state(&self) -> AudioMasterState {
         let default_device_short_name = self
             .devices
@@ -397,10 +429,13 @@ fn aggregate_audio_sessions_with_exe(
         })
         .collect();
 
+    // Deterministic alphabetical sort with stable `id` tie-breaker so mixer rows NEVER jump
+    // or reorder mid-playback when `is_active` toggles during silence/speech pauses.
     out.sort_by(|(a, _), (b, _)| {
-        b.is_active
-            .cmp(&a.is_active)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
     });
     out
 }
@@ -487,220 +522,943 @@ unsafe fn read_device_friendly_name(dev: &IMMDevice) -> String {
     "Аудио устройство".to_string()
 }
 
-unsafe fn read_endpoint_peak(dev: &IMMDevice, muted: bool) -> f32 {
-    if muted {
-        return 0.0;
-    }
-    dev.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None)
-        .ok()
-        .and_then(|m| m.GetPeakValue().ok())
-        .map(sanitize_peak)
-        .unwrap_or(0.0)
+const AUDIO_WORKER_CHANNEL_CAPACITY: usize = 32;
+const AUDIO_WORKER_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Coalesces rapid burst calls to `collect_audio_state_raw()` (e.g., repeated `Win` taps or
+/// concurrent Start/Sound/poller requests) without delaying external updates; invalidated
+/// immediately on every volume/mute/session/device mutation.
+const AUDIO_RAW_CACHE_TTL: Duration = Duration::from_millis(300);
+/// During 10-15Hz peak polling, only re-check default endpoint IDs once per second (or immediately
+/// on COM error / device switch) so steady-state VU frames make ZERO `GetDefaultAudioEndpoint` RPCs.
+const PEAK_DEFAULT_RECHECK_INTERVAL: Duration = Duration::from_millis(1000);
+/// Caches WASAPI endpoint friendly names by device ID to avoid repeating `OpenPropertyStore(STGM_READ)`
+/// across every audio poll while the mixer is open.
+const FRIENDLY_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Caches PID -> canonical app key for 15Hz peak polling to avoid 15Hz `OpenProcess` syscalls.
+const PID_APP_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
+const HRESULT_ERROR_NOT_FOUND: i32 = 0x80070490u32 as i32;
+
+struct CachedRenderEndpoint {
+    device_id: String,
+    short_name: String,
+    endpoint_vol: Option<IAudioEndpointVolume>,
+    meter: Option<IAudioMeterInformation>,
+    session_mgr: Option<IAudioSessionManager2>,
 }
 
-unsafe fn enumerate_audio_endpoints(
-    enumerator: &IMMDeviceEnumerator,
-    flow: EDataFlow,
-    default_id: &str,
-) -> Vec<AudioDeviceInfo> {
-    let mut devices = Vec::new();
-    if let Ok(coll) = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) {
-        let count = coll.GetCount().unwrap_or(0);
-        for i in 0..count {
-            let Ok(dev) = coll.Item(i) else {
-                continue;
-            };
-            let Some(id) = read_device_id(&dev) else {
-                continue;
-            };
-            let friendly = read_device_friendly_name(&dev);
-            let is_default = !default_id.is_empty() && id == default_id;
-            let short_name = shorten_device_name(&friendly);
-            devices.push(AudioDeviceInfo {
-                id,
-                name: friendly,
-                short_name,
-                is_default,
-            });
+struct CachedCaptureEndpoint {
+    device_id: String,
+    endpoint_vol: Option<IAudioEndpointVolume>,
+    meter: Option<IAudioMeterInformation>,
+}
+
+type RawAudioSnapshot = (AudioState, Vec<(AudioSessionInfo, Option<String>)>);
+
+enum AudioCommand {
+    GetMasterState {
+        reply: mpsc::SyncSender<AudioMasterState>,
+    },
+    CollectRawState {
+        reply: mpsc::SyncSender<Result<RawAudioSnapshot, String>>,
+    },
+    GetPeaks {
+        reply: mpsc::SyncSender<Result<AudioPeaksSnapshot, String>>,
+    },
+    SetMasterVolume {
+        volume_pct: u32,
+        muted: Option<bool>,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SetMicMuted {
+        muted: bool,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    ApplySessionState {
+        target_pids: HashSet<u32>,
+        target_key: Option<String>,
+        volume_scalar: Option<f32>,
+        muted: Option<bool>,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SetDefaultEndpoint {
+        device_id: String,
+        direction_label: &'static str,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+}
+
+struct AudioWorker {
+    tx: mpsc::SyncSender<AudioCommand>,
+}
+
+static AUDIO_WORKER: OnceLock<AudioWorker> = OnceLock::new();
+
+fn audio_worker() -> &'static AudioWorker {
+    AUDIO_WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<AudioCommand>(AUDIO_WORKER_CHANNEL_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("testbar-audio-mta".to_string())
+            .spawn(move || audio_worker_main(rx));
+        AudioWorker { tx }
+    })
+}
+
+struct AudioWorkerState {
+    enumerator: Option<IMMDeviceEnumerator>,
+    render: Option<CachedRenderEndpoint>,
+    capture: Option<CachedCaptureEndpoint>,
+    friendly_names: HashMap<String, (Instant, String)>,
+    pid_app_keys: HashMap<u32, (Instant, String)>,
+    last_raw_state: Option<(Instant, RawAudioSnapshot)>,
+    last_peak_default_check: Option<Instant>,
+}
+
+impl AudioWorkerState {
+    fn new() -> Self {
+        Self {
+            enumerator: None,
+            render: None,
+            capture: None,
+            friendly_names: HashMap::new(),
+            pid_app_keys: HashMap::new(),
+            last_raw_state: None,
+            last_peak_default_check: None,
         }
     }
-    devices
-}
 
-/// Lightweight WASAPI master-only query (zero per-app session enumeration, zero device list scan)
-/// for low-overhead `audio-master-updated` polling when neither Start nor Quick Sound is open (AD-6).
-pub fn get_audio_master_state() -> AudioMasterState {
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return AudioMasterState::default();
+    fn reset_all_endpoints(&mut self) {
+        self.render = None;
+        self.capture = None;
+        self.enumerator = None;
+        self.last_peak_default_check = None;
     }
 
-    unsafe {
-        let mut state = AudioMasterState::default();
-        let enumerator: IMMDeviceEnumerator =
-            match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
-                Ok(e) => e,
-                Err(_) => return state,
-            };
+    unsafe fn ensure_enumerator(&mut self) -> Result<IMMDeviceEnumerator, String> {
+        if let Some(ref e) = self.enumerator {
+            return Ok(e.clone());
+        }
+        let created: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("Не удалось создать MMDeviceEnumerator: {e}"))?;
+        self.enumerator = Some(created.clone());
+        Ok(created)
+    }
 
-        if let Ok(dev) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-            let friendly = read_device_friendly_name(&dev);
-            state.default_device_short_name = shorten_device_name(&friendly);
-            if let Ok(vol) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                if let Ok(scalar) = vol.GetMasterVolumeLevelScalar() {
-                    state.master_volume = (scalar * 100.0).round().clamp(0.0, 100.0) as u32;
-                    state.available = true;
-                }
-                if let Ok(muted) = vol.GetMute() {
-                    state.master_muted = muted.as_bool();
+    unsafe fn resolve_friendly_name(
+        &mut self,
+        dev: &IMMDevice,
+        device_id: &str,
+        now: Instant,
+    ) -> String {
+        if let Some((ts, cached)) = self.friendly_names.get(device_id) {
+            if now.duration_since(*ts) < FRIENDLY_NAME_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+        let name = read_device_friendly_name(dev);
+        if self.friendly_names.len() >= 64 {
+            self.friendly_names
+                .retain(|_, (ts, _)| now.duration_since(*ts) < FRIENDLY_NAME_CACHE_TTL);
+        }
+        self.friendly_names
+            .insert(device_id.to_string(), (now, name.clone()));
+        name
+    }
+
+    fn resolve_pid_app_key(&mut self, pid: u32, now: Instant) -> String {
+        if let Some((ts, cached)) = self.pid_app_keys.get(&pid) {
+            if now.duration_since(*ts) < PID_APP_KEY_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+        let exe = process_exe_path(pid);
+        let key = canonical_audio_app_key(exe.as_deref(), pid);
+        if self.pid_app_keys.len() >= 128 {
+            self.pid_app_keys
+                .retain(|_, (ts, _)| now.duration_since(*ts) < PID_APP_KEY_CACHE_TTL);
+        }
+        self.pid_app_keys.insert(pid, (now, key.clone()));
+        key
+    }
+
+    unsafe fn default_endpoint_with_retry(
+        &mut self,
+        flow: EDataFlow,
+    ) -> Result<Option<IMMDevice>, String> {
+        let enumerator = self.ensure_enumerator()?;
+        match enumerator.GetDefaultAudioEndpoint(flow, eConsole) {
+            Ok(dev) => Ok(Some(dev)),
+            Err(err) if err.code().0 == HRESULT_ERROR_NOT_FOUND => Ok(None),
+            Err(_) => {
+                // Audio service may have restarted; drop cached enumerator and retry once.
+                self.reset_all_endpoints();
+                let fresh = self.ensure_enumerator()?;
+                match fresh.GetDefaultAudioEndpoint(flow, eConsole) {
+                    Ok(dev) => Ok(Some(dev)),
+                    Err(err) if err.code().0 == HRESULT_ERROR_NOT_FOUND => Ok(None),
+                    Err(err) => Err(err.to_string()),
                 }
             }
         }
+    }
 
-        if let Ok(mic) = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) {
-            if let Ok(vol) = mic.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                if let Ok(muted) = vol.GetMute() {
-                    state.mic_muted = muted.as_bool();
+    unsafe fn sync_render_endpoint(&mut self, force_rebind: bool) -> Result<bool, String> {
+        let Some(dev) = self.default_endpoint_with_retry(eRender)? else {
+            self.render = None;
+            return Ok(false);
+        };
+        let Some(device_id) = read_device_id(&dev) else {
+            self.render = None;
+            return Ok(false);
+        };
+        if !force_rebind
+            && self
+                .render
+                .as_ref()
+                .is_some_and(|r| r.device_id == device_id)
+        {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        let friendly = self.resolve_friendly_name(&dev, &device_id, now);
+        let short_name = shorten_device_name(&friendly);
+        let endpoint_vol = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+        let meter = dev.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok();
+        let session_mgr = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None).ok();
+        self.render = Some(CachedRenderEndpoint {
+            device_id,
+            short_name,
+            endpoint_vol,
+            meter,
+            session_mgr,
+        });
+        Ok(true)
+    }
+
+    unsafe fn sync_capture_endpoint(&mut self, force_rebind: bool) -> Result<bool, String> {
+        let Some(dev) = self.default_endpoint_with_retry(eCapture)? else {
+            self.capture = None;
+            return Ok(false);
+        };
+        let Some(device_id) = read_device_id(&dev) else {
+            self.capture = None;
+            return Ok(false);
+        };
+        if !force_rebind
+            && self
+                .capture
+                .as_ref()
+                .is_some_and(|c| c.device_id == device_id)
+        {
+            return Ok(true);
+        }
+        let endpoint_vol = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+        let meter = dev.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok();
+        self.capture = Some(CachedCaptureEndpoint {
+            device_id,
+            endpoint_vol,
+            meter,
+        });
+        Ok(true)
+    }
+
+    unsafe fn read_render_master(&mut self) -> (bool, u32, bool, String) {
+        for attempt in 0..2 {
+            let force = attempt > 0;
+            if !self.sync_render_endpoint(force).unwrap_or(false) {
+                return (false, 0, false, String::new());
+            }
+            let Some(ref r) = self.render else {
+                return (false, 0, false, String::new());
+            };
+            let short_name = r.short_name.clone();
+            let Some(ref vol) = r.endpoint_vol else {
+                return (false, 0, false, short_name);
+            };
+            match (vol.GetMasterVolumeLevelScalar(), vol.GetMute()) {
+                (Ok(scalar), Ok(muted)) => {
+                    let pct = (scalar * 100.0).round().clamp(0.0, 100.0) as u32;
+                    return (true, pct, muted.as_bool(), short_name);
+                }
+                _ if attempt == 0 => {
+                    self.render = None;
+                }
+                _ => {
+                    return (false, 0, false, short_name);
                 }
             }
         }
-
-        state
-    }
-}
-
-fn collect_audio_state_raw() -> Result<(AudioState, Vec<(AudioSessionInfo, Option<String>)>), String> {
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для аудиоподсистемы".to_string());
+        (false, 0, false, String::new())
     }
 
-    unsafe {
+    unsafe fn read_capture_muted(&mut self) -> bool {
+        for attempt in 0..2 {
+            let force = attempt > 0;
+            if !self.sync_capture_endpoint(force).unwrap_or(false) {
+                return false;
+            }
+            let Some(ref c) = self.capture else {
+                return false;
+            };
+            let Some(ref vol) = c.endpoint_vol else {
+                return false;
+            };
+            match vol.GetMute() {
+                Ok(muted) => return muted.as_bool(),
+                Err(_) if attempt == 0 => {
+                    self.capture = None;
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    unsafe fn enumerate_endpoints_cached(
+        &mut self,
+        enumerator: &IMMDeviceEnumerator,
+        flow: EDataFlow,
+        default_id: &str,
+        now: Instant,
+    ) -> Vec<AudioDeviceInfo> {
+        let mut devices = Vec::new();
+        if let Ok(coll) = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) {
+            let count = coll.GetCount().unwrap_or(0);
+            for i in 0..count {
+                let Ok(dev) = coll.Item(i) else {
+                    continue;
+                };
+                let Some(id) = read_device_id(&dev) else {
+                    continue;
+                };
+                let friendly = self.resolve_friendly_name(&dev, &id, now);
+                let is_default = !default_id.is_empty() && id == default_id;
+                let short_name = shorten_device_name(&friendly);
+                devices.push(AudioDeviceInfo {
+                    id,
+                    name: friendly,
+                    short_name,
+                    is_default,
+                });
+            }
+        }
+        devices
+    }
+
+    unsafe fn handle_get_master_state(&mut self) -> AudioMasterState {
+        let (available, master_volume, master_muted, default_device_short_name) =
+            self.read_render_master();
+        let mic_muted = self.read_capture_muted();
+        AudioMasterState {
+            available,
+            master_volume,
+            master_muted,
+            mic_muted,
+            default_device_short_name,
+        }
+    }
+
+    unsafe fn handle_collect_raw_state(&mut self) -> Result<RawAudioSnapshot, String> {
+        let now = Instant::now();
+        if let Some((ts, ref cached)) = self.last_raw_state {
+            if now.duration_since(ts) < AUDIO_RAW_CACHE_TTL {
+                return Ok(cached.clone());
+            }
+        }
+
         let mut state = AudioState::default();
         let mut sessions_with_exe: Vec<(AudioSessionInfo, Option<String>)> = Vec::new();
 
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("Не удалось создать MMDeviceEnumerator: {e}"))?;
+        let (available, master_volume, master_muted, _short_name) = self.read_render_master();
+        state.available = available;
+        state.master_volume = master_volume;
+        state.master_muted = master_muted;
 
-        let default_render_id = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .ok()
-            .and_then(|dev| {
-                let id_str = read_device_id(&dev)?;
+        let default_render_id = self
+            .render
+            .as_ref()
+            .map(|r| r.device_id.clone())
+            .unwrap_or_default();
 
-                if let Ok(vol) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                    if let Ok(scalar) = vol.GetMasterVolumeLevelScalar() {
-                        state.master_volume = (scalar * 100.0).round().clamp(0.0, 100.0) as u32;
-                        state.available = true;
-                    }
-                    if let Ok(muted) = vol.GetMute() {
-                        state.master_muted = muted.as_bool();
+        if !default_render_id.is_empty() {
+            if !state.master_muted {
+                if let Some(ref meter) = self.render.as_ref().and_then(|r| r.meter.clone()) {
+                    if let Ok(p) = meter.GetPeakValue() {
+                        state.master_peak = sanitize_peak(p);
                     }
                 }
-                state.master_peak = read_endpoint_peak(&dev, state.master_muted);
+            }
 
-                // Per-app audio sessions: collect raw live sessions, then filter & aggregate cleanly.
-                let mut raw_sessions = Vec::new();
-                let mut exe_memo: HashMap<u32, (bool, Option<String>)> = HashMap::new();
-                if let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) {
-                    if let Ok(sess_enum) = mgr.GetSessionEnumerator() {
-                        let count = sess_enum.GetCount().unwrap_or(0);
-                        for i in 0..count {
-                            let Ok(ctrl) = sess_enum.GetSession(i) else {
-                                continue;
-                            };
-                            let sess_state = ctrl
-                                .GetState()
-                                .map(|st| st.0)
-                                .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
-                            if sess_state == AudioSessionStateExpired.0 {
-                                continue;
-                            }
-                            let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
-                                continue;
-                            };
-                            if ctrl2.IsSystemSoundsSession() == S_OK {
-                                continue;
-                            }
-                            let pid = ctrl2.GetProcessId().unwrap_or(0);
-                            if pid == 0 {
-                                continue;
-                            }
-                            let (pid_alive, exe_path) = exe_memo
-                                .entry(pid)
-                                .or_insert_with(|| {
-                                    let alive = is_process_alive(pid);
-                                    let exe = if alive { process_exe_path(pid) } else { None };
-                                    (alive, exe)
-                                })
-                                .clone();
-                            if !pid_alive {
-                                continue;
-                            }
-                            let Ok(svol) = ctrl.cast::<ISimpleAudioVolume>() else {
-                                continue;
-                            };
-                            let v = (svol.GetMasterVolume().unwrap_or(1.0) * 100.0)
-                                .round()
-                                .clamp(0.0, 100.0) as u32;
-                            let m = svol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-                            let peak = if m || sess_state != AudioSessionStateActive.0 {
-                                0.0
-                            } else {
-                                ctrl2
-                                    .cast::<IAudioMeterInformation>()
-                                    .ok()
-                                    .and_then(|meter| meter.GetPeakValue().ok())
-                                    .map(sanitize_peak)
-                                    .unwrap_or(0.0)
-                            };
-                            let display_name = ctrl
-                                .GetDisplayName()
+            // Per-app audio sessions: collect raw live sessions, then filter & aggregate cleanly.
+            let mut raw_sessions = Vec::new();
+            let mut exe_memo: HashMap<u32, (bool, Option<String>)> = HashMap::new();
+            let mut sess_enum_opt = self
+                .render
+                .as_ref()
+                .and_then(|r| r.session_mgr.as_ref())
+                .and_then(|mgr| mgr.GetSessionEnumerator().ok());
+            if sess_enum_opt.is_none() && self.sync_render_endpoint(true).unwrap_or(false) {
+                sess_enum_opt = self
+                    .render
+                    .as_ref()
+                    .and_then(|r| r.session_mgr.as_ref())
+                    .and_then(|mgr| mgr.GetSessionEnumerator().ok());
+            }
+
+            if let Some(sess_enum) = sess_enum_opt {
+                let count = sess_enum.GetCount().unwrap_or(0);
+                for i in 0..count {
+                    let Ok(ctrl) = sess_enum.GetSession(i) else {
+                        continue;
+                    };
+                    let sess_state = ctrl
+                        .GetState()
+                        .map(|st| st.0)
+                        .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
+                    if sess_state == AudioSessionStateExpired.0 {
+                        continue;
+                    }
+                    let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+                        continue;
+                    };
+                    if ctrl2.IsSystemSoundsSession() == S_OK {
+                        continue;
+                    }
+                    let pid = ctrl2.GetProcessId().unwrap_or(0);
+                    if pid == 0 {
+                        continue;
+                    }
+                    let (pid_alive, exe_path) = exe_memo
+                        .entry(pid)
+                        .or_insert_with(|| {
+                            let alive = is_process_alive(pid);
+                            let exe = if alive { process_exe_path(pid) } else { None };
+                            (alive, exe)
+                        })
+                        .clone();
+                    if !pid_alive {
+                        continue;
+                    }
+                    let app_key = canonical_audio_app_key(exe_path.as_deref(), pid);
+                    self.pid_app_keys.insert(pid, (now, app_key));
+
+                    let Ok(svol) = ctrl.cast::<ISimpleAudioVolume>() else {
+                        continue;
+                    };
+                    let v = (svol.GetMasterVolume().unwrap_or(1.0) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u32;
+                    let m = svol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+                    let peak = if m || sess_state != AudioSessionStateActive.0 {
+                        0.0
+                    } else {
+                        ctrl2
+                            .cast::<IAudioMeterInformation>()
+                            .ok()
+                            .and_then(|meter| meter.GetPeakValue().ok())
+                            .map(sanitize_peak)
+                            .unwrap_or(0.0)
+                    };
+                    let display_name = ctrl
+                        .GetDisplayName()
+                        .ok()
+                        .and_then(|pw| CoTaskPwstr(pw).into_string_opt());
+                    raw_sessions.push(RawAudioSession {
+                        pid,
+                        exe_path,
+                        display_name,
+                        state: sess_state,
+                        pid_alive,
+                        volume: v,
+                        muted: m,
+                        peak,
+                    });
+                }
+            }
+            sessions_with_exe = aggregate_audio_sessions_with_exe(raw_sessions);
+        }
+
+        // Default capture endpoint: mute status, live peak & default input ID
+        state.mic_muted = self.read_capture_muted();
+        let default_capture_id = self
+            .capture
+            .as_ref()
+            .map(|c| c.device_id.clone())
+            .unwrap_or_default();
+        if !default_capture_id.is_empty() && !state.mic_muted {
+            if let Some(ref meter) = self.capture.as_ref().and_then(|c| c.meter.clone()) {
+                if let Ok(p) = meter.GetPeakValue() {
+                    state.mic_peak = sanitize_peak(p);
+                }
+            }
+        }
+
+        let enumerator = self.ensure_enumerator()?;
+        state.devices =
+            self.enumerate_endpoints_cached(&enumerator, eRender, &default_render_id, now);
+        state.input_devices =
+            self.enumerate_endpoints_cached(&enumerator, eCapture, &default_capture_id, now);
+
+        let result = (state, sessions_with_exe);
+        self.last_raw_state = Some((now, result.clone()));
+        self.last_peak_default_check = Some(now);
+        Ok(result)
+    }
+
+    unsafe fn handle_get_peaks(&mut self) -> Result<AudioPeaksSnapshot, String> {
+        let now = Instant::now();
+        let need_recheck = self.render.is_none()
+            || self
+                .last_peak_default_check
+                .is_none_or(|ts| now.duration_since(ts) >= PEAK_DEFAULT_RECHECK_INTERVAL);
+        if need_recheck {
+            let _ = self.sync_render_endpoint(false);
+            let _ = self.sync_capture_endpoint(false);
+            self.last_peak_default_check = Some(now);
+        }
+
+        let mut master_peak = 0.0f32;
+        let mut mic_peak = 0.0f32;
+        let mut peak_by_app: HashMap<String, f32> = HashMap::new();
+
+        for attempt in 0..2 {
+            if attempt > 0 && !self.sync_render_endpoint(true).unwrap_or(false) {
+                break;
+            }
+            let Some(ref r) = self.render else {
+                break;
+            };
+            let mut render_ok = true;
+            let master_muted = match r.endpoint_vol.as_ref() {
+                Some(vol) => match vol.GetMute() {
+                    Ok(b) => b.as_bool(),
+                    Err(_) => {
+                        render_ok = false;
+                        false
+                    }
+                },
+                None => false,
+            };
+            if render_ok && !master_muted {
+                if let Some(ref meter) = r.meter {
+                    match meter.GetPeakValue() {
+                        Ok(p) => master_peak = sanitize_peak(p),
+                        Err(_) => render_ok = false,
+                    }
+                }
+            }
+
+            let sess_enum_res = if render_ok {
+                r.session_mgr
+                    .as_ref()
+                    .map(|mgr| mgr.GetSessionEnumerator())
+            } else {
+                None
+            };
+
+            if !render_ok {
+                if attempt == 0 {
+                    self.render = None;
+                    continue;
+                }
+                break;
+            }
+
+            match sess_enum_res {
+                Some(Ok(sess_enum)) => {
+                    let count = sess_enum.GetCount().unwrap_or(0);
+                    for i in 0..count {
+                        let Ok(ctrl) = sess_enum.GetSession(i) else {
+                            continue;
+                        };
+                        let sess_state = ctrl
+                            .GetState()
+                            .map(|st| st.0)
+                            .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
+                        if sess_state != AudioSessionStateActive.0 {
+                            continue;
+                        }
+                        let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+                            continue;
+                        };
+                        if ctrl2.IsSystemSoundsSession() == S_OK {
+                            continue;
+                        }
+                        let pid = ctrl2.GetProcessId().unwrap_or(0);
+                        if pid == 0 {
+                            continue;
+                        }
+                        let muted = ctrl
+                            .cast::<ISimpleAudioVolume>()
+                            .ok()
+                            .and_then(|sv| sv.GetMute().ok())
+                            .map(|b| b.as_bool())
+                            .unwrap_or(false);
+                        let peak = if muted {
+                            0.0
+                        } else {
+                            ctrl2
+                                .cast::<IAudioMeterInformation>()
                                 .ok()
-                                .and_then(|pw| CoTaskPwstr(pw).into_string_opt());
-                            raw_sessions.push(RawAudioSession {
-                                pid,
-                                exe_path,
-                                display_name,
-                                state: sess_state,
-                                pid_alive,
-                                volume: v,
-                                muted: m,
-                                peak,
-                            });
+                                .and_then(|meter| meter.GetPeakValue().ok())
+                                .map(sanitize_peak)
+                                .unwrap_or(0.0)
+                        };
+                        let app_key = self.resolve_pid_app_key(pid, now);
+                        let slot = peak_by_app.entry(app_key).or_insert(0.0);
+                        if peak > *slot {
+                            *slot = peak;
+                        }
+                    }
+                    break;
+                }
+                Some(Err(_)) if attempt == 0 => {
+                    self.render = None;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        for attempt in 0..2 {
+            if attempt > 0 && !self.sync_capture_endpoint(true).unwrap_or(false) {
+                break;
+            }
+            let Some(ref c) = self.capture else {
+                break;
+            };
+            let mut capture_ok = true;
+            let mic_muted = match c.endpoint_vol.as_ref() {
+                Some(vol) => match vol.GetMute() {
+                    Ok(b) => b.as_bool(),
+                    Err(_) => {
+                        capture_ok = false;
+                        false
+                    }
+                },
+                None => false,
+            };
+            if capture_ok && !mic_muted {
+                if let Some(ref meter) = c.meter {
+                    match meter.GetPeakValue() {
+                        Ok(p) => mic_peak = sanitize_peak(p),
+                        Err(_) => capture_ok = false,
+                    }
+                }
+            }
+            if capture_ok {
+                break;
+            }
+            self.capture = None;
+        }
+
+        let mut session_peaks: Vec<(String, f32)> = peak_by_app.into_iter().collect();
+        session_peaks.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(AudioPeaksSnapshot {
+            master_peak,
+            mic_peak,
+            session_peaks,
+        })
+    }
+
+    unsafe fn handle_set_master_volume(
+        &mut self,
+        volume_pct: u32,
+        muted: Option<bool>,
+    ) -> Result<(), String> {
+        self.last_raw_state = None;
+        let scalar = (volume_pct.min(100) as f32) / 100.0;
+        for attempt in 0..2 {
+            if !self.sync_render_endpoint(attempt > 0)? {
+                return Err("Нет активного аудиоустройства вывода".to_string());
+            }
+            let vol = self
+                .render
+                .as_ref()
+                .and_then(|r| r.endpoint_vol.as_ref())
+                .ok_or_else(|| "IAudioEndpointVolume недоступен".to_string())?;
+            let res = vol
+                .SetMasterVolumeLevelScalar(scalar, std::ptr::null())
+                .and_then(|()| {
+                    if let Some(m) = muted {
+                        vol.SetMute(m, std::ptr::null())
+                    } else {
+                        Ok(())
+                    }
+                });
+            match res {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt == 0 => {
+                    self.render = None;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("Не удалось изменить общую громкость".to_string())
+    }
+
+    unsafe fn handle_set_mic_muted(&mut self, muted: bool) -> Result<(), String> {
+        self.last_raw_state = None;
+        for attempt in 0..2 {
+            if !self.sync_capture_endpoint(attempt > 0)? {
+                return Err("Нет активного микрофона".to_string());
+            }
+            let vol = self
+                .capture
+                .as_ref()
+                .and_then(|c| c.endpoint_vol.as_ref())
+                .ok_or_else(|| "IAudioEndpointVolume микрофона недоступен".to_string())?;
+            match vol.SetMute(muted, std::ptr::null()) {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt == 0 => {
+                    self.capture = None;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("Не удалось переключить микрофон".to_string())
+    }
+
+    unsafe fn handle_apply_session_state(
+        &mut self,
+        target_pids: HashSet<u32>,
+        target_key: Option<String>,
+        volume_scalar: Option<f32>,
+        muted: Option<bool>,
+    ) -> Result<(), String> {
+        self.last_raw_state = None;
+        let now = Instant::now();
+
+        let sess_enum = {
+            let mut found = None;
+            let mut last_err = String::new();
+            for attempt in 0..2 {
+                if !self.sync_render_endpoint(attempt > 0)? {
+                    return Err("Нет активного аудиоустройства вывода".to_string());
+                }
+                match self
+                    .render
+                    .as_ref()
+                    .and_then(|r| r.session_mgr.as_ref())
+                    .map(|mgr| mgr.GetSessionEnumerator())
+                {
+                    Some(Ok(e)) => {
+                        found = Some(e);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        last_err = e.to_string();
+                        self.render = None;
+                    }
+                    None => {
+                        last_err = "IAudioSessionManager2 недоступен".to_string();
+                        self.render = None;
+                    }
+                }
+            }
+            found.ok_or(last_err)?
+        };
+
+        let count = sess_enum.GetCount().unwrap_or(0);
+        let mut first_err: Option<String> = None;
+
+        for i in 0..count {
+            let Ok(ctrl) = sess_enum.GetSession(i) else {
+                continue;
+            };
+            let sess_state = ctrl
+                .GetState()
+                .map(|st| st.0)
+                .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
+            if sess_state == AudioSessionStateExpired.0 {
+                continue;
+            }
+            let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            let sess_pid = ctrl2.GetProcessId().unwrap_or(0);
+            if sess_pid == 0 {
+                continue;
+            }
+
+            let mut matched = target_pids.contains(&sess_pid);
+            if !matched {
+                if let Some(ref want_key) = target_key {
+                    let sess_key = self.resolve_pid_app_key(sess_pid, now);
+                    matched = &sess_key == want_key;
+                }
+            }
+
+            if matched {
+                if let Ok(svol) = ctrl.cast::<ISimpleAudioVolume>() {
+                    let res = apply_session_mutation(
+                        volume_scalar,
+                        muted,
+                        |scalar| {
+                            svol.SetMasterVolume(scalar, std::ptr::null())
+                                .map_err(|err| format!("Не удалось изменить громкость приложения: {err}"))
+                        },
+                        |m| {
+                            svol.SetMute(m, std::ptr::null())
+                                .map_err(|err| format!("Не удалось переключить звук приложения: {err}"))
+                        },
+                    );
+                    if let Err(err) = res {
+                        if first_err.is_none() {
+                            first_err = Some(err);
                         }
                     }
                 }
-                sessions_with_exe = aggregate_audio_sessions_with_exe(raw_sessions);
+            }
+        }
 
-                Some(id_str)
-            })
-            .unwrap_or_default();
-
-        // Default capture endpoint: mute status, live peak & default input ID
-        let default_capture_id = enumerator
-            .GetDefaultAudioEndpoint(eCapture, eConsole)
-            .ok()
-            .and_then(|mic| {
-                let id_str = read_device_id(&mic);
-                if let Ok(vol) = mic.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                    if let Ok(muted) = vol.GetMute() {
-                        state.mic_muted = muted.as_bool();
-                    }
-                }
-                state.mic_peak = read_endpoint_peak(&mic, state.mic_muted);
-                id_str
-            })
-            .unwrap_or_default();
-
-        // Enumerate active render & capture devices
-        state.devices = enumerate_audio_endpoints(&enumerator, eRender, &default_render_id);
-        state.input_devices =
-            enumerate_audio_endpoints(&enumerator, eCapture, &default_capture_id);
-
-        Ok((state, sessions_with_exe))
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(())
     }
+
+    unsafe fn handle_set_default_endpoint(
+        &mut self,
+        device_id: &str,
+        direction_label: &str,
+    ) -> Result<(), String> {
+        self.last_raw_state = None;
+        self.render = None;
+        self.capture = None;
+        self.last_peak_default_check = None;
+        self.friendly_names.clear();
+
+        let policy: IPolicyConfig = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
+            .map_err(|e| format!("Не удалось открыть IPolicyConfig: {e}"))?;
+        let w = wide(device_id);
+        apply_default_endpoint_all_roles_labeled(device_id, direction_label, |role| {
+            policy.set_default_endpoint(PCWSTR(w.as_ptr()), role)
+        })
+    }
+}
+
+fn audio_worker_main(rx: mpsc::Receiver<AudioCommand>) {
+    // CRITICAL COM DROP ORDER: `_com` MUST be declared BEFORE `state` so that all cached COM
+    // interfaces inside `state` drop cleanly BEFORE `AudioComGuard::drop` calls `CoUninitialize()`.
+    let _com = AudioComGuard::init_mta();
+    let com_ok = _com.is_usable();
+    let mut state = AudioWorkerState::new();
+
+    while let Ok(cmd) = rx.recv() {
+        if !com_ok {
+            match cmd {
+                AudioCommand::GetMasterState { reply } => {
+                    let _ = reply.send(AudioMasterState::default());
+                }
+                AudioCommand::CollectRawState { reply } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для аудиоподсистемы".to_string(),
+                    ));
+                }
+                AudioCommand::GetPeaks { reply } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для индикаторов громкости".to_string(),
+                    ));
+                }
+                AudioCommand::SetMasterVolume { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для аудиоподсистемы".to_string(),
+                    ));
+                }
+                AudioCommand::SetMicMuted { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для микрофона".to_string(),
+                    ));
+                }
+                AudioCommand::ApplySessionState { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для микшера".to_string(),
+                    ));
+                }
+                AudioCommand::SetDefaultEndpoint { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "Не удалось инициализировать COM для переключения аудио".to_string(),
+                    ));
+                }
+            }
+            continue;
+        }
+
+        unsafe {
+            match cmd {
+                AudioCommand::GetMasterState { reply } => {
+                    let _ = reply.send(state.handle_get_master_state());
+                }
+                AudioCommand::CollectRawState { reply } => {
+                    let _ = reply.send(state.handle_collect_raw_state());
+                }
+                AudioCommand::GetPeaks { reply } => {
+                    let _ = reply.send(state.handle_get_peaks());
+                }
+                AudioCommand::SetMasterVolume {
+                    volume_pct,
+                    muted,
+                    reply,
+                } => {
+                    let _ = reply.send(state.handle_set_master_volume(volume_pct, muted));
+                }
+                AudioCommand::SetMicMuted { muted, reply } => {
+                    let _ = reply.send(state.handle_set_mic_muted(muted));
+                }
+                AudioCommand::ApplySessionState {
+                    target_pids,
+                    target_key,
+                    volume_scalar,
+                    muted,
+                    reply,
+                } => {
+                    let _ = reply.send(state.handle_apply_session_state(
+                        target_pids,
+                        target_key,
+                        volume_scalar,
+                        muted,
+                    ));
+                }
+                AudioCommand::SetDefaultEndpoint {
+                    device_id,
+                    direction_label,
+                    reply,
+                } => {
+                    let _ =
+                        reply.send(state.handle_set_default_endpoint(&device_id, direction_label));
+                }
+            }
+        }
+    }
+}
+
+/// Lightweight WASAPI master-only query (zero per-app session enumeration, zero device list scan,
+/// zero per-call COM/Activate churn) routed through the persistent MTA audio worker (AD-5/AD-6).
+pub fn get_audio_master_state() -> AudioMasterState {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if audio_worker()
+        .tx
+        .try_send(AudioCommand::GetMasterState { reply: reply_tx })
+        .is_err()
+    {
+        return AudioMasterState::default();
+    }
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .unwrap_or_default()
+}
+
+fn collect_audio_state_raw() -> Result<RawAudioSnapshot, String> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::CollectRawState { reply: reply_tx })
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания аудиоподсистемы".to_string())?
 }
 
 pub fn get_audio_state() -> AudioState {
@@ -852,150 +1610,45 @@ pub fn get_audio_state_with_icons(
 
 /// Ultra-lightweight live hardware peak meter query (`IAudioMeterInformation::GetPeakValue()`).
 /// Intended to be polled ONLY while the Sound flyout or Start Audio card is open (0% idle cost).
+/// Executes on the persistent MTA audio worker reusing cached endpoints (ZERO per-call COM/Activate churn).
 pub fn get_audio_peaks() -> Result<AudioPeaksSnapshot, String> {
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для индикаторов громкости".to_string());
-    }
-
-    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("Не удалось создать MMDeviceEnumerator: {e}"))?;
-
-        let mut master_peak = 0.0f32;
-        let mut mic_peak = 0.0f32;
-        let mut peak_by_app: HashMap<String, f32> = HashMap::new();
-
-        if let Ok(dev) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-            let master_muted = dev
-                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-                .ok()
-                .and_then(|v| v.GetMute().ok())
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
-            master_peak = read_endpoint_peak(&dev, master_muted);
-
-            let mut key_memo: HashMap<u32, String> = HashMap::new();
-            if let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) {
-                if let Ok(sess_enum) = mgr.GetSessionEnumerator() {
-                    let count = sess_enum.GetCount().unwrap_or(0);
-                    for i in 0..count {
-                        let Ok(ctrl) = sess_enum.GetSession(i) else {
-                            continue;
-                        };
-                        let sess_state = ctrl
-                            .GetState()
-                            .map(|st| st.0)
-                            .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
-                        if sess_state != AudioSessionStateActive.0 {
-                            continue;
-                        }
-                        let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
-                            continue;
-                        };
-                        if ctrl2.IsSystemSoundsSession() == S_OK {
-                            continue;
-                        }
-                        let pid = ctrl2.GetProcessId().unwrap_or(0);
-                        if pid == 0 {
-                            continue;
-                        }
-                        let muted = ctrl
-                            .cast::<ISimpleAudioVolume>()
-                            .ok()
-                            .and_then(|sv| sv.GetMute().ok())
-                            .map(|b| b.as_bool())
-                            .unwrap_or(false);
-                        let peak = if muted {
-                            0.0
-                        } else {
-                            ctrl2
-                                .cast::<IAudioMeterInformation>()
-                                .ok()
-                                .and_then(|meter| meter.GetPeakValue().ok())
-                                .map(sanitize_peak)
-                                .unwrap_or(0.0)
-                        };
-                        let app_key = key_memo
-                            .entry(pid)
-                            .or_insert_with(|| {
-                                let exe = process_exe_path(pid);
-                                canonical_audio_app_key(exe.as_deref(), pid)
-                            })
-                            .clone();
-                        let slot = peak_by_app.entry(app_key).or_insert(0.0);
-                        if peak > *slot {
-                            *slot = peak;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Ok(mic) = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) {
-            let mic_muted = mic
-                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-                .ok()
-                .and_then(|v| v.GetMute().ok())
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
-            mic_peak = read_endpoint_peak(&mic, mic_muted);
-        }
-
-        let mut session_peaks: Vec<(String, f32)> = peak_by_app.into_iter().collect();
-        session_peaks.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(AudioPeaksSnapshot {
-            master_peak,
-            mic_peak,
-            session_peaks,
-        })
-    }
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::GetPeaks { reply: reply_tx })
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания индикаторов громкости".to_string())?
 }
 
 pub fn set_master_volume(volume_pct: u32, muted: Option<bool>) -> Result<(), String> {
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для аудиоподсистемы".to_string());
-    }
-    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-        let dev = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|e| e.to_string())?;
-        let vol = dev
-            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            .map_err(|e| e.to_string())?;
-        let scalar = (volume_pct.min(100) as f32) / 100.0;
-        vol.SetMasterVolumeLevelScalar(scalar, std::ptr::null())
-            .map_err(|e| e.to_string())?;
-        if let Some(m) = muted {
-            vol.SetMute(m, std::ptr::null()).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::SetMasterVolume {
+            volume_pct,
+            muted,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания изменения громкости".to_string())?
 }
 
 pub fn set_mic_muted(muted: bool) -> Result<(), String> {
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для микрофона".to_string());
-    }
-    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-        let dev = enumerator
-            .GetDefaultAudioEndpoint(eCapture, eConsole)
-            .map_err(|e| e.to_string())?;
-        let vol = dev
-            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            .map_err(|e| e.to_string())?;
-        vol.SetMute(muted, std::ptr::null())
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::SetMicMuted {
+            muted,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания переключения микрофона".to_string())?
 }
 
 /// Pure, testable session mutation applier:
@@ -1051,11 +1704,6 @@ fn apply_session_state_internal(
         }
     }
 
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для микшера".to_string());
-    }
-
     let mut target_pids = HashSet::new();
     if pid != 0 {
         target_pids.insert(pid);
@@ -1087,78 +1735,20 @@ fn apply_session_state_internal(
         return Err("Не указано приложение для изменения звука".to_string());
     }
 
-    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-        let dev = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|e| e.to_string())?;
-        let mgr = dev
-            .Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
-            .map_err(|e| e.to_string())?;
-        let sess_enum = mgr.GetSessionEnumerator().map_err(|e| e.to_string())?;
-        let count = sess_enum.GetCount().unwrap_or(0);
-        let mut exe_key_memo: HashMap<u32, String> = HashMap::new();
-        let mut first_err: Option<String> = None;
-
-        for i in 0..count {
-            let Ok(ctrl) = sess_enum.GetSession(i) else {
-                continue;
-            };
-            let sess_state = ctrl
-                .GetState()
-                .map(|st| st.0)
-                .unwrap_or(AUDIO_SESSION_STATE_EXPIRED);
-            if sess_state == AudioSessionStateExpired.0 {
-                continue;
-            }
-            let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
-                continue;
-            };
-            let sess_pid = ctrl2.GetProcessId().unwrap_or(0);
-            if sess_pid == 0 {
-                continue;
-            }
-
-            let mut matched = target_pids.contains(&sess_pid);
-            if !matched {
-                if let Some(ref want_key) = target_key {
-                    let sess_key = exe_key_memo.entry(sess_pid).or_insert_with(|| {
-                        let exe = process_exe_path(sess_pid);
-                        canonical_audio_app_key(exe.as_deref(), sess_pid)
-                    });
-                    matched = sess_key == want_key;
-                }
-            }
-
-            if matched {
-                if let Ok(svol) = ctrl.cast::<ISimpleAudioVolume>() {
-                    let res = apply_session_mutation(
-                        volume_scalar,
-                        muted,
-                        |scalar| {
-                            svol.SetMasterVolume(scalar, std::ptr::null())
-                                .map_err(|err| format!("Не удалось изменить громкость приложения: {err}"))
-                        },
-                        |m| {
-                            svol.SetMute(m, std::ptr::null())
-                                .map_err(|err| format!("Не удалось переключить звук приложения: {err}"))
-                        },
-                    );
-                    if let Err(err) = res {
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(err) = first_err {
-            return Err(err);
-        }
-        Ok(())
-    }
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::ApplySessionState {
+            target_pids,
+            target_key,
+            volume_scalar,
+            muted,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания микшера".to_string())?
 }
 
 /// Adjusts volume (`0.0..=1.0`) and/or mute for ALL live non-expired WASAPI sessions matching
@@ -1253,23 +1843,26 @@ where
     apply_default_endpoint_all_roles_labeled(device_id, "вывода", set_role)
 }
 
-fn set_default_endpoint_via_policy(device_id: &str, direction_label: &str) -> Result<(), String> {
+fn set_default_endpoint_via_policy(
+    device_id: &str,
+    direction_label: &'static str,
+) -> Result<(), String> {
     let trimmed = device_id.trim();
     if trimmed.is_empty() {
         return Err("Не указано аудиоустройство".to_string());
     }
-    let com = AudioComGuard::init_mta();
-    if !com.is_usable() {
-        return Err("Не удалось инициализировать COM для переключения аудио".to_string());
-    }
-    unsafe {
-        let policy: IPolicyConfig = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
-            .map_err(|e| format!("Не удалось открыть IPolicyConfig: {e}"))?;
-        let w = wide(trimmed);
-        apply_default_endpoint_all_roles_labeled(trimmed, direction_label, |role| {
-            policy.set_default_endpoint(PCWSTR(w.as_ptr()), role)
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    audio_worker()
+        .tx
+        .try_send(AudioCommand::SetDefaultEndpoint {
+            device_id: trimmed.to_string(),
+            direction_label,
+            reply: reply_tx,
         })
-    }
+        .map_err(|_| "Аудиоворкер перегружен".to_string())?;
+    reply_rx
+        .recv_timeout(AUDIO_WORKER_TIMEOUT)
+        .map_err(|_| "Превышено время ожидания переключения аудио".to_string())?
 }
 
 pub fn set_default_audio_device(device_id: &str) -> Result<(), String> {
@@ -1431,7 +2024,7 @@ mod tests {
         let sessions = aggregate_audio_sessions(raw);
         assert_eq!(sessions.len(), 3);
 
-        // Active sessions come first, sorted alphabetically: Chrome, Telegram, then inactive Discord
+        // Deterministic alphabetical order regardless of `is_active`: Chrome, Discord, Telegram
         assert_eq!(sessions[0].name, "Chrome");
         assert_eq!(sessions[0].id, "chrome.exe");
         assert_eq!(sessions[0].pid, 2020);
@@ -1441,18 +2034,66 @@ mod tests {
         assert!(sessions[0].is_active);
         assert!((sessions[0].peak - 0.42).abs() < 1e-6); // muted active tab peak ignored
 
-        assert_eq!(sessions[1].name, "Telegram");
-        assert_eq!(sessions[1].volume, 100);
-        assert!(sessions[1].is_active);
-        assert_eq!(sessions[1].peak, 1.0);
+        assert_eq!(sessions[1].name, "Discord");
+        assert_eq!(sessions[1].id, "discord.exe");
+        assert_eq!(sessions[1].pids, vec![3010, 3020]);
+        assert_eq!(sessions[1].volume, 80);
+        assert!(sessions[1].muted);
+        assert!(!sessions[1].is_active);
+        assert_eq!(sessions[1].peak, 0.0);
 
-        assert_eq!(sessions[2].name, "Discord");
-        assert_eq!(sessions[2].id, "discord.exe");
-        assert_eq!(sessions[2].pids, vec![3010, 3020]);
-        assert_eq!(sessions[2].volume, 80);
-        assert!(sessions[2].muted);
-        assert!(!sessions[2].is_active);
-        assert_eq!(sessions[2].peak, 0.0);
+        assert_eq!(sessions[2].name, "Telegram");
+        assert_eq!(sessions[2].volume, 100);
+        assert!(sessions[2].is_active);
+        assert_eq!(sessions[2].peak, 1.0);
+    }
+
+    #[test]
+    fn audio_state_structurally_eq_ignores_volatile_peaks_and_is_active() {
+        let base_session = AudioSessionInfo {
+            id: "chrome.exe".into(),
+            pid: 100,
+            pids: vec![100, 101],
+            name: "Chrome".into(),
+            volume: 70,
+            muted: false,
+            is_active: true,
+            peak: 0.12,
+            icon_key: Some("exe:chrome".into()),
+        };
+        let a = AudioState {
+            available: true,
+            master_volume: 60,
+            master_muted: false,
+            mic_muted: false,
+            master_peak: 0.10,
+            mic_peak: 0.02,
+            devices: vec![],
+            input_devices: vec![],
+            sessions: vec![base_session.clone()],
+        };
+        let mut volatile_only = a.clone();
+        volatile_only.master_peak = 0.88;
+        volatile_only.mic_peak = 0.45;
+        volatile_only.sessions[0].peak = 0.91;
+        volatile_only.sessions[0].is_active = false;
+        volatile_only.sessions[0].pid = 101;
+        assert!(
+            a.structurally_eq(&volatile_only),
+            "peaks, transient is_active toggles, and active-tab pid flips must not trigger structural mixer diffs"
+        );
+
+        let mut vol_changed = volatile_only.clone();
+        vol_changed.sessions[0].volume = 72;
+        assert!(!a.structurally_eq(&vol_changed));
+
+        let mut mute_changed = volatile_only.clone();
+        mute_changed.master_muted = true;
+        assert!(!a.structurally_eq(&mute_changed));
+
+        let mut list_changed = volatile_only.clone();
+        list_changed.sessions.clear();
+        assert!(!a.structurally_eq(&list_changed));
     }
 
     #[test]
@@ -1815,5 +2456,32 @@ mod tests {
         );
         assert_eq!(extract_calls_2, 0);
         assert_eq!(sessions_2[0].icon_key, sessions[0].icon_key);
+    }
+
+    #[test]
+    fn persistent_mta_worker_handles_rapid_burst_queries_cleanly() {
+        // First query warms the persistent MTA worker + cached endpoints.
+        let master1 = get_audio_master_state();
+        assert!(master1.master_volume <= 100);
+
+        // Rapid consecutive burst simulating 15Hz VU meter + 1.6s idle poll + rapid Win taps.
+        let t0 = Instant::now();
+        for _ in 0..15 {
+            let m = get_audio_master_state();
+            assert!(m.master_volume <= 100);
+            let peaks = get_audio_peaks().expect("cached MTA worker peak query must succeed");
+            assert!((0.0..=1.0).contains(&peaks.master_peak));
+            assert!((0.0..=1.0).contains(&peaks.mic_peak));
+        }
+        // Coalesced raw state burst: 2nd call hits 300ms cache.
+        let st1 = get_audio_state();
+        let st2 = get_audio_state();
+        assert_eq!(st1.available, st2.available);
+        assert_eq!(st1.master_volume, st2.master_volume);
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "15 consecutive persistent MTA audio queries took unexpectedly long: {:?}",
+            t0.elapsed()
+        );
     }
 }

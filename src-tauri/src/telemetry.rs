@@ -30,6 +30,7 @@ const NVML_ERROR_RESET_REQUIRED: i32 = 18;
 const NVML_VALUE_NOT_AVAILABLE_U64: u64 = u64::MAX;
 const NVML_TDR_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 const DISK_CACHE_TTL: Duration = Duration::from_secs(30);
+const TELEMETRY_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_PROCESS_LIMIT: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -257,8 +258,24 @@ struct CachedDiskHeadroom {
     refreshed_at: Instant,
 }
 
+#[derive(Clone)]
+struct CachedRawTelemetry {
+    refreshed_at: Instant,
+    cpu_name: String,
+    cpu_pct: u32,
+    ram_used_bytes: u64,
+    ram_total_bytes: u64,
+    samples: Vec<RawProcessSample>,
+    gpu: Option<GpuTelemetrySnapshot>,
+}
+
+struct TelemetrySamplerState {
+    sys: System,
+    cached: Option<CachedRawTelemetry>,
+}
+
 static NVML_STATE: OnceLock<Mutex<NvmlHolder>> = OnceLock::new();
-static SYS_STATE: OnceLock<Mutex<System>> = OnceLock::new();
+static SYS_STATE: OnceLock<Mutex<TelemetrySamplerState>> = OnceLock::new();
 static DISK_CACHE: OnceLock<Mutex<Option<CachedDiskHeadroom>>> = OnceLock::new();
 
 fn round_gb_1(bytes: u64) -> f32 {
@@ -386,6 +403,9 @@ pub fn merge_nvml_process_lists(
 
 fn is_excluded_telemetry_process(raw_name: &str) -> bool {
     let low = raw_name.trim().to_ascii_lowercase();
+    if low.starts_with("testbar") && low.ends_with(".exe") {
+        return true;
+    }
     matches!(
         low.as_str(),
         ""
@@ -396,7 +416,6 @@ fn is_excluded_telemetry_process(raw_name: &str) -> bool {
             | "idle"
             | "svchost.exe"
             | "dwm.exe"
-            | "testbar.exe"
     )
 }
 
@@ -1038,21 +1057,52 @@ fn lean_process_refresh_kind() -> ProcessRefreshKind {
         .with_exe(UpdateKind::OnlyIfNotSet)
 }
 
-fn collect_cpu_ram_and_processes() -> (String, u32, u64, u64, Vec<RawProcessSample>) {
-    let sys_mutex = SYS_STATE.get_or_init(|| {
+fn lean_cpu_refresh_kind() -> CpuRefreshKind {
+    CpuRefreshKind::nothing().with_cpu_usage()
+}
+
+fn lean_memory_refresh_kind() -> MemoryRefreshKind {
+    MemoryRefreshKind::nothing().with_ram()
+}
+
+/// Invalidates the 2-second raw telemetry cooldown cache (e.g. immediately after terminating
+/// a process group so the next sample reflects the exited process right away).
+pub fn invalidate_telemetry_cache() {
+    if let Some(lock) = SYS_STATE.get() {
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.cached = None;
+    }
+}
+
+fn collect_raw_telemetry_cached() -> CachedRawTelemetry {
+    let state_mutex = SYS_STATE.get_or_init(|| {
         let specifics = RefreshKind::nothing()
-            .with_cpu(CpuRefreshKind::everything())
-            .with_memory(MemoryRefreshKind::everything())
+            .with_cpu(lean_cpu_refresh_kind())
+            .with_memory(lean_memory_refresh_kind())
             .with_processes(lean_process_refresh_kind());
-        Mutex::new(System::new_with_specifics(specifics))
+        Mutex::new(TelemetrySamplerState {
+            sys: System::new_with_specifics(specifics),
+            cached: None,
+        })
     });
 
-    let mut sys = sys_mutex.lock().unwrap_or_else(|e| e.into_inner());
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, lean_process_refresh_kind());
+    // Coalesce concurrent/rapid callers (e.g. repeated Win taps + slow poller) behind a 2s
+    // cooldown so sysinfo never storms 300x OpenProcess + NVML kernel calls back-to-back.
+    let mut state = state_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref cached) = state.cached {
+        if cached.refreshed_at.elapsed() < TELEMETRY_SAMPLE_MIN_INTERVAL {
+            return cached.clone();
+        }
+    }
 
-    let cpu_name = sys
+    state.sys.refresh_cpu_specifics(lean_cpu_refresh_kind());
+    state.sys.refresh_memory_specifics(lean_memory_refresh_kind());
+    state
+        .sys
+        .refresh_processes_specifics(ProcessesToUpdate::All, true, lean_process_refresh_kind());
+
+    let cpu_name = state
+        .sys
         .cpus()
         .first()
         .map(|c| {
@@ -1069,12 +1119,13 @@ fn collect_cpu_ram_and_processes() -> (String, u32, u64, u64, Vec<RawProcessSamp
         })
         .unwrap_or_else(|| "CPU".to_string());
 
-    let cpu_pct = sys.global_cpu_usage().round().clamp(0.0, 100.0) as u32;
-    let total_ram_bytes = sys.total_memory().max(1);
-    let used_ram_bytes = sys.used_memory();
-    let cpu_count = sys.cpus().len().max(1) as f32;
+    let cpu_pct = state.sys.global_cpu_usage().round().clamp(0.0, 100.0) as u32;
+    let ram_total_bytes = state.sys.total_memory().max(1);
+    let ram_used_bytes = state.sys.used_memory();
+    let cpu_count = state.sys.cpus().len().max(1) as f32;
 
-    let samples: Vec<RawProcessSample> = sys
+    let samples: Vec<RawProcessSample> = state
+        .sys
         .processes()
         .iter()
         .map(|(pid, proc_)| RawProcessSample {
@@ -1086,7 +1137,19 @@ fn collect_cpu_ram_and_processes() -> (String, u32, u64, u64, Vec<RawProcessSamp
         })
         .collect();
 
-    (cpu_name, cpu_pct, used_ram_bytes, total_ram_bytes, samples)
+    let gpu = query_gpu();
+
+    let fresh = CachedRawTelemetry {
+        refreshed_at: Instant::now(),
+        cpu_name,
+        cpu_pct,
+        ram_used_bytes,
+        ram_total_bytes,
+        samples,
+        gpu,
+    };
+    state.cached = Some(fresh.clone());
+    fresh
 }
 
 fn extract_shell_icon_png(exe_path: &str) -> Option<String> {
@@ -1177,18 +1240,16 @@ pub fn sample_telemetry_with_icons_mutex(
     cache: &Mutex<IconCache>,
     pid_to_hwnd: &HashMap<u32, isize>,
 ) -> (TelemetrySnapshot, Vec<(String, String)>) {
-    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
-        collect_cpu_ram_and_processes();
-    let gpu = query_gpu();
+    let raw = collect_raw_telemetry_cached();
     let disks = get_disks_headroom_cached();
 
     build_telemetry_snapshot_with_icons(
-        cpu_name,
-        cpu_pct,
-        ram_used_bytes,
-        ram_total_bytes,
-        gpu,
-        &samples,
+        raw.cpu_name,
+        raw.cpu_pct,
+        raw.ram_used_bytes,
+        raw.ram_total_bytes,
+        raw.gpu,
+        &raw.samples,
         disks,
         pid_to_hwnd,
         |exe| resolve_exe_icon_key_into_cache_mutex(exe, cache),
@@ -1201,18 +1262,16 @@ pub fn sample_telemetry_with_icons(
     cache: &mut IconCache,
     pid_to_hwnd: &HashMap<u32, isize>,
 ) -> (TelemetrySnapshot, Vec<(String, String)>) {
-    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
-        collect_cpu_ram_and_processes();
-    let gpu = query_gpu();
+    let raw = collect_raw_telemetry_cached();
     let disks = get_disks_headroom_cached();
 
     build_telemetry_snapshot_with_icons(
-        cpu_name,
-        cpu_pct,
-        ram_used_bytes,
-        ram_total_bytes,
-        gpu,
-        &samples,
+        raw.cpu_name,
+        raw.cpu_pct,
+        raw.ram_used_bytes,
+        raw.ram_total_bytes,
+        raw.gpu,
+        &raw.samples,
         disks,
         pid_to_hwnd,
         |exe| resolve_exe_icon_key_into_cache(exe, cache),
@@ -1223,16 +1282,14 @@ fn collect_telemetry_with_icon_resolver<FIcon>(resolve_icon: FIcon) -> Telemetry
 where
     FIcon: FnMut(&str) -> Option<String>,
 {
-    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
-        collect_cpu_ram_and_processes();
-    let gpu = query_gpu();
+    let raw = collect_raw_telemetry_cached();
     let mut state = build_telemetry_state(
-        cpu_name,
-        cpu_pct,
-        ram_used_bytes,
-        ram_total_bytes,
-        gpu,
-        &samples,
+        raw.cpu_name,
+        raw.cpu_pct,
+        raw.ram_used_bytes,
+        raw.ram_total_bytes,
+        raw.gpu,
+        &raw.samples,
         resolve_icon,
     );
     state.disks = get_disks_headroom_cached();
@@ -1254,7 +1311,11 @@ pub fn sample_telemetry() -> TelemetrySnapshot {
 
 /// Terminates ALL PIDs belonging to a multi-process app group and propagates OS permission errors.
 pub fn kill_process_group(pids: &[u32]) -> Result<(), String> {
-    terminate_process_pids(pids)
+    let res = terminate_process_pids(pids);
+    if res.is_ok() {
+        invalidate_telemetry_cache();
+    }
+    res
 }
 
 #[cfg(test)]
@@ -1513,5 +1574,28 @@ mod tests {
 
         // Deduplicated across top_processes and gpu_processes: exactly 2 unique icon_sources
         assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_excludes_testbar_variants_and_coalesces_burst_samples() {
+        assert!(is_excluded_telemetry_process("testbar.exe"));
+        assert!(is_excluded_telemetry_process("TestBar-v2.exe"));
+        assert!(is_excluded_telemetry_process("testbar_dev.exe"));
+        assert!(!is_excluded_telemetry_process("chrome.exe"));
+
+        invalidate_telemetry_cache();
+        let cache = Mutex::new(IconCache::new(64));
+        let (first, _) = sample_telemetry_with_icons_mutex(&cache, &HashMap::new());
+        let t0 = Instant::now();
+        let (second, _) = sample_telemetry_with_icons_mutex(&cache, &HashMap::new());
+        let elapsed = t0.elapsed();
+        assert_eq!(first.cpu_pct, second.cpu_pct);
+        assert_eq!(first.ram_pct, second.ram_pct);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "2nd telemetry sample inside 2s cooldown should hit cache immediately, took {:?}",
+            elapsed
+        );
+        invalidate_telemetry_cache();
     }
 }

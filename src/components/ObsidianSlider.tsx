@@ -17,6 +17,10 @@ export interface ObsidianSliderProps {
   showCenterNotch?: boolean;
   onChange: (value: number) => void;
   onCommit?: (value: number) => void;
+  /** Optional drag lifecycle callback so callers can suppress incoming IPC echo updates mid-drag. */
+  onDragStateChange?: (dragging: boolean) => void;
+  /** Disable fill/thumb CSS transitions (used during initial surface open/hydration to prevent flying thumbs). */
+  noTransition?: boolean;
   disabled?: boolean;
   ariaLabel: string;
   className?: string;
@@ -51,6 +55,8 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
   showCenterNotch = true,
   onChange,
   onCommit,
+  onDragStateChange,
+  noTransition = false,
   disabled = false,
   ariaLabel,
   className = '',
@@ -166,6 +172,7 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
     dragRectRef.current = rect;
     activePointerIdRef.current = e.pointerId;
     setDragging(true);
+    onDragStateChange?.(true);
 
     const { next, snappedDetent } = resolveFromClientX(e.clientX, rect, true);
     setDetentHit(snappedDetent);
@@ -204,6 +211,7 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
     dragRectRef.current = null;
     setDragging(false);
     setDetentHit(false);
+    onDragStateChange?.(false);
     onCommit?.(lastEmittedRef.current);
   };
 
@@ -260,6 +268,7 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
       aria-valuenow={clampedValue}
       aria-disabled={disabled || undefined}
       data-dragging={dragging ? 'true' : 'false'}
+      data-no-transition={noTransition ? 'true' : 'false'}
       data-muted={muted ? 'true' : 'false'}
       data-detent={detentHit ? 'true' : 'false'}
       data-disabled={disabled ? 'true' : 'false'}

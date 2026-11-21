@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 export interface PinItem {
   id: string;
@@ -35,6 +36,7 @@ export interface CustomSpace {
 
 export type SecondaryTaskbarMode = 'testbar' | 'native' | 'hidden';
 export type GlassDepth = 'crystal' | 'obsidian' | 'matte';
+export type BackdropMode = 'dcomp' | 'swca' | 'none';
 export type SnapZone = 'left' | 'right' | 'maximize' | 'restore' | 'center';
 
 export interface FrecencyEntry {
@@ -77,6 +79,7 @@ export interface OpenWindowInfo {
   isActive: boolean;
   isMinimized: boolean;
   isTopmost?: boolean;
+  monitor?: 'primary' | 'secondary' | string | null;
 }
 
 export interface AppWindowGroup {
@@ -312,6 +315,12 @@ export interface StartStateEvent {
   immediate?: boolean;
 }
 
+export interface StartShownEvent {
+  open: boolean;
+  gen: number;
+  monitor?: 'primary' | 'secondary' | string | null;
+}
+
 export interface FlyoutHideEvent {
   gen: number;
 }
@@ -341,6 +350,8 @@ export interface MergedBarItem {
   pinned: boolean;
   pinId?: string;
   group?: AppWindowGroup;
+  /** Matched running window group residing on another monitor (used to focus & resolve icons without duplicating unpinned slots). */
+  remoteGroup?: AppWindowGroup;
 }
 
 export const ICON_CACHE_MAX_ENTRIES = 384;
@@ -387,7 +398,8 @@ export function isCacheIconKey(key: string | null | undefined): key is string {
     key.startsWith('exe:') ||
     key.startsWith('aumid:') ||
     key.startsWith('hwnd:') ||
-    key.startsWith('file:')
+    key.startsWith('file:') ||
+    key.startsWith('tray:')
   );
 }
 
@@ -556,70 +568,119 @@ function resolveCachedIcon(
   return null;
 }
 
+function extractBrandLeadToken(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/\.exe$/i, '')
+    .split(/[\s\-_.:/\\]+/)
+    .find((tok) => tok.length >= 4);
+  return cleaned ?? '';
+}
+
+export function findMatchingGroupForPin(
+  p: PinItem,
+  groups: readonly AppWindowGroup[],
+  excludeKeys?: ReadonlySet<string>,
+): AppWindowGroup | undefined {
+  const pinAumid = normalizeAumid(p.matchAumid) || extractAumidFromTarget(p.target);
+  const matchExeBase = extractBasename(p.matchExe);
+  const targetNorm = normalizePath(p.target);
+  const targetBase = extractBasename(p.target);
+  const titleLow = p.title.trim().toLowerCase();
+
+  const available = excludeKeys
+    ? groups.filter((g) => !excludeKeys.has(g.key))
+    : groups;
+
+  // Priority 1: Exact case-insensitive UWP AUMID match
+  let matchedGroup = pinAumid
+    ? available.find((g) => {
+        const groupAumid = normalizeAumid(g.aumid);
+        return Boolean(groupAumid) && groupAumid === pinAumid;
+      })
+    : undefined;
+
+  // Priority 2: Exact case-insensitive Win32 matchExe === basename(group.exePath)
+  if (!matchedGroup && matchExeBase) {
+    matchedGroup = available.find((g) => {
+      const groupBase = extractBasename(g.exePath);
+      return Boolean(groupBase) && groupBase === matchExeBase;
+    });
+  }
+
+  // Priority 3: Normalized target path / basename fallback
+  if (!matchedGroup && (targetNorm || targetBase)) {
+    matchedGroup = available.find((g) => {
+      const groupKeyNorm = normalizePath(g.key);
+      const groupExeNorm = normalizePath(g.exePath);
+      const groupBase = extractBasename(g.exePath);
+      return (
+        (Boolean(targetNorm) && (groupKeyNorm === targetNorm || groupExeNorm === targetNorm)) ||
+        (Boolean(targetBase) && Boolean(groupBase) && groupBase === targetBase)
+      );
+    });
+  }
+
+  // Priority 4: Exact case-insensitive display title fallback
+  if (!matchedGroup && titleLow) {
+    matchedGroup = available.find((g) => {
+      const groupNameLow = g.name.trim().toLowerCase();
+      return Boolean(groupNameLow) && groupNameLow === titleLow;
+    });
+  }
+
+  // Priority 5: Safe lead-brand token fallback for broken/empty-target pins (e.g. "Spark Mail" <-> "Spark Desktop")
+  if (!matchedGroup && !pinAumid && !matchExeBase && !targetNorm) {
+    const lead = extractBrandLeadToken(p.title) || extractBrandLeadToken(p.iconKey);
+    if (lead) {
+      matchedGroup = available.find((g) => {
+        const gLead = extractBrandLeadToken(g.name);
+        const exeLead = extractBrandLeadToken(extractBasename(g.exePath));
+        return gLead === lead || exeLead === lead;
+      });
+    }
+  }
+
+  return matchedGroup;
+}
+
 export function mergeTaskbarItems(
   pins: PinItem[],
   groups: AppWindowGroup[],
   iconMap: Record<string, string>,
+  allGroups?: AppWindowGroup[],
 ): MergedBarItem[] {
   const usedGroupKeys = new Set<string>();
   const merged: MergedBarItem[] = [];
 
   for (const p of pins) {
-    const pinAumid = normalizeAumid(p.matchAumid) || extractAumidFromTarget(p.target);
-    const matchExeBase = extractBasename(p.matchExe);
-    const targetNorm = normalizePath(p.target);
-    const targetBase = extractBasename(p.target);
-    const titleLow = p.title.trim().toLowerCase();
-
-    const available = groups.filter((g) => !usedGroupKeys.has(g.key));
-
-    // Priority 1: Exact case-insensitive UWP AUMID match
-    let matchedGroup = pinAumid
-      ? available.find((g) => {
-          const groupAumid = normalizeAumid(g.aumid);
-          return Boolean(groupAumid) && groupAumid === pinAumid;
-        })
-      : undefined;
-
-    // Priority 2: Exact case-insensitive Win32 matchExe === basename(group.exePath)
-    if (!matchedGroup && matchExeBase) {
-      matchedGroup = available.find((g) => {
-        const groupBase = extractBasename(g.exePath);
-        return Boolean(groupBase) && groupBase === matchExeBase;
-      });
-    }
-
-    // Priority 3: Normalized target path / basename fallback
-    if (!matchedGroup && (targetNorm || targetBase)) {
-      matchedGroup = available.find((g) => {
-        const groupKeyNorm = normalizePath(g.key);
-        const groupExeNorm = normalizePath(g.exePath);
-        const groupBase = extractBasename(g.exePath);
-        return (
-          (Boolean(targetNorm) && (groupKeyNorm === targetNorm || groupExeNorm === targetNorm)) ||
-          (Boolean(targetBase) && Boolean(groupBase) && groupBase === targetBase)
-        );
-      });
-    }
-
-    // Priority 4: Exact case-insensitive display title fallback
-    if (!matchedGroup && titleLow) {
-      matchedGroup = available.find((g) => {
-        const groupNameLow = g.name.trim().toLowerCase();
-        return Boolean(groupNameLow) && groupNameLow === titleLow;
-      });
-    }
+    const matchedGroup = findMatchingGroupForPin(p, groups, usedGroupKeys);
 
     if (matchedGroup) {
       usedGroupKeys.add(matchedGroup.key);
     }
 
-    const cacheKey = matchedGroup?.iconKey ?? (isCacheIconKey(p.iconKey) ? p.iconKey : null);
+    // If pinned app is running on another monitor (e.g. Monitor 2 while pinned on Monitor 1),
+    // bind `remoteGroup` for icon/target resolution and click-to-focus without duplicating slots.
+    const remoteGroup =
+      !matchedGroup && allGroups && allGroups.length > 0
+        ? findMatchingGroupForPin(p, allGroups)
+        : undefined;
+    const effectiveGroup = matchedGroup ?? remoteGroup;
+
+    const cacheKey = effectiveGroup?.iconKey ?? (isCacheIconKey(p.iconKey) ? p.iconKey : null);
     const resolvedIconData =
-      resolveCachedIcon(iconMap, matchedGroup?.iconKey, isCacheIconKey(p.iconKey) ? p.iconKey : null) ||
-      matchedGroup?.iconData ||
+      resolveCachedIcon(
+        iconMap,
+        effectiveGroup?.iconKey,
+        isCacheIconKey(p.iconKey) ? p.iconKey : null,
+      ) ||
+      effectiveGroup?.iconData ||
       p.iconData ||
       iconMap[p.target] ||
+      (p.target ? iconMap[p.target.toLowerCase()] : undefined) ||
       null;
 
     merged.push({
@@ -627,17 +688,20 @@ export function mergeTaskbarItems(
       name: p.title,
       target:
         p.target ||
-        matchedGroup?.exePath ||
-        (matchedGroup?.aumid ? `shell:AppsFolder\\${matchedGroup.aumid}` : ''),
+        effectiveGroup?.exePath ||
+        (effectiveGroup?.aumid ? `shell:AppsFolder\\${effectiveGroup.aumid}` : ''),
       args: p.args ?? null,
-      matchExe: p.matchExe ?? (matchedGroup?.exePath ? extractBasename(matchedGroup.exePath) || null : null),
-      matchAumid: p.matchAumid ?? matchedGroup?.aumid ?? null,
+      matchExe:
+        p.matchExe ??
+        (effectiveGroup?.exePath ? extractBasename(effectiveGroup.exePath) || null : null),
+      matchAumid: p.matchAumid ?? effectiveGroup?.aumid ?? null,
       iconKey: p.iconKey,
       cacheIconKey: cacheKey,
       iconData: resolvedIconData,
       pinned: true,
       pinId: p.id,
       group: matchedGroup,
+      remoteGroup,
     });
   }
 
@@ -670,6 +734,14 @@ export async function ipc<T>(cmd: string, args?: Record<string, unknown>): Promi
 
 export async function onEvent<T>(event: string, cb: (payload: T) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => {};
+  try {
+    const win = getCurrentWebviewWindow();
+    if (win && typeof win.listen === 'function') {
+      return await win.listen<T>(event, (e) => cb(e.payload));
+    }
+  } catch {
+    // Fallback for test/browser environments without a Tauri WebviewWindow handle
+  }
   return listen<T>(event, (e) => cb(e.payload));
 }
 
@@ -689,6 +761,47 @@ export function surfaceCommitAck(
 
 export function surfaceExitAck(surface: 'start' | 'flyout', gen: number): Promise<void> {
   return ipc<void>('surface_exit_ack', { surface, gen });
+}
+
+export function animateSurfaceIn(
+  surface: 'start' | 'flyout',
+  gen: number,
+  opts?: { durationMs?: number; offsetY?: number; fromScale?: number },
+): Promise<void> {
+  return ipc<void>('animate_surface_in', {
+    surface,
+    gen,
+    durationMs: opts?.durationMs ?? 240,
+    offsetY: opts?.offsetY ?? 20,
+    fromScale: opts?.fromScale ?? 0.96,
+  });
+}
+
+export function animateSurfaceOut(
+  surface: 'start' | 'flyout',
+  gen: number,
+  opts?: { durationMs?: number; offsetY?: number; toScale?: number },
+): Promise<void> {
+  return ipc<void>('animate_surface_out', {
+    surface,
+    gen,
+    durationMs: opts?.durationMs ?? 120,
+    offsetY: opts?.offsetY ?? 12,
+    toScale: opts?.toScale ?? 0.975,
+  });
+}
+
+export function getBackdropMode(): Promise<BackdropMode> {
+  return ipc<BackdropMode>('get_backdrop_mode');
+}
+
+export function getOpenWindows(
+  monitor?: 'primary' | 'secondary',
+): Promise<AppWindowGroup[]> {
+  return ipc<AppWindowGroup[]>(
+    'get_open_windows',
+    monitor ? { monitor } : undefined,
+  );
 }
 
 export function dismissOverlays(): Promise<void> {

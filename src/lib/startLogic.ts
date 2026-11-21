@@ -1,5 +1,6 @@
 import { canRunAsAdmin } from './flyoutLogic';
 import type {
+  AudioState,
   ClipboardEntry,
   ClipboardKind,
   DiskHeadroomInfo,
@@ -10,7 +11,7 @@ import type {
   TopProcessInfo,
 } from './ipc';
 
-export type StartAnimPhase = 'hidden' | 'open' | 'closing';
+export type StartAnimPhase = 'hidden' | 'arming' | 'open' | 'closing';
 
 export interface StartAnimState {
   phase: StartAnimPhase;
@@ -20,6 +21,8 @@ export interface StartAnimState {
   gen: number;
 }
 
+export const START_ENTER_ANIM_MS = 240;
+export const START_OPACITY_ANIM_MS = 170;
 export const START_EXIT_ANIM_MS = 120;
 
 export const INITIAL_START_ANIM_STATE: StartAnimState = {
@@ -37,8 +40,10 @@ export interface StartStateReduceInput {
 }
 
 /**
- * Transitions Start Menu animation phase immediately without unmounting DOM:
- * - `open: true` -> `'open'` immediately (incrementing `openSeq` to replay `@keyframes startInA/B` at frame 0!)
+ * Transitions Start Menu animation phase deterministically without unmounting DOM:
+ * - `open: true` -> `'arming'` (locks chassis at opacity 0 / translateY(20px) scale(0.96)
+ *   until post-SW_SHOW visible frame + double rAF triggers the WAAPI spring, preventing any
+ *   1-frame pop-in flash or Chromium SW_HIDE->SW_SHOW animation collapse!)
  * - `open: false, immediate: true` -> `'hidden'` immediately
  * - `open: false` -> `'closing'` (or stays `'hidden'` if already hidden)
  */
@@ -55,7 +60,7 @@ export function reduceStartState(
 
   if (visible) {
     return {
-      phase: 'open',
+      phase: 'arming',
       open: true,
       closing: false,
       openSeq: state.openSeq + 1,
@@ -83,12 +88,36 @@ export function reduceStartState(
 }
 
 /**
- * Alternates `.open-a` / `.open-b` keyed by `openSeq % 2` so Chromium WebView2 replays the
- * silky 230ms spring open keyframe on every `Win` press without unmounting `.start-chassis`.
+ * Commits an `'arming'` Start Menu surface into its settled `'open'` state once the WAAPI
+ * spring finishes (or immediately under `prefers-reduced-motion`). Ignores stale generations.
+ */
+export function settleStartOpen(
+  state: StartAnimState,
+  expectedGen?: number,
+): StartAnimState {
+  if (state.phase !== 'arming') {
+    return state;
+  }
+  if (typeof expectedGen === 'number' && state.gen !== expectedGen) {
+    return state;
+  }
+  return {
+    ...state,
+    phase: 'open',
+    open: true,
+    closing: false,
+  };
+}
+
+/**
+ * Class marker matching the current Start animation phase (`open-arming`, `open-a/b`, `closing`).
  */
 export function getStartChassisAnimClass(
   anim: Pick<StartAnimState, 'phase' | 'openSeq'>,
 ): string {
+  if (anim.phase === 'arming') {
+    return 'open-arming';
+  }
   if (anim.phase === 'open') {
     return anim.openSeq % 2 === 1 ? 'open-anim open-a' : 'open-anim open-b';
   }
@@ -119,6 +148,45 @@ export function completeStartClosing(
   };
 }
 
+/**
+ * Merges an incoming WASAPI `AudioState` push while preserving the local optimistic volume of
+ * any slider currently being dragged (or within its post-commit settle window) so IPC echoes
+ * never yank the slider thumb backward mid-drag.
+ */
+export function mergeAudioStateRespectingLocks(
+  prev: AudioState | null,
+  incoming: AudioState,
+  lockedUntilByKey: ReadonlyMap<string, number>,
+  nowMs: number,
+): AudioState {
+  if (!prev || lockedUntilByKey.size === 0) {
+    return incoming;
+  }
+  const masterLock = lockedUntilByKey.get('__master__');
+  const preserveMaster = masterLock !== undefined && masterLock > nowMs;
+  let sessionsChanged = false;
+  const nextSessions = incoming.sessions.map((sess) => {
+    const lockUntil = lockedUntilByKey.get(sess.id);
+    if (lockUntil !== undefined && lockUntil > nowMs) {
+      const prevSess = prev.sessions.find((p) => p.id === sess.id);
+      if (prevSess && prevSess.volume !== sess.volume) {
+        sessionsChanged = true;
+        return { ...sess, volume: prevSess.volume };
+      }
+    }
+    return sess;
+  });
+
+  if (!preserveMaster && !sessionsChanged) {
+    return incoming;
+  }
+  return {
+    ...incoming,
+    masterVolume: preserveMaster ? prev.masterVolume : incoming.masterVolume,
+    sessions: sessionsChanged ? nextSessions : incoming.sessions,
+  };
+}
+
 export interface SpaceAccentOption {
   hex: string;
   rgb: string;
@@ -126,10 +194,10 @@ export interface SpaceAccentOption {
 }
 
 export const CUSTOM_SPACE_ACCENTS: readonly SpaceAccentOption[] = [
-  { hex: '#8B96F8', rgb: '139, 150, 248', label: 'Индиго' },
-  { hex: '#52B8F2', rgb: '82, 184, 242', label: 'Кобальт' },
-  { hex: '#3ED598', rgb: '62, 213, 152', label: 'Изумруд' },
-  { hex: '#F26E84', rgb: '242, 110, 132', label: 'Коралл' },
+  { hex: '#818CF8', rgb: '129, 140, 248', label: 'Индиго' },
+  { hex: '#38BDF8', rgb: '56, 189, 248', label: 'Кобальт' },
+  { hex: '#34D399', rgb: '52, 211, 153', label: 'Изумруд' },
+  { hex: '#FB7185', rgb: '251, 113, 133', label: 'Коралл' },
   { hex: '#A78BFA', rgb: '167, 139, 250', label: 'Аметист' },
 ] as const;
 
@@ -227,6 +295,147 @@ export function getPinnedItemInSpace(
       return false;
     }) ?? null
   );
+}
+
+export const START_DRAG_THRESHOLD_PX = 6;
+
+export interface StartPinDragSlot {
+  spaceKey: string;
+  idx: number;
+}
+
+export function hasExceededDragThreshold(
+  startX: number,
+  startY: number,
+  curX: number,
+  curY: number,
+  thresholdPx: number = START_DRAG_THRESHOLD_PX,
+): boolean {
+  const dx = curX - startX;
+  const dy = curY - startY;
+  return dx * dx + dy * dy >= thresholdPx * thresholdPx;
+}
+
+export function computePointerReorderRequest(
+  origin: StartPinDragSlot | null,
+  target: StartPinDragSlot | null,
+): { space: string; fromIdx: number; toIdx: number } | null {
+  if (!origin || !target) return null;
+  if (!origin.spaceKey || origin.spaceKey !== target.spaceKey) return null;
+  if (!Number.isInteger(origin.idx) || !Number.isInteger(target.idx)) return null;
+  if (origin.idx < 0 || target.idx < 0 || origin.idx === target.idx) return null;
+  return {
+    space: origin.spaceKey,
+    fromIdx: origin.idx,
+    toIdx: target.idx,
+  };
+}
+
+function reorderArrayCopy<T>(list: readonly T[], fromIdx: number, toIdx: number): T[] | null {
+  if (fromIdx < 0 || toIdx < 0 || fromIdx >= list.length || toIdx >= list.length || fromIdx === toIdx) {
+    return null;
+  }
+  const next = list.slice();
+  const [moved] = next.splice(fromIdx, 1);
+  next.splice(toIdx, 0, moved);
+  return next;
+}
+
+/**
+ * Optimistically reorders a Start space pin list in memory (supporting Hero 0..1 <-> Compact 2..N
+ * and custom spaces) so pointer drag-and-drop feels instantaneous before Rust confirms via IPC.
+ */
+export function applyOptimisticPinReorder(
+  config: TestBarConfig | null,
+  spaceKey: string,
+  fromIdx: number,
+  toIdx: number,
+): TestBarConfig | null {
+  if (!config) return null;
+  switch (spaceKey) {
+    case 'taskbar': {
+      const next = reorderArrayCopy(config.taskbarPins, fromIdx, toIdx);
+      return next ? { ...config, taskbarPins: next } : null;
+    }
+    case 'personal': {
+      const next = reorderArrayCopy(config.personalPins, fromIdx, toIdx);
+      return next ? { ...config, personalPins: next } : null;
+    }
+    case 'personal_links': {
+      const next = reorderArrayCopy(config.personalLinks, fromIdx, toIdx);
+      return next ? { ...config, personalLinks: next } : null;
+    }
+    case 'work_folders': {
+      const next = reorderArrayCopy(config.workFolders, fromIdx, toIdx);
+      return next ? { ...config, workFolders: next } : null;
+    }
+    case 'work_apps': {
+      const next = reorderArrayCopy(config.workApps, fromIdx, toIdx);
+      return next ? { ...config, workApps: next } : null;
+    }
+    case 'studio': {
+      const next = reorderArrayCopy(config.studioPins, fromIdx, toIdx);
+      return next ? { ...config, studioPins: next } : null;
+    }
+    case 'studio_tools': {
+      const next = reorderArrayCopy(config.studioTools, fromIdx, toIdx);
+      return next ? { ...config, studioTools: next } : null;
+    }
+    case 'game_launchers': {
+      const next = reorderArrayCopy(config.gameLaunchers, fromIdx, toIdx);
+      return next ? { ...config, gameLaunchers: next } : null;
+    }
+    case 'game_combos': {
+      const next = reorderArrayCopy(config.gameCombos, fromIdx, toIdx);
+      return next ? { ...config, gameCombos: next } : null;
+    }
+    default: {
+      const csIdx = config.customSpaces.findIndex((s) => s.id === spaceKey);
+      if (csIdx < 0) return null;
+      const nextItems = reorderArrayCopy(config.customSpaces[csIdx].items, fromIdx, toIdx);
+      if (!nextItems) return null;
+      const nextSpaces = config.customSpaces.slice();
+      nextSpaces[csIdx] = { ...config.customSpaces[csIdx], items: nextItems };
+      return { ...config, customSpaces: nextSpaces };
+    }
+  }
+}
+
+export function findMatchingInstalledAppForPin(
+  pin: PinItem,
+  apps: readonly IndexedApp[],
+): IndexedApp | undefined {
+  if (apps.length === 0) return undefined;
+  const pTarget = normTarget(pin.target);
+  const pBase = pTarget && !pTarget.endsWith('\\') ? pTarget.split('\\').pop() ?? '' : '';
+  const pAumid = normAumid(pin.matchAumid || (pTarget.startsWith('shell:appsfolder\\') ? pTarget : ''));
+  const pMatchExe = (pin.matchExe ?? '').trim().toLowerCase();
+  const pTitle = pin.title.trim().toLowerCase();
+
+  if (pAumid) {
+    const byAumid = apps.find((a) => {
+      const aAumid = normAumid(a.aumid || (normTarget(a.target).startsWith('shell:appsfolder\\') ? a.target : ''));
+      return Boolean(aAumid) && aAumid === pAumid;
+    });
+    if (byAumid) return byAumid;
+  }
+  if (pTarget) {
+    const byTarget = apps.find((a) => normTarget(a.target) === pTarget);
+    if (byTarget) return byTarget;
+  }
+  if (pMatchExe || (pBase && pBase.endsWith('.exe'))) {
+    const wantedExe = pMatchExe || pBase;
+    const byExe = apps.find((a) => {
+      const aTarget = normTarget(a.target);
+      return aTarget.endsWith('\\' + wantedExe) || aTarget === wantedExe;
+    });
+    if (byExe) return byExe;
+  }
+  if (pTitle) {
+    const byName = apps.find((a) => a.name.trim().toLowerCase() === pTitle);
+    if (byName) return byName;
+  }
+  return undefined;
 }
 
 export function isAppPinnedInSpace(

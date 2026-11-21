@@ -1,32 +1,41 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::core::{GUID, PCWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-    SetupDiGetDevicePropertyW, DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA,
+    SetupDiGetDevicePropertyW, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA,
 };
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_FriendlyName, DEVPROPTYPE, DEVPROPKEY,
 };
 use windows::Win32::Foundation::{
-    GlobalFree, BOOL, E_UNEXPECTED, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, RECT, S_FALSE, S_OK,
-    WPARAM,
+    CloseHandle, GlobalFree, BOOL, ERROR_SUCCESS, E_UNEXPECTED, FILETIME, HANDLE, HGLOBAL, HWND,
+    LPARAM, LRESULT, RECT, S_FALSE, S_OK, WPARAM,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::Power::SetSuspendState;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -35,8 +44,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_SPACE,
 };
 use windows::Win32::UI::Shell::{
-    SHEmptyRecycleBinW, SHQueryRecycleBinW, ShellExecuteW, SHERB_NOCONFIRMATION,
-    SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO,
+    SHEmptyRecycleBinW, SHGetKnownFolderPath, SHQueryRecycleBinW, ShellExecuteW,
+    KNOWN_FOLDER_FLAG, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowW,
@@ -54,8 +63,7 @@ use crate::win_shell::wide;
 use crate::windows_tracker::{
     extract_path_icon_raw, focus_or_toggle_window, friendly_exe_name, hicon_to_data_url,
     is_application_frame_host, launch_target_with_args, process_exe_path,
-    resolve_exe_or_hwnd_icon_key, resolve_uwp_core_window_hwnd, terminate_process_pids,
-    AppWindowGroup,
+    resolve_uwp_core_window_hwnd, terminate_process_pids, AppWindowGroup,
 };
 
 const CF_UNICODETEXT: u32 = 13;
@@ -683,6 +691,7 @@ pub fn build_ctrl_v_inputs() -> [INPUT; 4] {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VK_CONTROL,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -692,6 +701,7 @@ pub fn build_ctrl_v_inputs() -> [INPUT; 4] {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(b'V' as u16),
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -702,6 +712,7 @@ pub fn build_ctrl_v_inputs() -> [INPUT; 4] {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(b'V' as u16),
                     dwFlags: KEYEVENTF_KEYUP,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -712,6 +723,7 @@ pub fn build_ctrl_v_inputs() -> [INPUT; 4] {
                 ki: KEYBDINPUT {
                     wVk: VK_CONTROL,
                     dwFlags: KEYEVENTF_KEYUP,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -926,8 +938,9 @@ where
 // ======================= WIN-CHORD SENDINPUT HELPERS =======================
 
 /// Builds an atomic 4-event `[VK_LWIN down, vk down, vk up, VK_LWIN up]` `SendInput` batch.
-/// Because all injected events carry `LLKHF_INJECTED`, TestBar's `WH_KEYBOARD_LL` hook
-/// ignores them cleanly and never falsely toggles TestBar Start.
+/// Tagged with `TESTBAR_INJECTED_EXTRA_INFO` so TestBar's `WH_KEYBOARD_LL` hook recognizes
+/// our own `Win+N`/`Win+B` chords and passes them through while still intercepting untagged
+/// external injected `VK_LWIN` taps from third-party tools.
 pub fn build_win_chord_inputs(vk: u16) -> [INPUT; 4] {
     [
         INPUT {
@@ -936,6 +949,7 @@ pub fn build_win_chord_inputs(vk: u16) -> [INPUT; 4] {
                 ki: KEYBDINPUT {
                     wVk: VK_LWIN,
                     dwFlags: KEYEVENTF_EXTENDEDKEY,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -945,6 +959,7 @@ pub fn build_win_chord_inputs(vk: u16) -> [INPUT; 4] {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(vk),
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -955,6 +970,7 @@ pub fn build_win_chord_inputs(vk: u16) -> [INPUT; 4] {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(vk),
                     dwFlags: KEYEVENTF_KEYUP,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -965,6 +981,7 @@ pub fn build_win_chord_inputs(vk: u16) -> [INPUT; 4] {
                 ki: KEYBDINPUT {
                     wVk: VK_LWIN,
                     dwFlags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -989,6 +1006,7 @@ fn send_single_vk(vk: VIRTUAL_KEY) {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: vk,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -999,6 +1017,7 @@ fn send_single_vk(vk: VIRTUAL_KEY) {
                 ki: KEYBDINPUT {
                     wVk: vk,
                     dwFlags: KEYEVENTF_KEYUP,
+                    dwExtraInfo: crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
                     ..Default::default()
                 },
             },
@@ -1277,10 +1296,25 @@ fn classify_peripheral_kind(clean_name: &str) -> &'static str {
     }
 }
 
-/// Reads real Bluetooth device battery percentages reported by Windows 11 PnP
-/// (`DEVPKEY_Bluetooth_Battery`), restricted strictly to `"BTH"` and `"BTHLE"` enumerators
-/// with properly aligned UTF-16 stack buffers.
-pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
+const PERIPHERAL_BATTERY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+static PERIPHERAL_BATTERY_CACHE: OnceLock<Mutex<Option<(Instant, Vec<PeripheralBattery>)>>> =
+    OnceLock::new();
+static PERIPHERAL_BATTERY_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct DevInfoGuard(HDEVINFO);
+
+impl Drop for DevInfoGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = SetupDiDestroyDeviceInfoList(self.0);
+            }
+        }
+    }
+}
+
+fn scan_peripheral_batteries_live() -> Vec<PeripheralBattery> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1295,6 +1329,7 @@ pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
             ) else {
                 continue;
             };
+            let _hdev_guard = DevInfoGuard(hdev);
 
             let mut idx = 0u32;
             loop {
@@ -1366,11 +1401,50 @@ pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
                     }
                 }
             }
-            let _ = SetupDiDestroyDeviceInfoList(hdev);
         }
     }
 
     results
+}
+
+/// Reads real Bluetooth device battery percentages reported by Windows 11 PnP
+/// (`DEVPKEY_Bluetooth_Battery`), restricted strictly to `"BTH"` and `"BTHLE"` enumerators.
+/// Cached for 30s and guarded by single-flight `try_lock` so rapid `Win` presses NEVER stack
+/// parallel SetupAPI/PnP device-tree scans.
+pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
+    let cache = PERIPHERAL_BATTERY_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, ref list)) = *guard {
+            if ts.elapsed() < PERIPHERAL_BATTERY_CACHE_TTL {
+                return list.clone();
+            }
+        }
+    }
+
+    let scan_lock = PERIPHERAL_BATTERY_SCAN_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_scan_guard) = scan_lock.try_lock() else {
+        // Another thread is already performing the PnP Bluetooth scan; return cached snapshot immediately.
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        return guard
+            .as_ref()
+            .map(|(_, list)| list.clone())
+            .unwrap_or_default();
+    };
+
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ts, ref list)) = *guard {
+            if ts.elapsed() < PERIPHERAL_BATTERY_CACHE_TTL {
+                return list.clone();
+            }
+        }
+    }
+
+    let fresh = scan_peripheral_batteries_live();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
 }
 
 // ======================= TWO-TIER TRAY BACKGROUND APPS =======================
@@ -1914,18 +1988,1393 @@ pub fn filter_hidden_tray_apps(items: Vec<TrayAppInfo>, hidden_keys: &[String]) 
         .collect()
 }
 
-/// Enumerates real Windows background/tray-capable user apps owning hidden or tool top-level
-/// windows (excluding open taskbar apps and OS daemons), resolving crisp icons via `IconCache`.
+// ======================= WIN11 NOTIFYICONSETTINGS TRAY (OPTION A) =======================
+
+const NOTIFY_ICON_SETTINGS_SUBKEY: &str = r"Control Panel\NotifyIconSettings";
+const MAX_NOTIFY_ICON_SNAPSHOT_READ_BYTES: usize = 256 * 1024;
+const MAX_NOTIFY_ICON_SNAPSHOT_CACHE_BYTES: usize = 128 * 1024;
+const FNV1A_TRAY_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_TRAY_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+static KNOWN_FOLDER_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn known_folder_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    KNOWN_FOLDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct RegKeyGuard(HKEY);
+
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+struct SnapshotHandleGuard(HANDLE);
+
+impl Drop for SnapshotHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct CoTaskMemPwstrGuard(PWSTR);
+
+impl Drop for CoTaskMemPwstrGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                CoTaskMemFree(Some(self.0 .0 as *const _));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawNotifyIconEntry {
+    pub subkey: String,
+    pub executable_path: String,
+    pub initial_tooltip: String,
+    pub publisher: String,
+    pub is_promoted: Option<bool>,
+    pub icon_snapshot: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProcessEntry {
+    pub pid: u32,
+    pub exe_path: String,
+    pub exe_name: String,
+}
+
+fn parse_guid_str(raw: &str) -> Option<GUID> {
+    let trimmed = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    if parts[0].len() != 8
+        || parts[1].len() != 4
+        || parts[2].len() != 4
+        || parts[3].len() != 4
+        || parts[4].len() != 12
+    {
+        return None;
+    }
+    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let d4_hi = u16::from_str_radix(parts[3], 16).ok()?;
+    let d4_lo = u64::from_str_radix(parts[4], 16).ok()?;
+    let data4 = [
+        (d4_hi >> 8) as u8,
+        (d4_hi & 0xff) as u8,
+        ((d4_lo >> 40) & 0xff) as u8,
+        ((d4_lo >> 32) & 0xff) as u8,
+        ((d4_lo >> 24) & 0xff) as u8,
+        ((d4_lo >> 16) & 0xff) as u8,
+        ((d4_lo >> 8) & 0xff) as u8,
+        (d4_lo & 0xff) as u8,
+    ];
+    Some(GUID::from_values(data1, data2, data3, data4))
+}
+
+/// Splits a Win11 `NotifyIconSettings` Known Folder prefixed path like
+/// `{6D809377-6AF0-444B-8957-A3773F02200E}\App\app.exe` into `("{6D809377-...}", "App\\app.exe")`.
+pub fn split_known_folder_prefix(raw: &str) -> Option<(&str, &str)> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let close_idx = trimmed.find('}')?;
+    if close_idx != 37 {
+        return None;
+    }
+    let guid_braced = &trimmed[..=close_idx];
+    let rest = trimmed[close_idx + 1..].trim_start_matches(['\\', '/']);
+    Some((guid_braced, rest))
+}
+
+/// Pure Known Folder path normalizer accepting an injectable resolver for deterministic unit tests.
+pub fn resolve_known_folder_path_with<F>(raw: &str, resolver: F) -> String
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let trimmed = raw.trim();
+    if let Some((guid_braced, rest)) = split_known_folder_prefix(trimmed) {
+        if let Some(base) = resolver(guid_braced) {
+            let clean_base = base.trim().trim_end_matches(['\\', '/']);
+            if rest.is_empty() {
+                return clean_base.to_string();
+            }
+            return format!("{clean_base}\\{}", rest.replace('/', "\\"));
+        }
+    }
+    trimmed.replace('/', "\\")
+}
+
+fn resolve_known_folder_guid_cached(guid_braced: &str) -> Option<String> {
+    let key = guid_braced.to_ascii_uppercase();
+    if let Some(hit) = known_folder_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+
+    let resolved = parse_guid_str(&key).and_then(|guid| unsafe {
+        let pwstr = SHGetKnownFolderPath(&guid, KNOWN_FOLDER_FLAG(0), HANDLE::default()).ok()?;
+        let _guard = CoTaskMemPwstrGuard(pwstr);
+        let s = pwstr.to_string().ok()?;
+        let trimmed = s.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+
+    known_folder_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, resolved.clone());
+    resolved
+}
+
+fn resolve_known_folder_path_live(raw: &str) -> String {
+    resolve_known_folder_path_with(raw, resolve_known_folder_guid_cached)
+}
+
+/// Validates a PNG header (`\x89PNG\r\n\x1a\n` + `IHDR`) and extracts `(width, height)` in `1..=2048`.
+pub fn parse_png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 {
+        return None;
+    }
+    if bytes[..8] != PNG_SIG || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if !(1..=2048).contains(&width) || !(1..=2048).contains(&height) {
+        return None;
+    }
+    Some((width, height))
+}
+
+/// Chooses whether to prefer Win11's stored `IconSnapshot` PNG (`tray:<hash>`) over extracting
+/// the executable icon (`exe:<hash>`):
+/// - Always prefers `IconSnapshot` for `nvcontainer.exe` (generic exe icon vs crisp 128px NVIDIA icon).
+/// - Prefers `IconSnapshot` for `WindowsApps` paths (when `<= 256px`) and crisp native tray icons (`32..=256px`).
+/// - Prefers crisp exe extraction first for tiny `16×16` snapshots or oversized `> 256px` blobs
+///   (falling back to `IconSnapshot` if exe extraction fails).
+pub fn should_prefer_icon_snapshot(exe_path: &str, snap_dims: Option<(u32, u32)>) -> bool {
+    let Some((w, h)) = snap_dims else {
+        return false;
+    };
+    let norm = canonical_tray_exe_key(exe_path);
+    let base = exe_basename_lower(&norm);
+    if base == "nvcontainer.exe" {
+        return true;
+    }
+    if norm.contains(r"\windowsapps\") && w <= 256 && h <= 256 {
+        return true;
+    }
+    (32..=256).contains(&w) && (32..=256).contains(&h)
+}
+
+/// Deterministic `IconCache` key (`tray:<16hex>`) for a `NotifyIconSettings` PNG `IconSnapshot`.
+pub fn tray_snapshot_icon_key(subkey_name: &str, base_exe: &str) -> String {
+    let mut hash = FNV1A_TRAY_OFFSET_BASIS;
+    for byte in subkey_name.trim().to_ascii_lowercase().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV1A_TRAY_PRIME);
+    }
+    hash ^= u64::from(b'|');
+    hash = hash.wrapping_mul(FNV1A_TRAY_PRIME);
+    for byte in base_exe.trim().to_ascii_lowercase().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV1A_TRAY_PRIME);
+    }
+    format!("tray:{hash:016x}")
+}
+
+/// Detects temporary Windows 11 OS privacy indicator entries (mic / camera / location access badges)
+/// that Explorer persists in `NotifyIconSettings` under arbitrary app executables (e.g. browsers).
+pub fn is_os_privacy_tooltip(tooltip: &str) -> bool {
+    let low = tooltip.trim().to_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    const PRIVACY_PHRASES: [&str; 19] = [
+        "открыли доступ к своему микрофону",
+        "открыли доступ к своей камере",
+        "открыли доступ к своему местоположению",
+        "контроля доступа",
+        "использует ваш микрофон",
+        "использует вашу камеру",
+        "использует ваше местоположение",
+        "доступ к микрофону",
+        "доступ к камере",
+        "доступ к местоположению",
+        "using your microphone",
+        "using your camera",
+        "using your location",
+        "accessed your microphone",
+        "accessed your camera",
+        "accessed your location",
+        "shared your microphone",
+        "shared your camera",
+        "click to control access",
+    ];
+    PRIVACY_PHRASES.iter().any(|p| low.contains(p))
+}
+
+/// Identifies web browsers so they are excluded from `^` while already open on the taskbar,
+/// while still allowing a background-only browser tray icon if no visible window is open.
+pub fn is_browser_exe(base_exe: &str) -> bool {
+    let base = exe_basename_lower(base_exe);
+    matches!(
+        base.as_str(),
+        "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "zen.exe"
+            | "brave.exe"
+            | "opera.exe"
+            | "opera_gx.exe"
+            | "vivaldi.exe"
+            | "browser.exe"
+            | "arc.exe"
+            | "waterfox.exe"
+            | "librewolf.exe"
+            | "floorp.exe"
+            | "thorium.exe"
+            | "chromium.exe"
+            | "iexplore.exe"
+    )
+}
+
+/// Excludes TestBar itself and Windows OS shell/system hosts from `NotifyIconSettings` tray output
+/// while explicitly allowing real user tray utilities like `nvcontainer.exe` (NVIDIA Settings),
+/// `securityhealthsystray.exe` (Windows Security), and `magicpodsservice.exe`.
+pub fn is_excluded_notify_icon_process(exe_path: &str) -> bool {
+    let norm = canonical_tray_exe_key(exe_path);
+    if norm.is_empty() {
+        return true;
+    }
+    let base = exe_basename_lower(&norm);
+    if base.is_empty() {
+        return true;
+    }
+
+    // Explicitly allow real Win11 system/GPU tray icons that live under System32 or NvContainer.
+    if matches!(base.as_str(), "nvcontainer.exe" | "securityhealthsystray.exe") {
+        return false;
+    }
+
+    if base.starts_with("testbar")
+        || base.starts_with("gamebar")
+        || base.starts_with("widgets")
+    {
+        return true;
+    }
+
+    if matches!(
+        base.as_str(),
+        "explorer.exe"
+            | "shellhost.exe"
+            | "shellexperiencehost.exe"
+            | "startmenuexperiencehost.exe"
+            | "textinputhost.exe"
+            | "searchhost.exe"
+            | "searchapp.exe"
+            | "searchindexer.exe"
+            | "runtimebroker.exe"
+            | "svchost.exe"
+            | "sihost.exe"
+            | "taskhostw.exe"
+            | "ctfmon.exe"
+            | "dwm.exe"
+            | "dllhost.exe"
+            | "conhost.exe"
+            | "applicationframehost.exe"
+            | "systemsettings.exe"
+            | "lockapp.exe"
+            | "smartscreen.exe"
+            | "msedgewebview2.exe"
+            | "backgroundtaskhost.exe"
+            | "compkgsrv.exe"
+            | "wmiprvse.exe"
+            | "audiodg.exe"
+            | "monotificationux.exe"
+            | "mousocoreworker.exe"
+            | "usoclient.exe"
+            | "phoneexperiencehost.exe"
+            | "crossdeviceresume.exe"
+            | "crossdeviceservice.exe"
+            | "yourphone.exe"
+            | "tabtip.exe"
+            | "tabtip32.exe"
+            | "msctfmonitor.exe"
+            | "credentialuibroker.exe"
+            | "useroobebroker.exe"
+            | "systemsettingsbroker.exe"
+            | "pickerhost.exe"
+            | "openwith.exe"
+            | "consent.exe"
+            | "officeclicktorun.exe"
+            | "nvdisplay.container.exe"
+    ) {
+        return true;
+    }
+
+    const EXCLUDED_TOKENS: [&str; 4] = [
+        "webview2",
+        "crashpad",
+        "crashhandler",
+        "crashreporter",
+    ];
+    EXCLUDED_TOKENS.iter().any(|tok| base.contains(tok))
+}
+
+/// Cleans a `NotifyIconSettings` `InitialTooltip` to a concise app name (first non-empty line,
+/// stripping dynamic `" — status"` / `" - status"` suffixes when the app prefix is >= 3 chars).
+pub fn clean_tray_tooltip(initial_tooltip: &str) -> Option<String> {
+    let first_line = initial_tooltip
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut cleaned = first_line;
+    for sep in [" — ", " – ", " - ", " | ", "\t"] {
+        if let Some((head, _)) = cleaned.split_once(sep) {
+            let head_trimmed = head.trim();
+            if head_trimmed.chars().count() >= 3 {
+                cleaned = head_trimmed;
+                break;
+            }
+        }
+    }
+    let cleaned = cleaned.trim().trim_end_matches([':', '.']).trim();
+    if cleaned.is_empty()
+        || cleaned.chars().count() > 48
+        || cleaned.contains('\\')
+        || cleaned.contains('/')
+    {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+fn known_tray_display_name(base_exe: &str) -> Option<&'static str> {
+    match base_exe {
+        "nvcontainer.exe" => Some("Настройки NVIDIA"),
+        "securityhealthsystray.exe" => Some("Безопасность Windows"),
+        "vgtray.exe" => Some("Riot Vanguard"),
+        "magicpodsservice.exe" => Some("MagicPods"),
+        "radeonsoftware.exe" => Some("AMD Software"),
+        "wallpaper32.exe" | "wallpaper64.exe" => Some("Wallpaper Engine"),
+        "spark desktop.exe" => Some("Spark"),
+        "hearthstonedecktracker.exe" => Some("Hearthstone Deck Tracker"),
+        "fluentflyout.exe" => Some("FluentFlyout"),
+        "battle.net.exe" => Some("Battle.net"),
+        _ => None,
+    }
+}
+
+/// Resolves a clean human-readable tray app name from `InitialTooltip`, known tray utility
+/// overrides, or executable stem fallback.
+pub fn resolve_tray_display_name(exe_path: &str, initial_tooltip: &str) -> String {
+    let base = exe_basename_lower(exe_path);
+    if let Some(tip) = clean_tray_tooltip(initial_tooltip) {
+        return tip;
+    }
+    if let Some(known) = known_tray_display_name(&base) {
+        return known.to_string();
+    }
+    friendly_exe_name(exe_path)
+}
+
+fn score_notify_icon_entry(
+    entry: &RawNotifyIconEntry,
+    base_exe: &str,
+    exact_path_match: bool,
+) -> i32 {
+    let mut score = 0i32;
+    if exact_path_match {
+        score += 50;
+    }
+    if entry.is_promoted == Some(true) {
+        score += 30;
+    }
+    if let Some(cleaned) = clean_tray_tooltip(&entry.initial_tooltip) {
+        score += 25;
+        let stem = base_exe.strip_suffix(".exe").unwrap_or(base_exe);
+        if stem.len() >= 3 && cleaned.to_lowercase().contains(stem) {
+            score += 15;
+        }
+    }
+    if let Some(snap) = entry.icon_snapshot.as_deref() {
+        if let Some((w, h)) = parse_png_dimensions(snap) {
+            score += if w >= 32 && h >= 32 { 20 } else { 10 };
+        }
+    }
+    score
+}
+
+/// Pure Option-A Win11 tray builder intersecting `HKCU\Control Panel\NotifyIconSettings` entries
+/// against live current-session processes:
+/// - Keeps real tray-resident apps (Steam, Telegram, Battle.net, NVIDIA, Wallpaper Engine,
+///   Riot Vanguard, PowerToys, etc.) visible in `^` even when they also have an open window
+///   on the taskbar, enriching `hwnd` from the open taskbar group when present.
+/// - Excludes OS privacy indicator ghosts (mic/camera/location tooltips), open browsers,
+///   own TestBar process, and OS shell hosts.
+/// - Deduplicates multi-subkey apps (e.g. Overwolf or upgraded paths) strictly by lowercase
+///   executable filename, selecting the highest-scoring live subkey.
+pub fn build_tray_apps_from_notify_settings<FResolveIcon>(
+    entries: Vec<RawNotifyIconEntry>,
+    live_processes: &[LiveProcessEntry],
+    open_taskbar_groups: &[AppWindowGroup],
+    fallback_hwnds: &HashMap<String, (isize, u32)>,
+    extra_open_bases: &HashSet<String>,
+    own_pid: u32,
+    mut resolve_icon: FResolveIcon,
+) -> Vec<TrayAppItem>
+where
+    FResolveIcon: FnMut(&str, Option<isize>, &str, Option<&[u8]>) -> Option<String>,
+{
+    let mut open_exe_paths = HashSet::new();
+    let mut open_exe_bases: HashSet<String> = extra_open_bases.clone();
+    let mut open_hwnd_by_base: HashMap<String, (isize, u32)> = HashMap::new();
+
+    for g in open_taskbar_groups {
+        let g_norm = canonical_tray_exe_key(&g.exe_path);
+        let g_base = exe_basename_lower(&g_norm);
+        if !g_norm.is_empty() {
+            open_exe_paths.insert(g_norm);
+        }
+        if !g_base.is_empty() {
+            open_exe_bases.insert(g_base.clone());
+        }
+        for w in &g.windows {
+            let w_norm = canonical_tray_exe_key(&w.exe_path);
+            let w_base = if !w_norm.is_empty() {
+                open_exe_paths.insert(w_norm.clone());
+                exe_basename_lower(&w_norm)
+            } else {
+                g_base.clone()
+            };
+            if !w_base.is_empty() {
+                open_exe_bases.insert(w_base.clone());
+                if w.hwnd != 0 {
+                    // Prefer the active window if available, otherwise keep the first valid HWND.
+                    if w.is_active || !open_hwnd_by_base.contains_key(&w_base) {
+                        open_hwnd_by_base.insert(w_base, (w.hwnd, w.pid));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut live_by_base: HashMap<String, Vec<&LiveProcessEntry>> = HashMap::new();
+    for proc in live_processes {
+        if proc.pid == 0 || proc.pid == own_pid {
+            continue;
+        }
+        let base = if !proc.exe_name.trim().is_empty() {
+            exe_basename_lower(&proc.exe_name)
+        } else {
+            exe_basename_lower(&proc.exe_path)
+        };
+        if !base.is_empty() {
+            live_by_base.entry(base).or_default().push(proc);
+        }
+    }
+
+    struct SelectedEntry {
+        entry: RawNotifyIconEntry,
+        resolved_exe_path: String,
+        score: i32,
+        cleaned_tip_len: usize,
+    }
+
+    let mut winners: HashMap<String, SelectedEntry> = HashMap::new();
+
+    for entry in entries {
+        if entry.executable_path.trim().is_empty() {
+            continue;
+        }
+        if is_os_privacy_tooltip(&entry.initial_tooltip) {
+            continue;
+        }
+        let norm_reg = canonical_tray_exe_key(&entry.executable_path);
+        let base_exe = exe_basename_lower(&norm_reg);
+        if base_exe.is_empty() || !base_exe.ends_with(".exe") {
+            continue;
+        }
+        let Some(procs) = live_by_base.get(&base_exe) else {
+            continue;
+        };
+
+        let mut exact_path_match = false;
+        let mut live_exe_path: Option<&str> = None;
+        for p in procs {
+            let p_norm = canonical_tray_exe_key(&p.exe_path);
+            if !p_norm.is_empty() {
+                if p_norm == norm_reg {
+                    exact_path_match = true;
+                    live_exe_path = Some(&p.exe_path);
+                    break;
+                }
+                if live_exe_path.is_none() {
+                    live_exe_path = Some(&p.exe_path);
+                }
+            }
+        }
+
+        let resolved_exe_path = live_exe_path
+            .unwrap_or(&entry.executable_path)
+            .trim()
+            .to_string();
+        if is_excluded_notify_icon_process(&resolved_exe_path) {
+            continue;
+        }
+
+        let resolved_norm = canonical_tray_exe_key(&resolved_exe_path);
+        if is_browser_exe(&base_exe)
+            && (open_exe_bases.contains(&base_exe) || open_exe_paths.contains(&resolved_norm))
+        {
+            continue;
+        }
+
+        let score = score_notify_icon_entry(&entry, &base_exe, exact_path_match);
+        let cleaned_tip_len = clean_tray_tooltip(&entry.initial_tooltip)
+            .map(|s| s.chars().count())
+            .unwrap_or(usize::MAX);
+
+        let replace = match winners.get(&base_exe) {
+            None => true,
+            Some(cur) => {
+                score > cur.score
+                    || (score == cur.score
+                        && (cleaned_tip_len < cur.cleaned_tip_len
+                            || (cleaned_tip_len == cur.cleaned_tip_len
+                                && entry.subkey < cur.entry.subkey)))
+            }
+        };
+        if replace {
+            winners.insert(
+                base_exe,
+                SelectedEntry {
+                    entry,
+                    resolved_exe_path,
+                    score,
+                    cleaned_tip_len,
+                },
+            );
+        }
+    }
+
+    let mut items: Vec<TrayAppItem> = winners
+        .into_iter()
+        .filter_map(|(base_exe, selected)| {
+            let procs = live_by_base.get(&base_exe)?;
+            let mut all_pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+            all_pids.sort_unstable();
+            all_pids.dedup();
+            if all_pids.is_empty() {
+                return None;
+            }
+
+            let (hwnd, pid) = if let Some(&(h, p)) = open_hwnd_by_base.get(&base_exe) {
+                (Some(h), if p != 0 { p } else { all_pids[0] })
+            } else if let Some(&(h, p)) = fallback_hwnds.get(&base_exe) {
+                (
+                    (h != 0).then_some(h),
+                    if p != 0 { p } else { all_pids[0] },
+                )
+            } else {
+                (None, all_pids[0])
+            };
+
+            let name = resolve_tray_display_name(
+                &selected.resolved_exe_path,
+                &selected.entry.initial_tooltip,
+            );
+            let icon_key = resolve_icon(
+                &selected.resolved_exe_path,
+                hwnd,
+                &selected.entry.subkey,
+                selected.entry.icon_snapshot.as_deref(),
+            );
+
+            Some(TrayAppItem {
+                id: base_exe,
+                hwnd,
+                pid,
+                all_pids,
+                name,
+                exe_path: selected.resolved_exe_path,
+                icon_key,
+                icon_data: None,
+            })
+        })
+        .collect();
+
+    items.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if items.len() > MAX_TRAY_APPS {
+        items.truncate(MAX_TRAY_APPS);
+    }
+    items
+}
+
+fn reg_query_string_value(hkey: HKEY, name: &str) -> Option<String> {
+    let wname = wide(name);
+    let mut val_type = REG_VALUE_TYPE(0);
+    let mut byte_len: u32 = 0;
+    let err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(wname.as_ptr()),
+            None,
+            Some(&mut val_type),
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if err != ERROR_SUCCESS || byte_len < 2 || byte_len > 32_768 {
+        return None;
+    }
+    if val_type != REG_SZ && val_type != REG_EXPAND_SZ {
+        return None;
+    }
+    let mut buf = vec![0u8; byte_len as usize];
+    let err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(wname.as_ptr()),
+            None,
+            Some(&mut val_type),
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return None;
+    }
+    let u16_count = (byte_len as usize) / 2;
+    let mut wide_chars = Vec::with_capacity(u16_count);
+    for chunk in buf[..u16_count * 2].chunks_exact(2) {
+        let code = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if code == 0 {
+            break;
+        }
+        wide_chars.push(code);
+    }
+    let s = String::from_utf16_lossy(&wide_chars);
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn reg_query_dword_value(hkey: HKEY, name: &str) -> Option<u32> {
+    let wname = wide(name);
+    let mut val_type = REG_VALUE_TYPE(0);
+    let mut raw = [0u8; 4];
+    let mut byte_len: u32 = 4;
+    let err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(wname.as_ptr()),
+            None,
+            Some(&mut val_type),
+            Some(raw.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    if err != ERROR_SUCCESS || val_type != REG_DWORD || byte_len < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes(raw))
+}
+
+fn reg_query_binary_value(hkey: HKEY, name: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    let wname = wide(name);
+    let mut val_type = REG_VALUE_TYPE(0);
+    let mut byte_len: u32 = 0;
+    let err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(wname.as_ptr()),
+            None,
+            Some(&mut val_type),
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if err != ERROR_SUCCESS || byte_len == 0 || (byte_len as usize) > max_bytes {
+        return None;
+    }
+    if val_type != REG_BINARY {
+        return None;
+    }
+    let mut buf = vec![0u8; byte_len as usize];
+    let err = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(wname.as_ptr()),
+            None,
+            Some(&mut val_type),
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return None;
+    }
+    buf.truncate(byte_len as usize);
+    Some(buf)
+}
+
+const NOTIFY_ICON_META_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct CachedNotifyIconMeta {
+    subkey_count: u32,
+    last_write_u64: u64,
+    refreshed_at: Instant,
+    entries: Vec<RawNotifyIconEntry>,
+}
+
+static NOTIFY_ICON_META_CACHE: OnceLock<Mutex<Option<CachedNotifyIconMeta>>> = OnceLock::new();
+
+/// Lazily reads a single subkey's `IconSnapshot` (`REG_BINARY`) ONLY on `IconCache` miss
+/// (instead of reading ~2MB of PNG blobs across 130+ registry subkeys on every 4.8s poll).
+fn read_notify_icon_snapshot_by_subkey(subkey: &str) -> Option<Vec<u8>> {
+    if subkey.trim().is_empty() {
+        return None;
+    }
+    let full_path = format!("{NOTIFY_ICON_SETTINGS_SUBKEY}\\{subkey}");
+    let full_wide = wide(&full_path);
+    let mut sub_hkey = HKEY::default();
+    let err = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(full_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut sub_hkey,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return None;
+    }
+    let _guard = RegKeyGuard(sub_hkey);
+    reg_query_binary_value(sub_hkey, "IconSnapshot", MAX_NOTIFY_ICON_SNAPSHOT_READ_BYTES)
+}
+
+/// Reads Windows 11 tray icon metadata from `HKCU\Control Panel\NotifyIconSettings` using
+/// strictly documented Win32 Registry APIs (zero DLL injection, zero `explorer.exe` memory access).
+/// Uses `RegQueryInfoKeyW` (`subkey_count` + `ftLastWriteTime`) with a 30s metadata cache and
+/// defers `IconSnapshot` binary reads to `IconCache` misses so steady-state polls do 1 syscall
+/// and allocate zero PNG buffers.
+fn read_notify_icon_settings_registry() -> Option<Vec<RawNotifyIconEntry>> {
+    let root_wide = wide(NOTIFY_ICON_SETTINGS_SUBKEY);
+    let mut root_hkey = HKEY::default();
+    let open_err = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(root_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut root_hkey,
+        )
+    };
+    if open_err != ERROR_SUCCESS {
+        return None;
+    }
+    let _root_guard = RegKeyGuard(root_hkey);
+
+    let mut subkey_count: u32 = 0;
+    let mut last_write = FILETIME::default();
+    let info_ok = unsafe {
+        RegQueryInfoKeyW(
+            root_hkey,
+            PWSTR::null(),
+            None,
+            None,
+            Some(&mut subkey_count),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut last_write),
+        ) == ERROR_SUCCESS
+    };
+    let last_write_u64 =
+        ((last_write.dwHighDateTime as u64) << 32) | (last_write.dwLowDateTime as u64);
+
+    let cache = NOTIFY_ICON_META_CACHE.get_or_init(|| Mutex::new(None));
+    if info_ok {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cached) = *guard {
+            if cached.subkey_count == subkey_count
+                && cached.last_write_u64 == last_write_u64
+                && cached.refreshed_at.elapsed() < NOTIFY_ICON_META_CACHE_TTL
+            {
+                return Some(cached.entries.clone());
+            }
+        }
+    }
+
+    let mut entries = Vec::with_capacity(subkey_count as usize);
+    let mut index: u32 = 0;
+    let mut name_buf = [0u16; 260];
+
+    loop {
+        let mut name_len = name_buf.len() as u32;
+        let enum_err = unsafe {
+            RegEnumKeyExW(
+                root_hkey,
+                index,
+                PWSTR(name_buf.as_mut_ptr()),
+                &mut name_len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            )
+        };
+        if enum_err != ERROR_SUCCESS {
+            break;
+        }
+        index = index.saturating_add(1);
+
+        let subkey = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        let subkey_wide = wide(&subkey);
+        let mut sub_hkey = HKEY::default();
+        let sub_err = unsafe {
+            RegOpenKeyExW(
+                root_hkey,
+                PCWSTR(subkey_wide.as_ptr()),
+                0,
+                KEY_READ,
+                &mut sub_hkey,
+            )
+        };
+        if sub_err != ERROR_SUCCESS {
+            continue;
+        }
+        let _sub_guard = RegKeyGuard(sub_hkey);
+
+        let Some(raw_exe) = reg_query_string_value(sub_hkey, "ExecutablePath") else {
+            continue;
+        };
+        let executable_path = resolve_known_folder_path_live(&raw_exe);
+        let initial_tooltip = reg_query_string_value(sub_hkey, "InitialTooltip").unwrap_or_default();
+        let publisher = reg_query_string_value(sub_hkey, "Publisher").unwrap_or_default();
+        let is_promoted = reg_query_dword_value(sub_hkey, "IsPromoted").map(|v| v != 0);
+
+        entries.push(RawNotifyIconEntry {
+            subkey,
+            executable_path,
+            initial_tooltip,
+            publisher,
+            is_promoted,
+            // Loaded lazily ONLY on IconCache miss!
+            icon_snapshot: None,
+        });
+    }
+
+    if info_ok {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(CachedNotifyIconMeta {
+            subkey_count,
+            last_write_u64,
+            refreshed_at: Instant::now(),
+            entries: entries.clone(),
+        });
+    }
+
+    Some(entries)
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn ProcessIdToSessionId(dw_process_id: u32, p_session_id: *mut u32) -> i32;
+}
+
+fn process_session_id(pid: u32) -> Option<u32> {
+    let mut sid: u32 = 0;
+    let ok = unsafe { ProcessIdToSessionId(pid, &mut sid) };
+    (ok != 0).then_some(sid)
+}
+
+/// Enumerates live processes in the current interactive user session whose lowercase executable
+/// basename appears in `candidate_bases` (fast Toolhelp32 scan; queries full image path at most
+/// ONCE per unique executable basename to avoid 45x OpenProcess churn on multi-process apps).
+fn enumerate_live_session_processes(
+    own_pid: u32,
+    candidate_bases: &HashSet<String>,
+) -> Vec<LiveProcessEntry> {
+    if candidate_bases.is_empty() {
+        return Vec::new();
+    }
+
+    let my_session = process_session_id(own_pid);
+
+    let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return Vec::new(),
+    };
+    let _snap_guard = SnapshotHandleGuard(snap);
+
+    let mut pe = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snap, &mut pe) }.is_err() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut path_by_base: HashMap<String, String> = HashMap::new();
+    loop {
+        let pid = pe.th32ProcessID;
+        if pid != 0 && pid != own_pid {
+            let nul_pos = pe
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(pe.szExeFile.len());
+            let exe_name = String::from_utf16_lossy(&pe.szExeFile[..nul_pos]);
+            let base_low = exe_name.trim().to_ascii_lowercase();
+
+            if candidate_bases.contains(&base_low) {
+                let same_session = match (my_session, process_session_id(pid)) {
+                    (Some(mine), Some(theirs)) => theirs == mine,
+                    // SYSTEM / Session-0 services (e.g. OfficeClickToRun, NVDisplay.Container)
+                    // fail ProcessIdToSessionId from a Medium-IL user process; exclude them so
+                    // only real interactive-session user tray apps appear.
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+
+                if same_session {
+                    let exe_path = if let Some(cached_path) = path_by_base.get(&base_low) {
+                        cached_path.clone()
+                    } else {
+                        let resolved = process_exe_path(pid).unwrap_or_default();
+                        if !resolved.is_empty() {
+                            path_by_base.insert(base_low, resolved.clone());
+                        }
+                        resolved
+                    };
+                    result.push(LiveProcessEntry {
+                        pid,
+                        exe_path,
+                        exe_name,
+                    });
+                }
+            }
+        }
+
+        if unsafe { Process32NextW(snap, &mut pe) }.is_err() {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Fast single-pass PID-filtered `EnumWindows` inspecting ONLY windows owned by matched live
+/// tray processes (skips all other PIDs immediately after `GetWindowThreadProcessId`).
+/// Returns `(best_hwnd_by_base, visible_main_window_bases)`.
+fn enumerate_best_hwnds_for_tray_pids(
+    pid_to_base: &HashMap<u32, String>,
+    own_pid: u32,
+) -> (HashMap<String, (isize, u32)>, HashSet<String>) {
+    if pid_to_base.is_empty() {
+        return (HashMap::new(), HashSet::new());
+    }
+
+    struct FastCtx<'a> {
+        own_pid: u32,
+        pid_to_base: &'a HashMap<u32, String>,
+        best: HashMap<String, (i32, isize, u32)>,
+        visible_main_bases: HashSet<String>,
+    }
+
+    extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut FastCtx<'_>);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 || pid == ctx.own_pid {
+                return BOOL(1);
+            }
+            let Some(base_exe) = ctx.pid_to_base.get(&pid) else {
+                return BOOL(1);
+            };
+
+            let mut cls_buf = [0u16; 96];
+            let cls_len = GetClassNameW(hwnd, &mut cls_buf);
+            let class_name = if cls_len > 0 {
+                String::from_utf16_lossy(&cls_buf[..cls_len as usize])
+            } else {
+                String::new()
+            };
+            if is_synthetic_tray_window_class(&class_name) {
+                return BOOL(1);
+            }
+
+            let title_len = GetWindowTextLengthW(hwnd);
+            let title = if title_len > 0 && title_len < 512 {
+                let mut buf = vec![0u16; (title_len + 1) as usize];
+                let got = GetWindowTextW(hwnd, &mut buf);
+                if got > 0 {
+                    String::from_utf16_lossy(&buf[..got as usize])
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let is_visible = IsWindowVisible(hwnd).as_bool();
+            let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+            let has_owner = !GetWindow(hwnd, GW_OWNER).unwrap_or_default().0.is_null();
+            let has_class_icon =
+                GetClassLongPtrW(hwnd, GCLP_HICON) != 0 || GetClassLongPtrW(hwnd, GCLP_HICONSM) != 0;
+            let has_app_frame_style = (style & (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0)) != 0;
+
+            if is_visible && !is_tool_window && !has_owner && !title.trim().is_empty() {
+                ctx.visible_main_bases.insert(base_exe.clone());
+            }
+
+            let cand = RawTrayWindowCandidate {
+                hwnd: hwnd.0 as isize,
+                pid,
+                exe_path: String::new(),
+                title,
+                class_name,
+                is_visible,
+                is_tool_window,
+                has_owner,
+                has_class_icon,
+                has_app_frame_style,
+            };
+            let mut score = score_tray_candidate(&cand);
+            if is_visible && !is_tool_window && !has_owner {
+                score += 20;
+            }
+            match ctx.best.get_mut(base_exe) {
+                Some(entry) => {
+                    if score > entry.0 {
+                        *entry = (score, hwnd.0 as isize, pid);
+                    }
+                }
+                None => {
+                    ctx.best
+                        .insert(base_exe.clone(), (score, hwnd.0 as isize, pid));
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = FastCtx {
+        own_pid,
+        pid_to_base,
+        best: HashMap::new(),
+        visible_main_bases: HashSet::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+
+    let best_hwnds = ctx
+        .best
+        .into_iter()
+        .map(|(k, (_, h, p))| (k, (h, p)))
+        .collect();
+    (best_hwnds, ctx.visible_main_bases)
+}
+
+fn try_put_tray_snapshot_into_cache(
+    exe_path: &str,
+    subkey: &str,
+    snapshot: Option<&[u8]>,
+    cache: &mut IconCache,
+    icon_sources: &mut Vec<(String, String)>,
+    seen_sources: &mut HashSet<String>,
+) -> Option<String> {
+    let bytes = snapshot?;
+    if bytes.len() > MAX_NOTIFY_ICON_SNAPSHOT_CACHE_BYTES || parse_png_dimensions(bytes).is_none() {
+        return None;
+    }
+    let base = exe_basename_lower(exe_path);
+    let key = tray_snapshot_icon_key(subkey, &base);
+    let trimmed = exe_path.trim();
+    if !trimmed.is_empty() && seen_sources.insert(key.clone()) {
+        icon_sources.push((key.clone(), trimmed.to_string()));
+    }
+    if cache.get(&key).is_some() {
+        return Some(key);
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    cache.put(key.clone(), format!("data:image/png;base64,{encoded}"));
+    Some(key)
+}
+
+fn try_put_tray_snapshot_into_cache_mutex(
+    exe_path: &str,
+    subkey: &str,
+    snapshot: Option<&[u8]>,
+    cache: &Mutex<IconCache>,
+    icon_sources: &mut Vec<(String, String)>,
+    seen_sources: &mut HashSet<String>,
+) -> Option<String> {
+    let bytes = snapshot?;
+    if bytes.len() > MAX_NOTIFY_ICON_SNAPSHOT_CACHE_BYTES || parse_png_dimensions(bytes).is_none() {
+        return None;
+    }
+    let base = exe_basename_lower(exe_path);
+    let key = tray_snapshot_icon_key(subkey, &base);
+    let trimmed = exe_path.trim();
+    if !trimmed.is_empty() && seen_sources.insert(key.clone()) {
+        icon_sources.push((key.clone(), trimmed.to_string()));
+    }
+    let hit = {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&key).is_some()
+    };
+    if hit {
+        return Some(key);
+    }
+    // Base64 encode outside the shared IconCache mutex.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let uri = format!("data:image/png;base64,{encoded}");
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.put(key.clone(), uri);
+    Some(key)
+}
+
+fn resolve_notify_tray_icon_into_cache(
+    exe_path: &str,
+    hwnd_raw: Option<isize>,
+    subkey: &str,
+    snapshot: Option<&[u8]>,
+    cache: &mut IconCache,
+    icon_sources: &mut Vec<(String, String)>,
+    seen_sources: &mut HashSet<String>,
+) -> Option<String> {
+    let trimmed = exe_path.trim();
+    let base = exe_basename_lower(trimmed);
+    let tray_key = tray_snapshot_icon_key(subkey, &base);
+    if cache.get(&tray_key).is_some() {
+        if !trimmed.is_empty() && seen_sources.insert(tray_key.clone()) {
+            icon_sources.push((tray_key.clone(), trimmed.to_string()));
+        }
+        return Some(tray_key);
+    }
+    if !trimmed.is_empty() && base != "nvcontainer.exe" && !is_application_frame_host(trimmed) {
+        let exe_key = icon_cache::path_icon_key(trimmed);
+        if cache.get(&exe_key).is_some() {
+            if seen_sources.insert(exe_key.clone()) {
+                icon_sources.push((exe_key.clone(), trimmed.to_string()));
+            }
+            return Some(exe_key);
+        }
+    }
+
+    // Cold cache miss: lazily load IconSnapshot from HKCU ONLY for this subkey.
+    let owned_snap = if snapshot.is_none() {
+        read_notify_icon_snapshot_by_subkey(subkey)
+    } else {
+        None
+    };
+    let effective_snap = snapshot.or(owned_snap.as_deref());
+    let snap_dims = effective_snap.and_then(parse_png_dimensions);
+    if should_prefer_icon_snapshot(exe_path, snap_dims) {
+        try_put_tray_snapshot_into_cache(
+            exe_path,
+            subkey,
+            effective_snap,
+            cache,
+            icon_sources,
+            seen_sources,
+        )
+        .or_else(|| {
+            resolve_tray_icon_into_cache(exe_path, hwnd_raw, cache, icon_sources, seen_sources)
+        })
+    } else {
+        resolve_tray_icon_into_cache(exe_path, hwnd_raw, cache, icon_sources, seen_sources)
+            .or_else(|| {
+                try_put_tray_snapshot_into_cache(
+                    exe_path,
+                    subkey,
+                    effective_snap,
+                    cache,
+                    icon_sources,
+                    seen_sources,
+                )
+            })
+    }
+}
+
+fn resolve_notify_tray_icon_into_cache_mutex(
+    exe_path: &str,
+    hwnd_raw: Option<isize>,
+    subkey: &str,
+    snapshot: Option<&[u8]>,
+    cache: &Mutex<IconCache>,
+    icon_sources: &mut Vec<(String, String)>,
+    seen_sources: &mut HashSet<String>,
+) -> Option<String> {
+    let trimmed = exe_path.trim();
+    let base = exe_basename_lower(trimmed);
+    let tray_key = tray_snapshot_icon_key(subkey, &base);
+    let exe_key = (!trimmed.is_empty()
+        && base != "nvcontainer.exe"
+        && !is_application_frame_host(trimmed))
+    .then(|| icon_cache::path_icon_key(trimmed));
+
+    // Fast-path cache check: 100% hit on steady-state polls -> ZERO registry I/O, ZERO GDI!
+    let cached_hit = {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.get(&tray_key).is_some() {
+            Some(tray_key)
+        } else if let Some(ref ek) = exe_key {
+            if guard.get(ek).is_some() {
+                Some(ek.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(hit_key) = cached_hit {
+        if !trimmed.is_empty() && seen_sources.insert(hit_key.clone()) {
+            icon_sources.push((hit_key.clone(), trimmed.to_string()));
+        }
+        return Some(hit_key);
+    }
+
+    // Cold cache miss: lazily load IconSnapshot outside the IconCache mutex.
+    let owned_snap = if snapshot.is_none() {
+        read_notify_icon_snapshot_by_subkey(subkey)
+    } else {
+        None
+    };
+    let effective_snap = snapshot.or(owned_snap.as_deref());
+    let snap_dims = effective_snap.and_then(parse_png_dimensions);
+    if should_prefer_icon_snapshot(exe_path, snap_dims) {
+        try_put_tray_snapshot_into_cache_mutex(
+            exe_path,
+            subkey,
+            effective_snap,
+            cache,
+            icon_sources,
+            seen_sources,
+        )
+        .or_else(|| {
+            resolve_tray_icon_into_cache_mutex(
+                exe_path,
+                hwnd_raw,
+                cache,
+                icon_sources,
+                seen_sources,
+            )
+        })
+    } else {
+        resolve_tray_icon_into_cache_mutex(exe_path, hwnd_raw, cache, icon_sources, seen_sources)
+            .or_else(|| {
+                try_put_tray_snapshot_into_cache_mutex(
+                    exe_path,
+                    subkey,
+                    effective_snap,
+                    cache,
+                    icon_sources,
+                    seen_sources,
+                )
+            })
+    }
+}
+
+fn collect_live_notify_tray_inputs(
+    own_pid: u32,
+    open_taskbar_groups: &[AppWindowGroup],
+) -> Option<(
+    Vec<RawNotifyIconEntry>,
+    Vec<LiveProcessEntry>,
+    HashMap<String, (isize, u32)>,
+    HashSet<String>,
+)> {
+    let entries = read_notify_icon_settings_registry()?;
+    let candidate_bases: HashSet<String> = entries
+        .iter()
+        .filter(|e| !is_os_privacy_tooltip(&e.initial_tooltip))
+        .map(|e| exe_basename_lower(&e.executable_path))
+        .filter(|b| !b.is_empty() && b.ends_with(".exe"))
+        .collect();
+
+    let live_processes = enumerate_live_session_processes(own_pid, &candidate_bases);
+    let mut open_bases_with_hwnd = HashSet::new();
+    for g in open_taskbar_groups {
+        let g_base = exe_basename_lower(&g.exe_path);
+        if !g_base.is_empty() && g.windows.iter().any(|w| w.hwnd != 0) {
+            open_bases_with_hwnd.insert(g_base);
+        }
+        for w in &g.windows {
+            if w.hwnd != 0 {
+                let w_base = exe_basename_lower(&w.exe_path);
+                if !w_base.is_empty() {
+                    open_bases_with_hwnd.insert(w_base);
+                }
+            }
+        }
+    }
+
+    let mut pid_to_base = HashMap::with_capacity(live_processes.len());
+    for p in &live_processes {
+        let base = if !p.exe_name.trim().is_empty() {
+            exe_basename_lower(&p.exe_name)
+        } else {
+            exe_basename_lower(&p.exe_path)
+        };
+        if !base.is_empty() && !open_bases_with_hwnd.contains(&base) {
+            pid_to_base.insert(p.pid, base);
+        }
+    }
+    let (fallback_hwnds, visible_main_bases) =
+        enumerate_best_hwnds_for_tray_pids(&pid_to_base, own_pid);
+    Some((entries, live_processes, fallback_hwnds, visible_main_bases))
+}
+
+/// Enumerates real Windows 11 tray apps via `HKCU\Control Panel\NotifyIconSettings` intersected
+/// with live current-session processes (Option A), falling back to legacy hidden-window scan only
+/// if the registry key is unavailable.
 pub fn list_tray_background_apps_cached(
     cache: &Mutex<IconCache>,
     open_taskbar_groups: &[AppWindowGroup],
 ) -> Vec<TrayAppItem> {
-    let own_pid = unsafe { GetCurrentProcessId() };
-    let candidates = enumerate_tray_window_candidates(own_pid);
-
-    build_tray_background_apps(candidates, open_taskbar_groups, own_pid, |exe, hwnd| {
-        resolve_exe_or_hwnd_icon_key(exe, hwnd, cache)
-    })
+    let (items, _) = list_tray_background_apps_filtered_with_open_mutex(cache, open_taskbar_groups, &[]);
+    items
 }
 
 fn resolve_tray_icon_into_cache_mutex(
@@ -2003,19 +3452,47 @@ fn resolve_tray_icon_into_cache_mutex(
     None
 }
 
-/// Enumerates tray background apps with user ignore-list filtering using narrow `Mutex<IconCache>`
-/// locking: `EnumWindows` enumeration and any `SHGetFileInfoW`/`SendMessageTimeoutW` icon
-/// extraction run completely outside the shared `IconCache` mutex.
+/// Enumerates real Windows 11 tray apps (`NotifyIconSettings` × live current-session processes)
+/// with user ignore-list filtering using narrow `Mutex<IconCache>` locking: registry reads,
+/// Toolhelp32 process scan, PID-filtered `EnumWindows`, base64 encoding, and icon extraction
+/// all run completely outside the shared `IconCache` mutex.
 pub fn list_tray_background_apps_filtered_with_open_mutex(
     cache: &Mutex<IconCache>,
     open_taskbar_groups: &[AppWindowGroup],
     hidden_keys: &[String],
 ) -> (Vec<TrayAppInfo>, Vec<(String, String)>) {
     let own_pid = unsafe { GetCurrentProcessId() };
-    let candidates = enumerate_tray_window_candidates(own_pid);
     let mut icon_sources = Vec::new();
     let mut seen_sources = HashSet::new();
 
+    if let Some((entries, live_processes, fallback_hwnds, visible_main_bases)) =
+        collect_live_notify_tray_inputs(own_pid, open_taskbar_groups)
+    {
+        let items = build_tray_apps_from_notify_settings(
+            entries,
+            &live_processes,
+            open_taskbar_groups,
+            &fallback_hwnds,
+            &visible_main_bases,
+            own_pid,
+            |exe, hwnd, subkey, snap| {
+                resolve_notify_tray_icon_into_cache_mutex(
+                    exe,
+                    hwnd,
+                    subkey,
+                    snap,
+                    cache,
+                    &mut icon_sources,
+                    &mut seen_sources,
+                )
+            },
+        );
+        let filtered = filter_hidden_tray_apps(items, hidden_keys);
+        return (filtered, icon_sources);
+    }
+
+    // Legacy fallback if HKCU\Control Panel\NotifyIconSettings cannot be opened
+    let candidates = enumerate_tray_window_candidates(own_pid);
     let mut extra_open_groups: Vec<AppWindowGroup> = Vec::new();
     let effective_open: &[AppWindowGroup] = if open_taskbar_groups.is_empty() {
         let mut seen_open = HashSet::new();
@@ -2048,21 +3525,46 @@ pub fn list_tray_background_apps_filtered_with_open_mutex(
     (filtered, icon_sources)
 }
 
-/// Enumerates tray background apps with user ignore-list filtering and returns BOTH the filtered
-/// `TrayAppInfo` list AND `(icon_key, exe_path)` icon source pairs so callers can register them
-/// in `AppState.icon_sources` (surviving 256-LRU eviction).
+/// Enumerates real Windows 11 tray apps with user ignore-list filtering and returns BOTH the
+/// filtered `TrayAppInfo` list AND `(icon_key, exe_path)` icon source pairs so callers can
+/// register them in `AppState.icon_sources` (surviving 256-LRU eviction).
 pub fn list_tray_background_apps_filtered_with_open(
     cache: &mut IconCache,
     open_taskbar_groups: &[AppWindowGroup],
     hidden_keys: &[String],
 ) -> (Vec<TrayAppInfo>, Vec<(String, String)>) {
     let own_pid = unsafe { GetCurrentProcessId() };
-    let candidates = enumerate_tray_window_candidates(own_pid);
     let mut icon_sources = Vec::new();
     let mut seen_sources = HashSet::new();
 
-    // Also synthesize open-exe exclusions from visible standard desktop windows when caller
-    // passes an empty `open_taskbar_groups` slice.
+    if let Some((entries, live_processes, fallback_hwnds, visible_main_bases)) =
+        collect_live_notify_tray_inputs(own_pid, open_taskbar_groups)
+    {
+        let items = build_tray_apps_from_notify_settings(
+            entries,
+            &live_processes,
+            open_taskbar_groups,
+            &fallback_hwnds,
+            &visible_main_bases,
+            own_pid,
+            |exe, hwnd, subkey, snap| {
+                resolve_notify_tray_icon_into_cache(
+                    exe,
+                    hwnd,
+                    subkey,
+                    snap,
+                    cache,
+                    &mut icon_sources,
+                    &mut seen_sources,
+                )
+            },
+        );
+        let filtered = filter_hidden_tray_apps(items, hidden_keys);
+        return (filtered, icon_sources);
+    }
+
+    // Legacy fallback if HKCU\Control Panel\NotifyIconSettings cannot be opened
+    let candidates = enumerate_tray_window_candidates(own_pid);
     let mut extra_open_groups: Vec<AppWindowGroup> = Vec::new();
     let effective_open: &[AppWindowGroup] = if open_taskbar_groups.is_empty() {
         let mut seen_open = HashSet::new();
@@ -2095,8 +3597,8 @@ pub fn list_tray_background_apps_filtered_with_open(
     (filtered, icon_sources)
 }
 
-/// Enumerates tray background apps (auto-excluding visible desktop taskbar apps and user
-/// `hidden_keys`), populating `cache` and returning `(apps, icon_sources)`.
+/// Enumerates tray background apps (excluding user `hidden_keys`), populating `cache` and
+/// returning `(apps, icon_sources)`.
 pub fn list_tray_background_apps_filtered(
     cache: &mut IconCache,
     hidden_keys: &[String],
@@ -2121,9 +3623,10 @@ pub fn should_activate_hidden_hwnd(
     is_iconic || !is_tool_window || has_app_frame_style || (rect_width > 40 && rect_height > 40)
 }
 
-/// Activates a background tray app by restoring & focusing its existing hidden window when valid
-/// (avoiding duplicate app spawns), falling back to `launch_target_with_args` only when no
-/// restorable hidden window exists.
+/// Activates a background tray app by restoring & focusing its existing window when valid
+/// (avoiding duplicate app spawns), falling back to a smart shell/UI launch when no restorable
+/// window exists (e.g. `windowsdefender:` for SecurityHealthSystray, NVIDIA App/Control Panel
+/// for `nvcontainer.exe`, or single-instance relaunch for standard apps).
 pub fn activate_tray_app(hwnd_opt: Option<isize>, exe_path: &str) -> Result<(), String> {
     if let Some(raw) = hwnd_opt.filter(|&h| h != 0) {
         unsafe {
@@ -2158,6 +3661,20 @@ pub fn activate_tray_app(hwnd_opt: Option<isize>, exe_path: &str) -> Result<(), 
                     return Ok(());
                 }
             }
+        }
+    }
+
+    let base = exe_basename_lower(exe_path);
+    if base == "securityhealthsystray.exe" {
+        return launch_target_with_args("windowsdefender:", None, false);
+    }
+    if base == "nvcontainer.exe" {
+        const NV_APP_PATH: &str = r"C:\Program Files\NVIDIA Corporation\NVIDIA app\CEF\NVIDIA app.exe";
+        if std::path::Path::new(NV_APP_PATH).exists() {
+            return launch_target_with_args(NV_APP_PATH, None, false);
+        }
+        if launch_target_with_args("nvcplui.exe", None, false).is_ok() {
+            return Ok(());
         }
     }
 
@@ -2449,6 +3966,7 @@ mod tests {
                 is_active: false,
                 is_minimized: false,
                 is_topmost: false,
+                monitor: "primary".to_string(),
             }],
         }
     }
@@ -2641,6 +4159,13 @@ mod tests {
                 win_n[3].Anonymous.ki.dwFlags,
                 KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
             );
+            for input in &win_n {
+                assert_eq!(
+                    input.Anonymous.ki.dwExtraInfo,
+                    crate::win_shell::TESTBAR_INJECTED_EXTRA_INFO,
+                    "all Win-chord inputs must carry TESTBAR_INJECTED_EXTRA_INFO"
+                );
+            }
         }
 
         assert_eq!(lang_id_to_layout_code(0x0419_0419), "RU");
@@ -2986,5 +4511,393 @@ mod tests {
         );
         assert!(res_empty.is_err());
         assert!(!write_called);
+    }
+
+    fn make_fake_png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::with_capacity(32);
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&width.to_be_bytes());
+        png.extend_from_slice(&height.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0]);
+        png
+    }
+
+    #[test]
+    fn notify_icon_known_folder_and_png_snapshot_resolution() {
+        let raw = r"{6D809377-6AF0-444B-8957-A3773F02200E}\NVIDIA Corporation\NvContainer\nvcontainer.exe";
+        let (guid, rest) = split_known_folder_prefix(raw).expect("GUID prefix must split");
+        assert_eq!(guid, "{6D809377-6AF0-444B-8957-A3773F02200E}");
+        assert_eq!(rest, r"NVIDIA Corporation\NvContainer\nvcontainer.exe");
+        assert!(parse_guid_str(guid).is_some());
+
+        let resolved = resolve_known_folder_path_with(raw, |g| {
+            assert_eq!(g, "{6D809377-6AF0-444B-8957-A3773F02200E}");
+            Some(r"C:\Program Files".to_string())
+        });
+        assert_eq!(
+            resolved,
+            r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe"
+        );
+
+        // Plain path stays untouched (slashes normalized)
+        assert_eq!(
+            resolve_known_folder_path_with("C:/Apps/Steam/steam.exe", |_| None),
+            r"C:\Apps\Steam\steam.exe"
+        );
+
+        // PNG IHDR validation & snapshot preference matrix
+        let png16 = make_fake_png(16, 16);
+        let png32 = make_fake_png(32, 32);
+        let png128 = make_fake_png(128, 128);
+        let png512 = make_fake_png(512, 512);
+        assert_eq!(parse_png_dimensions(&png32), Some((32, 32)));
+        assert_eq!(parse_png_dimensions(b"not a png"), None);
+        assert_eq!(parse_png_dimensions(&make_fake_png(0, 32)), None);
+
+        // nvcontainer always prefers IconSnapshot (even at 16 or 128px)
+        assert!(should_prefer_icon_snapshot(
+            r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe",
+            parse_png_dimensions(&png128)
+        ));
+        // WindowsApps prefers IconSnapshot <= 256px
+        assert!(should_prefer_icon_snapshot(
+            r"C:\Program Files\WindowsApps\FluentFlyout\FluentFlyout.exe",
+            parse_png_dimensions(&png16)
+        ));
+        // Desktop 32px native tray icon prefers IconSnapshot
+        assert!(should_prefer_icon_snapshot(
+            r"C:\Program Files (x86)\Steam\steam.exe",
+            parse_png_dimensions(&png32)
+        ));
+        // Desktop 16px tiny snapshot prefers crisp exe icon extraction first
+        assert!(!should_prefer_icon_snapshot(
+            r"C:\Apps\Telegram\Telegram.exe",
+            parse_png_dimensions(&png16)
+        ));
+        // Oversized 512px snapshot (e.g. Antigravity) prefers crisp exe icon extraction first
+        assert!(!should_prefer_icon_snapshot(
+            r"C:\Users\u\AppData\Local\Programs\Antigravity\Antigravity.exe",
+            parse_png_dimensions(&png512)
+        ));
+
+        // Deterministic tray: cache key
+        let k1 = tray_snapshot_icon_key("1234567890", "nvcontainer.exe");
+        let k2 = tray_snapshot_icon_key("1234567890", "NVCONTAINER.EXE");
+        assert!(k1.starts_with("tray:"));
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn notify_icon_privacy_tooltip_browser_and_exclusion_filters() {
+        // Live Windows 11 Russian & English OS privacy indicator tooltips MUST be filtered
+        assert!(is_os_privacy_tooltip(
+            "Вы открыли доступ к своему микрофону. Щёлкните для контроля доступа."
+        ));
+        assert!(is_os_privacy_tooltip(
+            "Discord is using your microphone. Click to control access."
+        ));
+        assert!(is_os_privacy_tooltip("Zoom accessed your camera"));
+        // Normal tray tooltips must NOT be misclassified
+        assert!(!is_os_privacy_tooltip("Настройки NVIDIA"));
+        assert!(!is_os_privacy_tooltip("Telegram Desktop"));
+        assert!(!is_os_privacy_tooltip("Безопасность Windows — Действия не требуются"));
+
+        // Tooltip cleanup & friendly overrides
+        assert_eq!(
+            resolve_tray_display_name(
+                r"C:\Windows\System32\SecurityHealthSystray.exe",
+                "Безопасность Windows — Действия не требуются"
+            ),
+            "Безопасность Windows"
+        );
+        assert_eq!(
+            resolve_tray_display_name(r"C:\Program Files\Riot Vanguard\vgtray.exe", ""),
+            "Riot Vanguard"
+        );
+        assert_eq!(
+            resolve_tray_display_name(r"C:\Apps\MagicPods\MagicPodsService.exe", ""),
+            "MagicPods"
+        );
+        assert_eq!(
+            resolve_tray_display_name(
+                r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe",
+                "Настройки NVIDIA"
+            ),
+            "Настройки NVIDIA"
+        );
+
+        // Browsers detected
+        for b in ["chrome.exe", "zen.exe", "msedge.exe", "firefox.exe", "brave.exe"] {
+            assert!(is_browser_exe(b), "{b} must be detected as browser");
+        }
+        assert!(!is_browser_exe("steam.exe"));
+        assert!(!is_browser_exe("telegram.exe"));
+
+        // NotifyIconSettings exclusion matrix: allows real tray daemons, blocks OS/self
+        assert!(!is_excluded_notify_icon_process(
+            r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe"
+        ));
+        assert!(!is_excluded_notify_icon_process(
+            r"C:\Windows\System32\SecurityHealthSystray.exe"
+        ));
+        assert!(!is_excluded_notify_icon_process(
+            r"C:\Apps\MagicPods\MagicPodsService.exe"
+        ));
+        for excl in [
+            r"C:\Windows\explorer.exe",
+            r"C:\Apps\TestBar\testbar-v2.exe",
+            r"C:\Windows\System32\MoNotificationUx.exe",
+            r"C:\Program Files\WindowsApps\PhoneExperienceHost.exe",
+        ] {
+            assert!(
+                is_excluded_notify_icon_process(excl),
+                "{excl} must be excluded from NotifyIconSettings tray"
+            );
+        }
+    }
+
+    #[test]
+    fn notify_icon_option_a_keeps_open_tray_apps_excludes_open_browsers_and_dedups_overwolf() {
+        let own_pid = 777;
+        let png32 = make_fake_png(32, 32);
+        let png128 = make_fake_png(128, 128);
+
+        let open_groups = vec![
+            make_open_group(r"C:\Program Files (x86)\Steam\steam.exe", 2001),
+            make_open_group(r"C:\Program Files\Zen Browser\zen.exe", 3001),
+            make_open_group(r"C:\Program Files\Google\Chrome\Application\chrome.exe", 3002),
+        ];
+
+        let live_processes = vec![
+            LiveProcessEntry {
+                pid: own_pid,
+                exe_path: r"C:\Apps\TestBar\testbar-v2.exe".into(),
+                exe_name: "testbar-v2.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 2001,
+                exe_path: r"C:\Program Files (x86)\Steam\steam.exe".into(),
+                exe_name: "steam.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 2002,
+                exe_path: r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe".into(),
+                exe_name: "nvcontainer.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 2003,
+                exe_path: String::new(), // Simulates protected anti-cheat process where QueryFullProcessImageNameW failed
+                exe_name: "vgtray.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 2004,
+                exe_path: r"C:\Program Files (x86)\Overwolf\0.264\Overwolf.exe".into(),
+                exe_name: "Overwolf.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 2005,
+                exe_path: r"C:\Program Files (x86)\Overwolf\0.264\Overwolf.exe".into(),
+                exe_name: "Overwolf.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 3001,
+                exe_path: r"C:\Program Files\Zen Browser\zen.exe".into(),
+                exe_name: "zen.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 3002,
+                exe_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+                exe_name: "chrome.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 3003,
+                exe_path: r"C:\Program Files\Mozilla Firefox\firefox.exe".into(),
+                exe_name: "firefox.exe".into(),
+            },
+            LiveProcessEntry {
+                pid: 4000,
+                exe_path: r"C:\Windows\explorer.exe".into(),
+                exe_name: "explorer.exe".into(),
+            },
+        ];
+
+        let entries = vec![
+            // Open Steam -> MUST stay in tray (Option A) with HWND enriched from open_groups (999)
+            RawNotifyIconEntry {
+                subkey: "100".into(),
+                executable_path: r"C:\Program Files (x86)\Steam\steam.exe".into(),
+                initial_tooltip: "Steam".into(),
+                publisher: "Valve".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // NVIDIA Container -> MUST be kept with 128px snapshot & localized tooltip
+            RawNotifyIconEntry {
+                subkey: "101".into(),
+                executable_path: r"C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe".into(),
+                initial_tooltip: "Настройки NVIDIA".into(),
+                publisher: "NVIDIA".into(),
+                is_promoted: Some(true),
+                icon_snapshot: Some(png128),
+            },
+            // Riot Vanguard (empty live exe_path due to anti-cheat DACL) -> falls back to registry path cleanly!
+            RawNotifyIconEntry {
+                subkey: "102".into(),
+                executable_path: r"C:\Program Files\Riot Vanguard\vgtray.exe".into(),
+                initial_tooltip: String::new(),
+                publisher: "Riot Games".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Multi-subkey Overwolf: old version vs current version -> dedups to 1 winning entry with both PIDs
+            RawNotifyIconEntry {
+                subkey: "103".into(),
+                executable_path: r"C:\Program Files (x86)\Overwolf\0.250\Overwolf.exe".into(),
+                initial_tooltip: String::new(),
+                publisher: "Overwolf".into(),
+                is_promoted: Some(false),
+                icon_snapshot: None,
+            },
+            RawNotifyIconEntry {
+                subkey: "104".into(),
+                executable_path: r"C:\Program Files (x86)\Overwolf\0.264\Overwolf.exe".into(),
+                initial_tooltip: "Overwolf".into(),
+                publisher: "Overwolf".into(),
+                is_promoted: Some(true),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Open Zen browser with OS mic privacy ghost -> excluded by BOTH privacy tooltip & open browser rule
+            RawNotifyIconEntry {
+                subkey: "105".into(),
+                executable_path: r"C:\Program Files\Zen Browser\zen.exe".into(),
+                initial_tooltip: "Вы открыли доступ к своему микрофону. Щёлкните для контроля доступа.".into(),
+                publisher: "".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Open Chrome -> excluded because it's a browser currently open on the taskbar
+            RawNotifyIconEntry {
+                subkey: "106".into(),
+                executable_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+                initial_tooltip: "Google Chrome".into(),
+                publisher: "Google".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Background-only Firefox (NOT open on taskbar) -> kept!
+            RawNotifyIconEntry {
+                subkey: "107".into(),
+                executable_path: r"C:\Program Files\Mozilla Firefox\firefox.exe".into(),
+                initial_tooltip: "Firefox".into(),
+                publisher: "Mozilla".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Stale uninstalled/not-running app -> excluded (no live process)
+            RawNotifyIconEntry {
+                subkey: "108".into(),
+                executable_path: r"C:\Apps\NotRunning\ghost.exe".into(),
+                initial_tooltip: "Ghost".into(),
+                publisher: "".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            // Explorer & own TestBar -> excluded
+            RawNotifyIconEntry {
+                subkey: "109".into(),
+                executable_path: r"C:\Windows\explorer.exe".into(),
+                initial_tooltip: "Explorer".into(),
+                publisher: "Microsoft".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32.clone()),
+            },
+            RawNotifyIconEntry {
+                subkey: "110".into(),
+                executable_path: r"C:\Apps\TestBar\testbar-v2.exe".into(),
+                initial_tooltip: "TestBar".into(),
+                publisher: "".into(),
+                is_promoted: Some(false),
+                icon_snapshot: Some(png32),
+            },
+        ];
+
+        let mut fallback_hwnds = HashMap::new();
+        fallback_hwnds.insert("overwolf.exe".to_string(), (8888isize, 2004u32));
+
+        let items = build_tray_apps_from_notify_settings(
+            entries,
+            &live_processes,
+            &open_groups,
+            &fallback_hwnds,
+            &HashSet::new(),
+            own_pid,
+            |exe, _hwnd, subkey, snap| {
+                let dims = snap.and_then(parse_png_dimensions);
+                if should_prefer_icon_snapshot(exe, dims) {
+                    Some(tray_snapshot_icon_key(subkey, &exe_basename_lower(exe)))
+                } else {
+                    Some(icon_cache::path_icon_key(exe))
+                }
+            },
+        );
+
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["firefox.exe", "overwolf.exe", "vgtray.exe", "steam.exe", "nvcontainer.exe"]
+        );
+
+        let steam = items.iter().find(|i| i.id == "steam.exe").unwrap();
+        assert_eq!(steam.hwnd, Some(999), "open tray app must receive HWND from open taskbar group");
+        assert!(steam.icon_data.is_none(), "AD-6: tray payload must carry icon_key only");
+
+        let nv = items.iter().find(|i| i.id == "nvcontainer.exe").unwrap();
+        assert_eq!(nv.name, "Настройки NVIDIA");
+        assert!(nv.icon_key.as_deref().unwrap().starts_with("tray:"));
+
+        let vg = items.iter().find(|i| i.id == "vgtray.exe").unwrap();
+        assert_eq!(vg.name, "Riot Vanguard");
+        assert_eq!(vg.exe_path, r"C:\Program Files\Riot Vanguard\vgtray.exe");
+
+        let ow = items.iter().find(|i| i.id == "overwolf.exe").unwrap();
+        assert_eq!(ow.name, "Overwolf");
+        assert_eq!(ow.hwnd, Some(8888));
+        assert_eq!(ow.all_pids, vec![2004, 2005]);
+    }
+
+    #[test]
+    fn notify_icon_live_smoke_reads_registry_safely() {
+        let cache = Mutex::new(IconCache::default());
+        let (items, _sources) =
+            list_tray_background_apps_filtered_with_open_mutex(&cache, &[], &[]);
+        for item in &items {
+            assert!(item.icon_data.is_none(), "AD-6: tray item must not carry inline icon_data");
+            assert_ne!(item.id, "explorer.exe");
+            assert!(!item.id.starts_with("testbar"));
+            assert!(!is_os_privacy_tooltip(&item.name));
+        }
+
+        // Second call hits NotifyIconSettings metadata cache + IconCache without error
+        let (items2, _sources2) =
+            list_tray_background_apps_filtered_with_open_mutex(&cache, &[], &[]);
+        for item in &items2 {
+            assert!(item.icon_data.is_none());
+        }
+    }
+
+    #[test]
+    fn peripheral_batteries_uses_ttl_cache_on_consecutive_calls() {
+        let first = get_peripheral_batteries();
+        let t0 = Instant::now();
+        let second = get_peripheral_batteries();
+        let elapsed = t0.elapsed();
+        assert_eq!(first.len(), second.len());
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "2nd peripheral battery call within 30s TTL must hit cache immediately, took {:?}",
+            elapsed
+        );
     }
 }

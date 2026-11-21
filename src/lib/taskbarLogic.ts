@@ -1,5 +1,6 @@
 import { formatSelectedDateHeader } from './calendarLogic';
 import type {
+  AppWindowGroup,
   AudioMasterState,
   FlyoutRequest,
   MergedBarItem,
@@ -58,7 +59,7 @@ export const SOUND_FLYOUT_INITIAL_HEIGHT = 340;
 export const CALENDAR_FLYOUT_WIDTH = 310;
 export const CALENDAR_FLYOUT_INITIAL_HEIGHT = 408;
 export const EDGE_CENTERED_MIN_WIDTH = 1180;
-export const DOCK_CHROME_EXTRA_PX = 19; // 14px horizontal padding + 2px border + 3px group gap
+export const DOCK_CHROME_EXTRA_PX = 21; // 16px horizontal padding (8px*2) + 2px border + 3px group gap
 
 const WEEKDAYS_JS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'] as const;
 
@@ -101,14 +102,55 @@ export function getTaskbarItemStateClass(item: Pick<MergedBarItem, 'group'>): Ta
 }
 
 /**
+ * Option A secondary monitor contract: Monitor 2 shows Start + ONLY windows currently on
+ * Monitor 2 (never duplicating Monitor 1 `taskbarPins`).
+ */
+export function selectTaskbarPinsForMonitor(
+  pins: PinItem[] | null | undefined,
+  monitor: TaskbarMonitor,
+): PinItem[] {
+  if (monitor === 'secondary') return [];
+  return pins ?? [];
+}
+
+/**
+ * Filters `AppWindowGroup[]` strictly to windows residing on `monitor` when per-window `monitor`
+ * metadata is present. Untagged windows (legacy payloads) stay on `'primary'` only.
+ */
+export function filterGroupsForMonitor(
+  groups: readonly AppWindowGroup[],
+  monitor: TaskbarMonitor,
+): AppWindowGroup[] {
+  const result: AppWindowGroup[] = [];
+  for (const g of groups) {
+    const filteredWins = g.windows.filter((w) => {
+      if (!w.monitor) return monitor === 'primary';
+      return w.monitor === monitor;
+    });
+    if (filteredWins.length === 0) continue;
+    if (filteredWins.length === g.windows.length) {
+      result.push(g);
+    } else {
+      result.push({
+        ...g,
+        isActive: filteredWins.some((w) => w.isActive),
+        windows: filteredWins,
+      });
+    }
+  }
+  return result;
+}
+
+/**
  * Computes unconstrained logical dock width from `scrollWidth` and `getBoundingClientRect().width`,
- * guarding against zero/sub-threshold measurements before initial paint.
+ * guarding against zero/sub-threshold measurements before initial paint while supporting compact
+ * secondary monitor docks (Start + Clock = ~130px).
  */
 export function computeDockLogicalWidth(scrollWidth: number, rectWidth: number): number | null {
   const safeScroll = Number.isFinite(scrollWidth) ? scrollWidth : 0;
   const safeRect = Number.isFinite(rectWidth) ? rectWidth : 0;
   const measured = Math.ceil(Math.max(safeScroll, safeRect));
-  return measured > 200 ? measured : null;
+  return measured > 96 ? measured : null;
 }
 
 /**
@@ -482,12 +524,46 @@ export function buildPreviewFlyoutRequest(
   };
 }
 
+export type TaskbarClickAction =
+  | { type: 'focus'; hwnd: number; toggleMinimize: boolean }
+  | { type: 'launch'; target: string; args: string | null };
+
+/**
+ * Resolves left-click behavior for a taskbar slot:
+ * 1. Running window(s) on this monitor -> focus / cycle / toggle minimize.
+ * 2. Pinned app currently running on another monitor (`remoteGroup`) -> focus that running window
+ *    without minimizing it (`toggleMinimize: false`) so clicking e.g. Spark on Monitor 1 activates
+ *    Spark on Monitor 2 cleanly.
+ * 3. Otherwise -> launch `item.target`.
+ */
+export function resolveTaskbarItemClick(
+  item: Pick<MergedBarItem, 'group' | 'remoteGroup' | 'target' | 'args'>,
+): TaskbarClickAction | null {
+  const localWin = selectWindowToFocusOnTaskbarClick(item.group?.windows ?? []);
+  if (localWin) {
+    return { type: 'focus', hwnd: localWin.hwnd, toggleMinimize: localWin.toggleMinimize };
+  }
+  const remoteWins = item.remoteGroup?.windows ?? [];
+  if (remoteWins.length > 0) {
+    const preferred =
+      remoteWins.find((w) => w.isActive) ??
+      remoteWins.find((w) => !w.isMinimized) ??
+      remoteWins[0];
+    return { type: 'focus', hwnd: preferred.hwnd, toggleMinimize: false };
+  }
+  if (item.target) {
+    return { type: 'launch', target: item.target, args: item.args ?? null };
+  }
+  return null;
+}
+
 export function buildAppContextMenuRequest(
   item: MergedBarItem,
   anchorXLogical: number,
   monitor: TaskbarMonitor,
 ): FlyoutRequest {
-  const windows = item.group?.windows ?? [];
+  const localWins = item.group?.windows ?? [];
+  const windows = localWins.length > 0 ? localWins : (item.remoteGroup?.windows ?? []);
   const hasWins = windows.length > 0;
   const payload: AppContextPayload = {
     id: item.id,
@@ -496,7 +572,7 @@ export function buildAppContextMenuRequest(
     target: item.target,
     args: item.args ?? null,
     matchExe: item.matchExe ?? null,
-    aumid: item.group?.aumid ?? item.matchAumid ?? null,
+    aumid: item.group?.aumid ?? item.remoteGroup?.aumid ?? item.matchAumid ?? null,
     iconKey: item.cacheIconKey || item.iconKey,
     pinned: item.pinned,
     windows,

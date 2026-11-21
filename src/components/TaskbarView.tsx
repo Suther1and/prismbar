@@ -4,6 +4,7 @@ import {
   applyConfigUpdate,
   dismissOverlays,
   fetchIconsBatch,
+  getOpenWindows,
   iconCache,
   ipc,
   isCacheIconKey,
@@ -30,6 +31,7 @@ import {
   computeNaturalDockWidth,
   computeNextWheelVolume,
   createTaskbarOrderMemory,
+  filterGroupsForMonitor,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
   getPreviewHoverDelayMs,
@@ -37,15 +39,18 @@ import {
   getTaskbarRootClassName,
   planSoundFeedbackAction,
   resolvePinnedReorderIndices,
+  resolveTaskbarItemClick,
   resolveTaskbarMonitor,
-  selectWindowToFocusOnTaskbarClick,
+  selectTaskbarPinsForMonitor,
   shouldTriggerPreviewHover,
   shouldUseEdgeCenteredLayout,
   SOUND_FLYOUT_INITIAL_HEIGHT,
   SOUND_FLYOUT_WIDTH,
   stabilizeTaskbarItemsOrder,
   TASKBAR_LAUNCH_HOP_MS,
+  type TaskbarMonitor,
 } from '../lib/taskbarLogic';
+import { hasExceededDragThreshold } from '../lib/startLogic';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import { ChevronUpIcon, FallbackAppIcon, NetIcon, StartLogoIcon, VolIcon } from './Icons';
 
@@ -60,11 +65,18 @@ function audioStateToMaster(st: AudioState): AudioMasterState {
   };
 }
 
-export const TaskbarView: React.FC = () => {
-  const monitor = useMemo(
-    () => (typeof window !== 'undefined' ? resolveTaskbarMonitor(window.location.search) : 'primary'),
-    [],
+export interface TaskbarViewProps {
+  monitorOverride?: TaskbarMonitor;
+}
+
+export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => {
+  const monitor = useMemo<TaskbarMonitor>(
+    () =>
+      monitorOverride ??
+      (typeof window !== 'undefined' ? resolveTaskbarMonitor(window.location.search) : 'primary'),
+    [monitorOverride],
   );
+  const isSecondary = monitor === 'secondary';
   const reducedMotion = useReducedMotion();
 
   const [config, setConfig] = useState<TestBarConfig | null>(null);
@@ -104,6 +116,9 @@ export const TaskbarView: React.FC = () => {
   const requestedTargetsRef = useRef<Set<string>>(new Set());
   const iconMapRef = useRef<Record<string, string>>({});
   const mountedRef = useRef<boolean>(true);
+  const pointerDragCleanupRef = useRef<(() => void) | null>(null);
+  const suppressClickUntilRef = useRef<number>(0);
+  const barItemsRef = useRef<MergedBarItem[]>([]);
 
   iconMapRef.current = iconMap;
 
@@ -158,6 +173,10 @@ export const TaskbarView: React.FC = () => {
       }
       launchTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
       launchTimersRef.current.clear();
+      if (pointerDragCleanupRef.current) {
+        pointerDragCleanupRef.current();
+        pointerDragCleanupRef.current = null;
+      }
     };
   }, []);
 
@@ -165,10 +184,14 @@ export const TaskbarView: React.FC = () => {
     ipc<TestBarConfig>('get_config')
       .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
       .catch(() => {});
-    ipc<AppWindowGroup[]>('get_open_windows').then(setGroups).catch(() => {});
-    ipc<AudioMasterState>('get_audio_master_state').then(setAudioMaster).catch(() => {});
-    ipc<NetworkInfo>('get_network_info').then(setNet).catch(() => {});
-    ipc<string>('get_keyboard_layout').then(setLayout).catch(() => {});
+    // Primary monitor fetches all open windows so pinned items running on Monitor 2
+    // can resolve native icons and focus across monitors without duplicating unpinned slots.
+    getOpenWindows(isSecondary ? monitor : undefined).then(setGroups).catch(() => {});
+    if (!isSecondary) {
+      ipc<AudioMasterState>('get_audio_master_state').then(setAudioMaster).catch(() => {});
+      ipc<NetworkInfo>('get_network_info').then(setNet).catch(() => {});
+      ipc<string>('get_keyboard_layout').then(setLayout).catch(() => {});
+    }
 
     const clearActiveFlyout = () => {
       if (activeFlyoutRef.current === 'preview') {
@@ -183,9 +206,13 @@ export const TaskbarView: React.FC = () => {
         setConfig((prev) => applyConfigUpdate(prev, next)),
       ),
       onEvent<AppWindowGroup[]>('windows-updated', setGroups),
-      onEvent<AudioMasterState>('audio-master-updated', setAudioMaster),
-      onEvent<NetworkInfo>('network-updated', setNet),
-      onEvent<string>('layout-updated', setLayout),
+      ...(!isSecondary
+        ? [
+            onEvent<AudioMasterState>('audio-master-updated', setAudioMaster),
+            onEvent<NetworkInfo>('network-updated', setNet),
+            onEvent<string>('layout-updated', setLayout),
+          ]
+        : []),
       onEvent<boolean | StartStateEvent>('start-state', (ev) => {
         setStartOpen(normalizeStartStatePayload(ev).open);
       }),
@@ -199,45 +226,98 @@ export const TaskbarView: React.FC = () => {
     return () => {
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, []);
+  }, [monitor, isSecondary]);
 
-  // Load real native .exe and shell:AppsFolder\ UWP icons for pinned taskbar apps without stranding on config churn
+  // Load real native .exe, WindowsApps aliases, and shell:AppsFolder\ UWP icons for pinned taskbar apps (primary only)
   useEffect(() => {
-    if (!config) return;
+    if (!config || isSecondary) return;
 
+    const targetsToResolve: string[] = [];
     for (const p of config.taskbarPins) {
       const target = p.target?.trim() ?? '';
+      const low = target.toLowerCase();
       const canResolve =
-        target.includes(':\\') || target.toLowerCase().startsWith('shell:appsfolder\\');
+        target.includes(':\\') ||
+        target.startsWith('\\\\') ||
+        low.startsWith('shell:appsfolder\\') ||
+        low.startsWith('http://') ||
+        low.startsWith('https://');
       if (
         !target ||
         !canResolve ||
         p.iconData ||
         iconMapRef.current[target] ||
-        requestedTargetsRef.current.has(target)
+        iconMapRef.current[low] ||
+        requestedTargetsRef.current.has(low)
       ) {
         continue;
       }
-      requestedTargetsRef.current.add(target);
-      ipc<string | null>('get_icon_for_path', { path: target })
-        .then((data) => {
-          if (!mountedRef.current) {
-            requestedTargetsRef.current.delete(target);
-            return;
-          }
-          if (data) {
-            setIconMap((prev) => (prev[target] === data ? prev : { ...prev, [target]: data }));
-          } else {
-            requestedTargetsRef.current.delete(target);
-          }
-        })
-        .catch(() => {
-          requestedTargetsRef.current.delete(target);
-        });
+      requestedTargetsRef.current.add(low);
+      targetsToResolve.push(target);
     }
-  }, [config]);
 
-  // Batch-fetch missing cached icon keys from Rust IconCache for running windows & cache-keyed pins
+    if (targetsToResolve.length === 0) return;
+
+    ipc<Record<string, string>>('resolve_pin_icons', { targets: targetsToResolve })
+      .then((batch) => {
+        if (!mountedRef.current) {
+          for (const t of targetsToResolve) {
+            requestedTargetsRef.current.delete(t.toLowerCase());
+          }
+          return;
+        }
+        const updates: Record<string, string> = {};
+        const unresolved: string[] = [];
+        for (const t of targetsToResolve) {
+          const hit = batch?.[t] ?? batch?.[t.toLowerCase()];
+          if (hit) {
+            updates[t] = hit;
+            updates[t.toLowerCase()] = hit;
+          } else {
+            unresolved.push(t);
+          }
+        }
+        if (Object.keys(updates).length > 0) {
+          setIconMap((prev) => ({ ...prev, ...updates }));
+        }
+        // Fallback per-path lookup for any local exe/UWP target missed by batch
+        for (const t of unresolved) {
+          const low = t.toLowerCase();
+          if (low.startsWith('http://') || low.startsWith('https://')) {
+            continue;
+          }
+          ipc<string | null>('get_icon_for_path', { path: t })
+            .then((data) => {
+              if (!mountedRef.current) {
+                requestedTargetsRef.current.delete(low);
+                return;
+              }
+              if (data) {
+                setIconMap((prev) =>
+                  prev[t] === data ? prev : { ...prev, [t]: data, [low]: data },
+                );
+              } else {
+                requestedTargetsRef.current.delete(low);
+              }
+            })
+            .catch(() => {
+              requestedTargetsRef.current.delete(low);
+            });
+        }
+      })
+      .catch(() => {
+        for (const t of targetsToResolve) {
+          requestedTargetsRef.current.delete(t.toLowerCase());
+        }
+      });
+  }, [config, isSecondary]);
+
+  const visibleGroups = useMemo<AppWindowGroup[]>(
+    () => filterGroupsForMonitor(groups, monitor),
+    [groups, monitor],
+  );
+
+  // Batch-fetch missing cached icon keys from Rust IconCache for running windows (including cross-monitor pins) & cache-keyed pins
   useEffect(() => {
     const missing = new Set<string>();
     const immediate: Record<string, string> = {};
@@ -253,11 +333,14 @@ export const TaskbarView: React.FC = () => {
       }
     };
 
-    for (const g of groups) {
+    const groupsForIcons = isSecondary ? visibleGroups : groups;
+    for (const g of groupsForIcons) {
       checkKey(g.iconKey);
     }
-    for (const p of config?.taskbarPins ?? []) {
-      checkKey(p.iconKey);
+    if (!isSecondary) {
+      for (const p of config?.taskbarPins ?? []) {
+        checkKey(p.iconKey);
+      }
     }
 
     if (Object.keys(immediate).length > 0) {
@@ -282,18 +365,24 @@ export const TaskbarView: React.FC = () => {
         });
       })
       .catch(() => {});
-  }, [groups, config]);
+  }, [groups, visibleGroups, config, isSecondary]);
 
-  // Merge pinned apps + running window groups cleanly without duplicates, preserving stable
-  // first-seen order for unpinned apps & multi-window groups so clicks NEVER shuffle icons
+  // Merge monitor-appropriate pins (Option A: none on secondary) + monitor-filtered open windows,
+  // passing full `groups` on primary so cross-monitor pinned apps (e.g. Spark on Monitor 2) resolve icons & click-to-focus.
   const barItems = useMemo<MergedBarItem[]>(
     () =>
       stabilizeTaskbarItemsOrder(
-        mergeTaskbarItems(config?.taskbarPins ?? [], groups, iconMap),
+        mergeTaskbarItems(
+          selectTaskbarPinsForMonitor(config?.taskbarPins, monitor),
+          visibleGroups,
+          iconMap,
+          !isSecondary ? groups : undefined,
+        ),
         orderMemoryRef.current,
       ),
-    [config, groups, iconMap],
+    [config, visibleGroups, groups, iconMap, monitor, isSecondary],
   );
+  barItemsRef.current = barItems;
 
   // Immediately end bounded launch hop once the app's window group appears
   useEffect(() => {
@@ -415,6 +504,12 @@ export const TaskbarView: React.FC = () => {
     const pill = hoverPillRef.current;
     if (!pill) return;
 
+    // Never double-stack sliding hover pill behind an active app or open Start button
+    if (btn.classList.contains('active') || btn.classList.contains('start-on')) {
+      hideHoverPill();
+      return;
+    }
+
     const targetX = btn.offsetLeft;
     if (!pillVisibleRef.current) {
       pill.classList.add('snap');
@@ -437,11 +532,19 @@ export const TaskbarView: React.FC = () => {
       pill.style.transform = `translate3d(${targetX}px, 0, 0)`;
       pill.style.opacity = '1';
     }
-  }, [dragPinId]);
+  }, [dragPinId, hideHoverPill]);
 
-  const handleBarPointerEnter = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    barRectRef.current = e.currentTarget.getBoundingClientRect();
-  }, []);
+  const handleBarPointerEnter = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      barRectRef.current = rect;
+      if (!reducedMotion && sheenRef.current) {
+        const localX = e.clientX - rect.left;
+        sheenRef.current.style.transform = `translate3d(${Math.round(localX - 120)}px, 0, 0)`;
+      }
+    },
+    [reducedMotion],
+  );
 
   const handleBarPointerMove = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
@@ -464,22 +567,25 @@ export const TaskbarView: React.FC = () => {
   );
 
   const handleAppClick = (item: MergedBarItem) => {
+    if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
+      return;
+    }
     if (hoverTimer.current !== null) {
       window.clearTimeout(hoverTimer.current);
       hoverTimer.current = null;
     }
-    const windows = item.group?.windows ?? [];
-    const targetWin = selectWindowToFocusOnTaskbarClick(windows);
-    if (targetWin) {
+    const action = resolveTaskbarItemClick(item);
+    if (!action) return;
+    if (action.type === 'focus') {
       ipc('focus_window', {
-        hwnd: targetWin.hwnd,
-        toggleMinimize: targetWin.toggleMinimize,
+        hwnd: action.hwnd,
+        toggleMinimize: action.toggleMinimize,
       }).catch(() => {});
-    } else if (item.target) {
+    } else {
       triggerLaunchHop(item.id);
       ipc('launch_item', {
-        target: item.target,
-        args: item.args ?? null,
+        target: action.target,
+        args: action.args,
         asAdmin: false,
         closeStart: false,
       }).catch(() => {});
@@ -497,6 +603,7 @@ export const TaskbarView: React.FC = () => {
     const launchTarget =
       item.target ||
       item.group?.exePath ||
+      item.remoteGroup?.exePath ||
       (item.matchAumid ? `shell:AppsFolder\\${item.matchAumid}` : '');
     if (!launchTarget) return;
     if (!item.group || item.group.windows.length === 0) {
@@ -586,59 +693,83 @@ export const TaskbarView: React.FC = () => {
     }
   };
 
-  const handlePinDragStart = (e: React.DragEvent<HTMLButtonElement>, item: MergedBarItem) => {
-    if (!item.pinned) {
-      e.preventDefault();
-      return;
+  // Pointer-based pin reordering (works natively in Tauri v2 WebView2 even with dragDropEnabled: true)
+  const handlePinPointerDown = (e: React.PointerEvent<HTMLButtonElement>, item: MergedBarItem) => {
+    if (!item.pinned || e.button !== 0 || typeof window === 'undefined') return;
+    if (pointerDragCleanupRef.current) {
+      pointerDragCleanupRef.current();
+      pointerDragCleanupRef.current = null;
     }
-    if (hoverTimer.current !== null) {
-      window.clearTimeout(hoverTimer.current);
-      hoverTimer.current = null;
-    }
-    hideHoverPill();
-    setDragPinId(item.id);
-    setDragOverPinId(null);
-    e.dataTransfer.effectAllowed = 'move';
-    try {
-      e.dataTransfer.setData('text/plain', item.id);
-    } catch {
-      // Ignore synthetic environments without dataTransfer backing store
-    }
-  };
 
-  const handlePinDragOver = (e: React.DragEvent<HTMLButtonElement>, item: MergedBarItem) => {
-    if (!dragPinId || !item.pinned || item.id === dragPinId) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    if (dragOverPinId !== item.id) {
-      setDragOverPinId(item.id);
-    }
-  };
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const sourceId = item.id;
+    let active = false;
+    let currentOverId: string | null = null;
 
-  const handlePinDragLeave = (item: MergedBarItem) => {
-    if (dragOverPinId === item.id) {
+    const onMove = (ev: PointerEvent) => {
+      if (!active) {
+        if (!hasExceededDragThreshold(startX, startY, ev.clientX, ev.clientY)) {
+          return;
+        }
+        active = true;
+        if (hoverTimer.current !== null) {
+          window.clearTimeout(hoverTimer.current);
+          hoverTimer.current = null;
+        }
+        hideHoverPill();
+        setDragPinId(sourceId);
+      }
+
+      const hit =
+        typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
+      const targetBtn = hit?.closest?.<HTMLElement>('[data-pin-id]');
+      const overId = targetBtn?.dataset?.pinId ?? null;
+      const nextOver = overId && overId !== sourceId ? overId : null;
+      if (nextOver !== currentOverId) {
+        currentOverId = nextOver;
+        setDragOverPinId(nextOver);
+      }
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      pointerDragCleanupRef.current = null;
+    };
+
+    const onCancel = () => {
+      cleanup();
+      if (active) {
+        setDragPinId(null);
+        setDragOverPinId(null);
+      }
+    };
+
+    const onUp = () => {
+      cleanup();
+      if (!active) return;
+      suppressClickUntilRef.current = performance.now() + 240;
+      const targetId = currentOverId;
+      setDragPinId(null);
       setDragOverPinId(null);
-    }
-  };
+      if (targetId) {
+        const indices = resolvePinnedReorderIndices(barItemsRef.current, sourceId, targetId);
+        if (indices) {
+          ipc('reorder_pins', {
+            space: 'taskbar',
+            fromIdx: indices.fromIdx,
+            toIdx: indices.toIdx,
+          }).catch(() => {});
+        }
+      }
+    };
 
-  const handlePinDrop = (e: React.DragEvent<HTMLButtonElement>, targetItem: MergedBarItem) => {
-    e.preventDefault();
-    const sourceId = dragPinId;
-    setDragPinId(null);
-    setDragOverPinId(null);
-    if (!sourceId || !targetItem.pinned) return;
-    const indices = resolvePinnedReorderIndices(barItems, sourceId, targetItem.id);
-    if (!indices) return;
-    ipc('reorder_pins', {
-      space: 'taskbar',
-      fromIdx: indices.fromIdx,
-      toIdx: indices.toIdx,
-    }).catch(() => {});
-  };
-
-  const handlePinDragEnd = () => {
-    setDragPinId(null);
-    setDragOverPinId(null);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    pointerDragCleanupRef.current = cleanup;
   };
 
   const applyVolumeChange = (
@@ -712,7 +843,7 @@ export const TaskbarView: React.FC = () => {
 
             <button
               type="button"
-              className={`tb-btn ${startOpen ? 'start-on' : ''}`}
+              className={`tb-btn tb-start ${startOpen ? 'start-on' : ''}`}
               aria-label="Пуск"
               onMouseEnter={(e) => moveHoverPillTo(e.currentTarget)}
               onClick={() => toggleStart(undefined, monitor).catch(() => {})}
@@ -744,28 +875,26 @@ export const TaskbarView: React.FC = () => {
                   type="button"
                   className={btnCls}
                   aria-label={item.name}
-                  draggable={item.pinned}
+                  data-pin-id={item.pinned ? item.id : undefined}
+                  onPointerDown={(e) => handlePinPointerDown(e, item)}
                   onClick={() => handleAppClick(item)}
                   onAuxClick={(e) => handleAppAuxClick(e, item)}
                   onContextMenu={(e) => handleAppCtx(e, item)}
                   onMouseEnter={(e) => handleAppHover(item, e.currentTarget)}
                   onMouseLeave={handleAppLeave}
-                  onDragStart={(e) => handlePinDragStart(e, item)}
-                  onDragOver={(e) => handlePinDragOver(e, item)}
-                  onDragLeave={() => handlePinDragLeave(item)}
-                  onDrop={(e) => handlePinDrop(e, item)}
-                  onDragEnd={handlePinDragEnd}
                 >
                   <span className="tb-ic">
                     {item.iconData ? (
                       <img src={item.iconData} alt="" className="native-ic" draggable={false} />
                     ) : (
-                      <FallbackAppIcon iconKey={item.iconKey} size={22} />
+                      <FallbackAppIcon iconKey={item.iconKey} target={item.target} size={32} />
                     )}
                   </span>
-                  <span className="tb-indicators" aria-hidden="true">
+                  <span
+                    className={`tb-indicators ${winCount > 1 ? 'has-multi' : ''}`.trim()}
+                    aria-hidden="true"
+                  >
                     <span className="tb-pill" />
-                    {winCount > 1 && <span className="tb-multi" />}
                   </span>
                 </button>
               );
@@ -776,43 +905,47 @@ export const TaskbarView: React.FC = () => {
         <div ref={trayGroupRef} className="tb-group tb-tray">
           {!isEdge && <div className="tb-sep" />}
 
-          <button
-            type="button"
-            className={`tb-tray-btn chevron ${activeFlyout === 'tray' ? 'open' : ''}`}
-            aria-label="Фоновые приложения"
-            onClick={(e) => openFlyoutAt('tray', e.currentTarget, TRAY_CARD_WIDTH, TRAY_MIN_CARD_HEIGHT, false)}
-          >
-            <ChevronUpIcon className="ic14" />
-          </button>
+          {!isSecondary && (
+            <>
+              <button
+                type="button"
+                className={`tb-tray-btn chevron ${activeFlyout === 'tray' ? 'open' : ''}`}
+                aria-label="Фоновые приложения"
+                onClick={(e) =>
+                  openFlyoutAt('tray', e.currentTarget, TRAY_CARD_WIDTH, TRAY_MIN_CARD_HEIGHT, false)
+                }
+              >
+                <ChevronUpIcon className="ic20" />
+              </button>
 
-          <button
-            type="button"
-            className="tb-tray-btn tb-lang-btn"
-            aria-label={`Раскладка клавиатуры: ${layout}`}
-            onClick={() => ipc<string>('switch_keyboard_layout').then(setLayout).catch(() => {})}
-          >
-            {layout}
-          </button>
+              <button
+                type="button"
+                className="tb-tray-btn tb-lang-btn"
+                aria-label={`Раскладка клавиатуры: ${layout}`}
+                onClick={() => ipc<string>('switch_keyboard_layout').then(setLayout).catch(() => {})}
+              >
+                {layout}
+              </button>
 
-          <button
-            type="button"
-            className={`tb-tray-btn tb-sound-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''} ${audioMaster?.masterMuted ? 'muted' : ''}`}
-            aria-label={soundTooltip}
-            onClick={(e) =>
-              openFlyoutAt('sound', e.currentTarget, SOUND_FLYOUT_WIDTH, SOUND_FLYOUT_INITIAL_HEIGHT, false)
-            }
-            onWheel={handleSoundWheel}
-            onAuxClick={handleSoundAux}
-          >
-            <span className={!netConnected ? 'tb-net-offline' : undefined}>
-              <NetIcon kind={net?.kind} connected={netConnected} className="ic14" />
-            </span>
-            <span className="tb-vol-ic">
-              <VolIcon muted={audioMaster?.masterMuted} level={audioMaster?.masterVolume} className="ic14" />
-            </span>
-          </button>
-
-          <div className="tb-tray-sep" aria-hidden="true" />
+              <button
+                type="button"
+                className={`tb-tray-btn tb-sound-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''} ${audioMaster?.masterMuted ? 'muted' : ''}`}
+                aria-label={soundTooltip}
+                onClick={(e) =>
+                  openFlyoutAt('sound', e.currentTarget, SOUND_FLYOUT_WIDTH, SOUND_FLYOUT_INITIAL_HEIGHT, false)
+                }
+                onWheel={handleSoundWheel}
+                onAuxClick={handleSoundAux}
+              >
+                <span className={`tb-net-ic ${!netConnected ? 'tb-net-offline' : ''}`.trim()}>
+                  <NetIcon kind={net?.kind} connected={netConnected} className="ic20" />
+                </span>
+                <span className="tb-vol-ic">
+                  <VolIcon muted={audioMaster?.masterMuted} level={audioMaster?.masterVolume} className="ic20" />
+                </span>
+              </button>
+            </>
+          )}
 
           <button
             type="button"

@@ -47,6 +47,8 @@ import {
   type FlyoutAnimState,
 } from '../lib/flyoutLogic';
 import {
+  animateSurfaceIn,
+  animateSurfaceOut,
   fetchIconsBatch,
   getAudioPeaks,
   hideTrayApp,
@@ -77,6 +79,7 @@ import {
   type SessionAlert,
   type TrayAppItem,
 } from '../lib/ipc';
+import { mergeAudioStateRespectingLocks } from '../lib/startLogic';
 import {
   buildPinFromAppContext,
   computePreviewCardWidth,
@@ -126,7 +129,7 @@ import {
 } from './Icons';
 import { ObsidianSlider } from './ObsidianSlider';
 
-const MAX_THUMB_CACHE_ENTRIES = 48;
+const MAX_THUMB_CACHE_ENTRIES = 24;
 
 interface ContextActionEntry {
   key: string;
@@ -198,7 +201,10 @@ export const FlyoutView: React.FC = () => {
   const reducedMotion = useReducedMotion();
 
   const [anim, setAnim] = useState<FlyoutAnimState>(INITIAL_FLYOUT_ANIM_STATE);
+  const [enterReady, setEnterReady] = useState<boolean>(false);
+  const [jumpListReady, setJumpListReady] = useState<boolean>(true);
   const [trayApps, setTrayApps] = useState<TrayAppItem[]>([]);
+  const [trayHydrated, setTrayHydrated] = useState<boolean>(false);
   const [trayIconMap, setTrayIconMap] = useState<Record<string, string>>({});
   const [trayHover, setTrayHover] = useState<string>('');
   const [trayCtxItem, setTrayCtxItem] = useState<TrayAppItem | null>(null);
@@ -231,6 +237,9 @@ export const FlyoutView: React.FC = () => {
   const exitTimerRef = useRef<number | null>(null);
   const osdTimerRef = useRef<number | null>(null);
   const segReadyRafRef = useRef<number | null>(null);
+  const enterRafRef = useRef<number | null>(null);
+  const jumpListTimerRef = useRef<number | null>(null);
+  const activeFlyoutAnimsRef = useRef<Animation[]>([]);
   const previewCloseTimersRef = useRef<Map<number, number>>(new Map());
   const thumbCacheRef = useRef<Map<number, string>>(new Map());
   const lastTrayCtxRef = useRef<TrayAppItem | null>(null);
@@ -240,14 +249,23 @@ export const FlyoutView: React.FC = () => {
   const phaseRef = useRef<FlyoutAnimState['phase']>('closed');
   const currentGenRef = useRef<number>(0);
   const ackedGenRef = useRef<number>(-1);
+  const animatedRenderSeqRef = useRef<number>(0);
   const lastResizedHeightRef = useRef<number>(0);
   const previewGroupKeyRef = useRef<string>('');
+  const previewMonitorRef = useRef<'primary' | 'secondary' | undefined>(undefined);
   const trayCtxItemRef = useRef<TrayAppItem | null>(null);
   const devMenuOpenRef = useRef<boolean>(false);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const ctxActionsRef = useRef<ContextActionEntry[]>([]);
   const ctxFocusIdxRef = useRef<number>(-1);
   const seekSeqRef = useRef<number>(0);
+  const audioDragLocksRef = useRef<Map<string, number>>(new Map());
+  const draggingAudioKeysRef = useRef<Set<string>>(new Set());
+  const audioReqSeqRef = useRef<Map<string, number>>(new Map());
+  const audioThrottleTimersRef = useRef<Map<string, number>>(new Map());
+  const audioPendingSendRef = useRef<Map<string, () => void>>(new Map());
+  const reducedMotionRef = useRef<boolean>(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
 
   if (trayCtxItem) {
     lastTrayCtxRef.current = trayCtxItem;
@@ -268,6 +286,38 @@ export const FlyoutView: React.FC = () => {
     previewCloseTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
     previewCloseTimersRef.current.clear();
   }, []);
+
+  const cancelFlyoutAnims = useCallback(() => {
+    for (const a of activeFlyoutAnimsRef.current) {
+      try {
+        a.cancel();
+      } catch {
+        // Ignore finished animations
+      }
+    }
+    activeFlyoutAnimsRef.current = [];
+    if (cardRef.current) {
+      cardRef.current.style.pointerEvents = '';
+    }
+  }, []);
+
+  const clearPendingFlyoutEnter = useCallback(() => {
+    if (enterRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(enterRafRef.current);
+      enterRafRef.current = null;
+    }
+    if (jumpListTimerRef.current !== null) {
+      window.clearTimeout(jumpListTimerRef.current);
+      jumpListTimerRef.current = null;
+    }
+  }, []);
+
+  // Release entrance WAAPI fill:forwards strictly post-commit once [data-enter-ready="true"] is on DOM
+  useLayoutEffect(() => {
+    if (enterReady && anim.phase === 'open') {
+      cancelFlyoutAnims();
+    }
+  }, [enterReady, anim.phase, cancelFlyoutAnims]);
 
   const clearOsdTimer = useCallback(() => {
     if (osdTimerRef.current !== null) {
@@ -300,12 +350,35 @@ export const FlyoutView: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Background idle pre-warm for Tray apps & icons so first `^` click renders instantly with zero empty flash
+    const trayPrewarmTimer = window.setTimeout(() => {
+      ipc<TrayAppItem[]>('get_tray_apps')
+        .then((items) => {
+          setTrayApps(items);
+          setTrayHydrated(true);
+        })
+        .catch(() => {});
+    }, 1600);
+
     const subs = [
+      onEvent<TrayAppItem[]>('tray-updated', (items) => {
+        if (!Array.isArray(items)) return;
+        setTrayApps(items);
+        setTrayHydrated(true);
+        if (activeKindRef.current === 'tray' && phaseRef.current === 'open') {
+          const nextH = computeTrayFlyoutHeight(items.length, Boolean(trayCtxItemRef.current));
+          if (Math.abs(nextH - lastResizedHeightRef.current) > 2) {
+            lastResizedHeightRef.current = nextH;
+            ipc('resize_flyout', { width: TRAY_CARD_WIDTH, height: nextH }).catch(() => {});
+          }
+        }
+      }),
       onEvent<FlyoutRequest>('flyout-show', (r) => {
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
         }
+        clearPendingFlyoutEnter();
 
         const prevKind = activeKindRef.current;
         const isLive = phaseRef.current === 'open';
@@ -314,6 +387,12 @@ export const FlyoutView: React.FC = () => {
 
         if (!isInPlacePreview) {
           clearPreviewCloseTimers();
+        }
+        if (!isInPlaceOsd && !isInPlacePreview) {
+          cancelFlyoutAnims();
+          setEnterReady(false);
+        } else {
+          setEnterReady(true);
         }
 
         const nextSeq = isInPlaceOsd || isInPlacePreview ? renderSeqRef.current : renderSeqRef.current + 1;
@@ -330,51 +409,61 @@ export const FlyoutView: React.FC = () => {
         if (r.kind !== 'osd') {
           clearOsdTimer();
         }
-        setTrayCtxItem(null);
-        setTrayHover('');
-        setDevMenuOpen(false);
-        setActionError(null);
-        setCtxFocusIdx(-1);
-        setJumpList([]);
+        setTrayCtxItem((prev) => (prev === null ? prev : null));
+        setTrayHover((prev) => (prev === '' ? prev : ''));
+        setDevMenuOpen((prev) => (prev ? false : prev));
+        setActionError((prev) => (prev === null ? prev : null));
+        setCtxFocusIdx((prev) => (prev === -1 ? prev : -1));
+        setJumpList((prev) => (prev.length === 0 ? prev : []));
+        if (!isAppContextKind(r.kind)) {
+          setJumpListReady((prev) => (prev ? prev : true));
+        }
         seekSeqRef.current += 1;
-        setScrubOverrideSec(null);
-        setClosingHwnds({});
+        setScrubOverrideSec((prev) => (prev === null ? prev : null));
+        setClosingHwnds((prev) => (Object.keys(prev).length === 0 ? prev : {}));
 
         if (r.kind === 'sound' || r.kind === 'quick') {
-          setSegAnimReady(false);
           if (segReadyRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
             cancelAnimationFrame(segReadyRafRef.current);
+            segReadyRafRef.current = null;
           }
-          if (typeof requestAnimationFrame === 'function') {
-            segReadyRafRef.current = requestAnimationFrame(() => {
-              segReadyRafRef.current = null;
-              setSegAnimReady(true);
-            });
-          } else {
-            setSegAnimReady(true);
-          }
+          setSegAnimReady((prev) => (prev ? false : prev));
         }
 
         if (r.kind !== 'preview') {
           previewGroupKeyRef.current = '';
-          setPreviewGroupKey('');
-          setPreviewIconUri(null);
-          setPreviewWindows([]);
+          previewMonitorRef.current = undefined;
+          setPreviewGroupKey((prev) => (prev === '' ? prev : ''));
+          setPreviewIconUri((prev) => (prev === null ? prev : null));
+          setPreviewWindows((prev) => (prev.length === 0 ? prev : []));
         }
 
         if (r.kind === 'tray') {
-          ipc<TrayAppItem[]>('get_tray_apps')
-            .then((items) => {
-              if (renderSeqRef.current !== nextSeq || activeKindRef.current !== 'tray') return;
-              setTrayApps(items);
-              const nextH = computeTrayFlyoutHeight(items.length);
+          const payload = (r.payload ?? {}) as { trayApps?: TrayAppItem[] };
+          if (Array.isArray(payload.trayApps)) {
+            // Instant zero-flash hydration directly from Wave 2B Rust cached tray snapshot
+            setTrayApps(payload.trayApps);
+            setTrayHydrated(true);
+            const nextH = computeTrayFlyoutHeight(payload.trayApps.length);
+            if (Math.abs(nextH - lastResizedHeightRef.current) > 2) {
               lastResizedHeightRef.current = nextH;
-              ipc('resize_flyout', {
-                width: TRAY_CARD_WIDTH,
-                height: nextH,
-              }).catch(() => {});
-            })
-            .catch(() => {});
+              ipc('resize_flyout', { width: TRAY_CARD_WIDTH, height: nextH }).catch(() => {});
+            }
+          } else {
+            ipc<TrayAppItem[]>('get_tray_apps')
+              .then((items) => {
+                setTrayApps(items);
+                setTrayHydrated(true);
+                if (renderSeqRef.current !== nextSeq || activeKindRef.current !== 'tray') return;
+                const nextH = computeTrayFlyoutHeight(items.length);
+                lastResizedHeightRef.current = nextH;
+                ipc('resize_flyout', {
+                  width: TRAY_CARD_WIDTH,
+                  height: nextH,
+                }).catch(() => {});
+              })
+              .catch(() => {});
+          }
         } else if (r.kind === 'osd') {
           const payload = (r.payload ?? {}) as Partial<VolumeOsdPayload>;
           setOsdState({
@@ -401,6 +490,7 @@ export const FlyoutView: React.FC = () => {
             (iconKey ? iconCache.get(iconKey) ?? null : null);
 
           previewGroupKeyRef.current = gKey;
+          previewMonitorRef.current = r.monitor;
           setPreviewGroupKey(gKey);
           setPreviewWindows(wins);
           setPreviewIconUri(resolvedIcon);
@@ -436,22 +526,46 @@ export const FlyoutView: React.FC = () => {
               .catch(() => {});
           });
         } else if (isAppContextKind(r.kind)) {
-          const payload = r.payload as AppContextPayload;
-          ipc<JumpListItem[]>('get_jump_list', {
-            exePath: payload.target ?? '',
-            aumid: payload.aumid ?? null,
-          })
-            .then((items) => {
-              if (renderSeqRef.current === nextSeq) {
-                setJumpList(items);
+          const payload = r.payload as AppContextPayload & { jumpList?: JumpListItem[] };
+          if (Array.isArray(payload.jumpList)) {
+            setJumpList(payload.jumpList);
+            setJumpListReady(true);
+          } else {
+            // Wait up to 45ms for jump_list before measuring & launching the single-step spring
+            setJumpListReady(false);
+            let settled = false;
+            const settleJumpList = () => {
+              if (settled) return;
+              settled = true;
+              if (jumpListTimerRef.current !== null) {
+                window.clearTimeout(jumpListTimerRef.current);
+                jumpListTimerRef.current = null;
               }
+              if (renderSeqRef.current === nextSeq) {
+                setJumpListReady(true);
+              }
+            };
+            jumpListTimerRef.current = window.setTimeout(settleJumpList, 45);
+            ipc<JumpListItem[]>('get_jump_list', {
+              exePath: payload.target ?? '',
+              aumid: payload.aumid ?? null,
             })
-            .catch(() => {});
+              .then((items) => {
+                if (renderSeqRef.current === nextSeq) {
+                  setJumpList(items);
+                }
+                settleJumpList();
+              })
+              .catch(() => {
+                settleJumpList();
+              });
+          }
         }
       }),
       onEvent<FlyoutHideEvent | void>('flyout-hide', (ev) => {
         clearOsdTimer();
         clearPreviewCloseTimers();
+        clearPendingFlyoutEnter();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
@@ -463,12 +577,48 @@ export const FlyoutView: React.FC = () => {
         const hideSeq = renderSeqRef.current;
         const exitMs = getFlyoutExitMs(activeKindRef.current as FlyoutKind);
 
+        const el = cardRef.current;
+        let liveOpacity = 1;
+        let liveTransform = 'translate3d(0, 0, 0) scale(1)';
+        if (el && typeof window !== 'undefined') {
+          const cs = window.getComputedStyle(el);
+          const parsedOp = Number.parseFloat(cs.opacity);
+          if (Number.isFinite(parsedOp)) liveOpacity = parsedOp;
+          if (cs.transform && cs.transform !== 'none') liveTransform = cs.transform;
+        }
+
+        cancelFlyoutAnims();
         previewGroupKeyRef.current = '';
+        previewMonitorRef.current = undefined;
         setPreviewGroupKey('');
         setAnim((prev) => reduceFlyoutHideStart(prev));
 
+        animateSurfaceOut('flyout', hideGen, {
+          durationMs: reducedMotionRef.current ? 0 : exitMs,
+          offsetY: 6,
+          toScale: 0.975,
+        }).catch(() => {});
+
+        if (!reducedMotionRef.current && el && typeof el.animate === 'function') {
+          const exitAnim = el.animate(
+            [
+              { opacity: liveOpacity, transform: liveTransform },
+              { opacity: 0, transform: 'translate3d(0, 6px, 0) scale(0.975)' },
+            ],
+            {
+              duration: exitMs,
+              easing: 'cubic-bezier(0.4, 0, 1, 1)',
+              fill: 'forwards',
+            },
+          );
+          activeFlyoutAnimsRef.current = [exitAnim];
+        }
+
         exitTimerRef.current = window.setTimeout(() => {
           exitTimerRef.current = null;
+          cancelFlyoutAnims();
+          setEnterReady(false);
+          setJumpListReady(true);
           setAnim((prev) => reduceFlyoutHideComplete(prev, hideSeq));
           setTrayCtxItem(null);
           setDevMenuOpen(false);
@@ -481,12 +631,17 @@ export const FlyoutView: React.FC = () => {
       onEvent<FlyoutHideEvent | void>('flyout-hide-immediate', () => {
         clearOsdTimer();
         clearPreviewCloseTimers();
+        clearPendingFlyoutEnter();
+        cancelFlyoutAnims();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
         }
         previewGroupKeyRef.current = '';
+        previewMonitorRef.current = undefined;
         setPreviewGroupKey('');
+        setEnterReady(false);
+        setJumpListReady(true);
         setTrayCtxItem(null);
         setDevMenuOpen(false);
         setActionError(null);
@@ -495,20 +650,23 @@ export const FlyoutView: React.FC = () => {
         setAnim((prev) => reduceFlyoutHideImmediate(prev));
       }),
       onEvent<AudioState>('audio-mixer-updated', (st) => {
-        setAudio(st);
+        setAudio((prev) =>
+          mergeAudioStateRespectingLocks(prev, st, audioDragLocksRef.current, Date.now()),
+        );
       }),
       onEvent<AudioMasterState>('audio-master-updated', (m) => {
-        setAudio((prev) =>
-          prev
-            ? {
-                ...prev,
-                available: m.available,
-                masterVolume: m.masterVolume,
-                masterMuted: m.masterMuted,
-                micMuted: m.micMuted,
-              }
-            : prev,
-        );
+        setAudio((prev) => {
+          if (!prev) return prev;
+          const masterLock = audioDragLocksRef.current.get('__master__');
+          const keepMasterVol = masterLock !== undefined && masterLock > Date.now();
+          return {
+            ...prev,
+            available: m.available,
+            masterVolume: keepMasterVol ? prev.masterVolume : m.masterVolume,
+            masterMuted: m.masterMuted,
+            micMuted: m.micMuted,
+          };
+        });
         if (activeKindRef.current === 'osd') {
           setOsdState({ volume: m.masterVolume, muted: m.masterMuted });
         }
@@ -523,7 +681,7 @@ export const FlyoutView: React.FC = () => {
         if (activeKindRef.current !== 'preview') return;
         const key = previewGroupKeyRef.current;
         if (!key) return;
-        const synced = syncPreviewWindowsFromGroups(key, groups);
+        const synced = syncPreviewWindowsFromGroups(key, groups, previewMonitorRef.current);
         if (synced === null) return;
         setPreviewWindows(synced);
         if (synced.length === 0) {
@@ -569,21 +727,35 @@ export const FlyoutView: React.FC = () => {
 
     window.addEventListener('keydown', onKey);
     return () => {
+      window.clearTimeout(trayPrewarmTimer);
       window.removeEventListener('keydown', onKey);
       clearOsdTimer();
       if (exitTimerRef.current !== null) window.clearTimeout(exitTimerRef.current);
       if (segReadyRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(segReadyRafRef.current);
       }
+      audioThrottleTimersRef.current.forEach((id) => window.clearTimeout(id));
+      audioThrottleTimersRef.current.clear();
+      audioPendingSendRef.current.clear();
+      clearPendingFlyoutEnter();
+      cancelFlyoutAnims();
       clearPreviewCloseTimers();
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [armOsdAutoClose, cacheThumb, clearOsdTimer, clearPreviewCloseTimers]);
+  }, [
+    armOsdAutoClose,
+    cacheThumb,
+    cancelFlyoutAnims,
+    clearOsdTimer,
+    clearPendingFlyoutEnter,
+    clearPreviewCloseTimers,
+  ]);
 
-  // Synchronous post-commit height measurement ACK (zero show delay; instant atomic resize if >2px diff)
+  // Single-step commit-then-spring entrance: measures final height, waits for `surfaceCommitAck`,
+  // then launches ONE synchronized WAAPI + DComp spring (zero 2-step resize jump!).
   useLayoutEffect(() => {
     const req = anim.req;
-    if (!req || anim.phase !== 'open') return;
+    if (!req || anim.phase !== 'open' || !jumpListReady) return;
     const gen = req.gen ?? 0;
     if (ackedGenRef.current === gen) return;
     ackedGenRef.current = gen;
@@ -604,13 +776,96 @@ export const FlyoutView: React.FC = () => {
       }
     }
 
-    surfaceCommitAck('flyout', gen, measuredCardHeight).catch(() => {});
-  }, [anim.req, anim.phase, anim.renderSeq, anim.scrubSeq]);
+    const shouldAnimateIn =
+      !reducedMotionRef.current && animatedRenderSeqRef.current !== anim.renderSeq;
+    if (shouldAnimateIn) {
+      animatedRenderSeqRef.current = anim.renderSeq;
+    }
 
-  // Poll WASAPI live peaks every 130ms STRICTLY while Quick Sound flyout is visibly open (0% idle cost)
+    void surfaceCommitAck('flyout', gen, measuredCardHeight)
+      .catch(() => {})
+      .finally(() => {
+        if (currentGenRef.current !== gen || phaseRef.current !== 'open') {
+          return;
+        }
+        if (!shouldAnimateIn) {
+          setEnterReady(true);
+          return;
+        }
+
+        const runSpring = () => {
+          enterRafRef.current = null;
+          if (currentGenRef.current !== gen || phaseRef.current !== 'open') return;
+          const el = cardRef.current;
+
+          animateSurfaceIn('flyout', gen, {
+            durationMs: 185,
+            offsetY: 10,
+            fromScale: 0.97,
+          }).catch(() => {});
+
+          if (!el || typeof el.animate !== 'function') {
+            setEnterReady(true);
+            return;
+          }
+
+          cancelFlyoutAnims();
+          el.style.pointerEvents = 'auto';
+
+          const transformAnim = el.animate(
+            [
+              { transform: 'translate3d(0, 10px, 0) scale(0.97)' },
+              { transform: 'translate3d(0, 0, 0) scale(1)' },
+            ],
+            {
+              duration: 185,
+              easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+              fill: 'forwards',
+            },
+          );
+          const opacityAnim = el.animate(
+            [{ opacity: 0 }, { opacity: 1 }],
+            {
+              duration: 140,
+              easing: 'ease-out',
+              fill: 'forwards',
+            },
+          );
+          activeFlyoutAnimsRef.current = [transformAnim, opacityAnim];
+
+          transformAnim.finished
+            .then(() => {
+              if (currentGenRef.current === gen && phaseRef.current === 'open') {
+                setEnterReady(true);
+              }
+            })
+            .catch(() => {
+              // Cancelled by rapid reopen or hide
+            });
+        };
+
+        if (typeof requestAnimationFrame === 'function') {
+          enterRafRef.current = requestAnimationFrame(runSpring);
+        } else {
+          runSpring();
+        }
+      });
+  }, [anim.req, anim.phase, anim.renderSeq, anim.scrubSeq, jumpListReady, cancelFlyoutAnims]);
+
+  // Enable smooth slider/segmented-pill transitions & live WASAPI peaks STRICTLY AFTER the 185ms
+  // entrance spring settles (zero mid-spring IPC/re-render stalls & 0% idle cost!).
   const isSoundVisiblyOpen =
+    enterReady &&
     anim.phase === 'open' &&
     (anim.req?.kind === 'sound' || anim.req?.kind === 'quick');
+
+  useEffect(() => {
+    if (!isSoundVisiblyOpen) {
+      setSegAnimReady((prev) => (prev ? false : prev));
+      return;
+    }
+    setSegAnimReady(true);
+  }, [isSoundVisiblyOpen]);
 
   useEffect(() => {
     if (!isSoundVisiblyOpen) {
@@ -723,7 +978,7 @@ export const FlyoutView: React.FC = () => {
 
   // Auto-fit flyout height for dynamic post-open content (Jump List, audio sessions, media strip, alerts)
   useEffect(() => {
-    if (!req || isClosing || anim.phase === 'closed') return;
+    if (!req || isClosing || anim.phase === 'closed' || !jumpListReady) return;
     const needsAutoHeight =
       isAppContextKind(req.kind) ||
       isBarContextKind(req.kind) ||
@@ -735,6 +990,7 @@ export const FlyoutView: React.FC = () => {
     if (!el) return;
 
     const syncHeight = () => {
+      if (ackedGenRef.current !== currentGenRef.current) return;
       const h = measureCardHeight(el, req.kind);
       if (h !== null && Math.abs(h - lastResizedHeightRef.current) > 2) {
         lastResizedHeightRef.current = h;
@@ -753,6 +1009,7 @@ export const FlyoutView: React.FC = () => {
     anim.renderSeq,
     anim.phase,
     isClosing,
+    jumpListReady,
     jumpList.length,
     actionError,
     audio?.sessions.length,
@@ -783,10 +1040,14 @@ export const FlyoutView: React.FC = () => {
     }
   }, [req?.kind, anim.phase, anim.renderSeq, trayApps.length, trayCtxItem, actionError]);
 
+  const isCalendarOpen = anim.phase !== 'closed' && anim.req?.kind === 'calendar';
   const today = useMemo(() => new Date(), [anim.renderSeq]);
   const calCells = useMemo(
-    () => buildCalendarMonthGrid(calView.year, calView.month, today, selectedDate),
-    [calView.year, calView.month, today, selectedDate],
+    () =>
+      isCalendarOpen
+        ? buildCalendarMonthGrid(calView.year, calView.month, today, selectedDate)
+        : [],
+    [isCalendarOpen, calView.year, calView.month, today, selectedDate],
   );
 
   const sessionPeakMap = useMemo(() => {
@@ -836,6 +1097,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card tray-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={trayCardStyle}
         >
           <div className="tray-head">
@@ -856,7 +1118,9 @@ export const FlyoutView: React.FC = () => {
 
           <div className="tray-grid">
             {trayApps.length === 0 ? (
-              <div className="tray-empty">Нет фоновых приложений</div>
+              trayHydrated ? (
+                <div className="tray-empty">Нет фоновых приложений</div>
+              ) : null
             ) : (
               trayApps.map((t, idx) => {
                 const iconUri =
@@ -1020,6 +1284,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className={`flyout-card osd-card ${osdState.muted ? 'muted' : ''}`}
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
         >
           <span className="osd-ic">
@@ -1053,16 +1318,72 @@ export const FlyoutView: React.FC = () => {
         : interpolateMediaPosition(media, mediaNowMs);
     const mediaDuration = media?.durationSec ?? 0;
 
-    const setMaster = (vol: number, muted: boolean) => {
-      setActionError(null);
-      setAudio((prev) => (prev ? { ...prev, masterVolume: vol, masterMuted: muted } : prev));
-      ipc<AudioState>('set_master_volume', { volume: vol, muted })
-        .then(setAudio)
-        .catch((err) => setActionError(formatIpcError(err)));
+    const scheduleThrottledFlyoutAudio = (key: string, fn: () => void, flushNow: boolean) => {
+      if (flushNow) {
+        const existing = audioThrottleTimersRef.current.get(key);
+        if (existing !== undefined) {
+          window.clearTimeout(existing);
+          audioThrottleTimersRef.current.delete(key);
+        }
+        audioPendingSendRef.current.delete(key);
+        fn();
+        return;
+      }
+      audioPendingSendRef.current.set(key, fn);
+      if (!audioThrottleTimersRef.current.has(key)) {
+        const id = window.setTimeout(() => {
+          audioThrottleTimersRef.current.delete(key);
+          const pending = audioPendingSendRef.current.get(key);
+          audioPendingSendRef.current.delete(key);
+          pending?.();
+        }, 36);
+        audioThrottleTimersRef.current.set(key, id);
+      }
     };
 
-    const setSessionVolume = (s: AudioState['sessions'][number], vol: number) => {
+    const handleSliderDrag = (sliderKey: string, dragging: boolean) => {
+      if (dragging) {
+        draggingAudioKeysRef.current.add(sliderKey);
+        audioDragLocksRef.current.set(sliderKey, Number.POSITIVE_INFINITY);
+      } else {
+        draggingAudioKeysRef.current.delete(sliderKey);
+        audioDragLocksRef.current.set(sliderKey, Date.now() + 280);
+      }
+    };
+
+    const setMaster = (vol: number, muted: boolean, commit = false) => {
       setActionError(null);
+      const reqSeq = (audioReqSeqRef.current.get('__master__') ?? 0) + 1;
+      audioReqSeqRef.current.set('__master__', reqSeq);
+      setAudio((prev) => (prev ? { ...prev, masterVolume: vol, masterMuted: muted } : prev));
+      scheduleThrottledFlyoutAudio(
+        '__master__',
+        () => {
+          ipc<AudioState>('set_master_volume', { volume: vol, muted })
+            .then((nextState) => {
+              if (
+                audioReqSeqRef.current.get('__master__') === reqSeq &&
+                !draggingAudioKeysRef.current.has('__master__')
+              ) {
+                setAudio((prev) =>
+                  mergeAudioStateRespectingLocks(prev, nextState, audioDragLocksRef.current, Date.now()),
+                );
+              }
+            })
+            .catch((err) => setActionError(formatIpcError(err)));
+        },
+        commit,
+      );
+    };
+
+    const setSessionVolume = (
+      s: AudioState['sessions'][number],
+      vol: number,
+      commit = false,
+    ) => {
+      setActionError(null);
+      const reqSeq = (audioReqSeqRef.current.get(s.id) ?? 0) + 1;
+      audioReqSeqRef.current.set(s.id, reqSeq);
       const nextMuted = s.muted ? false : undefined;
       setAudio((prev) =>
         prev
@@ -1076,15 +1397,30 @@ export const FlyoutView: React.FC = () => {
             }
           : prev,
       );
-      setSessionState({
-        appKey: s.id,
-        volume: vol / 100,
-        muted: nextMuted,
-        pid: s.pid,
-        pids: s.pids,
-      })
-        .then(setAudio)
-        .catch((err) => setActionError(formatIpcError(err)));
+      scheduleThrottledFlyoutAudio(
+        s.id,
+        () => {
+          setSessionState({
+            appKey: s.id,
+            volume: vol / 100,
+            muted: nextMuted,
+            pid: s.pid,
+            pids: s.pids,
+          })
+            .then((nextState) => {
+              if (
+                audioReqSeqRef.current.get(s.id) === reqSeq &&
+                !draggingAudioKeysRef.current.has(s.id)
+              ) {
+                setAudio((prev) =>
+                  mergeAudioStateRespectingLocks(prev, nextState, audioDragLocksRef.current, Date.now()),
+                );
+              }
+            })
+            .catch((err) => setActionError(formatIpcError(err)));
+        },
+        commit,
+      );
     };
 
     const toggleSessionMute = (s: AudioState['sessions'][number]) => {
@@ -1134,6 +1470,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card qs-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
           onClick={() => {
             if (devMenuOpen) setDevMenuOpen(false);
@@ -1397,7 +1734,7 @@ export const FlyoutView: React.FC = () => {
               type="button"
               className="mix-mute"
               title={audio?.masterMuted ? 'Включить звук' : 'Выключить звук'}
-              onClick={() => setMaster(audio?.masterVolume ?? 0, !(audio?.masterMuted ?? false))}
+              onClick={() => setMaster(audio?.masterVolume ?? 0, !(audio?.masterMuted ?? false), true)}
             >
               <VolIcon muted={audio?.masterMuted} level={audio?.masterVolume} />
             </button>
@@ -1405,10 +1742,13 @@ export const FlyoutView: React.FC = () => {
             <ObsidianSlider
               value={audio?.masterVolume ?? 0}
               muted={audio?.masterMuted ?? false}
-              peak={peaks?.masterPeak ?? audio?.masterPeak}
+              peak={peaks ? peaks.masterPeak : 0}
+              noTransition={!segAnimReady}
               magneticDetents={[0, 50, 100]}
               ariaLabel="Общий звук"
-              onChange={(v) => setMaster(v, false)}
+              onDragStateChange={(d) => handleSliderDrag('__master__', d)}
+              onChange={(v) => setMaster(v, false, false)}
+              onCommit={(v) => setMaster(v, false, true)}
             />
             <span className="mix-val">
               {audio?.masterMuted ? '0%' : `${audio?.masterVolume ?? 0}%`}
@@ -1423,8 +1763,8 @@ export const FlyoutView: React.FC = () => {
                 const iconUri = s.iconKey
                   ? sessionIconMap[s.iconKey] || iconCache.get(s.iconKey) || null
                   : null;
-                const livePeak = sessionPeakMap.get(s.id) ?? s.peak ?? 0;
-                const isActiveAudio = s.isActive || livePeak > 0.02;
+                const livePeak = s.muted || !peaks ? 0 : (sessionPeakMap.get(s.id) ?? 0);
+                const isActiveAudio = !s.muted && livePeak > 0.02;
                 return (
                   <div
                     key={s.id || `sess-${s.pid ?? idx}-${s.name}-${idx}`}
@@ -1448,9 +1788,12 @@ export const FlyoutView: React.FC = () => {
                       value={s.volume}
                       muted={s.muted}
                       peak={livePeak}
+                      noTransition={!segAnimReady}
                       magneticDetents={[0, 50, 100]}
                       ariaLabel={`Громкость ${s.name}`}
-                      onChange={(v) => setSessionVolume(s, v)}
+                      onDragStateChange={(d) => handleSliderDrag(s.id, d)}
+                      onChange={(v) => setSessionVolume(s, v, false)}
+                      onCommit={(v) => setSessionVolume(s, v, true)}
                     />
                     <span className="mix-val">{s.muted ? '0%' : `${s.volume}%`}</span>
                   </div>
@@ -1494,6 +1837,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card cal-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
         >
           <div className="cal-selected-hdr">{formatSelectedDateHeader(selectedDate)}</div>
@@ -1679,6 +2023,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card preview-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
         >
           <div
@@ -1879,8 +2224,24 @@ export const FlyoutView: React.FC = () => {
 
     if (launchTarget) {
       pushAction({
+        key: 'open-app',
+        label: 'Открыть',
+        icon: <PlaySmallIcon className="ic14" />,
+        onActivate: () =>
+          runActionAndClose(
+            primaryWin
+              ? ipc('focus_window', { hwnd: primaryWin.hwnd, toggleMinimize: false })
+              : ipc('launch_item', {
+                  target: launchTarget,
+                  args: p.args ?? null,
+                  asAdmin: false,
+                  closeStart: false,
+                }),
+          ),
+      });
+      pushAction({
         key: 'new-window',
-        label: 'Открыть новое окно',
+        label: 'Новое окно',
         icon: <ExternalWindowIcon />,
         onActivate: () =>
           runActionAndClose(launchNewWindow(launchTarget, p.args ?? null, false)),
@@ -1890,7 +2251,7 @@ export const FlyoutView: React.FC = () => {
     if (showAdmin) {
       pushAction({
         key: 'run-admin',
-        label: 'Запустить от администратора',
+        label: 'Запустить от имени администратора',
         icon: <ShieldIcon />,
         onActivate: () =>
           runActionAndClose(
@@ -2002,6 +2363,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card ctx-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
           role="menu"
         >
@@ -2102,6 +2464,7 @@ export const FlyoutView: React.FC = () => {
           ref={cardRef}
           className="flyout-card ctx-card"
           data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
           style={cardOriginStyle}
           role="menu"
         >

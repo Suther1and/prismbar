@@ -8,18 +8,18 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
-    ERROR_SUCCESS, HWND, LPARAM, RECT, RPC_E_CHANGED_MODE, SIZE, STILL_ACTIVE, S_FALSE, S_OK,
-    WPARAM,
+    ERROR_SUCCESS, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE, SIZE, STILL_ACTIVE, S_FALSE,
+    S_OK, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromWindow, ReleaseDC, SelectObject,
-    SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    SRCCOPY,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetMonitorInfoW, GetObjectW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, ReleaseDC,
+    SelectObject, SetBrushOrgEx, SetStretchBltMode, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
 };
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
@@ -39,18 +39,18 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHGetFileInfoW,
     ShellExecuteW, ShellLink, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK,
-    SIIGBF_ICONONLY,
+    SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DrawIconEx, EnumChildWindows, EnumWindows, GetClassLongPtrW, GetClassNameW,
-    GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, ShowWindowAsync, DI_NORMAL, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE,
-    GWL_STYLE, GW_OWNER, HICON, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, ICON_SMALL2,
-    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_GETICON, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_VISIBLE,
+    GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongPtrW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SendMessageTimeoutW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, DI_NORMAL, GCLP_HICON,
+    GCLP_HICONSM, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HICON, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG,
+    ICON_SMALL, ICON_SMALL2, MONITORINFOF_PRIMARY, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WINDOWPLACEMENT,
+    WM_CLOSE, WM_GETICON, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_VISIBLE,
 };
 
 use crate::coordinator::PixelRect;
@@ -71,6 +71,10 @@ static FALLBACK_ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
 static PID_META_CACHE: OnceLock<Mutex<HashMap<u32, PidMetaEntry>>> = OnceLock::new();
 static STABLE_GROUP_ORDER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static STABLE_WINDOW_ORDER: OnceLock<Mutex<HashMap<String, Vec<isize>>>> = OnceLock::new();
+/// Remembers each live window's last-known non-minimized `HMONITOR` so minimizing a window
+/// on a secondary display (which Win32 parks at `(-32000, -32000)`) keeps it attributed to
+/// its true monitor instead of snapping to primary.
+static LAST_WINDOW_MONITOR: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
 /// Serializes cold Win32 Shell icon extractions (`IShellItemImageFactory` / `SHGetFileInfoW`)
 /// outside `IconCache` so concurrent poller/indexer/IPC threads never race on `shell32.dll`'s
 /// internal icon cache or per-thread COM teardown.
@@ -94,6 +98,10 @@ fn stable_group_order() -> &'static Mutex<Vec<String>> {
 
 fn stable_window_order() -> &'static Mutex<HashMap<String, Vec<isize>>> {
     STABLE_WINDOW_ORDER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn last_window_monitor() -> &'static Mutex<HashMap<isize, isize>> {
+    LAST_WINDOW_MONITOR.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -206,7 +214,14 @@ impl Drop for SelectedObjGuard {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub const MONITOR_PRIMARY: &str = "primary";
+pub const MONITOR_SECONDARY: &str = "secondary";
+
+fn default_monitor_label() -> String {
+    MONITOR_PRIMARY.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenWindowInfo {
     pub hwnd: isize,
@@ -219,6 +234,25 @@ pub struct OpenWindowInfo {
     pub is_minimized: bool,
     #[serde(default)]
     pub is_topmost: bool,
+    #[serde(default = "default_monitor_label")]
+    pub monitor: String,
+}
+
+impl Default for OpenWindowInfo {
+    fn default() -> Self {
+        Self {
+            hwnd: 0,
+            pid: 0,
+            title: String::new(),
+            exe_path: String::new(),
+            exe_name: String::new(),
+            aumid: None,
+            is_active: false,
+            is_minimized: false,
+            is_topmost: false,
+            monitor: default_monitor_label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -705,6 +739,7 @@ pub fn extract_uwp_icon_by_aumid(aumid: &str) -> Option<String> {
             .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
             .or_else(|_| factory.GetImage(size, SIIGBF_ICONONLY))
             .or_else(|_| factory.GetImage(size, SIIGBF_BIGGERSIZEOK))
+            .or_else(|_| factory.GetImage(size, SIIGBF_RESIZETOFIT))
             .ok()?;
         hbitmap_to_data_url(hbm)
     }
@@ -896,6 +931,39 @@ pub fn resolve_squirrel_app_exe(update_exe_path: &Path) -> Option<PathBuf> {
             return fallback;
         }
     }
+
+    // Fallback: sibling `<ParentName>.exe` directly next to `Update.exe` (e.g. `Discord\Discord.exe`).
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file()
+                || !p
+                    .extension()
+                    .map(|e| e.eq_ignore_ascii_case("exe"))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let stem_low = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if stem_low.is_empty()
+                || stem_low.contains("update")
+                || stem_low.contains("squirrel")
+                || stem_low.contains("uninstall")
+            {
+                continue;
+            }
+            if !parent_stem.is_empty()
+                && (stem_low == parent_stem
+                    || parent_stem.contains(&stem_low)
+                    || stem_low.contains(&parent_stem))
+            {
+                return Some(p);
+            }
+        }
+    }
     None
 }
 
@@ -903,11 +971,14 @@ pub fn resolve_squirrel_app_exe(update_exe_path: &Path) -> Option<PathBuf> {
 /// `\Microsoft\WindowsApps\` (e.g. `wt.exe`), whose shell icon is often a blank generic exe
 /// unless resolved via its UWP `shell:AppsFolder\<AUMID>` entry.
 pub fn is_windows_apps_execution_alias(path: &str) -> bool {
-    let norm = path.trim().trim_matches('"').replace('/', "\\").to_ascii_lowercase();
+    let clean = path.trim().trim_matches('"');
+    let norm = clean.replace('/', "\\").to_ascii_lowercase();
     if !norm.contains(r"\microsoft\windowsapps\") || !norm.ends_with(".exe") {
         return false;
     }
-    match std::fs::metadata(path.trim().trim_matches('"')) {
+    // Use `symlink_metadata` first because `fs::metadata` on `IO_REPARSE_TAG_APPEXECLINK`
+    // reparse points can fail with ERROR_CANT_ACCESS_FILE (1920).
+    match std::fs::symlink_metadata(clean).or_else(|_| std::fs::metadata(clean)) {
         Ok(meta) => meta.len() == 0,
         Err(_) => true,
     }
@@ -933,6 +1004,13 @@ pub fn resolve_icon_source_path(raw: &str) -> Option<String> {
     let norm = expand_common_env_vars(trimmed).replace('/', "\\");
     if norm.contains('\\') {
         let p = Path::new(&norm);
+        // Handle Windows App Execution Alias reparse points (`...\WindowsApps\wt.exe`) whose
+        // `Path::exists()` can return false even when the alias exists on disk.
+        if is_windows_apps_execution_alias(&norm)
+            && (std::fs::symlink_metadata(p).is_ok() || p.exists())
+        {
+            return Some(norm);
+        }
         if p.exists() {
             if let Some(real_exe) = resolve_squirrel_app_exe(p) {
                 return Some(real_exe.to_string_lossy().to_string());
@@ -984,7 +1062,7 @@ pub fn resolve_icon_source_path(raw: &str) -> Option<String> {
 /// (wrapped in RAII `ComGuard::init_sta()`), falling back to `SHGetFileInfoW` + 64x64 HALFTONE
 /// `hicon_to_data_url` ONLY when `IShellItemImageFactory` fails.
 pub fn extract_path_icon_raw(path: &str) -> Option<String> {
-    let trimmed = path.trim();
+    let trimmed = path.trim().trim_matches('"').trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -995,17 +1073,35 @@ pub fn extract_path_icon_raw(path: &str) -> Option<String> {
         return extract_uwp_icon_by_aumid(trimmed);
     }
 
+    // Windows Terminal App Execution Alias stub (`...\WindowsApps\wt.exe` or bare `wt.exe`) has
+    // 0 bytes (AppExecLink reparse point) and yields a generic box or `exists()==false` unless
+    // extracted directly via its UWP AppsFolder entry.
+    let low_trimmed = trimmed.replace('/', "\\").to_ascii_lowercase();
+    if low_trimmed == "wt.exe"
+        || (is_windows_apps_execution_alias(trimmed) && low_trimmed.ends_with(r"\wt.exe"))
+    {
+        for aumid in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe!App",
+        ] {
+            if let Some(uwp) = extract_uwp_icon_by_aumid(aumid) {
+                return Some(uwp);
+            }
+        }
+    }
+
     let resolved = resolve_icon_source_path(trimmed)?;
 
-    // Windows Terminal App Execution Alias stub (`...\WindowsApps\wt.exe`) has 0 bytes and
-    // yields a generic white box unless extracted through its real UWP AppsFolder entry.
     if is_windows_apps_execution_alias(&resolved)
         && resolved.to_ascii_lowercase().ends_with(r"\wt.exe")
     {
-        if let Some(uwp) =
-            extract_uwp_icon_by_aumid("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")
-        {
-            return Some(uwp);
+        for aumid in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe!App",
+        ] {
+            if let Some(uwp) = extract_uwp_icon_by_aumid(aumid) {
+                return Some(uwp);
+            }
         }
     }
 
@@ -1092,7 +1188,7 @@ fn extract_live_window_hicon(hwnd: HWND) -> Option<String> {
 }
 
 pub fn extract_icon_for_path_cached(path: &str, cache: &Mutex<IconCache>) -> Option<String> {
-    let trimmed = path.trim();
+    let trimmed = path.trim().trim_matches('"').trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -1449,6 +1545,201 @@ pub fn stabilize_window_groups_order(
     groups
 }
 
+/// Classifies a Win32 `MONITORINFO.dwFlags` value into `"primary"` or `"secondary"`.
+pub fn classify_monitor_flags(dw_flags: u32) -> &'static str {
+    if (dw_flags & MONITORINFOF_PRIMARY) != 0 {
+        MONITOR_PRIMARY
+    } else {
+        MONITOR_SECONDARY
+    }
+}
+
+/// Converts a `WINDOWPLACEMENT.rcNormalPosition` rectangle (workspace coordinates relative to
+/// the primary monitor work area) into virtual-screen coordinates suitable for `MonitorFromRect`.
+pub fn workspace_rect_to_screen_rect(
+    normal_rc: PixelRect,
+    primary_monitor_rc: PixelRect,
+    primary_work_rc: PixelRect,
+) -> PixelRect {
+    let dx = primary_work_rc.left - primary_monitor_rc.left;
+    let dy = primary_work_rc.top - primary_monitor_rc.top;
+    PixelRect::new(
+        normal_rc.left + dx,
+        normal_rc.top + dy,
+        normal_rc.right + dx,
+        normal_rc.bottom + dy,
+    )
+}
+
+/// Pure monitor attribution resolver combining live `MonitorFromWindow` readings, a last-known
+/// non-minimized `HMONITOR` cache, and `GetWindowPlacement` fallback for already-minimized windows.
+pub fn resolve_monitor_with_cache<FClassify, FPlacement>(
+    hwnd: isize,
+    is_minimized: bool,
+    live_hmon: Option<isize>,
+    prev_monitors: &HashMap<isize, isize>,
+    updated_monitors: &mut HashMap<isize, isize>,
+    mut classify_hmon: FClassify,
+    placement_hmon: FPlacement,
+) -> &'static str
+where
+    FClassify: FnMut(isize) -> Option<&'static str>,
+    FPlacement: FnOnce() -> Option<isize>,
+{
+    if !is_minimized {
+        if let Some(hmon) = live_hmon {
+            if let Some(label) = classify_hmon(hmon) {
+                updated_monitors.insert(hwnd, hmon);
+                return label;
+            }
+        }
+        if let Some(&cached) = prev_monitors.get(&hwnd) {
+            if let Some(label) = classify_hmon(cached) {
+                return label;
+            }
+        }
+        return MONITOR_PRIMARY;
+    }
+
+    if let Some(&cached) = prev_monitors.get(&hwnd) {
+        if let Some(label) = classify_hmon(cached) {
+            return label;
+        }
+    }
+
+    if let Some(hmon) = placement_hmon() {
+        if let Some(label) = classify_hmon(hmon) {
+            updated_monitors.insert(hwnd, hmon);
+            return label;
+        }
+    }
+
+    MONITOR_PRIMARY
+}
+
+/// Filters grouped open windows to a specific monitor (`"primary"` or `"secondary"`).
+///
+/// Prunes groups that have no windows on `monitor` and recomputes each remaining group's
+/// `is_active` strictly from its filtered windows so focusing a Monitor 1 window never falsely
+/// highlights the same app's Monitor 2 taskbar button.
+pub fn filter_window_groups_for_monitor(
+    groups: &[AppWindowGroup],
+    monitor: &str,
+) -> Vec<AppWindowGroup> {
+    let target = monitor.trim();
+    if target.is_empty() || target.eq_ignore_ascii_case("all") {
+        return groups.to_vec();
+    }
+
+    let mut filtered = Vec::with_capacity(groups.len());
+    for group in groups {
+        let windows: Vec<OpenWindowInfo> = group
+            .windows
+            .iter()
+            .filter(|w| {
+                let win_mon = if w.monitor.is_empty() {
+                    MONITOR_PRIMARY
+                } else {
+                    w.monitor.as_str()
+                };
+                win_mon.eq_ignore_ascii_case(target)
+            })
+            .cloned()
+            .collect();
+
+        if windows.is_empty() {
+            continue;
+        }
+
+        let is_active = windows.iter().any(|w| w.is_active);
+        filtered.push(AppWindowGroup {
+            key: group.key.clone(),
+            name: group.name.clone(),
+            exe_path: group.exe_path.clone(),
+            aumid: group.aumid.clone(),
+            icon_key: group.icon_key.clone(),
+            icon_data: group.icon_data.clone(),
+            is_active,
+            windows,
+        });
+    }
+    filtered
+}
+
+fn classify_hmonitor(hmon_raw: isize) -> Option<&'static str> {
+    if hmon_raw == 0 {
+        return None;
+    }
+    let hmon = HMONITOR(hmon_raw as *mut std::ffi::c_void);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(hmon, &mut mi).as_bool() } {
+        Some(classify_monitor_flags(mi.dwFlags))
+    } else {
+        None
+    }
+}
+
+fn primary_monitor_rects() -> (PixelRect, PixelRect) {
+    let hmon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !hmon.is_invalid() && unsafe { GetMonitorInfoW(hmon, &mut mi).as_bool() } {
+        let monitor_rc = PixelRect::new(
+            mi.rcMonitor.left,
+            mi.rcMonitor.top,
+            mi.rcMonitor.right,
+            mi.rcMonitor.bottom,
+        );
+        let work_rc = PixelRect::new(
+            mi.rcWork.left,
+            mi.rcWork.top,
+            mi.rcWork.right,
+            mi.rcWork.bottom,
+        );
+        (monitor_rc, work_rc)
+    } else {
+        (PixelRect::new(0, 0, 0, 0), PixelRect::new(0, 0, 0, 0))
+    }
+}
+
+fn monitor_from_window_placement(
+    hwnd: HWND,
+    primary_monitor_rc: PixelRect,
+    primary_work_rc: PixelRect,
+) -> Option<isize> {
+    let mut wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetWindowPlacement(hwnd, &mut wp).is_err() } {
+        return None;
+    }
+    let normal_rc = PixelRect::new(
+        wp.rcNormalPosition.left,
+        wp.rcNormalPosition.top,
+        wp.rcNormalPosition.right,
+        wp.rcNormalPosition.bottom,
+    );
+    let screen = workspace_rect_to_screen_rect(normal_rc, primary_monitor_rc, primary_work_rc);
+    let screen_rect = RECT {
+        left: screen.left,
+        top: screen.top,
+        right: screen.right,
+        bottom: screen.bottom,
+    };
+    let hmon = unsafe { MonitorFromRect(&screen_rect, MONITOR_DEFAULTTONEAREST) };
+    if hmon.is_invalid() {
+        None
+    } else {
+        Some(hmon.0 as isize)
+    }
+}
+
 /// Enumerates open user windows grouped by application and also returns unique
 /// `(icon_key, source_path)` pairs so the host can register every window icon into `icon_sources`
 /// and cleanly recover icons after LRU eviction.
@@ -1458,6 +1749,11 @@ pub fn list_open_window_groups_cached_with_sources(
     struct Ctx {
         own_pid: u32,
         fg_hwnd: HWND,
+        primary_monitor_rc: PixelRect,
+        primary_work_rc: PixelRect,
+        prev_monitors: HashMap<isize, isize>,
+        updated_monitors: HashMap<isize, isize>,
+        live_hwnds: HashSet<isize>,
         items: Vec<OpenWindowInfo>,
         active_pids: HashSet<u32>,
     }
@@ -1553,25 +1849,59 @@ pub fn list_open_window_groups_cached_with_sources(
             };
 
             let exe_name = display_name_for_window(&exe_path, is_uwp_host, &title);
+            let hwnd_raw = hwnd.0 as isize;
+            let is_minimized = IsIconic(hwnd).as_bool();
+            ctx.live_hwnds.insert(hwnd_raw);
+
+            let live_hmon = if is_minimized {
+                None
+            } else {
+                let h = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if h.is_invalid() {
+                    None
+                } else {
+                    Some(h.0 as isize)
+                }
+            };
+            let primary_mon_rc = ctx.primary_monitor_rc;
+            let primary_work_rc = ctx.primary_work_rc;
+            let monitor = resolve_monitor_with_cache(
+                hwnd_raw,
+                is_minimized,
+                live_hmon,
+                &ctx.prev_monitors,
+                &mut ctx.updated_monitors,
+                classify_hmonitor,
+                || monitor_from_window_placement(hwnd, primary_mon_rc, primary_work_rc),
+            );
 
             ctx.items.push(OpenWindowInfo {
-                hwnd: hwnd.0 as isize,
+                hwnd: hwnd_raw,
                 pid: effective_pid,
                 title,
                 exe_path,
                 exe_name,
                 aumid,
                 is_active: hwnd == ctx.fg_hwnd,
-                is_minimized: IsIconic(hwnd).as_bool(),
+                is_minimized,
                 is_topmost: (ex & WS_EX_TOPMOST.0) != 0,
+                monitor: monitor.to_string(),
             });
         }
         BOOL(1)
     }
 
+    let (primary_monitor_rc, primary_work_rc) = primary_monitor_rects();
+    let prev_monitors = lock_unpoisoned(last_window_monitor()).clone();
+
     let mut ctx = Ctx {
         own_pid: unsafe { GetCurrentProcessId() },
         fg_hwnd: unsafe { GetForegroundWindow() },
+        primary_monitor_rc,
+        primary_work_rc,
+        prev_monitors,
+        updated_monitors: HashMap::new(),
+        live_hwnds: HashSet::new(),
         items: Vec::new(),
         active_pids: HashSet::new(),
     };
@@ -1579,6 +1909,13 @@ pub fn list_open_window_groups_cached_with_sources(
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
     prune_pid_meta_cache(&ctx.active_pids);
+    {
+        let mut cache_map = lock_unpoisoned(last_window_monitor());
+        for (hwnd_raw, hmon_raw) in ctx.updated_monitors {
+            cache_map.insert(hwnd_raw, hmon_raw);
+        }
+        cache_map.retain(|hwnd_raw, _| ctx.live_hwnds.contains(hwnd_raw));
+    }
 
     let mut icon_sources: Vec<(String, String)> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
@@ -2425,10 +2762,623 @@ fn normalized_exe_basename(exe_path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Normalizes helper/CEF child executables (such as `D:\Steam\bin\cef\cef.win64\steamwebhelper.exe`
+/// or Squirrel `Discord\Update.exe`) to their parent desktop application executable so Jump List
+/// AppID lookup and quick tasks resolve identically to native Windows 11.
+pub fn normalize_jump_list_exe_path(exe_path: &str) -> String {
+    let clean = exe_path.trim().trim_matches('"').replace('/', "\\");
+    if clean.is_empty() {
+        return clean;
+    }
+    let base = normalized_exe_basename(&clean);
+    if base == "steamwebhelper.exe" {
+        let p = Path::new(&clean);
+        let mut cur = p.parent();
+        for _ in 0..5 {
+            let Some(dir) = cur else { break };
+            let candidate = dir.join("steam.exe");
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+            cur = dir.parent();
+        }
+        // Synthetic / offline path normalization fallback: strip `\bin\cef\...`
+        let low = clean.to_ascii_lowercase();
+        if let Some(idx) = low.find(r"\bin\cef\") {
+            return format!(r"{}\steam.exe", &clean[..idx]);
+        }
+    } else if base == "update.exe" {
+        if let Some(real_exe) = resolve_squirrel_app_exe(Path::new(&clean)) {
+            return real_exe.to_string_lossy().to_string();
+        }
+    }
+    clean
+}
+
+/// Computes the exact Windows Shell AppID CRC64-ECMA-182 hash used as the 16-hex-digit filename
+/// prefix under `%APPDATA%\Microsoft\Windows\Recent\CustomDestinations\<hash>.customDestinations-ms`.
+pub fn windows_appid_crc64(input: &str) -> u64 {
+    const POLY: u64 = 0x92C6_4265_D321_39A4;
+    static TABLE: OnceLock<[u64; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u64; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = i as u64;
+            for _ in 0..8 {
+                if (c & 1) != 0 {
+                    c = (c >> 1) ^ POLY;
+                } else {
+                    c >>= 1;
+                }
+            }
+            *slot = c;
+        }
+        t
+    });
+
+    let upper = input.trim().to_uppercase();
+    let mut hash: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    for unit in upper.encode_utf16() {
+        for b in unit.to_le_bytes() {
+            let idx = ((hash ^ u64::from(b)) & 0xFF) as usize;
+            hash = (hash >> 8) ^ table[idx];
+        }
+    }
+    hash
+}
+
+fn known_folder_substituted_exe_path(exe_path: &str) -> Option<String> {
+    let norm = exe_path.trim().trim_matches('"').replace('/', "\\");
+    if norm.is_empty() {
+        return None;
+    }
+    let norm_low = norm.to_ascii_lowercase();
+    let mut mappings: Vec<(String, &'static str)> = Vec::with_capacity(8);
+    if let Some(local) = dirs::data_local_dir() {
+        mappings.push((
+            local.to_string_lossy().replace('/', "\\"),
+            "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}",
+        ));
+    }
+    if let Some(roaming) = dirs::config_dir() {
+        mappings.push((
+            roaming.to_string_lossy().replace('/', "\\"),
+            "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}",
+        ));
+    }
+    mappings.push((
+        r"C:\Program Files (x86)".to_string(),
+        "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}",
+    ));
+    mappings.push((
+        r"C:\Program Files".to_string(),
+        "{6D809377-6AF0-444B-8957-A3773F02200E}",
+    ));
+    mappings.push((
+        r"C:\Windows\System32".to_string(),
+        "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}",
+    ));
+    mappings.push((
+        r"C:\Windows".to_string(),
+        "{F38BF404-1D43-42F2-9305-67DE0B28FC23}",
+    ));
+    // Prefer longest prefix match first (e.g. `System32` before `Windows`, `Program Files (x86)` before `Program Files`).
+    mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    for (prefix, guid) in mappings {
+        let p_low = prefix.trim_end_matches('\\').to_ascii_lowercase();
+        if p_low.is_empty() {
+            continue;
+        }
+        if norm_low.starts_with(&p_low) {
+            let rest = &norm[p_low.len()..];
+            if rest.starts_with('\\') {
+                return Some(format!("{guid}{rest}"));
+            }
+        }
+    }
+    None
+}
+
+/// Builds the O(1) candidate Windows AppID strings whose CRC64 hashes name
+/// `%APPDATA%\Microsoft\Windows\Recent\CustomDestinations\<16hex>.customDestinations-ms`.
+pub fn candidate_jump_list_app_ids(exe_path: &str, aumid: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |cand: &str| {
+        let t = cand.trim();
+        if !t.is_empty() && seen.insert(t.to_ascii_uppercase()) {
+            out.push(t.to_string());
+        }
+    };
+
+    if let Some(raw_aumid) = aumid {
+        let trimmed = raw_aumid.trim();
+        let stripped = if trimmed
+            .to_ascii_lowercase()
+            .starts_with("shell:appsfolder\\")
+        {
+            &trimmed["shell:appsfolder\\".len()..]
+        } else {
+            trimmed
+        };
+        push(stripped);
+    }
+
+    let norm_exe = normalize_jump_list_exe_path(exe_path);
+    let base = normalized_exe_basename(&norm_exe);
+    match base.as_str() {
+        "steam.exe" | "steamwebhelper.exe" => push("Valve.Steam.Client"),
+        "telegram.exe" => push("Telegram.TelegramDesktop"),
+        "discord.exe" => push("com.squirrel.Discord.Discord"),
+        "code.exe" => push("Microsoft.VisualStudioCode"),
+        "cursor.exe" => push("Cursor"),
+        "spotify.exe" => push("SpotifyAB.SpotifyMusic"),
+        "explorer.exe" => push("Microsoft.Windows.Explorer"),
+        _ => {}
+    }
+
+    if let Some(kf) = known_folder_substituted_exe_path(&norm_exe) {
+        push(&kf);
+    }
+    if !norm_exe.is_empty() {
+        push(&norm_exe);
+    }
+    out
+}
+
+fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn decode_utf16le_bytes(bytes: &[u8]) -> String {
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    String::from_utf16_lossy(&units).trim().to_string()
+}
+
+fn decode_cstr_lossy(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
+}
+
+fn read_lnk_string_data(data: &[u8], pos: &mut usize, is_unicode: bool) -> Option<String> {
+    let char_count = read_u16_le(data, *pos)? as usize;
+    *pos += 2;
+    let byte_len = if is_unicode {
+        char_count.checked_mul(2)?
+    } else {
+        char_count
+    };
+    let slice = data.get(*pos..(*pos).checked_add(byte_len)?)?;
+    *pos += byte_len;
+    if is_unicode {
+        Some(decode_utf16le_bytes(slice))
+    } else {
+        Some(decode_cstr_lossy(slice))
+    }
+}
+
+fn parse_property_store_block(block: &[u8]) -> (Option<String>, bool) {
+    // FMTID_SummaryInformation {F29F85E0-4FF9-1068-AB91-08002B27B3D9}, PID 2 = PKEY_Title
+    const FMTID_SUMMARY_INFO: [u8; 16] = [
+        0xE0, 0x85, 0x9F, 0xF2, 0xF9, 0x4F, 0x68, 0x10, 0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27, 0xB3,
+        0xD9,
+    ];
+    // FMTID_AppUserModel {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, PID 6 = IsDestListSeparator
+    const FMTID_APP_USER_MODEL: [u8; 16] = [
+        0x55, 0x28, 0x4C, 0x9F, 0x79, 0x9F, 0x39, 0x4B, 0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5,
+        0xF3,
+    ];
+    const SPS_VERSION: u32 = 0x5350_5331; // "1SPS"
+
+    let mut title: Option<String> = None;
+    let mut is_separator = false;
+    let mut pos = 0usize;
+
+    while pos + 4 <= block.len() {
+        let Some(storage_size) = read_u32_le(block, pos) else {
+            break;
+        };
+        if storage_size == 0 {
+            break;
+        }
+        let storage_end = pos.saturating_add(storage_size as usize).min(block.len());
+        if storage_size < 24 || storage_end <= pos + 24 {
+            break;
+        }
+        let version = read_u32_le(block, pos + 4).unwrap_or(0);
+        let fmtid = &block[pos + 8..pos + 24];
+        if version == SPS_VERSION
+            && (fmtid == FMTID_SUMMARY_INFO || fmtid == FMTID_APP_USER_MODEL)
+        {
+            let mut p = pos + 24;
+            while p + 4 <= storage_end {
+                let Some(val_size) = read_u32_le(block, p) else {
+                    break;
+                };
+                if val_size == 0 {
+                    break;
+                }
+                let val_end = p.saturating_add(val_size as usize).min(storage_end);
+                if val_size < 13 || val_end <= p + 13 {
+                    break;
+                }
+                let pid = read_u32_le(block, p + 4).unwrap_or(0);
+                // Byte at p+8 is reserved (0); typed property value starts at p+9: [vt:u16, pad:u16, data...]
+                let vt = read_u16_le(block, p + 9).unwrap_or(0);
+                let val_data_start = p + 13;
+
+                if fmtid == FMTID_SUMMARY_INFO && pid == 2 {
+                    if vt == 31 && val_data_start + 4 <= val_end {
+                        // VT_LPWSTR
+                        let chars = read_u32_le(block, val_data_start).unwrap_or(0) as usize;
+                        let str_start = val_data_start + 4;
+                        let str_end = str_start
+                            .saturating_add(chars.saturating_mul(2))
+                            .min(val_end);
+                        let s = decode_utf16le_bytes(&block[str_start..str_end]);
+                        if !s.is_empty() && !(s.starts_with('@') && s.contains(",-")) {
+                            title = Some(s);
+                        }
+                    } else if vt == 30 && val_data_start + 4 <= val_end {
+                        // VT_LPSTR
+                        let len = read_u32_le(block, val_data_start).unwrap_or(0) as usize;
+                        let str_start = val_data_start + 4;
+                        let str_end = str_start.saturating_add(len).min(val_end);
+                        let s = decode_cstr_lossy(&block[str_start..str_end]);
+                        if !s.is_empty() && !(s.starts_with('@') && s.contains(",-")) {
+                            title = Some(s);
+                        }
+                    }
+                } else if fmtid == FMTID_APP_USER_MODEL
+                    && pid == 6
+                    && vt == 11
+                    && val_data_start + 2 <= val_end
+                {
+                    // VT_BOOL: non-zero (typically 0xFFFF) means separator entry
+                    if read_u16_le(block, val_data_start).unwrap_or(0) != 0 {
+                        is_separator = true;
+                    }
+                }
+
+                p = val_end;
+            }
+        }
+        pos = storage_end;
+    }
+
+    (title, is_separator)
+}
+
+/// Parses a single MS-SHLLINK payload starting at `*pos`, advancing `*pos` to the exact byte
+/// immediately after its `TerminalBlock`. Returns `Ok(Some(item))` for valid entries,
+/// `Ok(None)` for Jump List separator entries, or `Err(())` if malformed.
+fn parse_embedded_shell_link(
+    data: &[u8],
+    pos: &mut usize,
+    kind: &str,
+    fallback_exe: &str,
+) -> Result<Option<JumpListItem>, ()> {
+    const SHLLINK_HEADER_MAGIC: [u8; 20] = [
+        0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x46,
+    ];
+    let start = *pos;
+    if data.get(start..start + 76).is_none() || data[start..start + 20] != SHLLINK_HEADER_MAGIC {
+        return Err(());
+    }
+    let flags = read_u32_le(data, start + 20).ok_or(())?;
+    let is_unicode = (flags & 0x0080) != 0;
+    let mut p = start + 76;
+
+    // 1. LinkTargetIDList
+    if (flags & 0x0001) != 0 {
+        let idlist_size = read_u16_le(data, p).ok_or(())? as usize;
+        p = p.checked_add(2).and_then(|v| v.checked_add(idlist_size)).ok_or(())?;
+        if p > data.len() {
+            return Err(());
+        }
+    }
+
+    // 2. LinkInfo (extract LocalBasePath + CommonPathSuffix)
+    let mut link_info_path = String::new();
+    if (flags & 0x0002) != 0 {
+        let li_start = p;
+        let li_size = read_u32_le(data, li_start).ok_or(())? as usize;
+        let li_end = li_start.checked_add(li_size).ok_or(())?;
+        if li_size < 28 || li_end > data.len() {
+            return Err(());
+        }
+        let li_hdr_size = read_u32_le(data, li_start + 4).unwrap_or(0) as usize;
+        let li_flags = read_u32_le(data, li_start + 8).unwrap_or(0);
+        if (li_flags & 0x01) != 0 {
+            let (base_path, suffix) = if li_hdr_size >= 0x24 && li_start + 36 <= li_end {
+                let u_off = read_u32_le(data, li_start + 28).unwrap_or(0) as usize;
+                let s_off = read_u32_le(data, li_start + 32).unwrap_or(0) as usize;
+                let bp = if u_off > 0 && li_start + u_off < li_end {
+                    decode_utf16le_bytes(&data[li_start + u_off..li_end])
+                } else {
+                    String::new()
+                };
+                let sf = if s_off > 0 && li_start + s_off < li_end {
+                    decode_utf16le_bytes(&data[li_start + s_off..li_end])
+                } else {
+                    String::new()
+                };
+                (bp, sf)
+            } else {
+                let a_off = read_u32_le(data, li_start + 16).unwrap_or(0) as usize;
+                let s_off = read_u32_le(data, li_start + 24).unwrap_or(0) as usize;
+                let bp = if a_off > 0 && li_start + a_off < li_end {
+                    decode_cstr_lossy(&data[li_start + a_off..li_end])
+                } else {
+                    String::new()
+                };
+                let sf = if s_off > 0 && li_start + s_off < li_end {
+                    decode_cstr_lossy(&data[li_start + s_off..li_end])
+                } else {
+                    String::new()
+                };
+                (bp, sf)
+            };
+            link_info_path = if suffix.is_empty() {
+                base_path
+            } else if base_path.ends_with('\\') || suffix.starts_with('\\') {
+                format!("{base_path}{suffix}")
+            } else {
+                format!("{base_path}\\{suffix}")
+            };
+        }
+        p = li_end;
+    }
+
+    // 3. StringData
+    let name_str = if (flags & 0x0004) != 0 {
+        read_lnk_string_data(data, &mut p, is_unicode).ok_or(())?
+    } else {
+        String::new()
+    };
+    let rel_path = if (flags & 0x0008) != 0 {
+        read_lnk_string_data(data, &mut p, is_unicode).ok_or(())?
+    } else {
+        String::new()
+    };
+    if (flags & 0x0010) != 0 {
+        let _working_dir = read_lnk_string_data(data, &mut p, is_unicode).ok_or(())?;
+    }
+    let args_str = if (flags & 0x0020) != 0 {
+        read_lnk_string_data(data, &mut p, is_unicode).ok_or(())?
+    } else {
+        String::new()
+    };
+    if (flags & 0x0040) != 0 {
+        let _icon_loc = read_lnk_string_data(data, &mut p, is_unicode).ok_or(())?;
+    }
+
+    // 4. ExtraData blocks up to TerminalBlock (< 4)
+    let mut prop_title: Option<String> = None;
+    let mut env_target: Option<String> = None;
+    let mut is_separator = false;
+
+    while p + 4 <= data.len() {
+        let block_size = read_u32_le(data, p).ok_or(())? as usize;
+        if block_size < 4 {
+            p += 4;
+            break;
+        }
+        let block_end = p.checked_add(block_size).ok_or(())?;
+        if block_end > data.len() {
+            return Err(());
+        }
+        if block_size >= 8 {
+            let sig = read_u32_le(data, p + 4).unwrap_or(0);
+            if sig == 0xA000_0009 {
+                let (t, sep) = parse_property_store_block(&data[p + 8..block_end]);
+                if t.is_some() {
+                    prop_title = t;
+                }
+                if sep {
+                    is_separator = true;
+                }
+            } else if sig == 0xA000_0001 && block_size >= 788 {
+                // EnvironmentVariableDataBlock: 260-char UTF-16LE TargetUnicode at offset 268
+                let expanded = expand_common_env_vars(&decode_utf16le_bytes(&data[p + 268..p + 788]));
+                if !expanded.is_empty() {
+                    env_target = Some(expanded);
+                }
+            }
+        }
+        p = block_end;
+    }
+
+    *pos = p;
+    if is_separator {
+        return Ok(None);
+    }
+
+    let target = if !link_info_path.trim().is_empty() {
+        link_info_path.trim().to_string()
+    } else if let Some(et) = env_target.filter(|s| !s.trim().is_empty()) {
+        et
+    } else if !rel_path.trim().is_empty() && !rel_path.trim().starts_with('.') {
+        rel_path.trim().to_string()
+    } else if !args_str.trim().is_empty() && !fallback_exe.trim().is_empty() {
+        fallback_exe.trim().to_string()
+    } else {
+        return Ok(None);
+    };
+
+    let args = if args_str.trim().is_empty() {
+        None
+    } else {
+        Some(args_str.trim().to_string())
+    };
+
+    let title = prop_title
+        .or_else(|| {
+            let n = name_str.trim();
+            if !n.is_empty() && !(n.starts_with('@') && n.contains(",-")) {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            Path::new(&target)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| target.clone());
+
+    Ok(Some(JumpListItem {
+        title,
+        target,
+        args,
+        kind: kind.to_string(),
+    }))
+}
+
+/// Pure-Rust bounds-checked parser for Windows `.customDestinations-ms` Jump List containers.
+/// Parses both Custom categories (e.g. Steam's recent games `Недавние`) and Tasks categories
+/// (e.g. Store, Library, Friends, Settings, Big Picture, Exit Steam) in `< 1ms` with zero COM overhead.
+pub fn parse_custom_destinations_bytes(data: &[u8], fallback_exe: &str) -> Vec<JumpListItem> {
+    const CLSID_SHELL_LINK: [u8; 16] = [
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const CATEGORY_FOOTER: u32 = 0xBABF_FBAB; // little-endian bytes: AB FB BF BA
+
+    if data.len() < 12 {
+        return Vec::new();
+    }
+    let Some(cat_count) = read_u32_le(data, 4) else {
+        return Vec::new();
+    };
+    let cat_count = (cat_count as usize).min(32);
+    let mut pos = 12usize;
+    let mut out = Vec::new();
+
+    for _ in 0..cat_count {
+        let Some(cat_type) = read_u32_le(data, pos) else {
+            break;
+        };
+        pos += 4;
+
+        let (item_count, kind): (usize, &'static str) = match cat_type {
+            0 => {
+                // Custom named category
+                let Some(title_chars) = read_u16_le(data, pos).map(|v| v as usize) else {
+                    break;
+                };
+                pos += 2;
+                let Some(title_end) = pos.checked_add(title_chars.saturating_mul(2)) else {
+                    break;
+                };
+                if title_end > data.len() {
+                    break;
+                }
+                let cat_title = decode_utf16le_bytes(&data[pos..title_end]).to_lowercase();
+                pos = title_end;
+                let Some(count) = read_u32_le(data, pos).map(|v| v as usize) else {
+                    break;
+                };
+                pos += 4;
+                let k = if cat_title.contains("task") || cat_title.contains("задач") {
+                    "task"
+                } else {
+                    "recent"
+                };
+                (count.min(64), k)
+            }
+            1 => {
+                // Known category (Frequent / Recent stored in AutomaticDestinations): 4-byte ID, no inline items
+                if pos + 4 > data.len() {
+                    break;
+                }
+                pos += 4;
+                (0, "recent")
+            }
+            2 => {
+                // Tasks category
+                let Some(count) = read_u32_le(data, pos).map(|v| v as usize) else {
+                    break;
+                };
+                pos += 4;
+                (count.min(64), "task")
+            }
+            _ => break,
+        };
+
+        for _ in 0..item_count {
+            if data.get(pos..pos + 16) != Some(&CLSID_SHELL_LINK[..]) {
+                break;
+            }
+            pos += 16;
+            match parse_embedded_shell_link(data, &mut pos, kind, fallback_exe) {
+                Ok(Some(item)) => out.push(item),
+                Ok(None) => {}
+                Err(()) => break,
+            }
+        }
+
+        if read_u32_le(data, pos) == Some(CATEGORY_FOOTER) {
+            pos += 4;
+        }
+    }
+
+    out
+}
+
+/// Performs an O(1) direct filename lookup in `%APPDATA%\Microsoft\Windows\Recent\CustomDestinations`
+/// using exact Windows AppID CRC64 hashes (NEVER linearly scanning the directory).
+fn load_native_custom_destinations(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
+    let Some(custom_dir) =
+        dirs::config_dir().map(|d| d.join(r"Microsoft\Windows\Recent\CustomDestinations"))
+    else {
+        return Vec::new();
+    };
+    let norm_exe = normalize_jump_list_exe_path(exe_path);
+    for cand in candidate_jump_list_app_ids(&norm_exe, aumid) {
+        let hash = windows_appid_crc64(&cand);
+        let path = custom_dir.join(format!("{hash:016x}.customDestinations-ms"));
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > 1024 * 1024 {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            let parsed = parse_custom_destinations_bytes(&bytes, &norm_exe);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Returns built-in app-specific quick Jump List tasks for common browsers, editors,
 /// terminals, Explorer, Notepad, OBS, and Steam.
 pub fn known_app_quick_tasks(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
-    let exe_clean = exe_path.trim().trim_matches('"');
+    let normalized = normalize_jump_list_exe_path(exe_path);
+    let exe_clean = normalized.trim().trim_matches('"');
     let base = normalized_exe_basename(exe_clean);
     let aumid_low = aumid.unwrap_or("").trim().to_ascii_lowercase();
     let mut tasks = Vec::new();
@@ -2699,19 +3649,58 @@ fn collect_windows_recent_targets(max_scan: usize) -> Vec<(String, String)> {
     resolved
 }
 
-/// Returns structured Jump List actions (app-specific quick tasks + matching Windows Recent
-/// items from `%APPDATA%\Microsoft\Windows\Recent` resolved behind RAII `ComGuard`).
+/// Returns structured Jump List actions, preferring O(1) native Windows `.customDestinations-ms`
+/// Jump Lists (e.g. Steam's recent games & native tasks via AppID CRC64 direct lookup) and falling
+/// back to app-specific quick tasks + matching Windows Recent `.lnk` items.
 pub fn get_jump_list(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
-    let mut items = known_app_quick_tasks(exe_path, aumid);
-    let base = normalized_exe_basename(exe_path);
+    let norm_exe = normalize_jump_list_exe_path(exe_path);
+    let native = load_native_custom_destinations(&norm_exe, aumid);
+    if !native.is_empty() {
+        let mut seen = HashSet::new();
+        let mut recents = Vec::new();
+        let mut tasks = Vec::new();
+        for item in native {
+            let key = format!(
+                "{}|{}|{}",
+                item.title.to_ascii_lowercase(),
+                item.target.to_ascii_lowercase(),
+                item.args.as_deref().unwrap_or("").to_ascii_lowercase()
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            if item.kind == "task" {
+                if tasks.len() < 8 {
+                    tasks.push(item);
+                }
+            } else if recents.len() < 4 {
+                recents.push(item);
+            }
+        }
+        let mut combined = Vec::with_capacity(tasks.len() + recents.len());
+        combined.extend(tasks);
+        combined.extend(recents);
+        if !combined.is_empty() {
+            return combined;
+        }
+    }
+
+    let mut items = known_app_quick_tasks(&norm_exe, aumid);
+    let base = normalized_exe_basename(&norm_exe);
     let aumid_low = aumid.unwrap_or("").trim().to_ascii_lowercase();
     let (exts, allow_dirs) = recent_extensions_for_app(&base, &aumid_low);
     if !exts.is_empty() || allow_dirs {
         let recent_raw = collect_windows_recent_targets(48);
-        let recent_matched = match_recent_entries_for_app(exe_path, aumid, &recent_raw, 4);
+        let recent_matched = match_recent_entries_for_app(&norm_exe, aumid, &recent_raw, 4);
         let mut seen: HashSet<String> = items
             .iter()
-            .map(|i| format!("{}|{}", i.target.to_ascii_lowercase(), i.args.as_deref().unwrap_or("")))
+            .map(|i| {
+                format!(
+                    "{}|{}",
+                    i.target.to_ascii_lowercase(),
+                    i.args.as_deref().unwrap_or("")
+                )
+            })
             .collect();
         for r in recent_matched {
             let key = format!("{}|", r.target.to_ascii_lowercase());
@@ -2722,6 +3711,107 @@ pub fn get_jump_list(exe_path: &str, aumid: Option<&str>) -> Vec<JumpListItem> {
     }
     items.truncate(6);
     items
+}
+
+/// Computes exact aspect-preserving thumbnail dimensions fitting cleanly inside `(max_w, max_h)`
+/// without upscaling past `1.0x` or distorting narrow/tall windows (e.g. Steam Friends).
+pub fn compute_aspect_preserving_thumb_size(
+    crop_w: i32,
+    crop_h: i32,
+    max_w: i32,
+    max_h: i32,
+) -> (i32, i32) {
+    let cw = crop_w.max(1) as f64;
+    let ch = crop_h.max(1) as f64;
+    let mw = max_w.max(1) as f64;
+    let mh = max_h.max(1) as f64;
+    let scale = (mw / cw).min(mh / ch).min(1.0);
+    let dst_w = ((cw * scale).round() as i32).clamp(1, max_w.max(1));
+    let dst_h = ((ch * scale).round() as i32).clamp(1, max_h.max(1));
+    (dst_w, dst_h)
+}
+
+/// High-quality 2D area-averaging box downsample converting a cropped top-down 32bpp BGRA region
+/// into crisp opaque RGBA pixels (eliminates GDI `StretchBlt(HALFTONE)` aliasing/blur at 4x–8x
+/// downscale factors and avoids a second GDI DC/bitmap allocation).
+#[allow(clippy::too_many_arguments)]
+pub fn downsample_bgra_region_to_rgba(
+    bgra: &[u8],
+    src_w: usize,
+    src_h: usize,
+    crop_x: usize,
+    crop_y: usize,
+    crop_w: usize,
+    crop_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    if src_w == 0 || src_h == 0 || crop_w == 0 || crop_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let expected = src_w.saturating_mul(src_h).saturating_mul(4);
+    if bgra.len() < expected || crop_x + crop_w > src_w || crop_y + crop_h > src_h {
+        return Vec::new();
+    }
+
+    let mut rgba = vec![0u8; dst_w * dst_h * 4];
+    let scale_x = crop_w as f64 / dst_w as f64;
+    let scale_y = crop_h as f64 / dst_h as f64;
+
+    // Precompute horizontal span weights once per column for O(src_pixels) crisp box filtering.
+    let mut x_spans: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(dst_w);
+    for dx in 0..dst_w {
+        let x0 = crop_x as f64 + dx as f64 * scale_x;
+        let x1 = (crop_x as f64 + (dx + 1) as f64 * scale_x).min((crop_x + crop_w) as f64);
+        let ix0 = (x0.floor() as usize).min(src_w - 1);
+        let ix1 = ((x1.ceil() as usize).saturating_sub(1)).clamp(ix0, src_w - 1);
+        x_spans.push((ix0, ix1, x0, x1));
+    }
+
+    for dy in 0..dst_h {
+        let y0 = crop_y as f64 + dy as f64 * scale_y;
+        let y1 = (crop_y as f64 + (dy + 1) as f64 * scale_y).min((crop_y + crop_h) as f64);
+        let iy0 = (y0.floor() as usize).min(src_h - 1);
+        let iy1 = ((y1.ceil() as usize).saturating_sub(1)).clamp(iy0, src_h - 1);
+
+        for (dx, &(ix0, ix1, x0, x1)) in x_spans.iter().enumerate() {
+            let mut sum_r = 0.0f64;
+            let mut sum_g = 0.0f64;
+            let mut sum_b = 0.0f64;
+            let mut sum_w = 0.0f64;
+
+            for sy in iy0..=iy1 {
+                let wy = ((sy + 1) as f64).min(y1) - (sy as f64).max(y0);
+                if wy <= 0.0 {
+                    continue;
+                }
+                let row_off = sy * src_w * 4;
+                for sx in ix0..=ix1 {
+                    let wx = ((sx + 1) as f64).min(x1) - (sx as f64).max(x0);
+                    if wx <= 0.0 {
+                        continue;
+                    }
+                    let w = wx * wy;
+                    let idx = row_off + sx * 4;
+                    sum_b += bgra[idx] as f64 * w;
+                    sum_g += bgra[idx + 1] as f64 * w;
+                    sum_r += bgra[idx + 2] as f64 * w;
+                    sum_w += w;
+                }
+            }
+
+            let out_idx = (dy * dst_w + dx) * 4;
+            if sum_w > 0.0 {
+                let inv = 1.0 / sum_w;
+                rgba[out_idx] = (sum_r * inv).round().clamp(0.0, 255.0) as u8;
+                rgba[out_idx + 1] = (sum_g * inv).round().clamp(0.0, 255.0) as u8;
+                rgba[out_idx + 2] = (sum_b * inv).round().clamp(0.0, 255.0) as u8;
+            }
+            rgba[out_idx + 3] = 255;
+        }
+    }
+
+    rgba
 }
 
 /// Computes the visible source crop `(crop_x, crop_y, crop_w, crop_h)` inside `win_rect`
@@ -2748,9 +3838,10 @@ pub fn compute_dwm_thumbnail_crop(win_rect: RECT, ext_rect: Option<RECT>) -> (i3
     (crop_x, crop_y, crop_w, crop_h)
 }
 
-/// Captures a live visual thumbnail of an open window (using PrintWindow PW_RENDERFULLCONTENT),
-/// cropping invisible DWM shadow borders via `DWMWA_EXTENDED_FRAME_BOUNDS` and guarding every
-/// GDI handle/pointer with RAII cleanup.
+/// Captures a crisp aspect-preserving live visual thumbnail of an open window using
+/// `PrintWindow(PW_RENDERFULLCONTENT)` into a single top-down 32bpp DIBSection, trimming invisible
+/// Win11 DWM shadow borders via `DWMWA_EXTENDED_FRAME_BOUNDS` and downsampling with exact 2D area
+/// averaging. Every GDI handle is guarded by RAII cleanup.
 pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Option<String> {
     if hwnd_raw == 0 || max_w <= 0 || max_h <= 0 {
         return None;
@@ -2779,12 +3870,7 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
         .ok()
         .map(|()| ext_rect);
         let (crop_x, crop_y, crop_w, crop_h) = compute_dwm_thumbnail_crop(rect, ext_opt);
-
-        let scale = (max_w as f32 / crop_w as f32)
-            .min(max_h as f32 / crop_h as f32)
-            .min(1.0);
-        let dst_w = ((crop_w as f32 * scale).round() as i32).max(16);
-        let dst_h = ((crop_h as f32 * scale).round() as i32).max(16);
+        let (dst_w, dst_h) = compute_aspect_preserving_thumb_size(crop_w, crop_h, max_w, max_h);
 
         let screen_dc = GetDC(HWND::default());
         if screen_dc.is_invalid() {
@@ -2801,8 +3887,21 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
         }
         let _src_dc_guard = MemDcGuard(src_dc);
 
-        let src_bmp = CreateCompatibleBitmap(screen_dc, src_w, src_h);
-        if src_bmp.is_invalid() {
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = src_w;
+        bmi.bmiHeader.biHeight = -src_h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let src_bmp =
+            CreateDIBSection(src_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?;
+        if src_bmp.is_invalid() || bits_ptr.is_null() {
+            if !src_bmp.is_invalid() {
+                let _ = DeleteObject(src_bmp);
+            }
             return None;
         }
         let _src_bmp_guard = HBitmapGuard(src_bmp);
@@ -2812,7 +3911,7 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
             prev: old_src,
         };
 
-        // PW_RENDERFULLCONTENT = 2
+        // PW_RENDERFULLCONTENT = 2 captures DirectComposition/CEF/Chromium surfaces cleanly.
         let printed = windows::Win32::Storage::Xps::PrintWindow(
             hwnd,
             src_dc,
@@ -2829,47 +3928,21 @@ pub fn capture_window_thumbnail(hwnd_raw: isize, max_w: i32, max_h: i32) -> Opti
             }
         }
 
-        let dst_dc = CreateCompatibleDC(screen_dc);
-        if dst_dc.is_invalid() {
-            return None;
-        }
-        let _dst_dc_guard = MemDcGuard(dst_dc);
-
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = dst_w;
-        bmi.bmiHeader.biHeight = -dst_h;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-
-        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dst_bmp = CreateDIBSection(dst_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?;
-        if dst_bmp.is_invalid() || bits_ptr.is_null() {
-            if !dst_bmp.is_invalid() {
-                let _ = DeleteObject(dst_bmp);
-            }
-            return None;
-        }
-        let _dst_bmp_guard = HBitmapGuard(dst_bmp);
-        let old_dst = SelectObject(dst_dc, dst_bmp);
-        let _dst_sel_guard = SelectedObjGuard {
-            hdc: dst_dc,
-            prev: old_dst,
-        };
-
-        SetStretchBltMode(dst_dc, HALFTONE);
-        let _ = StretchBlt(
-            dst_dc, 0, 0, dst_w, dst_h, src_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY,
+        let src_total = (src_w as usize).checked_mul(src_h as usize)?.checked_mul(4)?;
+        let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, src_total);
+        let rgba = downsample_bgra_region_to_rgba(
+            bgra,
+            src_w as usize,
+            src_h as usize,
+            crop_x as usize,
+            crop_y as usize,
+            crop_w as usize,
+            crop_h as usize,
+            dst_w as usize,
+            dst_h as usize,
         );
-        let total = (dst_w as usize).checked_mul(dst_h as usize)?.checked_mul(4)?;
-        let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, total);
-        let mut rgba = vec![0u8; total];
-        for i in (0..total).step_by(4) {
-            rgba[i] = bgra[i + 2];
-            rgba[i + 1] = bgra[i + 1];
-            rgba[i + 2] = bgra[i];
-            rgba[i + 3] = 255;
+        if rgba.is_empty() {
+            return None;
         }
         encode_rgba_png(dst_w as u32, dst_h as u32, &rgba)
     }
@@ -2972,6 +4045,7 @@ mod tests {
                 is_active: false,
                 is_minimized: false,
                 is_topmost: false,
+                monitor: MONITOR_PRIMARY.to_string(),
             },
             OpenWindowInfo {
                 hwnd: 102,
@@ -2984,6 +4058,7 @@ mod tests {
                 is_active: false,
                 is_minimized: false,
                 is_topmost: false,
+                monitor: MONITOR_PRIMARY.to_string(),
             },
             OpenWindowInfo {
                 hwnd: 103,
@@ -2996,6 +4071,7 @@ mod tests {
                 is_active: true,
                 is_minimized: false,
                 is_topmost: true,
+                monitor: MONITOR_PRIMARY.to_string(),
             },
             OpenWindowInfo {
                 hwnd: 104,
@@ -3008,6 +4084,7 @@ mod tests {
                 is_active: false,
                 is_minimized: false,
                 is_topmost: false,
+                monitor: MONITOR_PRIMARY.to_string(),
             },
             OpenWindowInfo {
                 hwnd: 105,
@@ -3020,6 +4097,7 @@ mod tests {
                 is_active: false,
                 is_minimized: true,
                 is_topmost: false,
+                monitor: MONITOR_PRIMARY.to_string(),
             },
         ];
 
@@ -3389,6 +4467,9 @@ mod tests {
     #[test]
     fn toggle_window_topmost_flips_flag_on_own_window() {
         use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let _z_lock = crate::WIN32_TOPMOST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         unsafe {
             let cls = wide("STATIC");
@@ -3491,6 +4572,7 @@ mod tests {
             is_active: active,
             is_minimized: false,
             is_topmost: false,
+            monitor: MONITOR_PRIMARY.to_string(),
         };
         let make_group = |key: &str, wins: Vec<OpenWindowInfo>| AppWindowGroup {
             key: key.to_string(),
@@ -3599,5 +4681,338 @@ mod tests {
         assert_eq!(keys3, vec!["chrome.exe", "notepad.exe", "discord.exe"]);
         let chrome_hwnds3: Vec<isize> = scan3[0].windows.iter().map(|w| w.hwnd).collect();
         assert_eq!(chrome_hwnds3, vec![100, 200, 50]);
+    }
+
+    #[test]
+    fn open_window_info_monitor_defaults_to_primary_in_default_and_legacy_json() {
+        let def = OpenWindowInfo::default();
+        assert_eq!(def.monitor, MONITOR_PRIMARY);
+
+        let raw = r#"{"hwnd":7,"pid":8,"title":"Legacy","exePath":"C:\\Windows\\notepad.exe","exeName":"Notepad","aumid":null,"isActive":false,"isMinimized":false}"#;
+        let parsed: OpenWindowInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.monitor, MONITOR_PRIMARY);
+
+        let with_sec = r#"{"hwnd":9,"pid":10,"title":"Monitor2","exePath":"C:\\Apps\\code.exe","exeName":"VS Code","aumid":null,"isActive":true,"isMinimized":false,"monitor":"secondary"}"#;
+        let parsed_sec: OpenWindowInfo = serde_json::from_str(with_sec).unwrap();
+        assert_eq!(parsed_sec.monitor, MONITOR_SECONDARY);
+    }
+
+    #[test]
+    fn monitor_flags_and_workspace_to_screen_rect_conversion() {
+        assert_eq!(classify_monitor_flags(MONITORINFOF_PRIMARY), MONITOR_PRIMARY);
+        assert_eq!(classify_monitor_flags(0), MONITOR_SECONDARY);
+
+        // Bottom taskbar (primary work top/left matches monitor top/left => zero offset)
+        let primary_mon = PixelRect::new(0, 0, 3840, 1600);
+        let bottom_work = PixelRect::new(0, 0, 3840, 1542);
+        let mon2_normal = PixelRect::new(3900, 120, 5100, 1800);
+        assert_eq!(
+            workspace_rect_to_screen_rect(mon2_normal, primary_mon, bottom_work),
+            mon2_normal
+        );
+
+        // Top/left taskbar offset shifts workspace coords back to screen coords
+        let shifted_work = PixelRect::new(60, 48, 3840, 1600);
+        assert_eq!(
+            workspace_rect_to_screen_rect(PixelRect::new(100, 200, 900, 800), primary_mon, shifted_work),
+            PixelRect::new(160, 248, 960, 848)
+        );
+    }
+
+    #[test]
+    fn resolve_monitor_with_cache_preserves_minimized_secondary_and_tracks_drags() {
+        const HMON_PRIMARY: isize = 0x1001;
+        const HMON_SECONDARY: isize = 0x2002;
+        const HMON_STALE: isize = 0x9999;
+
+        let classify = |h: isize| match h {
+            HMON_PRIMARY => Some(MONITOR_PRIMARY),
+            HMON_SECONDARY => Some(MONITOR_SECONDARY),
+            _ => None,
+        };
+
+        let mut prev: HashMap<isize, isize> = HashMap::new();
+        let mut updated: HashMap<isize, isize> = HashMap::new();
+
+        // 1. Live non-minimized window on secondary monitor records HMON_SECONDARY
+        let m1 = resolve_monitor_with_cache(
+            501,
+            false,
+            Some(HMON_SECONDARY),
+            &prev,
+            &mut updated,
+            classify,
+            || panic!("placement fallback must not run for live non-minimized windows"),
+        );
+        assert_eq!(m1, MONITOR_SECONDARY);
+        assert_eq!(updated.get(&501), Some(&HMON_SECONDARY));
+
+        // 2. Window 501 is now minimized -> preserves cached HMON_SECONDARY instead of snapping to primary
+        prev.extend(updated.drain());
+        let m2 = resolve_monitor_with_cache(
+            501,
+            true,
+            None,
+            &prev,
+            &mut updated,
+            classify,
+            || panic!("placement fallback must not run when valid cached HMONITOR exists"),
+        );
+        assert_eq!(m2, MONITOR_SECONDARY);
+
+        // 3. Brand-new window 502 was already minimized before TestBar launched -> uses placement fallback
+        let m3 = resolve_monitor_with_cache(
+            502,
+            true,
+            None,
+            &prev,
+            &mut updated,
+            classify,
+            || Some(HMON_SECONDARY),
+        );
+        assert_eq!(m3, MONITOR_SECONDARY);
+        assert_eq!(updated.get(&502), Some(&HMON_SECONDARY));
+
+        // 4. Stale cached HMONITOR (e.g. unplugged display) degrades to placement fallback cleanly
+        prev.insert(503, HMON_STALE);
+        let m4 = resolve_monitor_with_cache(
+            503,
+            true,
+            None,
+            &prev,
+            &mut updated,
+            classify,
+            || Some(HMON_PRIMARY),
+        );
+        assert_eq!(m4, MONITOR_PRIMARY);
+        assert_eq!(updated.get(&503), Some(&HMON_PRIMARY));
+
+        // 5. User drags window 501 from secondary to primary -> cache updates to HMON_PRIMARY
+        let m5 = resolve_monitor_with_cache(
+            501,
+            false,
+            Some(HMON_PRIMARY),
+            &prev,
+            &mut updated,
+            classify,
+            || None,
+        );
+        assert_eq!(m5, MONITOR_PRIMARY);
+        assert_eq!(updated.get(&501), Some(&HMON_PRIMARY));
+    }
+
+    #[test]
+    fn filter_window_groups_for_monitor_isolates_monitors_and_recomputes_is_active() {
+        let make_win = |hwnd: isize, active: bool, monitor: &str| OpenWindowInfo {
+            hwnd,
+            pid: hwnd as u32,
+            title: format!("Win {hwnd}"),
+            exe_path: r"C:\Apps\app.exe".to_string(),
+            exe_name: "App".to_string(),
+            aumid: None,
+            is_active: active,
+            is_minimized: false,
+            is_topmost: false,
+            monitor: monitor.to_string(),
+        };
+
+        let groups = vec![
+            // VS Code split across BOTH monitors: active window is on Monitor 1, inactive on Monitor 2
+            AppWindowGroup {
+                key: "code.exe".to_string(),
+                name: "VS Code".to_string(),
+                exe_path: r"C:\Apps\Code.exe".to_string(),
+                aumid: None,
+                icon_key: Some("exe:code".to_string()),
+                icon_data: None,
+                is_active: true,
+                windows: vec![
+                    make_win(1001, true, MONITOR_PRIMARY),
+                    make_win(1002, false, MONITOR_SECONDARY),
+                ],
+            },
+            // Chrome ONLY on Monitor 1 (including a legacy empty-monitor window treated as primary)
+            AppWindowGroup {
+                key: "chrome.exe".to_string(),
+                name: "Chrome".to_string(),
+                exe_path: r"C:\Apps\chrome.exe".to_string(),
+                aumid: None,
+                icon_key: Some("exe:chrome".to_string()),
+                icon_data: None,
+                is_active: false,
+                windows: vec![
+                    make_win(2001, false, MONITOR_PRIMARY),
+                    make_win(2002, false, ""),
+                ],
+            },
+            // Discord ONLY on Monitor 2
+            AppWindowGroup {
+                key: "discord.exe".to_string(),
+                name: "Discord".to_string(),
+                exe_path: r"C:\Apps\Discord.exe".to_string(),
+                aumid: None,
+                icon_key: Some("exe:discord".to_string()),
+                icon_data: None,
+                is_active: false,
+                windows: vec![make_win(3001, false, MONITOR_SECONDARY)],
+            },
+        ];
+
+        // Primary taskbar: sees VS Code (only hwnd 1001, active=true) + Chrome (2001, 2002); NO Discord
+        let primary = filter_window_groups_for_monitor(&groups, MONITOR_PRIMARY);
+        let primary_keys: Vec<&str> = primary.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(primary_keys, vec!["code.exe", "chrome.exe"]);
+        assert_eq!(primary[0].windows.len(), 1);
+        assert_eq!(primary[0].windows[0].hwnd, 1001);
+        assert!(primary[0].is_active);
+        assert_eq!(primary[1].windows.len(), 2);
+        assert!(!primary[1].is_active);
+
+        // Secondary taskbar: sees VS Code (only hwnd 1002, active=FALSE!) + Discord (3001); NO Chrome
+        let secondary = filter_window_groups_for_monitor(&groups, MONITOR_SECONDARY);
+        let secondary_keys: Vec<&str> = secondary.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(secondary_keys, vec!["code.exe", "discord.exe"]);
+        assert_eq!(secondary[0].windows.len(), 1);
+        assert_eq!(secondary[0].windows[0].hwnd, 1002);
+        assert!(
+            !secondary[0].is_active,
+            "focusing a Monitor 1 window must NOT mark Monitor 2 group active"
+        );
+        assert_eq!(secondary[1].windows.len(), 1);
+        assert_eq!(secondary[1].windows[0].hwnd, 3001);
+
+        // Defensive "all" / "" returns full group list unmodified
+        assert_eq!(filter_window_groups_for_monitor(&groups, "all").len(), 3);
+        assert_eq!(filter_window_groups_for_monitor(&groups, "").len(), 3);
+    }
+
+    #[test]
+    fn steam_appid_crc64_cef_normalization_and_native_custom_destinations_smoke() {
+        // Exact Windows AppID CRC64-ECMA-182 hash verified against live Windows 11 CustomDestinations
+        assert_eq!(
+            windows_appid_crc64("Valve.Steam.Client"),
+            0xd356_105f_ac55_27ef
+        );
+        assert_eq!(
+            windows_appid_crc64("VALVE.STEAM.CLIENT"),
+            0xd356_105f_ac55_27ef
+        );
+
+        // Steam CEF helper normalizes cleanly to parent steam.exe
+        let norm = normalize_jump_list_exe_path(r"D:\Steam\bin\cef\cef.win64\steamwebhelper.exe");
+        assert!(
+            norm.to_ascii_lowercase().ends_with(r"\steam.exe"),
+            "expected steamwebhelper.exe to normalize to steam.exe, got {norm}"
+        );
+        let cands = candidate_jump_list_app_ids(&norm, None);
+        assert!(
+            cands.iter().any(|c| c.eq_ignore_ascii_case("Valve.Steam.Client")),
+            "expected Valve.Steam.Client candidate for Steam, got {cands:?}"
+        );
+
+        // If Steam's native CustomDestinations file exists on this host, verify O(1) parse in < 20ms
+        if let Some(cd_path) = dirs::config_dir()
+            .map(|d| d.join(r"Microsoft\Windows\Recent\CustomDestinations\d356105fac5527ef.customDestinations-ms"))
+            .filter(|p| p.is_file())
+        {
+            let started = Instant::now();
+            let items = get_jump_list(r"D:\Steam\bin\cef\cef.win64\steamwebhelper.exe", None);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(25),
+                "Steam jump list lookup must be O(1) fast (<25ms), took {elapsed:?} for {}",
+                cd_path.display()
+            );
+            assert!(
+                items.iter().any(|i| i.kind == "task"
+                    && i.args
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains("steam://")),
+                "expected native Steam tasks from CustomDestinations, got {items:?}"
+            );
+            assert!(
+                items.len() >= 4,
+                "expected rich Steam native jump list (>=4 items), got {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aspect_preserving_thumbnail_sizing_and_area_box_downsample() {
+        // 16:9 desktop window fits cleanly within 440x260
+        assert_eq!(
+            compute_aspect_preserving_thumb_size(1920, 1080, 440, 260),
+            (440, 248)
+        );
+        // Narrow tall Steam Friends window (300x800) preserves exact 3:8 ratio without stretching!
+        let (fw, fh) = compute_aspect_preserving_thumb_size(300, 800, 440, 260);
+        assert_eq!((fw, fh), (98, 260));
+        // Small window never upscales past 1.0x
+        assert_eq!(
+            compute_aspect_preserving_thumb_size(180, 120, 440, 260),
+            (180, 120)
+        );
+
+        // 4x4 BGRA source (2x2 red top-left + 2x2 blue bottom-right cropped to 4x4) -> 2x2 RGBA exact average
+        let mut bgra = vec![0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                let idx = (y * 4 + x) * 4;
+                if x < 2 && y < 2 {
+                    // Pure red in BGRA = (0, 0, 240, 0)
+                    bgra[idx] = 0;
+                    bgra[idx + 1] = 0;
+                    bgra[idx + 2] = 240;
+                } else {
+                    // Pure blue in BGRA = (200, 0, 0, 0)
+                    bgra[idx] = 200;
+                    bgra[idx + 1] = 0;
+                    bgra[idx + 2] = 0;
+                }
+            }
+        }
+        let rgba = downsample_bgra_region_to_rgba(&bgra, 4, 4, 0, 0, 4, 4, 2, 2);
+        assert_eq!(rgba.len(), 2 * 2 * 4);
+        // Top-left pixel -> pure red, alpha=255
+        assert_eq!(&rgba[0..4], &[240, 0, 0, 255]);
+        // Bottom-right pixel -> pure blue, alpha=255
+        assert_eq!(&rgba[12..16], &[0, 0, 200, 255]);
+    }
+
+    #[test]
+    fn pin_icon_extraction_wt_discord_and_uwp_smoke() {
+        // 1. Windows Terminal AppExecLink alias (`WindowsApps\wt.exe`) resolves cleanly via UWP
+        if let Some(local) = dirs::data_local_dir() {
+            let wt = local.join(r"Microsoft\WindowsApps\wt.exe");
+            if std::fs::symlink_metadata(&wt).is_ok() {
+                assert!(is_windows_apps_execution_alias(&wt.to_string_lossy()));
+                let uri = extract_path_icon_raw(&wt.to_string_lossy())
+                    .expect("WindowsApps\\wt.exe must resolve crisp UWP icon");
+                assert!(uri.starts_with("data:image/png;base64,"));
+            }
+
+            // 2. Squirrel Discord\Update.exe resolves sibling app-*\Discord.exe (or Discord.exe)
+            let discord_upd = local.join(r"Discord\Update.exe");
+            if discord_upd.is_file() {
+                let real = resolve_squirrel_app_exe(&discord_upd)
+                    .expect("Discord\\Update.exe must resolve real Discord.exe");
+                assert!(
+                    real.to_string_lossy().to_ascii_lowercase().contains("discord.exe"),
+                    "unexpected resolved Squirrel exe: {}",
+                    real.display()
+                );
+                let uri = extract_path_icon_raw(&discord_upd.to_string_lossy())
+                    .expect("Discord\\Update.exe must extract crisp icon");
+                assert!(uri.starts_with("data:image/png;base64,"));
+            }
+        }
+
+        // 3. Quoted shell:AppsFolder\... path extracts cleanly
+        let quoted_settings = r#""shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel""#;
+        let uri = extract_path_icon_raw(quoted_settings)
+            .expect("quoted shell:AppsFolder AUMID must extract cleanly");
+        assert!(uri.starts_with("data:image/png;base64,"));
     }
 }

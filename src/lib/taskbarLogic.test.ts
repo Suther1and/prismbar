@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { MergedBarItem } from './ipc';
+import { mergeTaskbarItems, type AppWindowGroup, type MergedBarItem } from './ipc';
 import {
   buildAppContextMenuRequest,
   buildBarContextMenuRequest,
@@ -12,6 +12,7 @@ import {
   computePreviewCardWidth,
   createTaskbarOrderMemory,
   EDGE_CENTERED_MIN_WIDTH,
+  filterGroupsForMonitor,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
   getPreviewHoverDelayMs,
@@ -23,7 +24,9 @@ import {
   PREVIEW_HOVER_COLD_MS,
   PREVIEW_HOVER_WARM_MS,
   resolvePinnedReorderIndices,
+  resolveTaskbarItemClick,
   resolveTaskbarMonitor,
+  selectTaskbarPinsForMonitor,
   selectWindowToFocusOnTaskbarClick,
   shouldOpenVolumeOsd,
   shouldTriggerPreviewHover,
@@ -101,13 +104,56 @@ describe('TaskbarView Dock/Edge layout, states, cycling & pin DnD helpers', () =
     expect(SOUND_FLYOUT_WIDTH).toBe(336);
     expect(computeDockLogicalWidth(742.2, 604)).toBe(743);
     expect(computeDockLogicalWidth(500, 512.4)).toBe(513);
+    expect(computeDockLogicalWidth(134, 130)).toBe(134); // compact secondary monitor dock
     expect(computeDockLogicalWidth(0, 0)).toBeNull();
-    expect(computeDockLogicalWidth(180, 200)).toBeNull();
+    expect(computeDockLogicalWidth(80, 96)).toBeNull();
     expect(computeDockLogicalWidth(Number.NaN, 420)).toBe(420);
 
     // Unconstrained apps + tray + chrome prevents yellow-sliver clipping even if bar was narrower
-    expect(computeNaturalDockWidth(598, 600, 540, 225)).toBe(784);
+    expect(computeNaturalDockWidth(598, 600, 540, 225)).toBe(786);
     expect(computeNaturalDockWidth(700, 702, 400, 200)).toBe(702);
+  });
+
+  it('enforces Option A secondary monitor contract (no primary pins, strict per-monitor window filtering)', () => {
+    const samplePin = {
+      id: 'p1',
+      kind: 'app' as const,
+      title: 'VS Code',
+      subtitle: 'Code',
+      target: 'C:\\Apps\\Code.exe',
+      altAction: '',
+      accentRgb: '129,140,248',
+      iconKey: 'code',
+    };
+    expect(selectTaskbarPinsForMonitor([samplePin], 'primary')).toHaveLength(1);
+    expect(selectTaskbarPinsForMonitor([samplePin], 'secondary')).toEqual([]);
+
+    const baseGroup = makeRunningItem().group!;
+    const mixedGroups = [
+      {
+        ...baseGroup,
+        isActive: true,
+        windows: [
+          { ...baseGroup.windows[0], hwnd: 101, isActive: true, monitor: 'primary' },
+          { ...baseGroup.windows[1], hwnd: 102, isActive: false, monitor: 'secondary' },
+        ],
+      },
+      {
+        ...baseGroup,
+        key: 'legacy-untagged',
+        isActive: false,
+        windows: [{ ...baseGroup.windows[1], hwnd: 201, isActive: false, monitor: undefined }],
+      },
+    ];
+    const primaryOnly = filterGroupsForMonitor(mixedGroups, 'primary');
+    expect(primaryOnly).toHaveLength(2);
+    expect(primaryOnly[0].windows.map((w) => w.hwnd)).toEqual([101]);
+    expect(primaryOnly[0].isActive).toBe(true);
+
+    const secondaryOnly = filterGroupsForMonitor(mixedGroups, 'secondary');
+    expect(secondaryOnly).toHaveLength(1);
+    expect(secondaryOnly[0].windows.map((w) => w.hwnd)).toEqual([102]);
+    expect(secondaryOnly[0].isActive).toBe(false);
   });
 
   it('applies edge-centered layout strictly on wide primary displays (never secondary/narrow vertical)', () => {
@@ -457,5 +503,95 @@ describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => 
     expect(computeNextWheelVolume(40, 120)).toBe(36);
     expect(computeNextWheelVolume(0, 120)).toBe(0);
     expect(computeNextWheelVolume(100, -120)).toBe(100);
+  });
+
+  it('resolves cross-monitor pinned apps (e.g. Spark pinned on Monitor 1, running on Monitor 2) without duplicating unpinned slots', () => {
+    const sparkPin = {
+      id: 'spark',
+      kind: 'app' as const,
+      title: 'Spark Mail',
+      subtitle: 'Почта',
+      target: '',
+      altAction: '',
+      accentRgb: '56,189,248',
+      iconKey: 'spark',
+    };
+    const sparkSecondaryGroup: AppWindowGroup = {
+      key: 'c:\\users\\loki2\\appdata\\local\\programs\\sparkdesktop\\spark desktop.exe',
+      name: 'Spark Desktop',
+      exePath: 'C:\\Users\\loki2\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
+      aumid: null,
+      iconKey: 'exe:spark1234',
+      iconData: null,
+      isActive: false,
+      windows: [
+        {
+          hwnd: 909,
+          pid: 4242,
+          title: 'Inbox — Spark',
+          exePath: 'C:\\Users\\loki2\\AppData\\Local\\Programs\\SparkDesktop\\Spark Desktop.exe',
+          exeName: 'Spark Desktop',
+          aumid: null,
+          isActive: false,
+          isMinimized: false,
+          monitor: 'secondary',
+        },
+      ],
+    };
+    const secondaryUnpinned: AppWindowGroup = {
+      key: 'c:\\apps\\discord.exe',
+      name: 'Discord',
+      exePath: 'C:\\Apps\\Discord.exe',
+      aumid: null,
+      iconKey: 'exe:disc999',
+      iconData: null,
+      isActive: false,
+      windows: [
+        {
+          hwnd: 910,
+          pid: 4243,
+          title: 'Discord',
+          exePath: 'C:\\Apps\\Discord.exe',
+          exeName: 'Discord',
+          aumid: null,
+          isActive: false,
+          isMinimized: false,
+          monitor: 'secondary',
+        },
+      ],
+    };
+
+    const allGroups = [sparkSecondaryGroup, secondaryUnpinned];
+    const primaryVisible = filterGroupsForMonitor(allGroups, 'primary');
+    expect(primaryVisible).toEqual([]);
+
+    const merged = mergeTaskbarItems(
+      [sparkPin],
+      primaryVisible,
+      { 'exe:spark1234': 'data:image/png;base64,SPARK' },
+      allGroups,
+    );
+
+    // Monitor 2 unpinned Discord MUST NOT duplicate on Monitor 1!
+    expect(merged).toHaveLength(1);
+    const sparkItem = merged[0];
+    expect(sparkItem.id).toBe('spark');
+    expect(sparkItem.group).toBeUndefined();
+    expect(sparkItem.remoteGroup?.key).toBe(sparkSecondaryGroup.key);
+    expect(sparkItem.iconData).toBe('data:image/png;base64,SPARK');
+    expect(sparkItem.target).toBe(sparkSecondaryGroup.exePath);
+
+    // Left-clicking Spark on Monitor 1 focuses Spark's running window on Monitor 2 (without minimizing it)
+    expect(resolveTaskbarItemClick(sparkItem)).toEqual({
+      type: 'focus',
+      hwnd: 909,
+      toggleMinimize: false,
+    });
+
+    // Right-clicking Spark on Monitor 1 includes resolved target & remote windows so full menu appears
+    const ctxReq = buildAppContextMenuRequest(sparkItem, 220, 'primary');
+    const ctxPayload = ctxReq.payload as AppContextPayload;
+    expect(ctxPayload.target).toBe(sparkSecondaryGroup.exePath);
+    expect(ctxPayload.windows.map((w) => w.hwnd)).toEqual([909]);
   });
 });

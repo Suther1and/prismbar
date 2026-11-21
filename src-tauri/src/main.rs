@@ -2,6 +2,23 @@
 
 use testbar_lib::win_shell::{parse_watchdog_args, WatchdogCli};
 
+fn configure_webview2_browser_args() {
+    // Merge all 4 same-origin `http://tauri.localhost` WebViews into a single Chromium renderer
+    // process (`--process-per-site`), keep hidden overlay compositors warm across SW_HIDE/SW_SHOW
+    // (`CalculateNativeWinOcclusion` disabled), and strip unneeded Edge/Chromium background bloat.
+    const LEAN_ARGS: &str = "--process-per-site \
+        --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,InterestFeedContentSuggestions,CalculateNativeWinOcclusion \
+        --disable-background-networking \
+        --disable-component-update \
+        --disable-extensions \
+        --disable-sync";
+    let merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{} {LEAN_ARGS}", existing.trim()),
+        _ => LEAN_ARGS.to_string(),
+    };
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -18,6 +35,7 @@ fn main() {
         WatchdogCli::NotWatchdog => {}
     }
 
+    configure_webview2_browser_args();
     let hide_native = !args.iter().any(|a| a == "--no-hide-native");
     testbar_lib::run(hide_native);
 }

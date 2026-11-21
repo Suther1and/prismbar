@@ -24,7 +24,7 @@ export const PREVIEW_LEAVE_COMMAND = 'close_preview_if_outside' as const;
 export const OSD_AUTO_CLOSE_MS = 1100;
 export const PREVIEW_CARD_CLOSE_MS = 105;
 export const AUDIO_PEAK_POLL_MS = 130;
-export const FLYOUT_ROOT_PAD_LOGICAL = 12;
+export const FLYOUT_ROOT_PAD_LOGICAL = 16;
 export const FLYOUT_MAX_CARD_HEIGHT = 580;
 export const QS_MIXER_MAX_HEIGHT = 220;
 
@@ -217,10 +217,16 @@ export function removePreviewWindow(windows: OpenWindowInfo[], hwnd: number): Op
 export function syncPreviewWindowsFromGroups(
   groupKey: string | undefined,
   groups: AppWindowGroup[],
+  monitor?: 'primary' | 'secondary',
 ): OpenWindowInfo[] | null {
   if (!groupKey) return null;
   const match = groups.find((g) => g.key === groupKey);
-  return match ? match.windows : [];
+  if (!match) return [];
+  if (!monitor) return match.windows;
+  return match.windows.filter((w) => {
+    if (!w.monitor) return monitor === 'primary';
+    return w.monitor === monitor;
+  });
 }
 
 export function canOpenFileLocation(target: string | null | undefined): boolean {

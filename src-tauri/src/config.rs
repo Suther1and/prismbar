@@ -287,6 +287,9 @@ fn detect_app_target(name_key: &str) -> String {
             local.join(r"Programs\Telegram Desktop\Telegram.exe"),
         ],
         "spark" => vec![
+            local.join(r"Programs\SparkDesktop\Spark Desktop.exe"),
+            local.join(r"SparkDesktop\Spark Desktop.exe"),
+            pf.join(r"SparkDesktop\Spark Desktop.exe"),
             local.join(r"SparkDesktop\SparkDesktop.exe"),
             local.join(r"Programs\SparkDesktop\SparkDesktop.exe"),
             local.join(r"Programs\Spark\Spark.exe"),
@@ -302,8 +305,9 @@ fn detect_app_target(name_key: &str) -> String {
         ],
         "yandex" => vec![
             local.join(r"Yandex\YandexBrowser\Application\browser.exe"),
-            pf86.join(r"Yandex\YandexBrowser\Application\browser.exe"),
             pf.join(r"Yandex\YandexBrowser\Application\browser.exe"),
+            pf86.join(r"Yandex\YandexBrowser\Application\browser.exe"),
+            local.join(r"Yandex\YaPin\Yandex.exe"),
         ],
         "ymusic" => vec![
             local.join(r"Programs\YandexMusic\Яндекс Музыка.exe"),
@@ -312,7 +316,11 @@ fn detect_app_target(name_key: &str) -> String {
         "discord" => vec![local.join(r"Discord\Update.exe")],
         "obs" => vec![pf.join(r"obs-studio\bin\64bit\obs64.exe")],
         "antigravity" => vec![local.join(r"Programs\Antigravity\Antigravity.exe")],
-        "cursor" => vec![local.join(r"Programs\cursor\Cursor.exe")],
+        "cursor" => vec![
+            pf.join(r"cursor\Cursor.exe"),
+            pf.join(r"Cursor\Cursor.exe"),
+            local.join(r"Programs\cursor\Cursor.exe"),
+        ],
         "vscode" => vec![
             local.join(r"Programs\Microsoft VS Code\Code.exe"),
             pf.join(r"Microsoft VS Code\Code.exe"),
@@ -323,7 +331,10 @@ fn detect_app_target(name_key: &str) -> String {
         ],
         "lightroom" => vec![pf.join(r"Adobe\Adobe Lightroom Classic\Lightroom.exe")],
         "figma" => vec![local.join(r"Figma\Figma.exe")],
-        "unity" => vec![pf.join(r"Unity Hub\Unity Hub.exe")],
+        "unity" => vec![
+            pf.join(r"Unity Hub\Unity Hub.exe"),
+            local.join(r"Programs\Unity Hub\Unity Hub.exe"),
+        ],
         "steam" => {
             if let Some(detected) = crate::apps_indexer::detect_steam_exe() {
                 return detected;
@@ -1731,6 +1742,406 @@ fn ensure_parent_dir(p: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn path_exists_including_reparse(path: &str) -> bool {
+    let trimmed = path.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let p = Path::new(trimmed);
+    fs::symlink_metadata(p).is_ok() || p.exists()
+}
+
+fn looks_like_local_fs_path(target: &str) -> bool {
+    let t = target.trim().trim_matches('"');
+    let bytes = t.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || t.starts_with(r"\\")
+}
+
+fn is_non_app_uri(target: &str) -> bool {
+    let low = target.trim().to_ascii_lowercase();
+    low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("steam://")
+        || low.starts_with("ms-")
+        || low.starts_with("mailto:")
+}
+
+fn pin_target_needs_healing(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("shell:appsfolder\\")
+        || is_non_app_uri(trimmed)
+    {
+        return false;
+    }
+    if looks_like_local_fs_path(trimmed) {
+        return !path_exists_including_reparse(trimmed);
+    }
+    false
+}
+
+fn normalize_match_token(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn is_uninstaller_or_helper_label(name_or_target: &str) -> bool {
+    let low = name_or_target.to_lowercase();
+    low.contains("uninstall")
+        || low.contains("удален")
+        || low.contains("деинсталл")
+        || low.contains("report a problem")
+        || low.contains("crashpad")
+        || low.contains("installer")
+        || low.contains("setup.exe")
+}
+
+fn canonical_detect_key_for_pin(pin: &PinItem) -> Option<&'static str> {
+    let id_norm = normalize_match_token(&pin.id);
+    let title_norm = normalize_match_token(&pin.title);
+    let candidates = [id_norm.as_str(), title_norm.as_str()];
+    for c in candidates {
+        match c {
+            "spark" | "sparkmail" | "sparkdesktop" => return Some("spark"),
+            "cursor" | "wacur" | "cursors" => return Some("cursor"),
+            "yandex" | "яндекс" | "yandexbrowser" | "яндексбраузер" => return Some("yandex"),
+            "unity" | "unityhub" => return Some("unity"),
+            "zen" | "zenbrowser" => return Some("zen"),
+            "telegram" | "telegramdesktop" => return Some("telegram"),
+            "ymusic" | "ямузыка" | "яндексмузыка" | "yandexmusic" => return Some("ymusic"),
+            "discord" | "gldiscord" => return Some("discord"),
+            "obs" | "obss" | "globs" | "obsstudio" => return Some("obs"),
+            "antigravity" | "waag" | "antigravitys" => return Some("antigravity"),
+            "vscode" | "wavsc" | "vscodes" | "visualstudiocode" => return Some("vscode"),
+            "obsidian" | "obsidians" => return Some("obsidian"),
+            "photoshop" | "photoshop2025" => return Some("photoshop"),
+            "lightroom" => return Some("lightroom"),
+            "figma" => return Some("figma"),
+            "steam" | "glsteam" => return Some("steam"),
+            "battlenet" | "glbnet" => return Some("battlenet"),
+            "warp" | "warps" => return Some("warp"),
+            "wt" | "wawt" | "терминал" | "windowsterminal" => return Some("wt"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn alias_tokens_for_pin(pin: &PinItem) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        let norm = normalize_match_token(s);
+        if norm.len() >= 2 && !out.contains(&norm) {
+            out.push(norm);
+        }
+    };
+    push(&pin.title);
+    // Avoid noisy generic auto-generated pin ids like `app-1795267558157`
+    if !pin.id.to_ascii_lowercase().starts_with("app-") {
+        push(&pin.id);
+    }
+    if let Some(ref exe) = pin.match_exe {
+        push(exe.trim_end_matches(".exe"));
+    }
+
+    match canonical_detect_key_for_pin(pin) {
+        Some("spark") => {
+            push("spark desktop");
+            push("sparkdesktop");
+            push("spark mail");
+            push("spark");
+        }
+        Some("cursor") => {
+            push("cursor");
+        }
+        Some("yandex") => {
+            push("yandex");
+            push("yandex browser");
+            push("яндекс");
+            push("яндекс браузер");
+        }
+        Some("unity") => {
+            push("unity hub");
+            push("unityhub");
+            push("unity");
+        }
+        Some("ymusic") => {
+            push("яндекс музыка");
+            push("yandex music");
+            push("yandexmusic");
+        }
+        Some("vscode") => {
+            push("visual studio code");
+            push("vs code");
+            push("code");
+        }
+        _ => {}
+    }
+    out
+}
+
+fn apply_healed_target(
+    pin: &mut PinItem,
+    new_target: String,
+    new_aumid: Option<String>,
+) -> bool {
+    let new_target = new_target.trim().to_string();
+    if new_target.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    if pin.target != new_target {
+        pin.target = new_target.clone();
+        changed = true;
+    }
+    if let Some(aumid) = new_aumid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    {
+        if pin.match_aumid.as_deref() != Some(aumid.as_str()) {
+            pin.match_aumid = Some(aumid);
+            changed = true;
+        }
+    } else if let Some(rest) = new_target
+        .strip_prefix("shell:AppsFolder\\")
+        .or_else(|| new_target.strip_prefix("shell:appsfolder\\"))
+    {
+        let cleaned = rest.trim().to_string();
+        if !cleaned.is_empty() && pin.match_aumid.as_deref() != Some(cleaned.as_str()) {
+            pin.match_aumid = Some(cleaned);
+            changed = true;
+        }
+    } else if let Some(exe) = derive_match_exe(&new_target) {
+        if pin.match_exe.as_deref() != Some(exe.as_str()) {
+            pin.match_exe = Some(exe);
+            changed = true;
+        }
+    }
+    if changed {
+        let valid_ns = pin.icon_key.starts_with("exe:")
+            || pin.icon_key.starts_with("aumid:")
+            || pin.icon_key.starts_with("file:")
+            || pin.icon_key.starts_with("hwnd:");
+        if !valid_ns && !pin.icon_key.is_empty() {
+            pin.icon_key.clear();
+        }
+        pin.icon_data = None;
+    }
+    changed
+}
+
+fn try_heal_single_pin(
+    pin: &mut PinItem,
+    installed_apps: &[crate::apps_indexer::IndexedApp],
+    open_groups: &[crate::windows_tracker::AppWindowGroup],
+) -> bool {
+    if !pin.kind.is_empty() && !pin.kind.eq_ignore_ascii_case("app") {
+        return false;
+    }
+
+    // Backfill missing matchAumid / matchExe on already-valid targets so taskbar/start matching works cleanly.
+    if !pin_target_needs_healing(&pin.target) {
+        let mut metadata_updated = false;
+        let t_low = pin.target.trim().to_ascii_lowercase();
+        if t_low.starts_with("shell:appsfolder\\") && pin.match_aumid.is_none() {
+            let aumid = pin.target.trim()["shell:appsfolder\\".len()..].trim().to_string();
+            if !aumid.is_empty() {
+                pin.match_aumid = Some(aumid);
+                metadata_updated = true;
+            }
+        } else if pin.match_exe.is_none() {
+            if let Some(exe) = derive_match_exe(&pin.target) {
+                pin.match_exe = Some(exe);
+                metadata_updated = true;
+            }
+        }
+        return metadata_updated;
+    }
+
+    let aliases = alias_tokens_for_pin(pin);
+    let pin_match_exe = pin
+        .match_exe
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let pin_match_aumid = pin
+        .match_aumid
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    // 1. Live running windows (ground truth — e.g. Spark Desktop running on Monitor 2!)
+    let mut best_group: Option<(u32, String, Option<String>)> = None;
+    for g in open_groups {
+        let norm_exe = crate::windows_tracker::normalize_jump_list_exe_path(&g.exe_path);
+        let is_afh = norm_exe
+            .to_ascii_lowercase()
+            .ends_with("applicationframehost.exe");
+        let g_target = if is_afh || norm_exe.is_empty() {
+            match g.aumid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(aumid) => format!("shell:AppsFolder\\{aumid}"),
+                None => continue,
+            }
+        } else if is_uninstaller_or_helper_label(&norm_exe) {
+            continue;
+        } else {
+            norm_exe.clone()
+        };
+
+        let g_exe_low = derive_match_exe(&norm_exe).unwrap_or_default();
+        let g_aumid_low = g
+            .aumid
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let g_name_norm = normalize_match_token(&g.name);
+        let g_stem_norm = normalize_match_token(g_exe_low.trim_end_matches(".exe"));
+
+        let mut score = 0u32;
+        if pin_match_aumid.as_deref() == Some(g_aumid_low.as_str()) && !g_aumid_low.is_empty() {
+            score = 100;
+        } else if pin_match_exe.as_deref() == Some(g_exe_low.as_str()) && !g_exe_low.is_empty() {
+            score = 95;
+        } else {
+            for a in &aliases {
+                if !g_name_norm.is_empty() && (g_name_norm == *a || g_stem_norm == *a) {
+                    score = score.max(90);
+                } else if a.len() >= 4
+                    && ((!g_name_norm.is_empty()
+                        && (g_name_norm.starts_with(a.as_str()) || a.starts_with(&g_name_norm)))
+                        || (!g_stem_norm.is_empty()
+                            && (g_stem_norm.starts_with(a.as_str())
+                                || a.starts_with(&g_stem_norm))))
+                {
+                    score = score.max(75);
+                }
+            }
+        }
+        if score > best_group.as_ref().map(|b| b.0).unwrap_or(0) {
+            best_group = Some((score, g_target, g.aumid.clone()));
+        }
+    }
+    if let Some((_, target, aumid)) = best_group {
+        return apply_healed_target(pin, target, aumid);
+    }
+
+    // 2. Installed apps (Start Menu shortcuts + UWP AppsFolder)
+    let mut best_app: Option<(u32, String, Option<String>)> = None;
+    for app in installed_apps {
+        let target = app.target.trim();
+        if target.is_empty()
+            || is_uninstaller_or_helper_label(&app.name)
+            || is_uninstaller_or_helper_label(target)
+        {
+            continue;
+        }
+        let app_aumid_low = app
+            .aumid
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let app_exe_low = derive_match_exe(target).unwrap_or_default();
+        let app_name_norm = normalize_match_token(&app.name);
+        let app_stem_norm = normalize_match_token(app_exe_low.trim_end_matches(".exe"));
+
+        let mut score = 0u32;
+        if pin_match_aumid.as_deref() == Some(app_aumid_low.as_str()) && !app_aumid_low.is_empty() {
+            score = 100;
+        } else if pin_match_exe.as_deref() == Some(app_exe_low.as_str()) && !app_exe_low.is_empty()
+        {
+            score = 95;
+        } else {
+            for a in &aliases {
+                if !app_name_norm.is_empty() && (app_name_norm == *a || app_stem_norm == *a) {
+                    score = score.max(90);
+                } else if a.len() >= 4
+                    && ((!app_name_norm.is_empty() && app_name_norm.starts_with(a.as_str()))
+                        || (!app_stem_norm.is_empty() && app_stem_norm.starts_with(a.as_str())))
+                {
+                    // Avoid matching e.g. "Yandex Telemost" / "Yandex Disk" for bare "yandex" unless exact
+                    let is_subproduct = (a == "yandex" || a == "яндекс")
+                        && (app_name_norm.contains("disk")
+                            || app_name_norm.contains("telemost")
+                            || app_name_norm.contains("телемост")
+                            || app_name_norm.contains("music")
+                            || app_name_norm.contains("музык"));
+                    if !is_subproduct {
+                        score = score.max(75);
+                    }
+                }
+            }
+        }
+        if score > 0 && app.target.to_ascii_lowercase().ends_with(".exe") {
+            score += 2; // slightly prefer direct .exe over .lnk when tied
+        }
+        if score > best_app.as_ref().map(|b| b.0).unwrap_or(0) {
+            best_app = Some((score, target.to_string(), app.aumid.clone()));
+        }
+    }
+    if let Some((_, target, aumid)) = best_app {
+        return apply_healed_target(pin, target, aumid);
+    }
+
+    // 3. Built-in known filesystem candidate probe (only if target actually exists on disk!)
+    if let Some(key) = canonical_detect_key_for_pin(pin) {
+        let detected = detect_app_target(key);
+        if !detected.is_empty()
+            && !is_non_app_uri(&detected)
+            && path_exists_including_reparse(&detected)
+        {
+            return apply_healed_target(pin, detected, None);
+        }
+    }
+
+    false
+}
+
+/// Auto-heals empty or broken app pin targets across ALL TestBar pin lists (`taskbarPins`,
+/// `personalPins`, `workApps`, `studioPins`, `gameLaunchers`, and `customSpaces`) by matching
+/// against live running windows, indexed installed apps, and canonical disk locations.
+/// Returns `true` iff at least one pin was repaired or enriched.
+pub fn heal_broken_pins(
+    cfg: &mut TestBarConfig,
+    installed_apps: &[crate::apps_indexer::IndexedApp],
+    open_groups: &[crate::windows_tracker::AppWindowGroup],
+) -> bool {
+    let mut changed = false;
+    for list in [
+        &mut cfg.taskbar_pins,
+        &mut cfg.personal_pins,
+        &mut cfg.work_apps,
+        &mut cfg.studio_pins,
+        &mut cfg.game_launchers,
+    ] {
+        for pin in list.iter_mut() {
+            if try_heal_single_pin(pin, installed_apps, open_groups) {
+                changed = true;
+            }
+        }
+    }
+    for sp in &mut cfg.custom_spaces {
+        for pin in &mut sp.items {
+            if try_heal_single_pin(pin, installed_apps, open_groups) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2806,5 +3217,167 @@ mod tests {
         assert!(import_config_json("").is_err());
         assert!(import_config_json("[]").is_err());
         assert!(import_config_json("{broken").is_err());
+    }
+
+    #[test]
+    fn heal_broken_pins_repairs_spark_cursor_yandex_unity_and_custom_spaces() {
+        use crate::apps_indexer::IndexedApp;
+        use crate::windows_tracker::AppWindowGroup;
+
+        let make_pin = |id: &str, kind: &str, title: &str, target: &str| PinItem {
+            id: id.into(),
+            kind: kind.into(),
+            title: title.into(),
+            subtitle: String::new(),
+            target: target.into(),
+            args: None,
+            alt_action: String::new(),
+            alt_label: None,
+            accent_rgb: String::new(),
+            icon_key: "placeholder".into(),
+            icon_data: None,
+            match_exe: None,
+            match_aumid: None,
+            combo_targets: None,
+        };
+
+        let mut cfg = TestBarConfig::default();
+        cfg.taskbar_pins = vec![
+            make_pin("spark", "app", "Spark Mail", ""),
+            make_pin("claude-url", "app", "Claude", "https://claude.ai"),
+        ];
+        cfg.personal_pins = vec![
+            make_pin("yandex", "app", "Яндекс", ""),
+            make_pin(
+                "chatgpt",
+                "app",
+                "ChatGPT",
+                r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App",
+            ),
+        ];
+        cfg.work_apps = vec![make_pin("wa-cur", "app", "Cursor", "")];
+        cfg.studio_pins = vec![
+            make_pin("unity", "app", "Unity Hub", ""),
+            make_pin("cursor-s", "app", "Cursor", r"C:\NonExistent\OldCursor\Cursor.exe"),
+        ];
+        cfg.custom_spaces = vec![CustomSpace {
+            id: "sp-1".into(),
+            name: "Dev".into(),
+            accent_hex: "#818CF8".into(),
+            accent_rgb: "129,140,248".into(),
+            widget_preset: WIDGET_PRESET_MEDIA_CLIPBOARD.into(),
+            items: vec![make_pin("sp-spark", "app", "Spark Mail", "")],
+        }];
+
+        let open_groups = vec![AppWindowGroup {
+            key: "spark desktop.exe".into(),
+            name: "Spark Desktop".into(),
+            exe_path: r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+                .into(),
+            aumid: None,
+            icon_key: None,
+            icon_data: None,
+            is_active: false,
+            windows: vec![],
+        }];
+
+        let installed_apps = vec![
+            IndexedApp {
+                id: "uninstall-spark".into(),
+                name: "Uninstall Spark Desktop".into(),
+                category: "App".into(),
+                target: r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Uninstall Spark Desktop.exe".into(),
+                aumid: None,
+                icon_key: None,
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "yandex-disk".into(),
+                name: "Yandex Disk".into(),
+                category: "App".into(),
+                target: r"C:\Users\loki2\AppData\Local\Programs\Yandex\YandexDisk4\YandexDisk4.exe".into(),
+                aumid: None,
+                icon_key: None,
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "yandex-browser".into(),
+                name: "Yandex".into(),
+                category: "App".into(),
+                target: r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Yandex.lnk".into(),
+                aumid: None,
+                icon_key: None,
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "cursor".into(),
+                name: "Cursor".into(),
+                category: "App".into(),
+                target: r"C:\Program Files\cursor\Cursor.exe".into(),
+                aumid: None,
+                icon_key: None,
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "unity-hub".into(),
+                name: "Unity Hub".into(),
+                category: "App".into(),
+                target: r"C:\Program Files\Unity Hub\Unity Hub.exe".into(),
+                aumid: None,
+                icon_key: None,
+                icon_data: None,
+            },
+        ];
+
+        assert!(heal_broken_pins(&mut cfg, &installed_apps, &open_groups));
+
+        // 1. Spark Mail healed from running Spark Desktop.exe (not Uninstall!)
+        assert_eq!(
+            cfg.taskbar_pins[0].target,
+            r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+        );
+        assert_eq!(
+            cfg.taskbar_pins[0].match_exe.as_deref(),
+            Some("spark desktop.exe")
+        );
+        assert!(cfg.taskbar_pins[0].icon_key.is_empty());
+
+        // 2. Valid https URL pin untouched
+        assert_eq!(cfg.taskbar_pins[1].target, "https://claude.ai");
+
+        // 3. Yandex healed to Yandex.lnk (NOT Yandex Disk!)
+        assert_eq!(
+            cfg.personal_pins[0].target,
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Yandex.lnk"
+        );
+
+        // 4. UWP ChatGPT pin backfilled match_aumid cleanly without altering target
+        assert_eq!(
+            cfg.personal_pins[1].target,
+            r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App"
+        );
+        assert_eq!(
+            cfg.personal_pins[1].match_aumid.as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0!App")
+        );
+
+        // 5. Cursor (empty & stale path) + Unity Hub + CustomSpace healed
+        assert_eq!(cfg.work_apps[0].target, r"C:\Program Files\cursor\Cursor.exe");
+        assert_eq!(cfg.work_apps[0].match_exe.as_deref(), Some("cursor.exe"));
+        assert_eq!(
+            cfg.studio_pins[0].target,
+            r"C:\Program Files\Unity Hub\Unity Hub.exe"
+        );
+        assert_eq!(
+            cfg.studio_pins[1].target,
+            r"C:\Program Files\cursor\Cursor.exe"
+        );
+        assert_eq!(
+            cfg.custom_spaces[0].items[0].target,
+            r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+        );
+
+        // 6. Second pass is idempotent (returns false)
+        assert!(!heal_broken_pins(&mut cfg, &installed_apps, &open_groups));
     }
 }

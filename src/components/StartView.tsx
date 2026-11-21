@@ -1,11 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { canOpenFileLocation, canRunAsAdmin, formatIpcError } from '../lib/flyoutLogic';
 import {
+  animateSurfaceIn,
+  animateSurfaceOut,
   applyConfigUpdate,
   deleteCustomSpace,
   emptyRecycleBin,
   exportConfigDialog,
   fetchIconsBatch,
+  findMatchingGroupForPin,
   iconCache,
   importConfigDialog,
   ipc,
@@ -34,6 +37,7 @@ import {
   type PeripheralBattery,
   type PinItem,
   type SecondaryTaskbarMode,
+  type StartShownEvent,
   type StartStateEvent,
   type SteamGame,
   type TelemetryState,
@@ -46,23 +50,31 @@ import {
   rankSearchResults,
   resolveSearchLaunchPayload,
   resolveSearchSecondaryAction,
+  type RankedSearchResult,
   type SearchCorpusItem,
 } from '../lib/searchLogic';
 import {
+  applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
   completeStartClosing,
+  findMatchingInstalledAppForPin,
   getStartChassisAnimClass,
   INITIAL_START_ANIM_STATE,
+  mergeAudioStateRespectingLocks,
   reducePowerClick,
   reduceStartState,
   resolvePinAction,
+  settleStartOpen,
+  START_ENTER_ANIM_MS,
   START_EXIT_ANIM_MS,
+  START_OPACITY_ANIM_MS,
   type ArmedPowerKind,
   type PowerActionKind,
   type SpaceAccentOption,
   type StartAnimState,
 } from '../lib/startLogic';
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
+import { useReducedMotion } from '../lib/useReducedMotion';
 import {
   CopyIcon,
   EditIcon,
@@ -80,11 +92,18 @@ import { StartPinDrawer } from './start/StartPinDrawer';
 import { StartSettingsOverlay } from './start/StartSettingsOverlay';
 import { StartSpaces } from './start/StartSpaces';
 
+const EMPTY_RANKED_SEARCH: RankedSearchResult = {
+  items: [],
+  swappedHint: null,
+  totalMatches: 0,
+  matchIndices: {},
+};
+
 const BUILTIN_SPACE_AURA_RGB: Record<string, string> = {
-  personal: '139, 150, 248',
-  work: '82, 184, 242',
-  studio: '62, 213, 152',
-  games: '242, 110, 132',
+  personal: '129, 140, 248',
+  work: '56, 189, 248',
+  studio: '52, 211, 153',
+  games: '251, 113, 133',
 };
 
 const ALT_ACTION_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
@@ -208,7 +227,18 @@ export const StartView: React.FC = () => {
   const [cmdIdx, setCmdIdx] = useState(0);
   const cmdInputRef = useRef<HTMLInputElement>(null);
 
-  // Refs for lifecycle & animation coordination
+  // Refs for lifecycle, WAAPI spring & drag-lock audio coordination
+  const reducedMotion = useReducedMotion();
+  const reducedMotionRef = useRef<boolean>(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
+
+  const chassisRef = useRef<HTMLElement>(null);
+  const activeAnimsRef = useRef<Animation[]>([]);
+  const openArmCleanupRef = useRef<(() => void) | null>(null);
+  const pendingShowLaunchRef = useRef<{ gen: number; launch: () => void } | null>(null);
+  const deferredHydrateTimerRef = useRef<number | null>(null);
+  const audioDragLocksRef = useRef<Map<string, number>>(new Map());
+
   const mountedRef = useRef<boolean>(true);
   const latestGenRef = useRef<number>(0);
   const closeCleanupTimerRef = useRef<number | null>(null);
@@ -218,13 +248,107 @@ export const StartView: React.FC = () => {
   const spaceRef = useRef<string>(space);
   const secondaryHydratedRef = useRef<boolean>(false);
   const resolvedTargetsRef = useRef<Set<string>>(new Set());
+  const startActiveRef = useRef<boolean>(anim.phase !== 'hidden');
+  startActiveRef.current = anim.phase !== 'hidden';
+  const hasPendingHiddenRef = useRef<boolean>(false);
+  const pendingHiddenRef = useRef<{
+    groups?: AppWindowGroup[];
+    audio?: AudioState;
+    audioMaster?: AudioMasterState;
+    media?: MediaState;
+    telem?: TelemetryState;
+    clips?: ClipboardEntry[];
+    periphs?: PeripheralBattery[];
+  }>({});
+
+  const flushPendingHiddenState = useCallback(() => {
+    if (!hasPendingHiddenRef.current) return;
+    hasPendingHiddenRef.current = false;
+    const pending = pendingHiddenRef.current;
+    pendingHiddenRef.current = {};
+
+    if (pending.groups !== undefined) setGroups(pending.groups);
+    if (pending.audio !== undefined) {
+      const nextAudio = pending.audio;
+      setAudio((prev) =>
+        mergeAudioStateRespectingLocks(prev, nextAudio, audioDragLocksRef.current, Date.now()),
+      );
+    } else if (pending.audioMaster !== undefined) {
+      const master = pending.audioMaster;
+      setAudio((prev) => {
+        if (!prev) return prev;
+        const masterLock = audioDragLocksRef.current.get('__master__');
+        const keepMasterVol = masterLock !== undefined && masterLock > Date.now();
+        return {
+          ...prev,
+          available: master.available,
+          masterVolume: keepMasterVol ? prev.masterVolume : master.masterVolume,
+          masterMuted: master.masterMuted,
+          micMuted: master.micMuted,
+        };
+      });
+    }
+    if (pending.media !== undefined) setMedia(pending.media);
+    if (pending.telem !== undefined) setTelem(pending.telem);
+    if (pending.clips !== undefined) setClips(pending.clips);
+    if (pending.periphs !== undefined) setPeriphs(pending.periphs);
+  }, []);
+
+  const cancelChassisAnims = useCallback(() => {
+    for (const a of activeAnimsRef.current) {
+      try {
+        a.cancel();
+      } catch {
+        // Ignore already-finished animations
+      }
+    }
+    activeAnimsRef.current = [];
+    if (chassisRef.current) {
+      chassisRef.current.style.pointerEvents = '';
+    }
+  }, []);
+
+  const cancelPendingOpenArm = useCallback(() => {
+    pendingShowLaunchRef.current = null;
+    if (openArmCleanupRef.current) {
+      openArmCleanupRef.current();
+      openArmCleanupRef.current = null;
+    }
+  }, []);
+
+  const handleAudioDragStateChange = useCallback((sliderKey: string, dragging: boolean) => {
+    if (dragging) {
+      audioDragLocksRef.current.set(sliderKey, Number.POSITIVE_INFINITY);
+    } else {
+      audioDragLocksRef.current.set(sliderKey, Date.now() + 280);
+    }
+  }, []);
+
+  const handleSetAudioFromChild = useCallback((next: AudioState, fromServer = false) => {
+    if (fromServer) {
+      setAudio((prev) =>
+        mergeAudioStateRespectingLocks(prev, next, audioDragLocksRef.current, Date.now()),
+      );
+    } else {
+      setAudio(next);
+    }
+  }, []);
+
+  // Release entrance WAAPI fill:forwards strictly post-DOM-commit once [data-phase="open"] is painted
+  useLayoutEffect(() => {
+    if (anim.phase === 'open') {
+      cancelChassisAnims();
+    }
+  }, [anim.phase, cancelChassisAnims]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      cancelPendingOpenArm();
+      cancelChassisAnims();
     };
-  }, []);
+  }, [cancelPendingOpenArm, cancelChassisAnims]);
 
   configRef.current = config;
   spaceRef.current = space;
@@ -264,6 +388,13 @@ export const StartView: React.FC = () => {
   const handleApplyConfig = useCallback((next: TestBarConfig) => {
     setConfig((prev) => applyConfigUpdate(prev, next));
   }, []);
+
+  const handleOptimisticReorder = useCallback(
+    (spaceKey: string, fromIdx: number, toIdx: number) => {
+      setConfig((prev) => applyOptimisticPinReorder(prev, spaceKey, fromIdx, toIdx) ?? prev);
+    },
+    [],
+  );
 
   const resetTransientOverlays = useCallback(() => {
     setSearchOpen(false);
@@ -312,40 +443,114 @@ export const StartView: React.FC = () => {
       onEvent<TestBarConfig>('config-updated', (next) =>
         setConfig((prev) => applyConfigUpdate(prev, next)),
       ),
-      onEvent<AppWindowGroup[]>('windows-updated', setGroups),
+      onEvent<AppWindowGroup[]>('windows-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.groups = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setGroups(next);
+      }),
       onEvent<IndexedApp[]>('apps-indexed', setApps),
       onEvent<IndexedFile[]>('files-indexed', setFiles),
       onEvent<SteamGame[]>('games-indexed', setGames),
-      onEvent<AudioState>('audio-mixer-updated', setAudio),
-      onEvent<AudioMasterState>('audio-master-updated', (master) => {
+      onEvent<AudioState>('audio-mixer-updated', (incoming) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.audio = incoming;
+          pendingHiddenRef.current.audioMaster = undefined;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
         setAudio((prev) =>
-          prev
-            ? {
-                ...prev,
-                available: master.available,
-                masterVolume: master.masterVolume,
-                masterMuted: master.masterMuted,
-                micMuted: master.micMuted,
-              }
-            : prev,
+          mergeAudioStateRespectingLocks(prev, incoming, audioDragLocksRef.current, Date.now()),
         );
       }),
-      onEvent<MediaState>('media-updated', setMedia),
-      onEvent<TelemetryState>('telemetry-updated', setTelem),
-      onEvent<ClipboardEntry[]>('clipboard-updated', setClips),
-      onEvent<PeripheralBattery[]>('peripherals-updated', setPeriphs),
+      onEvent<AudioMasterState>('audio-master-updated', (master) => {
+        if (!startActiveRef.current) {
+          if (pendingHiddenRef.current.audio) {
+            pendingHiddenRef.current.audio = {
+              ...pendingHiddenRef.current.audio,
+              available: master.available,
+              masterVolume: master.masterVolume,
+              masterMuted: master.masterMuted,
+              micMuted: master.micMuted,
+            };
+          } else {
+            pendingHiddenRef.current.audioMaster = master;
+          }
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setAudio((prev) => {
+          if (!prev) return prev;
+          const masterLock = audioDragLocksRef.current.get('__master__');
+          const keepMasterVol = masterLock !== undefined && masterLock > Date.now();
+          return {
+            ...prev,
+            available: master.available,
+            masterVolume: keepMasterVol ? prev.masterVolume : master.masterVolume,
+            masterMuted: master.masterMuted,
+            micMuted: master.micMuted,
+          };
+        });
+      }),
+      onEvent<MediaState>('media-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.media = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setMedia(next);
+      }),
+      onEvent<TelemetryState>('telemetry-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.telem = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setTelem(next);
+      }),
+      onEvent<ClipboardEntry[]>('clipboard-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.clips = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setClips(next);
+      }),
+      onEvent<PeripheralBattery[]>('peripherals-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.periphs = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        setPeriphs(next);
+      }),
+      onEvent<StartShownEvent>('start-shown', (ev) => {
+        const pending = pendingShowLaunchRef.current;
+        if (pending && (ev?.gen === undefined || ev.gen === pending.gen)) {
+          pending.launch();
+        }
+      }),
       onEvent<boolean | StartStateEvent>('start-state', (raw) => {
         const ev = normalizeStartStatePayload(raw);
         latestGenRef.current = ev.gen;
 
+        cancelPendingOpenArm();
         if (closeCleanupTimerRef.current !== null) {
           window.clearTimeout(closeCleanupTimerRef.current);
           closeCleanupTimerRef.current = null;
         }
+        if (deferredHydrateTimerRef.current !== null) {
+          window.clearTimeout(deferredHydrateTimerRef.current);
+          deferredHydrateTimerRef.current = null;
+        }
 
         if (ev.open) {
-          hydrateSecondaryData();
-          setShiftHeld(false);
+          startActiveRef.current = true;
+          flushPendingHiddenState();
+          cancelChassisAnims();
+          setShiftHeld((prev) => (prev ? false : prev));
           const remember = configRef.current?.startRememberSpace ?? false;
           if (!remember && spaceRef.current !== 'personal') {
             setSpaceDir(0);
@@ -353,20 +558,168 @@ export const StartView: React.FC = () => {
             setSpace('personal');
           }
           setAnim((prev) => reduceStartState(prev, ev));
+
+          const openGen = ev.gen;
+          let launched = false;
+          let rafId = 0;
+          let fallbackTimer: number | null = null;
+
+          const cleanupWaiters = () => {
+            if (rafId) window.cancelAnimationFrame(rafId);
+            if (fallbackTimer !== null) {
+              window.clearTimeout(fallbackTimer);
+              fallbackTimer = null;
+            }
+            if (typeof document !== 'undefined') {
+              document.removeEventListener('visibilitychange', onVisChange);
+            }
+          };
+
+          const launchSpring = () => {
+            if (launched) return;
+            launched = true;
+            pendingShowLaunchRef.current = null;
+            if (fallbackTimer !== null) {
+              window.clearTimeout(fallbackTimer);
+              fallbackTimer = null;
+            }
+            if (typeof document !== 'undefined') {
+              document.removeEventListener('visibilitychange', onVisChange);
+            }
+
+            // Single rAF after `start-shown` (compositor stays permanently warm with
+            // CalculateNativeWinOcclusion disabled), guaranteeing post-SW_SHOW & post-commit
+            // while cutting perceived Win-key open latency in half!
+            rafId = window.requestAnimationFrame(() => {
+              rafId = 0;
+              openArmCleanupRef.current = null;
+              if (!mountedRef.current || latestGenRef.current !== openGen) return;
+
+              animateSurfaceIn('start', openGen, {
+                durationMs: START_ENTER_ANIM_MS,
+                offsetY: 20,
+                fromScale: 0.96,
+              }).catch(() => {});
+
+              const el = chassisRef.current;
+              if (reducedMotionRef.current || !el || typeof el.animate !== 'function') {
+                setAnim((prev) => settleStartOpen(prev, openGen));
+                hydrateSecondaryData();
+                return;
+              }
+
+              cancelChassisAnims();
+              // Allow clicks mid-flight while WAAPI drives transform & opacity
+              el.style.pointerEvents = 'auto';
+
+              const transformAnim = el.animate(
+                [
+                  { transform: 'translate3d(0, 20px, 0) scale(0.96)' },
+                  { transform: 'translate3d(0, 0, 0) scale(1)' },
+                ],
+                {
+                  duration: START_ENTER_ANIM_MS,
+                  easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+                  fill: 'forwards',
+                },
+              );
+              const opacityAnim = el.animate(
+                [{ opacity: 0 }, { opacity: 1 }],
+                {
+                  duration: START_OPACITY_ANIM_MS,
+                  easing: 'ease-out',
+                  fill: 'forwards',
+                },
+              );
+              activeAnimsRef.current = [transformAnim, opacityAnim];
+
+              transformAnim.finished
+                .then(() => {
+                  if (!mountedRef.current || latestGenRef.current !== openGen) return;
+                  setAnim((prev) => settleStartOpen(prev, openGen));
+                })
+                .catch(() => {
+                  // Cancelled by immediate close/reopen
+                });
+
+              if (!secondaryHydratedRef.current) {
+                deferredHydrateTimerRef.current = window.setTimeout(() => {
+                  deferredHydrateTimerRef.current = null;
+                  hydrateSecondaryData();
+                }, START_ENTER_ANIM_MS + 20);
+              }
+            });
+          };
+
+          const onVisChange = () => {
+            if (document.visibilityState === 'visible') {
+              launchSpring();
+            }
+          };
+
+          pendingShowLaunchRef.current = { gen: openGen, launch: launchSpring };
+          openArmCleanupRef.current = cleanupWaiters;
+
+          if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', onVisChange);
+          }
+          // Safety timer: starts immediately on `start-shown` or `visibilitychange`,
+          // or within 12ms if already visible / backend predates `start-shown`.
+          const waitMs =
+            typeof document !== 'undefined' && document.visibilityState === 'visible' ? 12 : 32;
+          fallbackTimer = window.setTimeout(launchSpring, waitMs);
         } else {
-          setAnim((prev) => reduceStartState(prev, ev));
           if (ev.immediate) {
+            startActiveRef.current = false;
+            cancelChassisAnims();
+            setAnim((prev) => reduceStartState(prev, ev));
             resetTransientOverlays();
             surfaceExitAck('start', ev.gen).catch(() => {});
           } else {
             const exitGen = ev.gen;
+            const el = chassisRef.current;
+            let liveOpacity = '1';
+            let liveTransform = 'translate3d(0, 0, 0) scale(1)';
+            if (el && typeof window !== 'undefined') {
+              const cs = window.getComputedStyle(el);
+              liveOpacity = cs.opacity || '1';
+              liveTransform = cs.transform && cs.transform !== 'none' ? cs.transform : liveTransform;
+            }
+
+            cancelChassisAnims();
+            setAnim((prev) => reduceStartState(prev, ev));
+
+            animateSurfaceOut('start', exitGen, {
+              durationMs: START_EXIT_ANIM_MS,
+              offsetY: 12,
+              toScale: 0.975,
+            }).catch(() => {});
+
+            const exitDuration = reducedMotionRef.current ? 0 : START_EXIT_ANIM_MS;
+            if (exitDuration > 0 && el && typeof el.animate === 'function') {
+              const exitAnim = el.animate(
+                [
+                  { opacity: Number(liveOpacity), transform: liveTransform },
+                  { opacity: 0, transform: 'translate3d(0, 12px, 0) scale(0.975)' },
+                ],
+                {
+                  duration: exitDuration,
+                  easing: 'cubic-bezier(0.4, 0, 1, 1)',
+                  fill: 'forwards',
+                },
+              );
+              activeAnimsRef.current = [exitAnim];
+            }
+
             closeCleanupTimerRef.current = window.setTimeout(() => {
               closeCleanupTimerRef.current = null;
               if (latestGenRef.current !== exitGen) return;
+              startActiveRef.current = false;
+              cancelChassisAnims();
               setAnim((prev) => completeStartClosing(prev, exitGen));
               resetTransientOverlays();
               surfaceExitAck('start', exitGen).catch(() => {});
-            }, START_EXIT_ANIM_MS);
+            }, exitDuration);
           }
         }
       }),
@@ -391,6 +744,11 @@ export const StartView: React.FC = () => {
 
     return () => {
       window.clearTimeout(idleTimer);
+      cancelPendingOpenArm();
+      cancelChassisAnims();
+      if (deferredHydrateTimerRef.current !== null) {
+        window.clearTimeout(deferredHydrateTimerRef.current);
+      }
       if (closeCleanupTimerRef.current !== null) {
         window.clearTimeout(closeCleanupTimerRef.current);
       }
@@ -399,7 +757,14 @@ export const StartView: React.FC = () => {
       }
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [hydrateCoreData, hydrateSecondaryData, resetTransientOverlays]);
+  }, [
+    hydrateCoreData,
+    hydrateSecondaryData,
+    flushPendingHiddenState,
+    resetTransientOverlays,
+    cancelPendingOpenArm,
+    cancelChassisAnims,
+  ]);
 
   // If active custom space was deleted remotely, fall back to 'personal'
   useEffect(() => {
@@ -473,10 +838,13 @@ export const StartView: React.FC = () => {
     if (config) {
       [
         ...config.personalPins,
+        ...config.personalLinks,
+        ...config.workFolders,
         ...config.workApps,
         ...config.studioPins,
         ...config.studioTools,
         ...config.gameLaunchers,
+        ...config.gameCombos,
         ...config.customSpaces.flatMap((s) => s.items),
       ].forEach((p) => {
         if (p.iconKey) keys.push(p.iconKey);
@@ -487,7 +855,7 @@ export const StartView: React.FC = () => {
     }
   }, [apps, groups, config, handleResolveIconKeys]);
 
-  // Batched native icon hydration for path/UWP pinned tiles through unified Rust IconCache
+  // Batched native icon hydration for path, UWP shell:AppsFolder\, WindowsApps aliases, and web/installed pins
   useEffect(() => {
     if (!config) return;
     const allPins = [
@@ -502,14 +870,18 @@ export const StartView: React.FC = () => {
 
     const targetsToResolve: string[] = [];
     for (const p of allPins) {
-      if ((p.kind === 'app' || p.kind === 'file') && p.target && !p.iconData) {
-        const low = p.target.toLowerCase();
-        const resolvable =
-          p.target.includes(':\\') || p.target.startsWith('\\\\') || low.startsWith('shell:appsfolder\\');
-        if (resolvable && !resolvedTargetsRef.current.has(p.target)) {
-          resolvedTargetsRef.current.add(p.target);
-          targetsToResolve.push(p.target);
-        }
+      if (p.kind === 'folder' || p.kind === 'combo' || !p.target || p.iconData) continue;
+      const target = p.target.trim();
+      const low = target.toLowerCase();
+      const resolvable =
+        target.includes(':\\') ||
+        target.startsWith('\\\\') ||
+        low.startsWith('shell:appsfolder\\') ||
+        low.startsWith('http://') ||
+        low.startsWith('https://');
+      if (resolvable && !resolvedTargetsRef.current.has(low)) {
+        resolvedTargetsRef.current.add(low);
+        targetsToResolve.push(target);
       }
     }
 
@@ -519,17 +891,50 @@ export const StartView: React.FC = () => {
       .then((batch) => {
         if (!mountedRef.current) {
           for (const t of targetsToResolve) {
-            resolvedTargetsRef.current.delete(t);
+            resolvedTargetsRef.current.delete(t.toLowerCase());
           }
           return;
         }
-        if (batch && Object.keys(batch).length > 0) {
-          setIconMap((prev) => ({ ...prev, ...batch }));
+        const updates: Record<string, string> = {};
+        const unresolvedLocal: string[] = [];
+        for (const t of targetsToResolve) {
+          const low = t.toLowerCase();
+          const hit = batch?.[t] ?? batch?.[low];
+          if (hit) {
+            updates[t] = hit;
+            updates[low] = hit;
+          } else if (!low.startsWith('http://') && !low.startsWith('https://')) {
+            unresolvedLocal.push(t);
+          }
+        }
+        if (Object.keys(updates).length > 0) {
+          setIconMap((prev) => ({ ...prev, ...updates }));
+        }
+        // Per-path fallback matching TaskbarView for any local/UWP exe missed by batch
+        for (const t of unresolvedLocal) {
+          const low = t.toLowerCase();
+          ipc<string | null>('get_icon_for_path', { path: t })
+            .then((data) => {
+              if (!mountedRef.current) {
+                resolvedTargetsRef.current.delete(low);
+                return;
+              }
+              if (data) {
+                setIconMap((prev) =>
+                  prev[t] === data ? prev : { ...prev, [t]: data, [low]: data },
+                );
+              } else {
+                resolvedTargetsRef.current.delete(low);
+              }
+            })
+            .catch(() => {
+              resolvedTargetsRef.current.delete(low);
+            });
         }
       })
       .catch(() => {
         for (const t of targetsToResolve) {
-          resolvedTargetsRef.current.delete(t);
+          resolvedTargetsRef.current.delete(t.toLowerCase());
         }
       });
   }, [config]);
@@ -573,33 +978,12 @@ export const StartView: React.FC = () => {
     [allSpaceIds],
   );
 
-  const runningExeSet = useMemo(() => {
-    const s = new Set<string>();
-    groups.forEach((g) => {
-      if (g.exePath) s.add(g.exePath.toLowerCase());
-      if (g.aumid) s.add(`shell:appsfolder\\${g.aumid.toLowerCase()}`);
-    });
-    return s;
-  }, [groups]);
-
   const isRunning = useCallback(
     (item: PinItem) => {
       if (item.kind !== 'app') return false;
-      if (item.matchAumid) {
-        const aumidLow = item.matchAumid.toLowerCase();
-        if (groups.some((g) => g.aumid?.toLowerCase() === aumidLow)) return true;
-      }
-      if (item.matchExe) {
-        const matchBase = item.matchExe.toLowerCase();
-        if (groups.some((g) => g.exePath.toLowerCase().endsWith('\\' + matchBase))) return true;
-      }
-      if (!item.target) return false;
-      const low = item.target.toLowerCase();
-      if (runningExeSet.has(low)) return true;
-      const base = low.split('\\').pop() || '';
-      return Boolean(base) && groups.some((g) => g.exePath.toLowerCase().endsWith('\\' + base));
+      return Boolean(findMatchingGroupForPin(item, groups));
     },
-    [groups, runningExeSet],
+    [groups],
   );
 
   const resolveIconForPin = useCallback(
@@ -608,19 +992,47 @@ export const StartView: React.FC = () => {
         const fromMap = iconMap[item.iconKey] || iconCache.get(item.iconKey);
         if (fromMap) return fromMap;
       }
-      return item.iconData || iconMap[item.target] || null;
+      if (item.iconData) return item.iconData;
+      if (item.target) {
+        const direct = iconMap[item.target] || iconMap[item.target.toLowerCase()];
+        if (direct) return direct;
+      }
+      // Fallback 1: inherit native icon from any matching running window group (even on another monitor!)
+      const runningGroup = findMatchingGroupForPin(item, groups);
+      if (runningGroup) {
+        if (isCacheIconKey(runningGroup.iconKey)) {
+          const fromGroupCache =
+            iconMap[runningGroup.iconKey] || iconCache.get(runningGroup.iconKey);
+          if (fromGroupCache) return fromGroupCache;
+        }
+        if (runningGroup.iconData) return runningGroup.iconData;
+      }
+      // Fallback 2: inherit native icon from matching installed app index (UWP/Start Menu shortcuts)
+      const installed = findMatchingInstalledAppForPin(item, apps);
+      if (installed) {
+        if (isCacheIconKey(installed.iconKey)) {
+          const fromAppCache = iconMap[installed.iconKey] || iconCache.get(installed.iconKey);
+          if (fromAppCache) return fromAppCache;
+        }
+        if (installed.iconData) return installed.iconData;
+      }
+      return null;
     },
-    [iconMap],
+    [iconMap, groups, apps],
   );
 
+  // Lazy Command Palette corpus & ranking: 0% CPU when search is closed or Start is hidden!
   const searchCorpus = useMemo(
-    () => buildSearchCorpus({ config, apps, games, files, iconMap, groups, audio, clips }),
-    [config, apps, games, files, iconMap, groups, audio, clips],
+    () =>
+      searchOpen
+        ? buildSearchCorpus({ config, apps, games, files, iconMap, groups, audio, clips })
+        : [],
+    [searchOpen, config, apps, games, files, iconMap, groups, audio, clips],
   );
 
-  const searchResults = useMemo(
-    () => rankSearchResults(searchCorpus, query, 12, config?.frecency),
-    [searchCorpus, query, config?.frecency],
+  const searchResults = useMemo<RankedSearchResult>(
+    () => (searchOpen ? rankSearchResults(searchCorpus, query, 12, config?.frecency) : EMPTY_RANKED_SEARCH),
+    [searchOpen, searchCorpus, query, config?.frecency],
   );
 
   const dispatchSearchSecondary = useCallback(
@@ -1370,8 +1782,9 @@ export const StartView: React.FC = () => {
         }
       }}
     >
-      {/* NON-REMOUNTING START CHASSIS — alternates .open-a / .open-b to replay spring keyframes at 0ms */}
+      {/* NON-REMOUNTING START CHASSIS — WAAPI-driven spring synced with DComp underlay */}
       <section
+        ref={chassisRef}
         className={`start-chassis ${startChassisAnimCls}`.trim()}
         data-phase={anim.phase}
       >
@@ -1500,18 +1913,21 @@ export const StartView: React.FC = () => {
             onLaunchPin={launchPin}
             onOpenDrawer={() => setDrawerOpen(true)}
             onOpenTileContext={openTileContextMenu}
-            onSetAudio={setAudio}
+            onSetAudio={handleSetAudioFromChild}
             onSetMedia={setMedia}
             onSetTelem={setTelem}
             onSetClips={setClips}
             onShowToast={showToast}
             startVisible={startVisible}
+            startAnimSettled={anim.phase === 'open'}
+            onAudioDragStateChange={handleAudioDragStateChange}
             spaceDir={spaceDir}
             rapidSwitch={rapidSwitch}
             iconMap={iconMap}
             apps={apps}
             onResolveIconKeys={handleResolveIconKeys}
             onSetConfig={handleApplyConfig}
+            onOptimisticReorder={handleOptimisticReorder}
             onEditPin={(item, spaceKey) => openTileEditPopover(item, spaceKey)}
           />
         </div>

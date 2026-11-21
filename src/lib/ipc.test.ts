@@ -1,8 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const invokeMock = vi.hoisted(() => vi.fn());
+const globalListenMock = vi.hoisted(() => vi.fn());
+const windowListenMock = vi.hoisted(() => vi.fn());
+const getCurrentWebviewWindowMock = vi.hoisted(() =>
+  vi.fn(() => ({ listen: windowListenMock })),
+);
+
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: invokeMock,
+}));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: globalListenMock,
+}));
+vi.mock('@tauri-apps/api/webviewWindow', () => ({
+  getCurrentWebviewWindow: getCurrentWebviewWindowMock,
 }));
 
 import {
@@ -29,6 +41,7 @@ import {
   mergeTaskbarItems,
   minimizeOtherWindows,
   normalizeStartStatePayload,
+  onEvent,
   openScreenSnip,
   pasteClipboardEntry,
   recordFrecency,
@@ -665,5 +678,53 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
 
     await importConfigDialog();
     expect(invokeMock).toHaveBeenLastCalledWith('import_config_dialog', undefined);
+  });
+
+  it('binds onEvent strictly to getCurrentWebviewWindow().listen() to prevent cross-window event clobbering', async () => {
+    windowListenMock.mockReset();
+    globalListenMock.mockReset();
+    getCurrentWebviewWindowMock.mockReset();
+
+    const unlistenWin = vi.fn();
+    windowListenMock.mockResolvedValue(unlistenWin);
+    getCurrentWebviewWindowMock.mockReturnValue({ listen: windowListenMock });
+
+    const g = globalThis as unknown as { window?: Record<string, unknown> };
+    const hadWindow = typeof g.window !== 'undefined';
+    if (!hadWindow) {
+      g.window = { __TAURI_INTERNALS__: {} };
+    } else {
+      g.window!.__TAURI_INTERNALS__ = {};
+    }
+
+    try {
+      const received: string[] = [];
+      const unlisten = await onEvent<string>('windows-updated', (p) => received.push(p));
+      expect(getCurrentWebviewWindowMock).toHaveBeenCalledTimes(1);
+      expect(windowListenMock).toHaveBeenCalledWith('windows-updated', expect.any(Function));
+      expect(globalListenMock).not.toHaveBeenCalled();
+      expect(unlisten).toBe(unlistenWin);
+
+      // Verify payload unwrapping
+      const handler = windowListenMock.mock.calls[0][1] as (e: { payload: string }) => void;
+      handler({ payload: 'primary-only' });
+      expect(received).toEqual(['primary-only']);
+
+      // Fallback cleanly to global listen only if getCurrentWebviewWindow() throws
+      const unlistenGlobal = vi.fn();
+      globalListenMock.mockResolvedValue(unlistenGlobal);
+      getCurrentWebviewWindowMock.mockImplementation(() => {
+        throw new Error('no webview window');
+      });
+      const fallbackUnlisten = await onEvent<string>('layout-updated', () => {});
+      expect(globalListenMock).toHaveBeenCalledWith('layout-updated', expect.any(Function));
+      expect(fallbackUnlisten).toBe(unlistenGlobal);
+    } finally {
+      if (!hadWindow) {
+        delete g.window;
+      } else {
+        delete g.window!.__TAURI_INTERNALS__;
+      }
+    }
   });
 });

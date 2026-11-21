@@ -3,7 +3,13 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { BellIcon, ChevronLeftIcon, ChevronRightIcon, NativeTrayIcon } from '../components/Icons';
 import { TaskbarView } from '../components/TaskbarView';
-import type { AppWindowGroup, AudioDeviceInfo, FlyoutRequest, OpenWindowInfo } from './ipc';
+import {
+  isCacheIconKey,
+  type AppWindowGroup,
+  type AudioDeviceInfo,
+  type FlyoutRequest,
+  type OpenWindowInfo,
+} from './ipc';
 import {
   canOpenFileLocation,
   canRunAsAdmin,
@@ -156,10 +162,10 @@ describe('Flyout instant-open animation, height measurement & preview scrub pres
   });
 
   it('computes clamped card-local transform-origin X from Rust anchorOriginX & natural card height up to 580px', () => {
-    expect(FLYOUT_ROOT_PAD_LOGICAL).toBe(12);
+    expect(FLYOUT_ROOT_PAD_LOGICAL).toBe(16);
     expect(FLYOUT_MAX_CARD_HEIGHT).toBe(580);
-    // Window left has 12px root pad; anchorOriginX = 112 -> local 100px
-    expect(computeCardOriginX(112, 300)).toBe(100);
+    // Window left has 16px DComp root pad; anchorOriginX = 116 -> local 100px
+    expect(computeCardOriginX(116, 300)).toBe(100);
     // Clamps near left/right card edges
     expect(computeCardOriginX(10, 300)).toBe(16);
     expect(computeCardOriginX(500, 300)).toBe(284);
@@ -214,10 +220,28 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
     expect(tbHtml).toContain('data-monitor="primary"');
     expect(tbHtml).toContain('tb-sheen');
     expect(tbHtml).toContain('tb-hover-pill');
-    expect(tbHtml).toContain('tb-tray-sep');
+    expect(tbHtml).toContain('tb-sep');
+    expect(tbHtml).not.toContain('tb-tray-sep');
+    expect(tbHtml).not.toContain('tb-multi');
+
+    // Monitor 2 Option A: Start + Clock only (no tray chevron, lang pill, or sound/net pill)
+    const secHtml = renderToStaticMarkup(
+      createElement(TaskbarView, { monitorOverride: 'secondary' }),
+    );
+    expect(secHtml).toContain('data-monitor="secondary"');
+    expect(secHtml).toContain('aria-label="Пуск"');
+    expect(secHtml).toContain('tb-clock');
+    expect(secHtml).not.toContain('tb-lang-btn');
+    expect(secHtml).not.toContain('tb-sound-btn');
+    expect(secHtml).not.toContain('Фоновые приложения');
+
+    // Win11 NotifyIconSettings tray icon keys resolve through IconCache batch fetcher
+    expect(isCacheIconKey('tray:deadbeef1234')).toBe(true);
+    expect(isCacheIconKey('exe:abcd')).toBe(true);
+    expect(isCacheIconKey('unknown:1')).toBe(false);
   });
 
-  it('updates preview window list on per-window close and live windows-updated sync', () => {
+  it('updates preview window list on per-window close and monitor-aware windows-updated sync', () => {
     const wins = [makeWin(1, 'Tab 1'), makeWin(2, 'Tab 2')];
     const afterCloseOne = removePreviewWindow(wins, 1);
     expect(afterCloseOne).toHaveLength(1);
@@ -235,10 +259,15 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
         iconKey: 'exe:1',
         iconData: null,
         isActive: true,
-        windows: [makeWin(2, 'Tab 2')],
+        windows: [
+          { ...makeWin(2, 'Tab 2'), monitor: 'primary' },
+          { ...makeWin(3, 'Secondary Tab'), monitor: 'secondary' },
+        ],
       },
     ];
-    expect(syncPreviewWindowsFromGroups('c:\\apps\\code.exe', groups)).toHaveLength(1);
+    expect(syncPreviewWindowsFromGroups('c:\\apps\\code.exe', groups)).toHaveLength(2);
+    expect(syncPreviewWindowsFromGroups('c:\\apps\\code.exe', groups, 'primary')?.map((w) => w.hwnd)).toEqual([2]);
+    expect(syncPreviewWindowsFromGroups('c:\\apps\\code.exe', groups, 'secondary')?.map((w) => w.hwnd)).toEqual([3]);
     expect(syncPreviewWindowsFromGroups('c:\\apps\\gone.exe', groups)).toEqual([]);
     expect(syncPreviewWindowsFromGroups('', groups)).toBeNull();
   });

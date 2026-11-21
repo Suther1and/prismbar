@@ -6,41 +6,43 @@ export interface IconProps {
 }
 
 /**
- * Razor-sharp 4-pane Start mark with luminous frosted silver/white specular panes.
- * Base panes render crisp high-contrast silver-white; `.start-logo-accent` illuminates
- * smoothly with `var(--accent)` on hover and `.start-on` via CSS opacity (GPU-only).
+ * Iconic 4-pane luminous gradient Start emblem matching complete-ux.html:
+ * 8.2×8.2 panes (rx="2.6") with vibrant indigo/sky/violet gradients and soft hover bloom.
  */
 export const StartLogoIcon: React.FC<{ className?: string }> = ({ className = 'ic24' }) => (
   <svg className={`${className} start-logo-svg`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <defs>
-      <linearGradient id="tb_pane_tl" x1="3.5" y1="3.5" x2="11.1" y2="11.1" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#FFFFFF" stopOpacity="1" />
-        <stop offset="100%" stopColor="#E6EDF9" stopOpacity="0.96" />
+      <linearGradient id="tb_start_g1" x1="3" y1="3" x2="11.2" y2="11.2" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#A5B4FC" />
+        <stop offset="100%" stopColor="#6366F1" />
       </linearGradient>
-      <linearGradient id="tb_pane_mid" x1="3.5" y1="3.5" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#F4F7FD" stopOpacity="0.96" />
-        <stop offset="100%" stopColor="#D3DDF0" stopOpacity="0.88" />
+      <linearGradient id="tb_start_g2" x1="12.8" y1="3" x2="21" y2="11.2" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#7DD3FC" />
+        <stop offset="100%" stopColor="#38BDF8" />
       </linearGradient>
-      <linearGradient id="tb_pane_br" x1="12.9" y1="12.9" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#E9EFFA" stopOpacity="0.94" />
-        <stop offset="100%" stopColor="#C4D1E7" stopOpacity="0.86" />
+      <linearGradient id="tb_start_g3" x1="3" y1="12.8" x2="11.2" y2="21" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#818CF8" />
+        <stop offset="100%" stopColor="#A855F7" />
+      </linearGradient>
+      <linearGradient id="tb_start_g4" x1="12.8" y1="12.8" x2="21" y2="21" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#38BDF8" />
+        <stop offset="100%" stopColor="#6366F1" />
       </linearGradient>
     </defs>
 
-    {/* Luminous frosted silver-white precision panes */}
     <g className="start-logo-base">
-      <rect x="3.5" y="3.5" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_tl)" />
-      <rect x="12.9" y="3.5" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_mid)" />
-      <rect x="3.5" y="12.9" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_mid)" />
-      <rect x="12.9" y="12.9" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_br)" />
+      <rect x="3" y="3" width="8.2" height="8.2" rx="2.6" fill="url(#tb_start_g1)" />
+      <rect x="12.8" y="3" width="8.2" height="8.2" rx="2.6" fill="url(#tb_start_g2)" opacity="0.92" />
+      <rect x="3" y="12.8" width="8.2" height="8.2" rx="2.6" fill="url(#tb_start_g3)" opacity="0.9" />
+      <rect x="12.8" y="12.8" width="8.2" height="8.2" rx="2.6" fill="url(#tb_start_g4)" />
     </g>
 
-    {/* Luminous Space Accent illumination overlay (faded in via CSS on hover / start-on) */}
+    {/* Subtle luminous highlight layer intensified on hover / start-on via GPU opacity */}
     <g className="start-logo-accent">
-      <rect x="3.5" y="3.5" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="1" />
-      <rect x="12.9" y="3.5" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.88" />
-      <rect x="3.5" y="12.9" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.84" />
-      <rect x="12.9" y="12.9" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.96" />
+      <rect x="3" y="3" width="8.2" height="8.2" rx="2.6" fill="#FFFFFF" fillOpacity="0.18" />
+      <rect x="12.8" y="3" width="8.2" height="8.2" rx="2.6" fill="#FFFFFF" fillOpacity="0.14" />
+      <rect x="3" y="12.8" width="8.2" height="8.2" rx="2.6" fill="#FFFFFF" fillOpacity="0.14" />
+      <rect x="12.8" y="12.8" width="8.2" height="8.2" rx="2.6" fill="#FFFFFF" fillOpacity="0.18" />
     </g>
   </svg>
 );
@@ -196,7 +198,7 @@ export const VolIcon: React.FC<{ muted?: boolean; level?: number; className?: st
 /* ===================== NETWORK ICONS ===================== */
 
 export const EthernetIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
-  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round">
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round">
     <rect x="3" y="4" width="18" height="14" rx="2.5" />
     <line x1="7.5" y1="4" x2="7.5" y2="8.5" />
     <line x1="10.5" y1="4" x2="10.5" y2="8.5" />
@@ -630,16 +632,81 @@ export const ArrowDownIcon: React.FC<{ size?: number }> = ({ size = 10 }) => (
   </svg>
 );
 
-export const FallbackAppIcon: React.FC<{ iconKey?: string; kind?: string; size?: number }> = ({
+export const FallbackAppIcon: React.FC<{
+  iconKey?: string;
+  kind?: string;
+  target?: string;
+  size?: number;
+}> = ({
   iconKey = '',
   kind = 'app',
+  target = '',
   size = 22,
 }) => {
   if (kind === 'folder') return <FolderSvg className="ic18" color="#F2B44B" />;
   if (kind === 'file') return <FileSvg className="ic18" color="#52B8F2" />;
-  if (kind === 'url') return <GlobeSvg className="ic18" color="#A78BFA" />;
 
   const k = iconKey.toLowerCase();
+  const t = target.trim().toLowerCase();
+  const isWebUrl = kind === 'url' || /^https?:\/\//i.test(t);
+
+  if (k.includes('claude') || t.includes('claude.ai')) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="2.5" width="19" height="19" rx="5.5" fill="rgba(217,119,87,0.18)" stroke="#E58C68" strokeWidth="1.35" />
+        <g stroke="#F1A784" strokeWidth="1.7" strokeLinecap="round">
+          <line x1="12" y1="6.2" x2="12" y2="17.8" />
+          <line x1="6.2" y1="12" x2="17.8" y2="12" />
+          <line x1="7.9" y1="7.9" x2="16.1" y2="16.1" />
+          <line x1="16.1" y1="7.9" x2="7.9" y2="16.1" />
+        </g>
+        <circle cx="12" cy="12" r="1.9" fill="#FFF3EC" />
+      </svg>
+    );
+  }
+  if (k.includes('github') || t.includes('github.com')) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="2.5" width="19" height="19" rx="5.5" fill="rgba(148,163,184,0.16)" stroke="#CBD5E1" strokeWidth="1.35" />
+        <path d="M9.6 17.6c-2.6.8-2.6-1.3-3.6-1.6m7.2 3.1v-2.1c0-.6.1-1.1-.3-1.5 1.8-.2 3.7-.9 3.7-4 0-.9-.3-1.6-.8-2.2.1-.2.4-1.1-.1-2.2 0 0-.7-.2-2.2.8a7.6 7.6 0 0 0-4 0c-1.5-1-2.2-.8-2.2-.8-.5 1.1-.2 2-.1 2.2-.5.6-.8 1.3-.8 2.2 0 3.1 1.9 3.8 3.7 4-.4.3-.4.9-.3 1.5v2.1" stroke="#F1F5F9" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+  if (k.includes('youtube') || t.includes('youtube.com') || t.includes('youtu.be')) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="5" width="19" height="14" rx="4.2" fill="rgba(239,68,68,0.22)" stroke="#F87171" strokeWidth="1.4" />
+        <polygon points="10.2,9.1 15.6,12 10.2,14.9" fill="#FCA5A5" />
+      </svg>
+    );
+  }
+  if (isWebUrl) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="2.5" width="19" height="19" rx="5.5" fill="rgba(129,140,248,0.14)" stroke="rgba(165,180,252,0.52)" strokeWidth="1.3" />
+        <circle cx="12" cy="12" r="5.6" stroke="#A5B4FC" strokeWidth="1.45" />
+        <ellipse cx="12" cy="12" rx="2.6" ry="5.6" stroke="#A5B4FC" strokeWidth="1.25" />
+        <line x1="6.6" y1="12" x2="17.4" y2="12" stroke="#A5B4FC" strokeWidth="1.25" />
+      </svg>
+    );
+  }
+  if (k.includes('terminal') || t.endsWith('\\wt.exe') || t === 'wt.exe') {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="3.5" width="19" height="17" rx="4.2" fill="#181C28" stroke="#64748B" strokeWidth="1.4" />
+        <polyline points="7.2 9.2 10.6 12 7.2 14.8" stroke="#E2E8F0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        <line x1="12.2" y1="14.8" x2="16.8" y2="14.8" stroke="#38BDF8" strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  if (k.includes('spark')) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2.5" y="2.5" width="19" height="19" rx="5.5" fill="rgba(56,189,248,0.18)" stroke="#38BDF8" strokeWidth="1.35" />
+        <path d="M12 6.2L17.4 16.8L12 14.1L6.6 16.8L12 6.2Z" fill="#7DD3FC" />
+      </svg>
+    );
+  }
   if (k.includes('zen')) {
     return (
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
