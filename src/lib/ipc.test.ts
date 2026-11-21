@@ -19,12 +19,15 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({
 
 import {
   addGameCombo,
+  addQuickTodo,
   applyConfigUpdate,
+  clearDoneQuickTodos,
   clearIconCache,
   createSpace,
   deleteClipboardEntry,
   deleteCustomSpace,
   deleteGameCombo,
+  deleteQuickTodo,
   deleteSpace,
   dismissOverlays,
   emptyRecycleBin,
@@ -39,7 +42,9 @@ import {
   getAudioPeaks,
   getClipboardPaused,
   getFileThumbnails,
+  getNetworkSnapshot,
   getPeripheralBatteries,
+  getQuickTogglesState,
   getWeather,
   hideBatteryDevice,
   hideTrayApp,
@@ -68,21 +73,27 @@ import {
   restoreAllTrayApps,
   restoreBatteryDevice,
   restoreTrayApp,
+  saveQuickNotesText,
   searchWeatherCities,
   seekMedia,
   selectMediaSession,
   setAppearanceSettings,
   setClipboardPaused,
   setInputDevice,
+  setKeepAwake,
+  setPowerPlan,
   setSessionState,
+  setSpaceWidgetLayout,
   setSpaceWidgets,
   setTaskbarWidgets,
   shouldApplyConfigUpdate,
   snapWindow,
   surfaceCommitAck,
   surfaceExitAck,
+  toggleQuickTodo,
   toggleStart,
   toggleWindowTopmost,
+  triggerScreenshot,
   updateCustomSpace,
   updateGameCombo,
   updatePin,
@@ -968,6 +979,78 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
 
     await restoreAllBatteryDevices();
     expect(invokeMock).toHaveBeenLastCalledWith('restore_all_battery_devices', undefined);
+
+    // Wave 1 V3.2 IPC commands
+    await setSpaceWidgetLayout('work', ['media', 'notes'], [{ id: 'weather', side: 'left' }]);
+    expect(invokeMock).toHaveBeenLastCalledWith('set_space_widget_layout', {
+      id: 'work',
+      widgets: ['media', 'notes'],
+      headerWidgets: [{ id: 'weather', side: 'left' }],
+    });
+
+    await setTaskbarWidgets({
+      leftWidgets: ['weather', 'network', 'timer'],
+      widgetsPosition: 'left',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_taskbar_widgets', {
+      showWeather: null,
+      showBatteries: null,
+      showTelemetry: null,
+      leftWidgets: ['weather', 'network', 'timer'],
+      widgetsPosition: 'left',
+      weatherCity: null,
+      weatherUnits: null,
+    });
+
+    await setAppearanceSettings({
+      themePreset: 'carbon',
+      glassDepth: 'solid',
+      accentMode: 'custom',
+      accentHex: '#38BDF8',
+      surfaceGradients: false,
+      hoverGlow: false,
+      clockDateFormat: 'short',
+      clockLayout: 'center',
+      defaultTileSize: 'small',
+      resetVisuals: false,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_appearance_settings', {
+      glassDepth: 'solid',
+      clockShowSeconds: null,
+      clockShowWeekday: null,
+      startRememberSpace: null,
+      themePreset: 'carbon',
+      accentMode: 'custom',
+      accentHex: '#38BDF8',
+      surfaceGradients: false,
+      hoverGlow: false,
+      clockDateFormat: 'short',
+      clockLayout: 'center',
+      defaultTileSize: 'small',
+      resetVisuals: false,
+    });
+
+    await saveQuickNotesText('hello');
+    expect(invokeMock).toHaveBeenLastCalledWith('save_quick_notes_text', { text: 'hello' });
+    await addQuickTodo('task');
+    expect(invokeMock).toHaveBeenLastCalledWith('add_quick_todo', { text: 'task' });
+    await toggleQuickTodo('todo-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('toggle_quick_todo', { id: 'todo-1' });
+    await deleteQuickTodo('todo-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('delete_quick_todo', { id: 'todo-1' });
+    await clearDoneQuickTodos();
+    expect(invokeMock).toHaveBeenLastCalledWith('clear_done_quick_todos', undefined);
+
+    await getNetworkSnapshot(true);
+    expect(invokeMock).toHaveBeenLastCalledWith('get_network_snapshot', { probePing: true });
+    await getQuickTogglesState();
+    expect(invokeMock).toHaveBeenLastCalledWith('get_quick_toggles_state', undefined);
+    await setKeepAwake(true);
+    expect(invokeMock).toHaveBeenLastCalledWith('set_keep_awake', { enable: true });
+    await setPowerPlan('balanced');
+    expect(invokeMock).toHaveBeenLastCalledWith('set_power_plan', { plan: 'balanced' });
+    await triggerScreenshot();
+    expect(invokeMock).toHaveBeenLastCalledWith('trigger_screenshot', undefined);
   });
 
   it('binds onEvent strictly to getCurrentWebviewWindow().listen() to prevent cross-window event clobbering', async () => {

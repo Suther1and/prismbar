@@ -14,7 +14,7 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const SECONDARY_TASKBAR_MODE_TESTBAR: &str = "testbar";
 pub const SECONDARY_TASKBAR_MODE_NATIVE: &str = "native";
 pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
@@ -22,6 +22,41 @@ pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
 pub const GLASS_DEPTH_CRYSTAL: &str = "crystal";
 pub const GLASS_DEPTH_OBSIDIAN: &str = "obsidian";
 pub const GLASS_DEPTH_MATTE: &str = "matte";
+pub const GLASS_DEPTH_SOLID: &str = "solid";
+
+pub const THEME_PRESET_OBSIDIAN: &str = "obsidian";
+pub const THEME_PRESET_CARBON: &str = "carbon";
+pub const THEME_PRESET_MIDNIGHT: &str = "midnight";
+pub const THEME_PRESET_EMERALD: &str = "emerald";
+pub const THEME_PRESET_AMETHYST: &str = "amethyst";
+pub const THEME_PRESET_GRAPHITE: &str = "graphite";
+
+pub const THEME_PRESETS: &[&str] = &[
+    THEME_PRESET_OBSIDIAN,
+    THEME_PRESET_CARBON,
+    THEME_PRESET_MIDNIGHT,
+    THEME_PRESET_EMERALD,
+    THEME_PRESET_AMETHYST,
+    THEME_PRESET_GRAPHITE,
+];
+
+pub const ACCENT_MODE_PER_SPACE: &str = "per_space";
+pub const ACCENT_MODE_CUSTOM: &str = "custom";
+
+pub const CLOCK_DATE_SHORT: &str = "short";
+pub const CLOCK_DATE_NUMERIC: &str = "numeric";
+pub const CLOCK_DATE_NONE: &str = "none";
+
+pub const CLOCK_LAYOUT_CENTER: &str = "center";
+pub const CLOCK_LAYOUT_RIGHT: &str = "right";
+pub const CLOCK_LAYOUT_SINGLE: &str = "single";
+
+pub const HEADER_WIDGET_SIDE_AUTO: &str = "auto";
+pub const HEADER_WIDGET_SIDE_LEFT: &str = "left";
+pub const HEADER_WIDGET_SIDE_RIGHT: &str = "right";
+
+pub const TASKBAR_WIDGETS_POSITION_LEFT: &str = "left";
+pub const TASKBAR_WIDGETS_POSITION_RIGHT: &str = "right";
 
 pub const WIDGET_PRESET_MEDIA_CLIPBOARD: &str = "media_clipboard";
 pub const WIDGET_PRESET_TELEMETRY_PROCESSES: &str = "telemetry_processes";
@@ -30,6 +65,7 @@ pub const WIDGET_PRESET_FULL_GRID: &str = "full_grid";
 
 pub const SPACE_LAYOUT_GRID: &str = "grid";
 pub const SPACE_LAYOUT_GAMES: &str = "games";
+pub const TILE_SIZE_SMALL: &str = "small";
 pub const TILE_SIZE_HERO: &str = "hero";
 pub const TILE_SIZE_COMPACT: &str = "compact";
 pub const TILE_SECTION_MAIN: &str = "main";
@@ -45,7 +81,24 @@ pub const SPACE_WIDGET_IDS: &[&str] = &[
     "game_combos",
     "weather",
     "batteries",
+    "notes",
+    "timer",
+    "network",
+    "quick_toggles",
 ];
+
+pub const TASKBAR_WIDGET_IDS: &[&str] = &[
+    "weather",
+    "telemetry",
+    "batteries",
+    "network",
+    "media",
+    "timer",
+];
+
+pub const MAX_QUICK_NOTES_CHARS: usize = 8_000;
+pub const MAX_QUICK_TODOS: usize = 40;
+pub const MAX_QUICK_TODO_CHARS: usize = 240;
 
 pub const MAX_FRECENCY_ENTRIES: usize = 200;
 pub const MAX_CUSTOM_ICON_DATA_BYTES: usize = 128 * 1024;
@@ -114,6 +167,7 @@ pub fn validate_space_layout_kind(kind: &str) -> Result<&'static str, String> {
 
 pub fn normalize_tile_size(size: &str) -> Option<&'static str> {
     match size.trim().to_ascii_lowercase().as_str() {
+        "small" => Some(TILE_SIZE_SMALL),
         "hero" => Some(TILE_SIZE_HERO),
         "compact" => Some(TILE_SIZE_COMPACT),
         _ => None,
@@ -122,12 +176,205 @@ pub fn normalize_tile_size(size: &str) -> Option<&'static str> {
 
 pub fn validate_tile_size(size: &str) -> Result<&'static str, String> {
     match size.trim().to_ascii_lowercase().as_str() {
+        "small" => Ok(TILE_SIZE_SMALL),
         "hero" => Ok(TILE_SIZE_HERO),
         "compact" => Ok(TILE_SIZE_COMPACT),
         other => Err(format!(
-            "Недопустимый размер плитки: '{other}' (допустимы: hero, compact)"
+            "Недопустимый размер плитки: '{other}' (допустимы: small, hero, compact)"
         )),
     }
+}
+
+pub fn default_tile_size() -> String {
+    TILE_SIZE_COMPACT.to_string()
+}
+
+pub fn default_clock_date_format() -> String {
+    CLOCK_DATE_SHORT.to_string()
+}
+
+pub fn normalize_clock_date_format(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "numeric" => CLOCK_DATE_NUMERIC,
+        "none" => CLOCK_DATE_NONE,
+        _ => CLOCK_DATE_SHORT,
+    }
+}
+
+pub fn validate_clock_date_format(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "short" => Ok(CLOCK_DATE_SHORT),
+        "numeric" => Ok(CLOCK_DATE_NUMERIC),
+        "none" => Ok(CLOCK_DATE_NONE),
+        other => Err(format!(
+            "Недопустимый формат даты: '{other}' (допустимы: short, numeric, none)"
+        )),
+    }
+}
+
+pub fn default_clock_layout() -> String {
+    CLOCK_LAYOUT_CENTER.to_string()
+}
+
+pub fn normalize_clock_layout(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "right" => CLOCK_LAYOUT_RIGHT,
+        "single" => CLOCK_LAYOUT_SINGLE,
+        _ => CLOCK_LAYOUT_CENTER,
+    }
+}
+
+pub fn validate_clock_layout(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "center" => Ok(CLOCK_LAYOUT_CENTER),
+        "right" => Ok(CLOCK_LAYOUT_RIGHT),
+        "single" => Ok(CLOCK_LAYOUT_SINGLE),
+        other => Err(format!(
+            "Недопустимый вид часов: '{other}' (допустимы: center, right, single)"
+        )),
+    }
+}
+
+pub fn default_header_widget_side() -> String {
+    HEADER_WIDGET_SIDE_AUTO.to_string()
+}
+
+pub fn normalize_header_widget_side(side: &str) -> &'static str {
+    match side.trim().to_ascii_lowercase().as_str() {
+        "left" => HEADER_WIDGET_SIDE_LEFT,
+        "right" => HEADER_WIDGET_SIDE_RIGHT,
+        _ => HEADER_WIDGET_SIDE_AUTO,
+    }
+}
+
+pub fn validate_header_widget_side(side: &str) -> Result<&'static str, String> {
+    match side.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(HEADER_WIDGET_SIDE_AUTO),
+        "left" => Ok(HEADER_WIDGET_SIDE_LEFT),
+        "right" => Ok(HEADER_WIDGET_SIDE_RIGHT),
+        other => Err(format!(
+            "Недопустимая сторона виджета шапки: '{other}' (допустимы: auto, left, right)"
+        )),
+    }
+}
+
+pub fn validate_taskbar_widget_id(id: &str) -> Result<&'static str, String> {
+    let norm = id.trim().to_ascii_lowercase();
+    for &valid in TASKBAR_WIDGET_IDS {
+        if norm == valid {
+            return Ok(valid);
+        }
+    }
+    Err(format!(
+        "Недопустимый виджет нижней панели: '{id}' (допустимы: {})",
+        TASKBAR_WIDGET_IDS.join(", ")
+    ))
+}
+
+pub fn normalize_taskbar_widget_list(list: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(list.len().min(TASKBAR_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for w in list {
+        if let Ok(valid) = validate_taskbar_widget_id(w) {
+            if seen.insert(valid) {
+                out.push(valid.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn validate_taskbar_widget_list(list: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(list.len().min(TASKBAR_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for w in list {
+        let valid = validate_taskbar_widget_id(w)?;
+        if seen.insert(valid) {
+            out.push(valid.to_string());
+        }
+    }
+    Ok(out)
+}
+
+pub fn default_taskbar_widgets_position() -> String {
+    TASKBAR_WIDGETS_POSITION_LEFT.to_string()
+}
+
+pub fn normalize_taskbar_widgets_position(pos: &str) -> &'static str {
+    match pos.trim().to_ascii_lowercase().as_str() {
+        "right" => TASKBAR_WIDGETS_POSITION_RIGHT,
+        _ => TASKBAR_WIDGETS_POSITION_LEFT,
+    }
+}
+
+pub fn validate_taskbar_widgets_position(pos: &str) -> Result<&'static str, String> {
+    match pos.trim().to_ascii_lowercase().as_str() {
+        "left" => Ok(TASKBAR_WIDGETS_POSITION_LEFT),
+        "right" => Ok(TASKBAR_WIDGETS_POSITION_RIGHT),
+        other => Err(format!(
+            "Недопустимое положение виджетов панели: '{other}' (допустимы: left, right)"
+        )),
+    }
+}
+
+pub fn default_theme_preset() -> String {
+    THEME_PRESET_OBSIDIAN.to_string()
+}
+
+pub fn normalize_theme_preset(theme: &str) -> &'static str {
+    let norm = theme.trim().to_ascii_lowercase();
+    for &valid in THEME_PRESETS {
+        if norm == valid {
+            return valid;
+        }
+    }
+    THEME_PRESET_OBSIDIAN
+}
+
+pub fn validate_theme_preset(theme: &str) -> Result<&'static str, String> {
+    let norm = theme.trim().to_ascii_lowercase();
+    for &valid in THEME_PRESETS {
+        if norm == valid {
+            return Ok(valid);
+        }
+    }
+    Err(format!(
+        "Недопустимая тема оформления: '{theme}' (допустимы: {})",
+        THEME_PRESETS.join(", ")
+    ))
+}
+
+pub fn default_accent_mode() -> String {
+    ACCENT_MODE_PER_SPACE.to_string()
+}
+
+pub fn normalize_accent_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "custom" => ACCENT_MODE_CUSTOM,
+        _ => ACCENT_MODE_PER_SPACE,
+    }
+}
+
+pub fn validate_accent_mode(mode: &str) -> Result<&'static str, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "per_space" => Ok(ACCENT_MODE_PER_SPACE),
+        "custom" => Ok(ACCENT_MODE_CUSTOM),
+        other => Err(format!(
+            "Недопустимый режим акцента: '{other}' (допустимы: per_space, custom)"
+        )),
+    }
+}
+
+pub fn default_global_accent_hex() -> String {
+    "#818CF8".to_string()
+}
+
+pub fn default_global_accent_rgb() -> String {
+    "129,140,248".to_string()
+}
+
+pub fn default_true() -> bool {
+    true
 }
 
 pub fn normalize_tile_section(section: &str) -> Option<&'static str> {
@@ -215,6 +462,7 @@ pub fn normalize_glass_depth(depth: &str) -> &'static str {
     match depth.trim().to_ascii_lowercase().as_str() {
         "crystal" => GLASS_DEPTH_CRYSTAL,
         "matte" => GLASS_DEPTH_MATTE,
+        "solid" => GLASS_DEPTH_SOLID,
         _ => GLASS_DEPTH_OBSIDIAN,
     }
 }
@@ -224,8 +472,9 @@ pub fn validate_glass_depth(depth: &str) -> Result<&'static str, String> {
         "crystal" => Ok(GLASS_DEPTH_CRYSTAL),
         "obsidian" => Ok(GLASS_DEPTH_OBSIDIAN),
         "matte" => Ok(GLASS_DEPTH_MATTE),
+        "solid" => Ok(GLASS_DEPTH_SOLID),
         other => Err(format!(
-            "Недопустимая глубина стекла: '{other}' (допустимы: crystal, obsidian, matte)"
+            "Недопустимая глубина стекла: '{other}' (допустимы: crystal, obsidian, matte, solid)"
         )),
     }
 }
@@ -344,6 +593,34 @@ pub struct PinItem {
     pub run_as_admin: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceHeaderWidget {
+    pub id: String,
+    /// "auto" | "left" | "right"
+    #[serde(default = "default_header_widget_side")]
+    pub side: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickTodoItem {
+    pub id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickNotesState {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub todos: Vec<QuickTodoItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SpaceConfig {
@@ -362,6 +639,8 @@ pub struct SpaceConfig {
     #[serde(default)]
     pub widgets: Vec<String>,
     #[serde(default)]
+    pub header_widgets: Vec<SpaceHeaderWidget>,
+    #[serde(default)]
     pub items: Vec<PinItem>,
 }
 
@@ -374,6 +653,10 @@ pub struct TaskbarWidgetSettings {
     pub show_batteries: bool,
     #[serde(default)]
     pub show_telemetry: bool,
+    #[serde(default)]
+    pub left_widgets: Vec<String>,
+    #[serde(default = "default_taskbar_widgets_position")]
+    pub widgets_position: String,
     #[serde(default)]
     pub weather_city: String,
     #[serde(default)]
@@ -390,6 +673,8 @@ impl Default for TaskbarWidgetSettings {
             show_weather: false,
             show_batteries: false,
             show_telemetry: false,
+            left_widgets: Vec::new(),
+            widgets_position: default_taskbar_widgets_position(),
             weather_city: String::new(),
             weather_lat: None,
             weather_lon: None,
@@ -436,13 +721,33 @@ pub struct TestBarConfig {
     #[serde(default)]
     pub autostart: bool,
     #[serde(default = "default_glass_depth")]
-    pub glass_depth: String, // "crystal" | "obsidian" | "matte"
+    pub glass_depth: String, // "crystal" | "obsidian" | "matte" | "solid"
+    #[serde(default = "default_theme_preset")]
+    pub theme_preset: String, // "obsidian" | "carbon" | "midnight" | "emerald" | "amethyst" | "graphite"
+    #[serde(default = "default_accent_mode")]
+    pub accent_mode: String, // "per_space" | "custom"
+    #[serde(default = "default_global_accent_hex")]
+    pub accent_hex: String,
+    #[serde(default = "default_global_accent_rgb")]
+    pub accent_rgb: String,
+    #[serde(default = "default_true")]
+    pub surface_gradients: bool,
+    #[serde(default = "default_true")]
+    pub hover_glow: bool,
     #[serde(default)]
     pub clock_show_seconds: bool,
     #[serde(default)]
     pub clock_show_weekday: bool,
+    #[serde(default = "default_clock_date_format")]
+    pub clock_date_format: String, // "short" | "numeric" | "none"
+    #[serde(default = "default_clock_layout")]
+    pub clock_layout: String, // "center" | "right" | "single"
     #[serde(default)]
     pub start_remember_space: bool,
+    #[serde(default = "default_tile_size")]
+    pub default_tile_size: String, // "small" | "compact" | "hero"
+    #[serde(default)]
+    pub quick_notes: QuickNotesState,
     #[serde(default)]
     pub hidden_tray_keys: Vec<String>,
     #[serde(default)]
@@ -1242,6 +1547,142 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
     changed
 }
 
+pub fn normalize_space_header_widgets(
+    header_widgets: &[SpaceHeaderWidget],
+    excluded_side_widgets: &[String],
+) -> Vec<SpaceHeaderWidget> {
+    let mut out = Vec::with_capacity(header_widgets.len().min(SPACE_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for entry in header_widgets {
+        if let Ok(valid_id) = validate_space_widget_id(&entry.id) {
+            if excluded_side_widgets.iter().any(|s| s == valid_id) {
+                continue;
+            }
+            if seen.insert(valid_id) {
+                out.push(SpaceHeaderWidget {
+                    id: valid_id.to_string(),
+                    side: normalize_header_widget_side(&entry.side).to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn validate_and_normalize_space_header_widgets(
+    header_widgets: &[SpaceHeaderWidget],
+    excluded_side_widgets: &[String],
+) -> Result<Vec<SpaceHeaderWidget>, String> {
+    let mut out = Vec::with_capacity(header_widgets.len().min(SPACE_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for entry in header_widgets {
+        let valid_id = validate_space_widget_id(&entry.id)?;
+        let valid_side = validate_header_widget_side(&entry.side)?;
+        if excluded_side_widgets.iter().any(|s| s == valid_id) {
+            continue;
+        }
+        if seen.insert(valid_id) {
+            out.push(SpaceHeaderWidget {
+                id: valid_id.to_string(),
+                side: valid_side.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn default_space_header_widgets(side_widgets: &[String]) -> Vec<SpaceHeaderWidget> {
+    let mut out = Vec::with_capacity(2);
+    for id in ["batteries", "weather"] {
+        if !side_widgets.iter().any(|w| w == id) {
+            out.push(SpaceHeaderWidget {
+                id: id.to_string(),
+                side: HEADER_WIDGET_SIDE_LEFT.to_string(),
+            });
+        }
+    }
+    out
+}
+
+pub fn sync_legacy_taskbar_booleans_from_left_widgets(settings: &mut TaskbarWidgetSettings) -> bool {
+    let has_weather = settings.left_widgets.iter().any(|w| w == "weather");
+    let has_batteries = settings.left_widgets.iter().any(|w| w == "batteries");
+    let has_telemetry = settings.left_widgets.iter().any(|w| w == "telemetry");
+    let mut changed = false;
+    if settings.show_weather != has_weather {
+        settings.show_weather = has_weather;
+        changed = true;
+    }
+    if settings.show_batteries != has_batteries {
+        settings.show_batteries = has_batteries;
+        changed = true;
+    }
+    if settings.show_telemetry != has_telemetry {
+        settings.show_telemetry = has_telemetry;
+        changed = true;
+    }
+    changed
+}
+
+pub fn apply_taskbar_widget_boolean_to_left_widgets(
+    left_widgets: &mut Vec<String>,
+    id: &str,
+    enabled: bool,
+) -> bool {
+    if enabled {
+        if left_widgets.iter().any(|w| w == id) {
+            false
+        } else {
+            left_widgets.push(id.to_string());
+            true
+        }
+    } else {
+        let before = left_widgets.len();
+        left_widgets.retain(|w| w != id);
+        left_widgets.len() != before
+    }
+}
+
+pub fn normalize_quick_notes(notes: &mut QuickNotesState) -> bool {
+    let mut changed = false;
+    if notes.text.chars().count() > MAX_QUICK_NOTES_CHARS {
+        notes.text = notes.text.chars().take(MAX_QUICK_NOTES_CHARS).collect();
+        changed = true;
+    }
+    let mut clean_todos = Vec::with_capacity(notes.todos.len().min(MAX_QUICK_TODOS));
+    let mut seen_ids = HashSet::new();
+    for (idx, item) in notes.todos.iter().enumerate() {
+        if clean_todos.len() >= MAX_QUICK_TODOS {
+            changed = true;
+            break;
+        }
+        let text: String = item.text.trim().chars().take(MAX_QUICK_TODO_CHARS).collect();
+        if text.is_empty() {
+            changed = true;
+            continue;
+        }
+        let base_id = if item.id.trim().is_empty() {
+            format!("todo-{}", idx + 1)
+        } else {
+            item.id.trim().to_string()
+        };
+        let unique_id = ensure_unique_space_id(&base_id, &mut seen_ids);
+        if unique_id != item.id || text != item.text {
+            changed = true;
+        }
+        clean_todos.push(QuickTodoItem {
+            id: unique_id,
+            text,
+            done: item.done,
+        });
+    }
+    if clean_todos != notes.todos {
+        notes.todos = clean_todos;
+        changed = true;
+    }
+    changed
+}
+
 pub fn normalize_taskbar_widgets(settings: &mut TaskbarWidgetSettings) -> bool {
     let mut changed = false;
 
@@ -1254,6 +1695,18 @@ pub fn normalize_taskbar_widgets(settings: &mut TaskbarWidgetSettings) -> bool {
     let clean_units = normalize_weather_units(&settings.weather_units);
     if settings.weather_units != clean_units {
         settings.weather_units = clean_units.to_string();
+        changed = true;
+    }
+
+    let clean_pos = normalize_taskbar_widgets_position(&settings.widgets_position);
+    if settings.widgets_position != clean_pos {
+        settings.widgets_position = clean_pos.to_string();
+        changed = true;
+    }
+
+    let clean_left = normalize_taskbar_widget_list(&settings.left_widgets);
+    if settings.left_widgets != clean_left {
+        settings.left_widgets = clean_left;
         changed = true;
     }
 
@@ -1345,6 +1798,12 @@ fn normalize_space_config(
         changed = true;
     }
 
+    let desired_header_widgets = normalize_space_header_widgets(&space.header_widgets, &space.widgets);
+    if space.header_widgets != desired_header_widgets {
+        space.header_widgets = desired_header_widgets;
+        changed = true;
+    }
+
     let clean_bottom_title = sanitize_optional_nonempty(&space.bottom_section_title);
     if space.bottom_section_title != clean_bottom_title {
         space.bottom_section_title = clean_bottom_title;
@@ -1403,6 +1862,11 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             "audio_mixer".to_string(),
             "clipboard".to_string(),
         ],
+        header_widgets: default_space_header_widgets(&[
+            "media".to_string(),
+            "audio_mixer".to_string(),
+            "clipboard".to_string(),
+        ]),
         items: personal_items,
     });
 
@@ -1428,6 +1892,10 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         show_hero_row: false,
         bottom_section_title: Some("Приложения".to_string()),
         widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
+        header_widgets: default_space_header_widgets(&[
+            "pc_health".to_string(),
+            "top_processes".to_string(),
+        ]),
         items: work_items,
     });
 
@@ -1460,6 +1928,11 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             "audio_mixer".to_string(),
             "top_processes".to_string(),
         ],
+        header_widgets: default_space_header_widgets(&[
+            "pc_health".to_string(),
+            "audio_mixer".to_string(),
+            "top_processes".to_string(),
+        ]),
         items: studio_items,
     });
 
@@ -1483,6 +1956,11 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             "game_combos".to_string(),
             "pc_health".to_string(),
         ],
+        header_widgets: default_space_header_widgets(&[
+            "audio_mixer".to_string(),
+            "game_combos".to_string(),
+            "pc_health".to_string(),
+        ]),
         items: game_items,
     });
 
@@ -1495,6 +1973,7 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             }
             custom_items.push(item);
         }
+        let custom_widgets = widget_preset_to_widgets(&cs.widget_preset);
         spaces.push(SpaceConfig {
             id: cs.id.clone(),
             name: cs.name.clone(),
@@ -1503,7 +1982,8 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             layout_kind: SPACE_LAYOUT_GRID.to_string(),
             show_hero_row: false,
             bottom_section_title: Some("Закреплённое".to_string()),
-            widgets: widget_preset_to_widgets(&cs.widget_preset),
+            header_widgets: default_space_header_widgets(&custom_widgets),
+            widgets: custom_widgets,
             items: custom_items,
         });
     }
@@ -1661,6 +2141,51 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         changed = true;
     }
 
+    let desired_theme = normalize_theme_preset(&cfg.theme_preset);
+    if cfg.theme_preset != desired_theme {
+        cfg.theme_preset = desired_theme.to_string();
+        changed = true;
+    }
+
+    let desired_accent_mode = normalize_accent_mode(&cfg.accent_mode);
+    if cfg.accent_mode != desired_accent_mode {
+        cfg.accent_mode = desired_accent_mode.to_string();
+        changed = true;
+    }
+
+    let (clean_acc_hex, clean_acc_rgb) =
+        sanitize_accent_hex_rgb(Some(&cfg.accent_hex), Some(&cfg.accent_rgb));
+    if cfg.accent_hex != clean_acc_hex {
+        cfg.accent_hex = clean_acc_hex;
+        changed = true;
+    }
+    if cfg.accent_rgb != clean_acc_rgb {
+        cfg.accent_rgb = clean_acc_rgb;
+        changed = true;
+    }
+
+    let desired_date_fmt = normalize_clock_date_format(&cfg.clock_date_format);
+    if cfg.clock_date_format != desired_date_fmt {
+        cfg.clock_date_format = desired_date_fmt.to_string();
+        changed = true;
+    }
+
+    let desired_clock_layout = normalize_clock_layout(&cfg.clock_layout);
+    if cfg.clock_layout != desired_clock_layout {
+        cfg.clock_layout = desired_clock_layout.to_string();
+        changed = true;
+    }
+
+    let desired_default_tile = normalize_tile_size(&cfg.default_tile_size).unwrap_or(TILE_SIZE_COMPACT);
+    if cfg.default_tile_size != desired_default_tile {
+        cfg.default_tile_size = desired_default_tile.to_string();
+        changed = true;
+    }
+
+    if normalize_quick_notes(&mut cfg.quick_notes) {
+        changed = true;
+    }
+
     for list in [
         &mut cfg.taskbar_pins,
         &mut cfg.personal_pins,
@@ -1712,13 +2237,25 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
             default_modular_spaces()
         };
         changed = true;
-    } else if prev_schema < CURRENT_SCHEMA_VERSION && upgrade_v2_spaces_to_v3(cfg) {
+    } else if prev_schema < 3 && upgrade_v2_spaces_to_v3(cfg) {
         changed = true;
     }
 
     if cfg.spaces.is_empty() {
         cfg.spaces = default_modular_spaces();
         changed = true;
+    }
+
+    if prev_schema < 4 {
+        for space in &mut cfg.spaces {
+            if space.header_widgets.is_empty() {
+                let seeded = default_space_header_widgets(&space.widgets);
+                if !seeded.is_empty() {
+                    space.header_widgets = seeded;
+                    changed = true;
+                }
+            }
+        }
     }
 
     let mut seen_space_ids = HashSet::new();
@@ -1728,9 +2265,28 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         }
     }
 
-    if prev_schema < CURRENT_SCHEMA_VERSION && cfg.taskbar_widgets.show_weather {
+    if prev_schema < 3 && cfg.taskbar_widgets.show_weather {
         cfg.taskbar_widgets.show_weather = false;
         changed = true;
+    }
+
+    if prev_schema < 4 && cfg.taskbar_widgets.left_widgets.is_empty() {
+        if cfg.taskbar_widgets.show_weather {
+            cfg.taskbar_widgets.left_widgets.push("weather".to_string());
+        }
+        if cfg.taskbar_widgets.show_batteries {
+            cfg.taskbar_widgets
+                .left_widgets
+                .push("batteries".to_string());
+        }
+        if cfg.taskbar_widgets.show_telemetry {
+            cfg.taskbar_widgets
+                .left_widgets
+                .push("telemetry".to_string());
+        }
+        if !cfg.taskbar_widgets.left_widgets.is_empty() {
+            changed = true;
+        }
     }
 
     if normalize_taskbar_widgets(&mut cfg.taskbar_widgets) {
@@ -1937,6 +2493,11 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
                 "audio_mixer".to_string(),
                 "clipboard".to_string(),
             ],
+            header_widgets: default_space_header_widgets(&[
+                "media".to_string(),
+                "audio_mixer".to_string(),
+                "clipboard".to_string(),
+            ]),
             items: personal_items,
         },
         SpaceConfig {
@@ -1948,6 +2509,10 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             show_hero_row: false,
             bottom_section_title: Some("Приложения".to_string()),
             widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
+            header_widgets: default_space_header_widgets(&[
+                "pc_health".to_string(),
+                "top_processes".to_string(),
+            ]),
             items: work_items,
         },
         SpaceConfig {
@@ -1963,6 +2528,11 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
                 "audio_mixer".to_string(),
                 "top_processes".to_string(),
             ],
+            header_widgets: default_space_header_widgets(&[
+                "pc_health".to_string(),
+                "audio_mixer".to_string(),
+                "top_processes".to_string(),
+            ]),
             items: studio_items,
         },
         SpaceConfig {
@@ -1978,6 +2548,11 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
                 "game_combos".to_string(),
                 "pc_health".to_string(),
             ],
+            header_widgets: default_space_header_widgets(&[
+                "audio_mixer".to_string(),
+                "game_combos".to_string(),
+                "pc_health".to_string(),
+            ]),
             items: game_items,
         },
     ]
@@ -2022,9 +2597,19 @@ impl Default for TestBarConfig {
             secondary_taskbar_mode: default_secondary_taskbar_mode(),
             autostart: false,
             glass_depth: default_glass_depth(),
+            theme_preset: default_theme_preset(),
+            accent_mode: default_accent_mode(),
+            accent_hex: default_global_accent_hex(),
+            accent_rgb: default_global_accent_rgb(),
+            surface_gradients: true,
+            hover_glow: true,
             clock_show_seconds: false,
             clock_show_weekday: false,
+            clock_date_format: default_clock_date_format(),
+            clock_layout: default_clock_layout(),
             start_remember_space: false,
+            default_tile_size: default_tile_size(),
+            quick_notes: QuickNotesState::default(),
             hidden_tray_keys: vec![],
             hidden_battery_ids: vec![],
             frecency: HashMap::new(),
@@ -2639,6 +3224,7 @@ pub fn create_space_from_template(
         Some(w) => validate_and_normalize_space_widgets(&w)?,
         None => spec.widgets.iter().map(|s| (*s).to_string()).collect(),
     };
+    let final_header_widgets = default_space_header_widgets(&final_widgets);
     let id = slugify_space_id(&clean_name, cfg);
     let bottom_title = default_bottom_section_title(template.trim(), spec.layout_kind).to_string();
     let space = SpaceConfig {
@@ -2650,6 +3236,7 @@ pub fn create_space_from_template(
         show_hero_row: spec.show_hero_row,
         bottom_section_title: Some(bottom_title),
         widgets: final_widgets,
+        header_widgets: final_header_widgets,
         items: vec![],
     };
     cfg.spaces.push(space.clone());
@@ -2728,6 +3315,12 @@ pub fn update_space_config(
     if let Some(w) = next_widgets {
         if space.widgets != w {
             space.widgets = w;
+            changed = true;
+        }
+        let filtered_header =
+            normalize_space_header_widgets(&space.header_widgets, &space.widgets);
+        if space.header_widgets != filtered_header {
+            space.header_widgets = filtered_header;
             changed = true;
         }
     }
@@ -2809,10 +3402,32 @@ pub fn set_space_widgets_by_id(
     let Some(space) = cfg.spaces.iter_mut().find(|s| s.id == id) else {
         return Err(format!("Пространство '{id}' не найдено"));
     };
-    if space.widgets == normalized {
+    let filtered_header = normalize_space_header_widgets(&space.header_widgets, &normalized);
+    if space.widgets == normalized && space.header_widgets == filtered_header {
         return Ok(false);
     }
     space.widgets = normalized;
+    space.header_widgets = filtered_header;
+    Ok(true)
+}
+
+pub fn set_space_widget_layout_in_config(
+    cfg: &mut TestBarConfig,
+    space_id: &str,
+    widgets: Vec<String>,
+    header_widgets: Vec<SpaceHeaderWidget>,
+) -> Result<bool, String> {
+    let normalized_widgets = validate_and_normalize_space_widgets(&widgets)?;
+    let normalized_header =
+        validate_and_normalize_space_header_widgets(&header_widgets, &normalized_widgets)?;
+    let Some(space) = cfg.spaces.iter_mut().find(|s| s.id == space_id) else {
+        return Err(format!("Пространство '{space_id}' не найдено"));
+    };
+    if space.widgets == normalized_widgets && space.header_widgets == normalized_header {
+        return Ok(false);
+    }
+    space.widgets = normalized_widgets;
+    space.header_widgets = normalized_header;
     Ok(true)
 }
 
@@ -2822,6 +3437,9 @@ pub fn set_taskbar_widgets(
 ) -> Result<bool, String> {
     settings.weather_city = settings.weather_city.trim().to_string();
     settings.weather_units = validate_weather_units(&settings.weather_units)?.to_string();
+    settings.widgets_position =
+        validate_taskbar_widgets_position(&settings.widgets_position)?.to_string();
+    settings.left_widgets = validate_taskbar_widget_list(&settings.left_widgets)?;
 
     match (settings.weather_lat, settings.weather_lon) {
         (Some(lat), Some(lon)) => {
@@ -3268,6 +3886,152 @@ pub fn delete_game_combo(cfg: &mut TestBarConfig, id: &str) -> bool {
     remove_by_id(&mut cfg.game_combos, id)
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct AppearancePatch {
+    pub glass_depth: Option<String>,
+    pub theme_preset: Option<String>,
+    pub accent_mode: Option<String>,
+    pub accent_hex: Option<String>,
+    pub accent_rgb: Option<String>,
+    pub surface_gradients: Option<bool>,
+    pub hover_glow: Option<bool>,
+    pub clock_show_seconds: Option<bool>,
+    pub clock_show_weekday: Option<bool>,
+    pub clock_date_format: Option<String>,
+    pub clock_layout: Option<String>,
+    pub start_remember_space: Option<bool>,
+    pub default_tile_size: Option<String>,
+    pub reset_visuals: bool,
+}
+
+pub fn set_appearance_settings_ext(
+    cfg: &mut TestBarConfig,
+    patch: AppearancePatch,
+) -> Result<bool, String> {
+    let mut changed = false;
+
+    if patch.reset_visuals {
+        if cfg.glass_depth != GLASS_DEPTH_OBSIDIAN {
+            cfg.glass_depth = GLASS_DEPTH_OBSIDIAN.to_string();
+            changed = true;
+        }
+        if cfg.theme_preset != THEME_PRESET_OBSIDIAN {
+            cfg.theme_preset = THEME_PRESET_OBSIDIAN.to_string();
+            changed = true;
+        }
+        if cfg.accent_mode != ACCENT_MODE_PER_SPACE {
+            cfg.accent_mode = ACCENT_MODE_PER_SPACE.to_string();
+            changed = true;
+        }
+        let def_hex = default_global_accent_hex();
+        let def_rgb = default_global_accent_rgb();
+        if cfg.accent_hex != def_hex {
+            cfg.accent_hex = def_hex;
+            changed = true;
+        }
+        if cfg.accent_rgb != def_rgb {
+            cfg.accent_rgb = def_rgb;
+            changed = true;
+        }
+        if !cfg.surface_gradients {
+            cfg.surface_gradients = true;
+            changed = true;
+        }
+        if !cfg.hover_glow {
+            cfg.hover_glow = true;
+            changed = true;
+        }
+    }
+
+    if let Some(depth) = patch.glass_depth {
+        let valid = validate_glass_depth(&depth)?;
+        if cfg.glass_depth != valid {
+            cfg.glass_depth = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(theme) = patch.theme_preset {
+        let valid = validate_theme_preset(&theme)?;
+        if cfg.theme_preset != valid {
+            cfg.theme_preset = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(mode) = patch.accent_mode {
+        let valid = validate_accent_mode(&mode)?;
+        if cfg.accent_mode != valid {
+            cfg.accent_mode = valid.to_string();
+            changed = true;
+        }
+    }
+    if patch.accent_hex.is_some() || patch.accent_rgb.is_some() {
+        let (hex, rgb) = sanitize_accent_hex_rgb(
+            patch.accent_hex.as_deref().or(Some(&cfg.accent_hex)),
+            patch.accent_rgb.as_deref(),
+        );
+        if cfg.accent_hex != hex {
+            cfg.accent_hex = hex;
+            changed = true;
+        }
+        if cfg.accent_rgb != rgb {
+            cfg.accent_rgb = rgb;
+            changed = true;
+        }
+    }
+    if let Some(grad) = patch.surface_gradients {
+        if cfg.surface_gradients != grad {
+            cfg.surface_gradients = grad;
+            changed = true;
+        }
+    }
+    if let Some(glow) = patch.hover_glow {
+        if cfg.hover_glow != glow {
+            cfg.hover_glow = glow;
+            changed = true;
+        }
+    }
+    if let Some(sec) = patch.clock_show_seconds {
+        if cfg.clock_show_seconds != sec {
+            cfg.clock_show_seconds = sec;
+            changed = true;
+        }
+    }
+    if let Some(wd) = patch.clock_show_weekday {
+        if cfg.clock_show_weekday != wd {
+            cfg.clock_show_weekday = wd;
+            changed = true;
+        }
+    }
+    if let Some(fmt) = patch.clock_date_format {
+        let valid = validate_clock_date_format(&fmt)?;
+        if cfg.clock_date_format != valid {
+            cfg.clock_date_format = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(layout) = patch.clock_layout {
+        let valid = validate_clock_layout(&layout)?;
+        if cfg.clock_layout != valid {
+            cfg.clock_layout = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(rem) = patch.start_remember_space {
+        if cfg.start_remember_space != rem {
+            cfg.start_remember_space = rem;
+            changed = true;
+        }
+    }
+    if let Some(size) = patch.default_tile_size {
+        let valid = validate_tile_size(&size)?;
+        if cfg.default_tile_size != valid {
+            cfg.default_tile_size = valid.to_string();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 pub fn set_appearance_settings(
     cfg: &mut TestBarConfig,
     glass_depth: Option<String>,
@@ -3275,33 +4039,65 @@ pub fn set_appearance_settings(
     clock_show_weekday: Option<bool>,
     start_remember_space: Option<bool>,
 ) -> Result<bool, String> {
-    let mut changed = false;
-    if let Some(depth) = glass_depth {
-        let valid = validate_glass_depth(&depth)?;
-        if cfg.glass_depth != valid {
-            cfg.glass_depth = valid.to_string();
-            changed = true;
-        }
+    set_appearance_settings_ext(
+        cfg,
+        AppearancePatch {
+            glass_depth,
+            clock_show_seconds,
+            clock_show_weekday,
+            start_remember_space,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn set_quick_notes_text(cfg: &mut TestBarConfig, raw_text: &str) -> bool {
+    let clamped: String = raw_text.chars().take(MAX_QUICK_NOTES_CHARS).collect();
+    if cfg.quick_notes.text == clamped {
+        return false;
     }
-    if let Some(sec) = clock_show_seconds {
-        if cfg.clock_show_seconds != sec {
-            cfg.clock_show_seconds = sec;
-            changed = true;
-        }
+    cfg.quick_notes.text = clamped;
+    true
+}
+
+pub fn add_quick_todo(
+    cfg: &mut TestBarConfig,
+    id: String,
+    raw_text: &str,
+) -> Result<bool, String> {
+    if cfg.quick_notes.todos.len() >= MAX_QUICK_TODOS {
+        return Err(format!("Максимум {MAX_QUICK_TODOS} задач в списке"));
     }
-    if let Some(wd) = clock_show_weekday {
-        if cfg.clock_show_weekday != wd {
-            cfg.clock_show_weekday = wd;
-            changed = true;
-        }
+    let clean: String = raw_text.trim().chars().take(MAX_QUICK_TODO_CHARS).collect();
+    if clean.is_empty() {
+        return Err("Текст задачи не может быть пустым".to_string());
     }
-    if let Some(rem) = start_remember_space {
-        if cfg.start_remember_space != rem {
-            cfg.start_remember_space = rem;
-            changed = true;
-        }
-    }
-    Ok(changed)
+    cfg.quick_notes.todos.push(QuickTodoItem {
+        id,
+        text: clean,
+        done: false,
+    });
+    Ok(true)
+}
+
+pub fn toggle_quick_todo(cfg: &mut TestBarConfig, id: &str) -> bool {
+    let Some(item) = cfg.quick_notes.todos.iter_mut().find(|t| t.id == id) else {
+        return false;
+    };
+    item.done = !item.done;
+    true
+}
+
+pub fn delete_quick_todo(cfg: &mut TestBarConfig, id: &str) -> bool {
+    let before = cfg.quick_notes.todos.len();
+    cfg.quick_notes.todos.retain(|t| t.id != id);
+    cfg.quick_notes.todos.len() != before
+}
+
+pub fn clear_done_quick_todos(cfg: &mut TestBarConfig) -> bool {
+    let before = cfg.quick_notes.todos.len();
+    cfg.quick_notes.todos.retain(|t| !t.done);
+    cfg.quick_notes.todos.len() != before
 }
 
 pub fn hide_tray_key(cfg: &mut TestBarConfig, key: &str) -> bool {
@@ -5682,6 +6478,7 @@ mod tests {
                 weather_lat: Some(55.7558),
                 weather_lon: Some(37.6173),
                 weather_units: "F".to_string(),
+                ..Default::default()
             }
         )
         .unwrap());
@@ -5962,7 +6759,7 @@ mod tests {
 
         let mut cfg: TestBarConfig = serde_json::from_str(v2_json).expect("parse v2");
         assert!(normalize_and_migrate(&mut cfg));
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.revision, 19);
         assert!(!cfg.taskbar_widgets.show_weather);
         assert!(cfg.taskbar_widgets.show_batteries);
@@ -6331,5 +7128,186 @@ mod tests {
         assert!(normalize_and_migrate(&mut cfg));
         assert_eq!(cfg.hidden_battery_ids, vec!["bt:aabb", "sony:0df2"]);
         assert!(!normalize_and_migrate(&mut cfg));
+    }
+
+    #[test]
+    fn v3_to_v4_migration_preserves_pins_and_populates_header_and_taskbar_widgets() {
+        let mut cfg = TestBarConfig::default();
+        cfg.schema_version = 3;
+        cfg.taskbar_widgets.show_weather = true;
+        cfg.taskbar_widgets.show_telemetry = true;
+        cfg.taskbar_widgets.left_widgets.clear();
+        for sp in &mut cfg.spaces {
+            sp.header_widgets.clear();
+            sp.items.push(pin(
+                &format!("keep-{}", sp.id),
+                "app",
+                "Keep",
+                "Sub",
+                "notepad.exe".to_string(),
+                "",
+                "129,140,248",
+                "app",
+            ));
+        }
+        // Put weather into personal sidebar to verify mutual exclusivity during seeding
+        cfg.spaces[0].widgets.push("weather".to_string());
+
+        assert!(normalize_and_migrate(&mut cfg));
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(cfg.taskbar_widgets.show_weather);
+        assert_eq!(
+            cfg.taskbar_widgets.left_widgets,
+            vec!["weather".to_string(), "telemetry".to_string()]
+        );
+        assert_eq!(cfg.taskbar_widgets.widgets_position, "left");
+        assert!(cfg.spaces.iter().all(|s| s.items.iter().any(|i| i.id.starts_with("keep-"))));
+
+        // Personal had weather in right rail so header got only batteries
+        assert_eq!(
+            cfg.spaces[0]
+                .header_widgets
+                .iter()
+                .map(|w| w.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["batteries"]
+        );
+        // Work got both batteries and weather
+        assert_eq!(
+            cfg.spaces[1]
+                .header_widgets
+                .iter()
+                .map(|w| w.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["batteries", "weather"]
+        );
+        assert!(!normalize_and_migrate(&mut cfg));
+    }
+
+    #[test]
+    fn small_tile_dual_widget_exclusivity_themes_clock_and_notes_work() {
+        let mut cfg = TestBarConfig::default();
+        let space_id = cfg.spaces[0].id.clone();
+
+        // Small tile size accepted
+        assert_eq!(validate_tile_size("small").unwrap(), "small");
+        cfg.spaces[0].items.push(pin(
+            "small-one",
+            "app",
+            "Mini",
+            "",
+            "notepad.exe".to_string(),
+            "",
+            "129,140,248",
+            "app",
+        ));
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space_id,
+            "small-one",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("small".into())),
+            None,
+            None,
+        )
+        .unwrap());
+        assert_eq!(
+            cfg.spaces[0]
+                .items
+                .iter()
+                .find(|p| p.id == "small-one")
+                .and_then(|p| p.tile_size.as_deref()),
+            Some("small")
+        );
+
+        // Dual widget mutual exclusivity: media in side strips media from header
+        assert!(set_space_widget_layout_in_config(
+            &mut cfg,
+            &space_id,
+            vec!["media".into(), "notes".into()],
+            vec![
+                SpaceHeaderWidget {
+                    id: "media".into(),
+                    side: "right".into(),
+                },
+                SpaceHeaderWidget {
+                    id: "timer".into(),
+                    side: "left".into(),
+                },
+                SpaceHeaderWidget {
+                    id: "network".into(),
+                    side: "right".into(),
+                },
+            ],
+        )
+        .unwrap());
+        assert_eq!(cfg.spaces[0].widgets, vec!["media", "notes"]);
+        assert_eq!(
+            cfg.spaces[0].header_widgets,
+            vec![
+                SpaceHeaderWidget {
+                    id: "timer".into(),
+                    side: "left".into(),
+                },
+                SpaceHeaderWidget {
+                    id: "network".into(),
+                    side: "right".into(),
+                },
+            ]
+        );
+
+        // Theme, solid background, no-gradient, no-glow, clock formats, reset_visuals
+        assert!(set_appearance_settings_ext(
+            &mut cfg,
+            AppearancePatch {
+                glass_depth: Some("solid".into()),
+                theme_preset: Some("carbon".into()),
+                accent_mode: Some("custom".into()),
+                accent_hex: Some("#34D399".into()),
+                surface_gradients: Some(false),
+                hover_glow: Some(false),
+                clock_date_format: Some("none".into()),
+                clock_layout: Some("single".into()),
+                default_tile_size: Some("small".into()),
+                ..Default::default()
+            }
+        )
+        .unwrap());
+        assert_eq!(cfg.glass_depth, "solid");
+        assert_eq!(cfg.theme_preset, "carbon");
+        assert_eq!(cfg.accent_mode, "custom");
+        assert!(!cfg.surface_gradients);
+        assert!(!cfg.hover_glow);
+        assert_eq!(cfg.clock_date_format, "none");
+        assert_eq!(cfg.clock_layout, "single");
+        assert_eq!(cfg.default_tile_size, "small");
+
+        assert!(set_appearance_settings_ext(
+            &mut cfg,
+            AppearancePatch {
+                reset_visuals: true,
+                ..Default::default()
+            }
+        )
+        .unwrap());
+        assert_eq!(cfg.glass_depth, "obsidian");
+        assert_eq!(cfg.theme_preset, "obsidian");
+        assert_eq!(cfg.accent_mode, "per_space");
+        assert!(cfg.surface_gradients);
+        assert!(cfg.hover_glow);
+
+        // Quick notes & todos CRUD
+        assert!(set_quick_notes_text(&mut cfg, "Купить кофе"));
+        assert!(add_quick_todo(&mut cfg, "t-1".into(), "Проверить билд").unwrap());
+        assert!(toggle_quick_todo(&mut cfg, "t-1"));
+        assert!(clear_done_quick_todos(&mut cfg));
+        assert!(cfg.quick_notes.todos.is_empty());
     }
 }

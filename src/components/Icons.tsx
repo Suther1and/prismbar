@@ -194,13 +194,11 @@ export const VolIcon: React.FC<{ muted?: boolean; level?: number; className?: st
 /* ===================== NETWORK ICONS ===================== */
 
 export const EthernetIcon: React.FC<{ className?: string }> = ({ className = 'ic14' }) => (
-  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="3" y="4" width="18" height="14" rx="2.5" />
-    <line x1="7.5" y1="4" x2="7.5" y2="8.5" />
-    <line x1="10.5" y1="4" x2="10.5" y2="8.5" />
-    <line x1="13.5" y1="4" x2="13.5" y2="8.5" />
-    <line x1="16.5" y1="4" x2="16.5" y2="8.5" />
-    <path d="M9 18v2.5h6V18" />
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="9" />
+    <ellipse cx="12" cy="12" rx="4" ry="9" />
+    <line x1="3.4" y1="9.2" x2="20.6" y2="9.2" />
+    <line x1="3.4" y1="14.8" x2="20.6" y2="14.8" />
   </svg>
 );
 

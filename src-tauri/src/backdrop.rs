@@ -145,6 +145,7 @@ pub enum GlassDepth {
     Crystal,
     Obsidian,
     Matte,
+    Solid,
 }
 
 impl GlassDepth {
@@ -152,6 +153,7 @@ impl GlassDepth {
         match raw.trim().to_ascii_lowercase().as_str() {
             "crystal" => Self::Crystal,
             "matte" => Self::Matte,
+            "solid" => Self::Solid,
             _ => Self::Obsidian,
         }
     }
@@ -169,6 +171,10 @@ impl GlassDepth {
             Self::Matte => GlassEffectParams {
                 blur_amount: 42.0,
                 saturation: 1.25,
+            },
+            Self::Solid => GlassEffectParams {
+                blur_amount: 0.0,
+                saturation: 1.0,
             },
         }
     }
@@ -715,7 +721,7 @@ impl StaEngine {
     }
 
     fn active_brush(&mut self, depth: GlassDepth) -> CompositionBrush {
-        if !self.transparency_enabled {
+        if !self.transparency_enabled || depth == GlassDepth::Solid {
             if let Ok(b) = self.solid_brush.cast::<CompositionBrush>() {
                 return b;
             }
@@ -1884,14 +1890,18 @@ mod tests {
         assert_eq!(GlassDepth::parse(" CRYSTAL "), GlassDepth::Crystal);
         assert_eq!(GlassDepth::parse("obsidian"), GlassDepth::Obsidian);
         assert_eq!(GlassDepth::parse("matte"), GlassDepth::Matte);
+        assert_eq!(GlassDepth::parse("solid"), GlassDepth::Solid);
+        assert_eq!(GlassDepth::parse(" SOLID "), GlassDepth::Solid);
         assert_eq!(GlassDepth::parse("unknown"), GlassDepth::Obsidian);
         assert_eq!(GlassDepth::parse(""), GlassDepth::Obsidian);
 
         let c = GlassDepth::Crystal.effect_params();
         let o = GlassDepth::Obsidian.effect_params();
         let m = GlassDepth::Matte.effect_params();
+        let s = GlassDepth::Solid.effect_params();
         assert!(c.blur_amount < o.blur_amount && o.blur_amount < m.blur_amount);
         assert!(c.saturation >= o.saturation && o.saturation >= m.saturation);
+        assert_eq!(s.blur_amount, 0.0);
     }
 
     #[test]

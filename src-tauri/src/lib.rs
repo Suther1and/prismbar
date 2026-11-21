@@ -7,6 +7,8 @@ pub mod coordinator;
 pub mod file_explorer;
 pub mod icon_cache;
 pub mod media;
+pub mod network_monitor;
+pub mod quick_toggles;
 pub mod system_widgets;
 pub mod telemetry;
 pub mod weather;
@@ -22,7 +24,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use apps_indexer::{IndexedApp, IndexedFile, SteamGame};
 use audio::{AudioMasterState, AudioPeaksSnapshot, AudioState};
 use backdrop::BackdropInsets;
-use config::{CustomSpace, PinItem, TestBarConfig};
+use config::{CustomSpace, PinItem, SpaceHeaderWidget, TestBarConfig};
 use coordinator::{
     BarMode, CoordinatorActions, FlyoutKind, ModalPickerGuard, PixelRect, WindowCoordinator,
     DOCK_APPBAR_LOGICAL_HEIGHT, EDGE_APPBAR_LOGICAL_HEIGHT, FLYOUT_ROOT_PAD_LOGICAL,
@@ -30,6 +32,8 @@ use coordinator::{
 };
 use icon_cache::IconCache;
 use media::MediaState;
+use network_monitor::NetworkSnapshot;
+use quick_toggles::QuickTogglesState;
 use system_widgets::{ClipboardEntry, NetworkInfo, PeripheralBattery, SessionAlert, TrayAppItem};
 use telemetry::TelemetryState;
 use win_shell::{ShellAppBarEvent, ShellHookEvent, WatchdogArgs};
@@ -328,6 +332,8 @@ fn flyout_backdrop_insets_and_radius(kind: FlyoutKind, sf: f64) -> (BackdropInse
         FlyoutKind::Tray
         | FlyoutKind::Sound
         | FlyoutKind::Battery
+        | FlyoutKind::Network
+        | FlyoutKind::Telemetry
         | FlyoutKind::ContextApp
         | FlyoutKind::ContextBar => 16.0,
     };
@@ -3917,6 +3923,35 @@ fn set_space_widgets(
 }
 
 #[tauri::command]
+fn set_space_widget_layout(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    widgets: Vec<String>,
+    header_widgets: Vec<SpaceHeaderWidget>,
+) -> Result<TestBarConfig, String> {
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::set_space_widget_layout_in_config(
+            cfg,
+            &id,
+            widgets.clone(),
+            header_widgets.clone(),
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn set_taskbar_widgets(
     app: AppHandle,
@@ -3924,6 +3959,8 @@ fn set_taskbar_widgets(
     show_weather: Option<bool>,
     show_batteries: Option<bool>,
     show_telemetry: Option<bool>,
+    left_widgets: Option<Vec<String>>,
+    widgets_position: Option<String>,
     weather_city: Option<String>,
     weather_lat: PatchArg<f64>,
     weather_lon: PatchArg<f64>,
@@ -3934,14 +3971,45 @@ fn set_taskbar_widgets(
     let mut inner_err: Option<String> = None;
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         let mut next = cfg.taskbar_widgets.clone();
-        if let Some(v) = show_weather {
-            next.show_weather = v;
+        if let Some(ref lw) = left_widgets {
+            match config::validate_taskbar_widget_list(lw) {
+                Ok(clean) => {
+                    next.left_widgets = clean;
+                    config::sync_legacy_taskbar_booleans_from_left_widgets(&mut next);
+                }
+                Err(err) => {
+                    inner_err = Some(err);
+                    return false;
+                }
+            }
+        } else {
+            if let Some(v) = show_weather {
+                next.show_weather = v;
+                config::apply_taskbar_widget_boolean_to_left_widgets(
+                    &mut next.left_widgets,
+                    "weather",
+                    v,
+                );
+            }
+            if let Some(v) = show_batteries {
+                next.show_batteries = v;
+                config::apply_taskbar_widget_boolean_to_left_widgets(
+                    &mut next.left_widgets,
+                    "batteries",
+                    v,
+                );
+            }
+            if let Some(v) = show_telemetry {
+                next.show_telemetry = v;
+                config::apply_taskbar_widget_boolean_to_left_widgets(
+                    &mut next.left_widgets,
+                    "telemetry",
+                    v,
+                );
+            }
         }
-        if let Some(v) = show_batteries {
-            next.show_batteries = v;
-        }
-        if let Some(v) = show_telemetry {
-            next.show_telemetry = v;
+        if let Some(ref pos) = widgets_position {
+            next.widgets_position = pos.clone();
         }
         if let Some(ref city) = weather_city {
             next.weather_city = city.clone();
@@ -4049,23 +4117,45 @@ fn delete_game_combo(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn set_appearance_settings(
     app: AppHandle,
     state: State<AppState>,
     glass_depth: Option<String>,
+    theme_preset: Option<String>,
+    accent_mode: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    surface_gradients: Option<bool>,
+    hover_glow: Option<bool>,
     clock_show_seconds: Option<bool>,
     clock_show_weekday: Option<bool>,
+    clock_date_format: Option<String>,
+    clock_layout: Option<String>,
     start_remember_space: Option<bool>,
+    default_tile_size: Option<String>,
+    reset_visuals: Option<bool>,
 ) -> Result<TestBarConfig, String> {
     let mut inner_err: Option<String> = None;
+    let glass_changed_hint = glass_depth.is_some() || reset_visuals.unwrap_or(false);
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
-        match config::set_appearance_settings(
-            cfg,
-            glass_depth.clone(),
+        let patch = config::AppearancePatch {
+            glass_depth: glass_depth.clone(),
+            theme_preset: theme_preset.clone(),
+            accent_mode: accent_mode.clone(),
+            accent_hex: accent_hex.clone(),
+            accent_rgb: accent_rgb.clone(),
+            surface_gradients,
+            hover_glow,
             clock_show_seconds,
             clock_show_weekday,
+            clock_date_format: clock_date_format.clone(),
+            clock_layout: clock_layout.clone(),
             start_remember_space,
-        ) {
+            default_tile_size: default_tile_size.clone(),
+            reset_visuals: reset_visuals.unwrap_or(false),
+        };
+        match config::set_appearance_settings_ext(cfg, patch) {
             Ok(changed) => changed,
             Err(err) => {
                 inner_err = Some(err);
@@ -4076,9 +4166,73 @@ fn set_appearance_settings(
     if let Some(err) = inner_err {
         return Err(err);
     }
-    if glass_depth.is_some() {
+    if glass_changed_hint {
         backdrop::set_glass_depth(&updated.glass_depth);
     }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn save_quick_notes_text(
+    app: AppHandle,
+    state: State<AppState>,
+    text: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::set_quick_notes_text(cfg, &text)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn add_quick_todo(
+    app: AppHandle,
+    state: State<AppState>,
+    text: String,
+) -> Result<TestBarConfig, String> {
+    let id = format!("todo-{}", now_ms());
+    let mut inner_err: Option<String> = None;
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        match config::add_quick_todo(cfg, id.clone(), &text) {
+            Ok(changed) => changed,
+            Err(err) => {
+                inner_err = Some(err);
+                false
+            }
+        }
+    })?;
+    if let Some(err) = inner_err {
+        return Err(err);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn toggle_quick_todo(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, |cfg| config::toggle_quick_todo(cfg, &id))?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn delete_quick_todo(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, |cfg| config::delete_quick_todo(cfg, &id))?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn clear_done_quick_todos(app: AppHandle, state: State<AppState>) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, config::clear_done_quick_todos)?;
     Ok(updated)
 }
 
@@ -4883,8 +5037,8 @@ async fn open_native_windows_tray(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn empty_recycle_bin() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(system_widgets::empty_recycle_bin)
+async fn empty_recycle_bin() -> Result<QuickTogglesState, String> {
+    tauri::async_runtime::spawn_blocking(quick_toggles::empty_recycle_bin_and_refresh)
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
@@ -4895,7 +5049,42 @@ async fn open_screen_snip(app: AppHandle) -> Result<(), String> {
     let _ = app.run_on_main_thread(move || {
         close_start_and_flyout(&h, true, true);
     });
+    std::thread::sleep(std::time::Duration::from_millis(120));
     tauri::async_runtime::spawn_blocking(system_widgets::open_screen_snip)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn trigger_screenshot(app: AppHandle) -> Result<(), String> {
+    open_screen_snip(app).await
+}
+
+#[tauri::command]
+async fn get_network_snapshot(probe_ping: Option<bool>) -> Result<NetworkSnapshot, String> {
+    let do_probe = probe_ping.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || network_monitor::get_network_snapshot(do_probe))
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn get_quick_toggles_state() -> Result<QuickTogglesState, String> {
+    tauri::async_runtime::spawn_blocking(quick_toggles::get_quick_toggles_state)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+async fn set_keep_awake(enable: bool) -> Result<QuickTogglesState, String> {
+    tauri::async_runtime::spawn_blocking(move || quick_toggles::set_keep_awake(enable))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn set_power_plan(plan: String) -> Result<QuickTogglesState, String> {
+    tauri::async_runtime::spawn_blocking(move || quick_toggles::set_power_plan(&plan))
         .await
         .map_err(|e| format!("task join error: {e}"))?
 }
@@ -5096,7 +5285,13 @@ pub fn run(hide_native: bool) {
             delete_space,
             reorder_spaces,
             set_space_widgets,
+            set_space_widget_layout,
             set_taskbar_widgets,
+            save_quick_notes_text,
+            add_quick_todo,
+            toggle_quick_todo,
+            delete_quick_todo,
+            clear_done_quick_todos,
             add_game_combo,
             update_game_combo,
             delete_game_combo,
@@ -5155,6 +5350,11 @@ pub fn run(hide_native: bool) {
             open_native_windows_tray,
             empty_recycle_bin,
             open_screen_snip,
+            trigger_screenshot,
+            get_network_snapshot,
+            get_quick_toggles_state,
+            set_keep_awake,
+            set_power_plan,
             get_session_alerts,
             clear_session_alerts,
             open_windows_notifications,
@@ -5595,6 +5795,7 @@ pub fn run(hide_native: bool) {
 
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            quick_toggles::shutdown();
             backdrop::shutdown();
             win_shell::stop_shell_hook_thread();
             if hide_native {

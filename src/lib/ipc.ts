@@ -2,8 +2,27 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
-export type TileSize = 'hero' | 'compact';
+export type TileSize = 'small' | 'hero' | 'compact';
 export type TileSection = 'main' | 'bottom';
+export type HeaderWidgetSide = 'auto' | 'left' | 'right';
+export type TaskbarWidgetId =
+  | 'weather'
+  | 'telemetry'
+  | 'batteries'
+  | 'network'
+  | 'media'
+  | 'timer';
+export type TaskbarWidgetsPosition = 'left' | 'right';
+export type ThemePreset =
+  | 'obsidian'
+  | 'carbon'
+  | 'midnight'
+  | 'emerald'
+  | 'amethyst'
+  | 'graphite';
+export type AccentMode = 'per_space' | 'custom';
+export type ClockDateFormat = 'short' | 'numeric' | 'none';
+export type ClockLayout = 'center' | 'right' | 'single';
 
 export interface PinItem {
   id: string;
@@ -41,7 +60,48 @@ export type SpaceWidgetId =
   | 'top_processes'
   | 'game_combos'
   | 'weather'
-  | 'batteries';
+  | 'batteries'
+  | 'notes'
+  | 'timer'
+  | 'network'
+  | 'quick_toggles';
+
+export interface SpaceHeaderWidget {
+  id: SpaceWidgetId;
+  side: HeaderWidgetSide;
+}
+
+export interface QuickTodoItem {
+  id: string;
+  text: string;
+  done: boolean;
+}
+
+export interface QuickNotesState {
+  text: string;
+  todos: QuickTodoItem[];
+}
+
+export interface NetworkSnapshot {
+  online: boolean;
+  kind: 'ethernet' | 'wifi' | 'offline' | string;
+  adapterName: string;
+  localIp: string;
+  rxBytesPerSec: number;
+  txBytesPerSec: number;
+  pingMs: number | null;
+  pingHost: string;
+}
+
+export type PowerPlanKind = 'balanced' | 'high_performance' | 'power_saver' | 'custom';
+
+export interface QuickTogglesState {
+  keepAwake: boolean;
+  powerPlan: PowerPlanKind | string;
+  powerPlanLabel: string;
+  recycleBinItems: number;
+  recycleBinBytes: number;
+}
 
 export type SpaceLayoutKind = 'grid' | 'games';
 
@@ -54,6 +114,7 @@ export interface SpaceConfig {
   showHeroRow: boolean;
   bottomSectionTitle?: string | null;
   widgets: SpaceWidgetId[];
+  headerWidgets?: SpaceHeaderWidget[];
   items: PinItem[];
 }
 
@@ -61,6 +122,8 @@ export interface TaskbarWidgetSettings {
   showWeather: boolean;
   showBatteries: boolean;
   showTelemetry: boolean;
+  leftWidgets?: TaskbarWidgetId[];
+  widgetsPosition?: TaskbarWidgetsPosition;
   weatherCity: string;
   weatherLat?: number | null;
   weatherLon?: number | null;
@@ -77,7 +140,7 @@ export interface CustomSpace {
 }
 
 export type SecondaryTaskbarMode = 'testbar' | 'native' | 'hidden';
-export type GlassDepth = 'crystal' | 'obsidian' | 'matte';
+export type GlassDepth = 'crystal' | 'obsidian' | 'matte' | 'solid';
 export type BackdropMode = 'dcomp' | 'swca' | 'none';
 export type SnapZone = 'left' | 'right' | 'maximize' | 'restore' | 'center';
 
@@ -93,9 +156,19 @@ export interface TestBarConfig {
   secondaryTaskbarMode: SecondaryTaskbarMode;
   autostart: boolean;
   glassDepth?: GlassDepth;
+  themePreset?: ThemePreset;
+  accentMode?: AccentMode;
+  accentHex?: string;
+  accentRgb?: string;
+  surfaceGradients?: boolean;
+  hoverGlow?: boolean;
   clockShowSeconds?: boolean;
   clockShowWeekday?: boolean;
+  clockDateFormat?: ClockDateFormat;
+  clockLayout?: ClockLayout;
   startRememberSpace?: boolean;
+  defaultTileSize?: TileSize;
+  quickNotes?: QuickNotesState;
   hiddenTrayKeys?: string[];
   hiddenBatteryIds?: string[];
   frecency?: Record<string, FrecencyEntry>;
@@ -448,6 +521,8 @@ export type FlyoutKind =
   | 'calendar'
   | 'weather'
   | 'battery'
+  | 'network'
+  | 'telemetry'
   | 'context_app'
   | 'context_bar'
   | 'osd'
@@ -1231,10 +1306,20 @@ export function setSpaceWidgets(id: string, widgets: SpaceWidgetId[]): Promise<T
   return ipc<TestBarConfig>('set_space_widgets', { id, widgets });
 }
 
+export function setSpaceWidgetLayout(
+  id: string,
+  widgets: SpaceWidgetId[],
+  headerWidgets: SpaceHeaderWidget[],
+): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('set_space_widget_layout', { id, widgets, headerWidgets });
+}
+
 export function setTaskbarWidgets(params: {
   showWeather?: boolean;
   showBatteries?: boolean;
   showTelemetry?: boolean;
+  leftWidgets?: TaskbarWidgetId[];
+  widgetsPosition?: TaskbarWidgetsPosition;
   weatherCity?: string;
   weatherLat?: number | null;
   weatherLon?: number | null;
@@ -1247,6 +1332,8 @@ export function setTaskbarWidgets(params: {
     weatherCity: params.weatherCity ?? null,
     weatherUnits: params.weatherUnits ?? null,
   };
+  if (params.leftWidgets !== undefined) payload.leftWidgets = params.leftWidgets;
+  if (params.widgetsPosition !== undefined) payload.widgetsPosition = params.widgetsPosition;
   if (params.weatherLat !== undefined) payload.weatherLat = params.weatherLat;
   if (params.weatherLon !== undefined) payload.weatherLon = params.weatherLon;
   return ipc<TestBarConfig>('set_taskbar_widgets', payload);
@@ -1368,16 +1455,77 @@ export function deleteGameCombo(id: string): Promise<TestBarConfig> {
 
 export function setAppearanceSettings(params: {
   glassDepth?: GlassDepth;
+  themePreset?: ThemePreset;
+  accentMode?: AccentMode;
+  accentHex?: string;
+  accentRgb?: string;
+  surfaceGradients?: boolean;
+  hoverGlow?: boolean;
   clockShowSeconds?: boolean;
   clockShowWeekday?: boolean;
+  clockDateFormat?: ClockDateFormat;
+  clockLayout?: ClockLayout;
   startRememberSpace?: boolean;
+  defaultTileSize?: TileSize;
+  resetVisuals?: boolean;
 }): Promise<TestBarConfig> {
-  return ipc<TestBarConfig>('set_appearance_settings', {
+  const payload: Record<string, unknown> = {
     glassDepth: params.glassDepth ?? null,
     clockShowSeconds: params.clockShowSeconds ?? null,
     clockShowWeekday: params.clockShowWeekday ?? null,
     startRememberSpace: params.startRememberSpace ?? null,
-  });
+  };
+  if (params.themePreset !== undefined) payload.themePreset = params.themePreset;
+  if (params.accentMode !== undefined) payload.accentMode = params.accentMode;
+  if (params.accentHex !== undefined) payload.accentHex = params.accentHex;
+  if (params.accentRgb !== undefined) payload.accentRgb = params.accentRgb;
+  if (params.surfaceGradients !== undefined) payload.surfaceGradients = params.surfaceGradients;
+  if (params.hoverGlow !== undefined) payload.hoverGlow = params.hoverGlow;
+  if (params.clockDateFormat !== undefined) payload.clockDateFormat = params.clockDateFormat;
+  if (params.clockLayout !== undefined) payload.clockLayout = params.clockLayout;
+  if (params.defaultTileSize !== undefined) payload.defaultTileSize = params.defaultTileSize;
+  if (params.resetVisuals !== undefined) payload.resetVisuals = params.resetVisuals;
+  return ipc<TestBarConfig>('set_appearance_settings', payload);
+}
+
+export function saveQuickNotesText(text: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('save_quick_notes_text', { text });
+}
+
+export function addQuickTodo(text: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('add_quick_todo', { text });
+}
+
+export function toggleQuickTodo(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('toggle_quick_todo', { id });
+}
+
+export function deleteQuickTodo(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('delete_quick_todo', { id });
+}
+
+export function clearDoneQuickTodos(): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('clear_done_quick_todos');
+}
+
+export function getNetworkSnapshot(probePing = false): Promise<NetworkSnapshot> {
+  return ipc<NetworkSnapshot>('get_network_snapshot', { probePing });
+}
+
+export function getQuickTogglesState(): Promise<QuickTogglesState> {
+  return ipc<QuickTogglesState>('get_quick_toggles_state');
+}
+
+export function setKeepAwake(enable: boolean): Promise<QuickTogglesState> {
+  return ipc<QuickTogglesState>('set_keep_awake', { enable });
+}
+
+export function setPowerPlan(plan: 'balanced' | 'high_performance' | 'power_saver' | string): Promise<QuickTogglesState> {
+  return ipc<QuickTogglesState>('set_power_plan', { plan });
+}
+
+export function triggerScreenshot(): Promise<void> {
+  return ipc<void>('trigger_screenshot');
 }
 
 export function hideTrayApp(key: string): Promise<TestBarConfig> {

@@ -37,6 +37,8 @@ pub enum FlyoutKind {
     Calendar,
     Weather,
     Battery,
+    Network,
+    Telemetry,
     #[serde(alias = "ctx_app")]
     ContextApp,
     #[serde(alias = "ctx_taskbar")]
@@ -61,6 +63,8 @@ impl FlyoutKind {
                 | FlyoutKind::Calendar
                 | FlyoutKind::Weather
                 | FlyoutKind::Battery
+                | FlyoutKind::Network
+                | FlyoutKind::Telemetry
         )
     }
 }
@@ -1021,6 +1025,8 @@ mod tests {
             ("\"calendar\"", FlyoutKind::Calendar),
             ("\"weather\"", FlyoutKind::Weather),
             ("\"battery\"", FlyoutKind::Battery),
+            ("\"network\"", FlyoutKind::Network),
+            ("\"telemetry\"", FlyoutKind::Telemetry),
             ("\"context_app\"", FlyoutKind::ContextApp),
             ("\"context_bar\"", FlyoutKind::ContextBar),
             ("\"osd\"", FlyoutKind::Osd),
@@ -1042,6 +1048,8 @@ mod tests {
             FlyoutKind::Calendar,
             FlyoutKind::Weather,
             FlyoutKind::Battery,
+            FlyoutKind::Network,
+            FlyoutKind::Telemetry,
             FlyoutKind::ContextApp,
             FlyoutKind::ContextBar,
         ];
@@ -1093,7 +1101,12 @@ mod tests {
 
     #[test]
     fn weather_and_battery_flyouts_are_interactive_and_toggle_on_reclick() {
-        for kind in [FlyoutKind::Weather, FlyoutKind::Battery] {
+        for kind in [
+            FlyoutKind::Weather,
+            FlyoutKind::Battery,
+            FlyoutKind::Network,
+            FlyoutKind::Telemetry,
+        ] {
             assert!(!kind.is_non_activating());
             assert!(kind.is_interactive_click());
             assert!(kind.toggles_on_reclick());
