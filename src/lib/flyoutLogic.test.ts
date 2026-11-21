@@ -1,6 +1,10 @@
+/// <reference types="vite/client" />
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import flyoutViewSrc from '../components/FlyoutView.tsx?raw';
+import startSettingsSrc from '../components/start/StartSettingsOverlay.tsx?raw';
+import taskbarViewSrc from '../components/TaskbarView.tsx?raw';
 import {
   BellIcon,
   ChargingBoltIcon,
@@ -237,8 +241,8 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
     expect(tbHtml).toContain('tb-sheen');
     expect(tbHtml).toContain('tb-hover-pill');
     expect(tbHtml).toContain('tb-sep');
-    expect(tbHtml).toContain('tb-weather-pill');
-    expect(tbHtml).toContain('tb-widget-sep');
+    expect(tbHtml).not.toContain('tb-weather-pill');
+    expect(tbHtml).not.toContain('tb-widget-sep');
     expect(tbHtml).not.toContain('tb-tray-sep');
     expect(tbHtml).not.toContain('tb-multi');
 
@@ -592,5 +596,29 @@ describe('Weather & Battery flyout logic, formatters, temperature range bars & i
     );
     expect(settingsHtml).toContain('Настройки');
     expect(settingsHtml).toContain('Панель и мониторы');
+  });
+
+  it('enforces Wave 5B bar/flyout/settings contracts (weather default OFF, runAsAdmin, hidden batteries, native ctx suppression)', () => {
+    // 1. TaskbarView: weather default OFF, hiddenBatteryIds filter, runAsAdmin, native ctx menu suppression
+    expect(taskbarViewSrc).toContain('showWeather === true');
+    expect(taskbarViewSrc).toContain('hiddenBatteryIds');
+    expect(taskbarViewSrc).toContain('asAdmin: Boolean(matchedPin?.runAsAdmin)');
+    expect(taskbarViewSrc).toContain('onContextMenu={handleRootContextMenu}');
+
+    // 2. FlyoutView: native ctx menu suppression, friendly battery sources, hideBatteryDevice + hiddenBatteryIds filter
+    expect(flyoutViewSrc).toContain('onContextMenu={handleRootContextMenu}');
+    expect(flyoutViewSrc).toContain("'PlayStation HID'");
+    expect(flyoutViewSrc).toContain("'Logitech HID++'");
+    expect(flyoutViewSrc).toContain("'Xbox / XInput'");
+    expect(flyoutViewSrc).toContain('hideBatteryDevice');
+    expect(flyoutViewSrc).toContain('hiddenBatteryIds');
+    expect(flyoutViewSrc).toContain('Все устройства скрыты');
+
+    // 3. StartSettingsOverlay: showWeather default OFF, hidden battery devices restore UI
+    expect(startSettingsSrc).not.toContain('tw?.showWeather !== false');
+    expect(startSettingsSrc).toContain('Boolean(tw?.showWeather)');
+    expect(startSettingsSrc).toContain('Скрытые устройства батарей');
+    expect(startSettingsSrc).toContain('restoreBatteryDevice');
+    expect(startSettingsSrc).toContain('restoreAllBatteryDevices');
   });
 });
