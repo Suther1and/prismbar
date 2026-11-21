@@ -534,8 +534,16 @@ export function formatMemoryRatio(usedGb: number, totalGb: number): string {
 }
 
 export function formatDiskSummary(disk: Pick<DiskHeadroomInfo, 'usedPct' | 'freeGb'>): string {
-  const pct = Math.max(0, Math.min(100, Math.round(Number.isFinite(disk.usedPct) ? disk.usedPct : 0)));
-  return `${pct}% · ${formatGbValue(disk.freeGb)} ГБ свободно`;
+  const safeFree = Number.isFinite(disk.freeGb) ? Math.max(0, disk.freeGb) : 0;
+  return `${safeFree.toFixed(0)} ГБ своб.`;
+}
+
+/**
+ * Converts a 0..100 UI volume slider percentage into a strictly normalized 0.0..=1.0 WASAPI scalar.
+ */
+export function normalizeSessionVolumeScalar(volumePct: number): number {
+  if (!Number.isFinite(volumePct)) return 0;
+  return clampNum(volumePct, 0, 100) / 100;
 }
 
 export const TELEMETRY_HISTORY_CAP = 30;

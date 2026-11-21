@@ -48,6 +48,7 @@ export const PREVIEW_HOVER_COLD_MS = 180;
 export const PREVIEW_HOVER_WARM_MS = 25;
 export const PREVIEW_WARM_WINDOW_MS = 300;
 export const PREVIEW_MAX_VISIBLE_CARDS = 4;
+export const PREVIEW_CARD_HEIGHT = 172;
 export const TASKBAR_LAUNCH_HOP_MS = 880;
 
 export const VOLUME_OSD_WIDTH = 184;
@@ -332,7 +333,7 @@ export function buildPreviewFlyoutRequest(
     anchorXLogical,
     anchorInTaskbar: true,
     width: computePreviewCardWidth(winCount),
-    height: 166,
+    height: PREVIEW_CARD_HEIGHT,
     noActivate: true,
     monitor,
     payload,

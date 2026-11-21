@@ -35,6 +35,7 @@ import {
   hexColorToRgbString,
   INITIAL_START_ANIM_STATE,
   isAppPinnedInSpace,
+  normalizeSessionVolumeScalar,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
   promoteStartEntering,
@@ -450,6 +451,25 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
 
     expect(startSpacesSrc).not.toContain('Замьючен');
     expect(startSpacesSrc).not.toContain('vu-bars');
+    expect(startSpacesSrc).not.toMatch(/setSessionState\(\{[\s\S]{0,160}volume:\s*nextVol\b/);
+    expect(startSpacesSrc).toContain('volume: normalizeSessionVolumeScalar(nextVol)');
+    expect(startSpacesSrc).not.toContain('[startVisible, space, displayedGames, loadedCovers]');
+    expect(startSpacesSrc).toContain('hasSession && durationSec > 0');
+    expect(startSpacesSrc).toContain('has-open-pop');
+    expect(startSpacesSrc).not.toContain('+ Закрепить');
+    expect(startSpacesSrc).not.toContain('+ Добавить');
+    expect(startSpacesSrc).not.toContain('+ Папка / Файл / URL');
+    expect(startSpacesSrc).not.toContain("style={{ position: 'absolute', inset: 0, zIndex: 20 }}");
+  });
+
+  it('normalizes per-app session volume percentages strictly to 0.0..=1.0 WASAPI scalars', () => {
+    expect(normalizeSessionVolumeScalar(0)).toBe(0);
+    expect(normalizeSessionVolumeScalar(1)).toBeCloseTo(0.01, 5);
+    expect(normalizeSessionVolumeScalar(50)).toBeCloseTo(0.5, 5);
+    expect(normalizeSessionVolumeScalar(100)).toBe(1);
+    expect(normalizeSessionVolumeScalar(-15)).toBe(0);
+    expect(normalizeSessionVolumeScalar(140)).toBe(1);
+    expect(normalizeSessionVolumeScalar(Number.NaN)).toBe(0);
   });
 
   it('formats single-line telemetry ratios, sparkline ring buffer, SVG paths, disk strip & 2-click safe process kill', () => {
@@ -457,7 +477,8 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     expect(formatMemoryRatio(6.0, 24.0)).toBe('6 / 24 ГБ');
     expect(formatMemoryRatio(18.4, 64)).not.toContain('\n');
 
-    expect(formatDiskSummary({ usedPct: 68, freeGb: 142.4 })).toBe('68% · 142.4 ГБ свободно');
+    expect(formatDiskSummary({ usedPct: 68, freeGb: 142.4 })).toBe('142 ГБ своб.');
+    expect(formatDiskSummary({ usedPct: 95, freeGb: -1 })).toBe('0 ГБ своб.');
     expect(getTelemetryLevelClass(42)).toBe('');
     expect(getTelemetryLevelClass(75)).toBe('lvl-warn');
     expect(getTelemetryLevelClass(92)).toBe('lvl-hot');

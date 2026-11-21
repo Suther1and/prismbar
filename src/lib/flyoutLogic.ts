@@ -32,7 +32,7 @@ export const TRAY_CELL_SIZE = 34;
 export const TRAY_GRID_GAP = 4;
 export const TRAY_HEADER_HEIGHT = 24;
 export const TRAY_GRID_MAX_HEIGHT = 224;
-export const TRAY_MIN_CARD_HEIGHT = 176;
+export const TRAY_MIN_CARD_HEIGHT = 204;
 
 export const INITIAL_FLYOUT_ANIM_STATE: FlyoutAnimState = {
   phase: 'closed',

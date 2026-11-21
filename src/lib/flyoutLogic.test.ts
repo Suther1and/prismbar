@@ -281,10 +281,12 @@ describe('Tray 6-column layout, Hide key, OSD, 4+ Audio Devices & Media interpol
     expect(formatTrayHeaderLabel('   ', 14)).toBe('Фоновые · 14');
     expect(formatTrayHeaderLabel('Telegram', 14)).toBe('Telegram');
 
+    expect(TRAY_MIN_CARD_HEIGHT).toBe(204);
     expect(computeTrayFlyoutHeight(0)).toBe(TRAY_MIN_CARD_HEIGHT);
     expect(computeTrayFlyoutHeight(6)).toBe(TRAY_MIN_CARD_HEIGHT);
     expect(computeTrayFlyoutHeight(18)).toBe(TRAY_MIN_CARD_HEIGHT);
-    expect(computeTrayFlyoutHeight(24)).toBe(194);
+    expect(computeTrayFlyoutHeight(24)).toBe(TRAY_MIN_CARD_HEIGHT);
+    expect(computeTrayFlyoutHeight(30)).toBe(232);
     expect(computeTrayFlyoutHeight(42)).toBe(270);
     expect(computeTrayFlyoutHeight(80)).toBe(270);
 

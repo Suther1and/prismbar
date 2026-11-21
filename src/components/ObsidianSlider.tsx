@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 export interface ObsidianSliderProps {
   value: number;
@@ -7,7 +7,7 @@ export interface ObsidianSliderProps {
   step?: number;
   wheelStep?: number;
   muted?: boolean;
-  /** Optional live audio peak level (0..1) rendered as a subtle GPU underlay bar. */
+  /** Optional live audio peak level (0..1) rendered as a subtle GPU live energy overlay bar. */
   peak?: number;
   /** Soft magnetic detent stops in value units (default `[0, 50, 100]` when range is `0..100`). */
   magneticDetents?: number[];
@@ -57,8 +57,8 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
 }) => {
   const span = Math.max(1e-6, max - min);
   const clampedValue = clamp(value, min, max);
-  const displayValue = muted ? min : clampedValue;
-  const pct = clamp((displayValue - min) / span, 0, 1);
+  // Preserve stored level visually when muted (rendered in dimmed danger tint via CSS)
+  const pct = clamp((clampedValue - min) / span, 0, 1);
   const peakNorm = typeof peak === 'number' && Number.isFinite(peak) ? clamp(peak, 0, 1) : null;
 
   const detents = useMemo<number[]>(() => {
@@ -74,10 +74,55 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
       .map((d) => clamp((d - min) / span, 0, 1));
   }, [showCenterNotch, detents, min, max, span]);
 
+  const rootRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const dragRectRef = useRef<DOMRect | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
   const lastEmittedRef = useRef<number>(clampedValue);
+  const wheelStateRef = useRef({
+    disabled,
+    wheelStep,
+    clampedValue,
+    min,
+    max,
+    step,
+    muted,
+    onChange,
+    onCommit,
+  });
+  wheelStateRef.current = {
+    disabled,
+    wheelStep,
+    clampedValue,
+    min,
+    max,
+    step,
+    muted,
+    onChange,
+    onCommit,
+  };
+
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const onNativeWheel = (e: WheelEvent) => {
+      const s = wheelStateRef.current;
+      if (s.disabled || e.deltaY === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const delta = e.deltaY < 0 ? s.wheelStep : -s.wheelStep;
+      const next = quantizeStep(s.clampedValue + delta, s.min, s.max, s.step);
+      if (next !== s.clampedValue || s.muted) {
+        lastEmittedRef.current = next;
+        s.onChange(next);
+        s.onCommit?.(next);
+      }
+    };
+    el.addEventListener('wheel', onNativeWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onNativeWheel);
+    };
+  }, []);
 
   const [dragging, setDragging] = useState(false);
   const [detentHit, setDetentHit] = useState(false);
@@ -199,23 +244,11 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
     onCommit?.(next);
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (disabled || e.deltaY === 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const delta = e.deltaY < 0 ? wheelStep : -wheelStep;
-    const next = quantizeStep(clampedValue + delta, min, max, step);
-    if (next !== clampedValue || muted) {
-      lastEmittedRef.current = next;
-      onChange(next);
-      onCommit?.(next);
-    }
-  };
-
   const rootCls = className ? `obs-slider ${className}` : 'obs-slider';
 
   return (
     <div
+      ref={rootRef}
       role="slider"
       tabIndex={disabled ? -1 : 0}
       aria-label={ariaLabel}
@@ -239,12 +272,11 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
       onPointerUp={finishDrag}
       onPointerCancel={finishDrag}
       onKeyDown={handleKeyDown}
-      onWheel={handleWheel}
     >
       <div ref={trackRef} className="obs-slider-track-wrap">
         <div className="obs-slider-track">
-          {peakNorm !== null && <div className="obs-slider-peak" aria-hidden="true" />}
           <div className="obs-slider-fill" aria-hidden="true" />
+          {peakNorm !== null && <div className="obs-slider-peak" aria-hidden="true" />}
         </div>
         {interiorNotchPcts.map((notchPct, idx) => (
           <span

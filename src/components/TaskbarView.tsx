@@ -95,6 +95,7 @@ export const TaskbarView: React.FC = () => {
   const lastPreviewCloseMsRef = useRef<number | null>(null);
   const requestedTargetsRef = useRef<Set<string>>(new Set());
   const iconMapRef = useRef<Record<string, string>>({});
+  const mountedRef = useRef<boolean>(true);
 
   iconMapRef.current = iconMap;
 
@@ -127,9 +128,11 @@ export const TaskbarView: React.FC = () => {
     };
   }, [showSeconds]);
 
-  // Global timer & rAF cleanup on unmount
+  // Global lifecycle & timer/rAF cleanup on unmount (StrictMode-safe mountedRef)
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (hoverTimer.current !== null) window.clearTimeout(hoverTimer.current);
       if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
       if (sheenRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
@@ -183,10 +186,9 @@ export const TaskbarView: React.FC = () => {
     };
   }, []);
 
-  // Load real native .exe and shell:AppsFolder\ UWP icons for pinned taskbar apps without stale-closure refetches
+  // Load real native .exe and shell:AppsFolder\ UWP icons for pinned taskbar apps without stranding on config churn
   useEffect(() => {
     if (!config) return;
-    let cancelled = false;
 
     for (const p of config.taskbarPins) {
       const target = p.target?.trim() ?? '';
@@ -204,7 +206,10 @@ export const TaskbarView: React.FC = () => {
       requestedTargetsRef.current.add(target);
       ipc<string | null>('get_icon_for_path', { path: target })
         .then((data) => {
-          if (cancelled) return;
+          if (!mountedRef.current) {
+            requestedTargetsRef.current.delete(target);
+            return;
+          }
           if (data) {
             setIconMap((prev) => (prev[target] === data ? prev : { ...prev, [target]: data }));
           } else {
@@ -215,10 +220,6 @@ export const TaskbarView: React.FC = () => {
           requestedTargetsRef.current.delete(target);
         });
     }
-
-    return () => {
-      cancelled = true;
-    };
   }, [config]);
 
   // Batch-fetch missing cached icon keys from Rust IconCache for running windows & cache-keyed pins
@@ -249,10 +250,9 @@ export const TaskbarView: React.FC = () => {
     }
     if (missing.size === 0) return;
 
-    let cancelled = false;
     fetchIconsBatch(Array.from(missing))
       .then((fetched) => {
-        if (cancelled) return;
+        if (!mountedRef.current) return;
         const keys = Object.keys(fetched);
         if (keys.length === 0) return;
         setIconMap((prev) => {
@@ -267,9 +267,6 @@ export const TaskbarView: React.FC = () => {
         });
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
   }, [groups, config]);
 
   // Merge pinned apps + running window groups cleanly without duplicates

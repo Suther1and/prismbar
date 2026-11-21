@@ -55,6 +55,7 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
   const [filterText, setFilterText] = useState('');
   const [drawerCat, setDrawerCat] = useState('Все');
   const [urlPromptOpen, setUrlPromptOpen] = useState(false);
+  const urlFormPresence = useAnimatedPresence(urlPromptOpen, 100);
   const [urlValue, setUrlValue] = useState('');
   const [urlTitle, setUrlTitle] = useState('');
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -221,73 +222,74 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         </button>
       </div>
 
-      {/* Smooth Grid-Row Collapsible Inline URL Form (Zero Teleport!) */}
-      <div className={`url-inline-collapse ${urlPromptOpen ? 'open' : ''}`} aria-hidden={!urlPromptOpen}>
-        <div className="url-inline-collapse-inner">
-          <div className="url-inline-form">
-            <input
-              ref={urlInputRef}
-              className="url-input url-main"
-              tabIndex={urlPromptOpen ? 0 : -1}
-              placeholder="https://example.com"
-              value={urlValue}
-              onChange={(e) => {
-                setUrlValue(e.target.value);
-                if (urlError) setUrlError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  void handleSubmitUrl();
-                } else if (e.key === 'Escape') {
-                  e.preventDefault();
-                  e.stopPropagation();
+      {/* Animated Inline URL Form (unmounted when closed -> zero flex gap, zero layout transition) */}
+      {urlFormPresence.mounted && (
+        <div
+          className={`url-inline-collapse ${urlPromptOpen ? 'open' : ''}`}
+          data-phase={urlFormPresence.phase}
+        >
+          <div className="url-inline-collapse-inner">
+            <div className="url-inline-form">
+              <input
+                ref={urlInputRef}
+                className="url-input url-main"
+                placeholder="https://example.com"
+                value={urlValue}
+                onChange={(e) => {
+                  setUrlValue(e.target.value);
+                  if (urlError) setUrlError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void handleSubmitUrl();
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setUrlPromptOpen(false);
+                  }
+                }}
+              />
+              <input
+                className="url-input url-title"
+                placeholder="Название (необязательно)"
+                maxLength={32}
+                value={urlTitle}
+                onChange={(e) => setUrlTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void handleSubmitUrl();
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setUrlPromptOpen(false);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="pin-any-btn primary"
+                disabled={submittingUrl}
+                onClick={() => void handleSubmitUrl()}
+              >
+                Добавить
+              </button>
+              <button
+                type="button"
+                className="pin-any-btn"
+                onClick={() => {
                   setUrlPromptOpen(false);
-                }
-              }}
-            />
-            <input
-              className="url-input url-title"
-              tabIndex={urlPromptOpen ? 0 : -1}
-              placeholder="Название (необязательно)"
-              maxLength={32}
-              value={urlTitle}
-              onChange={(e) => setUrlTitle(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  void handleSubmitUrl();
-                } else if (e.key === 'Escape') {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setUrlPromptOpen(false);
-                }
-              }}
-            />
-            <button
-              type="button"
-              className="pin-any-btn primary"
-              tabIndex={urlPromptOpen ? 0 : -1}
-              disabled={submittingUrl}
-              onClick={() => void handleSubmitUrl()}
-            >
-              Добавить
-            </button>
-            <button
-              type="button"
-              className="pin-any-btn"
-              tabIndex={urlPromptOpen ? 0 : -1}
-              onClick={() => {
-                setUrlPromptOpen(false);
-                setUrlError(null);
-              }}
-            >
-              Отмена
-            </button>
-            {urlError && <span className="url-inline-err">{urlError}</span>}
+                  setUrlError(null);
+                }}
+              >
+                Отмена
+              </button>
+              {urlError && <span className="url-inline-err">{urlError}</span>}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Category Filter Pills */}
       <div className="cat-pills">

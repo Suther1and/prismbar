@@ -532,6 +532,15 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
       pids: null,
     });
 
+    await setSessionState({ appKey: 'chrome.exe', volume: 0.01, pid: 4242, pids: [4242, 4243] });
+    expect(invokeMock).toHaveBeenLastCalledWith('set_session_state', {
+      appKey: 'chrome.exe',
+      volume: 0.01,
+      muted: null,
+      pid: 4242,
+      pids: [4242, 4243],
+    });
+
     await seekMedia(42.5);
     expect(invokeMock).toHaveBeenLastCalledWith('seek_media', { positionSec: 42.5 });
 

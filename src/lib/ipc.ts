@@ -715,6 +715,7 @@ export function setInputDevice(deviceId: string): Promise<AudioState> {
 
 export function setSessionState(params: {
   appKey: string;
+  /** Normalized WASAPI volume scalar in `0.0..=1.0` (e.g. `0.01` = 1%, `1.0` = 100%). */
   volume?: number;
   muted?: boolean;
   pid?: number;

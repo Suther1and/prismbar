@@ -789,7 +789,13 @@ impl WindowCoordinator {
                 self.close_start(&mut actions);
                 let _ = self.close_flyout(&mut actions);
                 actions.hide_start_immediate = true;
+                if actions.start_anim_gen.is_none() {
+                    actions.start_anim_gen = Some(self.next_start_gen());
+                }
                 actions.hide_flyout_immediate = true;
+                if actions.flyout_anim_gen.is_none() {
+                    actions.flyout_anim_gen = Some(self.next_flyout_gen());
+                }
             } else {
                 actions.taskbar_visible = Some(true);
             }
@@ -801,6 +807,9 @@ impl WindowCoordinator {
             if secondary && self.start_target_monitor.as_deref() == Some("secondary") {
                 self.close_start(&mut actions);
                 actions.hide_start_immediate = true;
+                if actions.start_anim_gen.is_none() {
+                    actions.start_anim_gen = Some(self.next_start_gen());
+                }
             }
         }
 
@@ -2032,5 +2041,49 @@ mod tests {
         assert_eq!(h_start.start_visible, Some(false));
         assert!(h_start.start_anim_gen.unwrap() > sg1);
         assert!(!coord.is_start_open());
+    }
+
+    #[test]
+    fn set_monitor_fullscreen_advances_anim_gens_even_when_surfaces_already_closed() {
+        let mut coord = WindowCoordinator::new();
+        assert_eq!(coord.start_anim_gen(), 0);
+        assert_eq!(coord.flyout_anim_gen(), 0);
+
+        // Entering primary fullscreen while both Start and Flyout are ALREADY closed must still
+        // advance both anim_gen counters so AppState and WindowCoordinator never desync.
+        let fs_enter = coord.set_monitor_fullscreen(true, false, 1000);
+        assert!(fs_enter.hide_start_immediate);
+        assert!(fs_enter.hide_flyout_immediate);
+        assert_eq!(fs_enter.start_anim_gen, Some(1));
+        assert_eq!(fs_enter.flyout_anim_gen, Some(1));
+        assert_eq!(coord.start_anim_gen(), 1);
+        assert_eq!(coord.flyout_anim_gen(), 1);
+
+        // Subsequent Start open (fullscreen Win override) and Flyout open (after fullscreen exit)
+        // emit strictly greater generations without duplicating or regressing gen IDs.
+        let start_open = coord.request_toggle_start_on_monitor(
+            Some(true),
+            Some("secondary".into()),
+            1200,
+        );
+        assert_eq!(start_open.start_anim_gen, Some(2));
+        assert_eq!(start_open.flyout_anim_gen, Some(2));
+
+        // Close Start cleanly so start_open == false while start_target_monitor stays Some("secondary")
+        let start_close = coord.request_toggle_start(Some(false), 1400);
+        assert_eq!(start_close.start_anim_gen, Some(3));
+        assert!(!coord.is_start_open());
+
+        // Entering secondary fullscreen when Start was already closed on secondary must also bump start_anim_gen
+        let sec_fs_enter = coord.set_monitor_fullscreen(true, true, 1600);
+        assert!(sec_fs_enter.hide_start_immediate);
+        assert_eq!(sec_fs_enter.start_anim_gen, Some(4));
+        assert_eq!(coord.start_anim_gen(), 4);
+
+        // Leave fullscreen and verify Flyout open continues strictly monotonically
+        let _ = coord.set_monitor_fullscreen(false, false, 1800);
+        let fly_open = coord.request_open_flyout(FlyoutKind::Sound, 2000);
+        assert_eq!(fly_open.flyout_anim_gen, Some(3));
+        assert!(fly_open.start_anim_gen.unwrap() > 4);
     }
 }

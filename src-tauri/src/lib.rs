@@ -183,10 +183,7 @@ fn build_pid_to_hwnd_map(groups: &[AppWindowGroup]) -> HashMap<u32, isize> {
 }
 
 fn sample_audio_state_with_icon_sources(state: &AppState) -> AudioState {
-    let mut cache = lock_unpoisoned(&state.icon_cache);
-    let res = audio::get_audio_state_with_icons(&mut cache);
-    drop(cache);
-    match res {
+    match audio::get_audio_state_with_icons_mutex(&state.icon_cache) {
         Ok((aud, sources)) => {
             state.register_icon_sources(sources);
             aud
@@ -200,9 +197,8 @@ fn sample_telemetry_with_icon_sources(state: &AppState) -> TelemetryState {
         let groups = lock_unpoisoned(&state.last_window_groups);
         build_pid_to_hwnd_map(&groups)
     };
-    let mut cache = lock_unpoisoned(&state.icon_cache);
-    let (telem, sources) = telemetry::sample_telemetry_with_icons(&mut cache, &pid_to_hwnd);
-    drop(cache);
+    let (telem, sources) =
+        telemetry::sample_telemetry_with_icons_mutex(&state.icon_cache, &pid_to_hwnd);
     state.register_icon_sources(sources);
     telem
 }
@@ -878,6 +874,7 @@ fn commit_pending_surface_show(
             if let Some(win) = app.get_webview_window("start") {
                 if let Some(hwnd) = win_hwnd(&win) {
                     let mut rect = p.rect;
+                    let mut resized = false;
                     if let Some(mh) = measured_height.filter(|h| h.is_finite() && *h >= 240.0) {
                         let new_h = ((mh.clamp(240.0, 960.0) + 2.0 * win_shell::START_ROOT_PAD_LOGICAL)
                             * p.scale_factor)
@@ -885,9 +882,10 @@ fn commit_pending_surface_show(
                         if (new_h - rect.height()).abs() > 2 {
                             let new_y = (p.bottom_anchor_y - new_h).max(p.monitor_top + 8);
                             rect = PixelRect::new(rect.left, new_y, rect.right, new_y + new_h);
-                            apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+                            resized = true;
                         }
-                    } else if p.was_already_visible {
+                    }
+                    if p.was_already_visible || resized {
                         apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
                     }
                     win_shell::set_window_hit_transparent(hwnd, false);
@@ -1744,6 +1742,9 @@ fn resize_flyout(app: AppHandle, state: State<AppState>, width: Option<i32>, hei
         if let Some(hwnd) = win_hwnd(&fly) {
             let layout = position_flyout_window(&app, &fly, hwnd, &updated_req);
             *lock_unpoisoned(&state.last_flyout_bounds) = Some((kind, layout.rect));
+            if let Some(pending) = lock_unpoisoned(&state.pending_flyout_show).as_mut() {
+                pending.rect = layout.rect;
+            }
         }
     }
 }
@@ -2594,6 +2595,16 @@ async fn set_session_volume(
     .map_err(|e| format!("task join error: {e}"))?
 }
 
+/// Strictly clamps a WASAPI per-app session volume scalar into `0.0..=1.0` (non-finite -> `0.0`).
+/// Removes any `> 1.0` heuristic so `0.01` always maps to 1% and never collides with `1.0` (100%).
+fn normalize_session_volume_scalar(v: f32) -> f32 {
+    if !v.is_finite() {
+        0.0
+    } else {
+        v.clamp(0.0, 1.0)
+    }
+}
+
 #[tauri::command]
 async fn set_session_state(
     app: AppHandle,
@@ -2604,15 +2615,7 @@ async fn set_session_state(
     pids: Option<Vec<u32>>,
 ) -> Result<AudioState, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let normalized_vol = volume.map(|v| {
-            if !v.is_finite() {
-                0.0
-            } else if v > 1.0 {
-                (v.clamp(0.0, 100.0)) / 100.0
-            } else {
-                v.clamp(0.0, 1.0)
-            }
-        });
+        let normalized_vol = volume.map(normalize_session_volume_scalar);
         if pid.unwrap_or(0) != 0 || pids.as_ref().is_some_and(|p| !p.is_empty()) {
             let vol_pct = normalized_vol.map(|s| (s * 100.0).round() as u32);
             audio::set_session_state_for_app_pct(
@@ -2788,13 +2791,24 @@ fn get_clipboard_paused() -> bool {
 #[tauri::command]
 async fn paste_clipboard_entry(app: AppHandle, text: String) -> Result<(), String> {
     let target_hwnd = app.state::<AppState>().last_external_fg.load(Ordering::Acquire);
+    let (hide_tx, hide_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let h = app.clone();
-    let _ = app.run_on_main_thread(move || {
+    let dispatch_res = app.run_on_main_thread(move || {
         dispatch_coordinator(&h, None, |coord| coord.hide_start_immediate());
+        let _ = hide_tx.send(());
     });
+    if dispatch_res.is_err() {
+        // Main thread unavailable; avoid blocking on channel forever
+        drop(hide_rx);
+        return tauri::async_runtime::spawn_blocking(move || {
+            system_widgets::paste_clipboard_text(target_hwnd, &text)
+        })
+        .await
+        .map_err(|e| format!("task join error: {e}"))?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        // Give Start SW_HIDE a brief moment to release foreground before restoring target & injecting Ctrl+V
-        std::thread::sleep(std::time::Duration::from_millis(45));
+        // Wait deterministically for main-thread SW_HIDE of Start before restoring target & pasting
+        let _ = hide_rx.recv_timeout(std::time::Duration::from_millis(250));
         system_widgets::paste_clipboard_text(target_hwnd, &text)
     })
     .await
@@ -2843,14 +2857,12 @@ async fn get_tray_apps(app: AppHandle) -> Result<Vec<TrayAppItem>, String> {
         *lock_unpoisoned(&state.last_window_groups) = open_groups.clone();
 
         let hidden_keys = lock_unpoisoned(&state.config).hidden_tray_keys.clone();
-        let (tray_items, tray_sources) = {
-            let mut cache = lock_unpoisoned(&state.icon_cache);
-            system_widgets::list_tray_background_apps_filtered_with_open(
-                &mut cache,
+        let (tray_items, tray_sources) =
+            system_widgets::list_tray_background_apps_filtered_with_open_mutex(
+                &state.icon_cache,
                 &open_groups,
                 &hidden_keys,
-            )
-        };
+            );
         state.register_icon_sources(tray_sources);
         tray_items
     })
@@ -4640,5 +4652,21 @@ mod integration_tests {
         let sources = state.icon_sources.lock().unwrap();
         assert_eq!(sources.get("exe:abc").map(String::as_str), Some(r"C:\Apps\Code.exe"));
         assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn normalize_session_volume_scalar_clamps_strictly_without_percent_heuristic() {
+        assert!((normalize_session_volume_scalar(0.0) - 0.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(0.01) - 0.01).abs() < 1e-6);
+        assert_eq!((normalize_session_volume_scalar(0.01) * 100.0).round() as u32, 1);
+        assert!((normalize_session_volume_scalar(0.5) - 0.5).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(1.0) - 1.0).abs() < 1e-6);
+        // No `> 1.0` heuristic: out-of-range values strictly clamp to 1.0, never rescale by /100
+        assert!((normalize_session_volume_scalar(2.0) - 1.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(50.0) - 1.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(-0.25) - 0.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(f32::NAN) - 0.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(f32::INFINITY) - 0.0).abs() < 1e-6);
+        assert!((normalize_session_volume_scalar(f32::NEG_INFINITY) - 0.0).abs() < 1e-6);
     }
 }

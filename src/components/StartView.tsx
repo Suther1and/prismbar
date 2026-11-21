@@ -211,9 +211,11 @@ export const StartView: React.FC = () => {
   const cmdInputRef = useRef<HTMLInputElement>(null);
 
   // Refs for lifecycle & Paint-Sync coordination
+  const mountedRef = useRef<boolean>(true);
   const latestGenRef = useRef<number>(0);
   const pendingCommitGenRef = useRef<number | null>(null);
-  const enterRafRef = useRef<number | null>(null);
+  const enterRaf1Ref = useRef<number | null>(null);
+  const enterRaf2Ref = useRef<number | null>(null);
   const closeCleanupTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const lastSpaceSwitchTsRef = useRef<number>(0);
@@ -221,6 +223,29 @@ export const StartView: React.FC = () => {
   const spaceRef = useRef<string>(space);
   const secondaryHydratedRef = useRef<boolean>(false);
   const resolvedTargetsRef = useRef<Set<string>>(new Set());
+
+  const cancelEnterRafs = useCallback(() => {
+    if (typeof cancelAnimationFrame !== 'function') {
+      enterRaf1Ref.current = null;
+      enterRaf2Ref.current = null;
+      return;
+    }
+    if (enterRaf1Ref.current !== null) {
+      cancelAnimationFrame(enterRaf1Ref.current);
+      enterRaf1Ref.current = null;
+    }
+    if (enterRaf2Ref.current !== null) {
+      cancelAnimationFrame(enterRaf2Ref.current);
+      enterRaf2Ref.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   configRef.current = config;
   spaceRef.current = space;
@@ -298,7 +323,7 @@ export const StartView: React.FC = () => {
     ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
   }, []);
 
-  // Paint-Sync commit ACK + rAF promotion from 'entering' -> 'open'
+  // Paint-Sync commit ACK + double-rAF promotion from 'entering' -> 'open'
   useLayoutEffect(() => {
     if (anim.phase !== 'entering') return;
     if (pendingCommitGenRef.current !== anim.gen) return;
@@ -307,22 +332,23 @@ export const StartView: React.FC = () => {
 
     surfaceCommitAck('start', gen).catch(() => {});
 
-    if (enterRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(enterRafRef.current);
-      enterRafRef.current = null;
-    }
+    cancelEnterRafs();
 
     if (typeof requestAnimationFrame === 'function') {
-      enterRafRef.current = requestAnimationFrame(() => {
-        enterRafRef.current = null;
-        if (latestGenRef.current === gen) {
-          setAnim((prev) => promoteStartEntering(prev));
-        }
+      enterRaf1Ref.current = requestAnimationFrame(() => {
+        enterRaf1Ref.current = null;
+        if (latestGenRef.current !== gen) return;
+        enterRaf2Ref.current = requestAnimationFrame(() => {
+          enterRaf2Ref.current = null;
+          if (latestGenRef.current === gen) {
+            setAnim((prev) => promoteStartEntering(prev));
+          }
+        });
       });
     } else if (latestGenRef.current === gen) {
       setAnim((prev) => promoteStartEntering(prev));
     }
-  }, [anim.phase, anim.gen, anim.openSeq]);
+  }, [anim.phase, anim.gen, anim.openSeq, cancelEnterRafs]);
 
   useEffect(() => {
     hydrateCoreData();
@@ -364,15 +390,12 @@ export const StartView: React.FC = () => {
           window.clearTimeout(closeCleanupTimerRef.current);
           closeCleanupTimerRef.current = null;
         }
-        if (enterRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
-          cancelAnimationFrame(enterRafRef.current);
-          enterRafRef.current = null;
-        }
+        cancelEnterRafs();
 
         if (ev.open) {
           hydrateSecondaryData();
           setShiftHeld(false);
-          const remember = configRef.current?.startRememberSpace ?? true;
+          const remember = configRef.current?.startRememberSpace ?? false;
           if (!remember && spaceRef.current !== 'personal') {
             setSpaceDir(0);
             setRapidSwitch(false);
@@ -422,15 +445,13 @@ export const StartView: React.FC = () => {
       if (closeCleanupTimerRef.current !== null) {
         window.clearTimeout(closeCleanupTimerRef.current);
       }
-      if (enterRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(enterRafRef.current);
-      }
+      cancelEnterRafs();
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
       }
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [hydrateCoreData, hydrateSecondaryData, resetTransientOverlays]);
+  }, [hydrateCoreData, hydrateSecondaryData, resetTransientOverlays, cancelEnterRafs]);
 
   // If active custom space was deleted remotely, fall back to 'personal'
   useEffect(() => {
@@ -475,6 +496,7 @@ export const StartView: React.FC = () => {
     if (missing.length === 0) return;
     fetchIconsBatch(missing)
       .then((batch) => {
+        if (!mountedRef.current) return;
         const fetchedKeys = Object.keys(batch);
         if (fetchedKeys.length === 0) return;
         setIconMap((prev) => {
@@ -545,18 +567,23 @@ export const StartView: React.FC = () => {
 
     if (targetsToResolve.length === 0) return;
 
-    let cancelled = false;
     ipc<Record<string, string>>('resolve_pin_icons', { targets: targetsToResolve })
       .then((batch) => {
-        if (!cancelled && batch && Object.keys(batch).length > 0) {
+        if (!mountedRef.current) {
+          for (const t of targetsToResolve) {
+            resolvedTargetsRef.current.delete(t);
+          }
+          return;
+        }
+        if (batch && Object.keys(batch).length > 0) {
           setIconMap((prev) => ({ ...prev, ...batch }));
         }
       })
-      .catch(() => {});
-
-    return () => {
-      cancelled = true;
-    };
+      .catch(() => {
+        for (const t of targetsToResolve) {
+          resolvedTargetsRef.current.delete(t);
+        }
+      });
   }, [config]);
 
   const allSpaceIds = useMemo(
@@ -589,6 +616,9 @@ export const StartView: React.FC = () => {
       setSettingsOpen(false);
       setAddingSpace(false);
       setManagingSpaceId(null);
+      setPeriphOpen(false);
+      setPowerOpen(false);
+      setArmedPower(null);
       setTileCtx(null);
       setTileEdit(null);
     },
@@ -824,8 +854,8 @@ export const StartView: React.FC = () => {
       const vw = typeof window !== 'undefined' ? window.innerWidth : 1188;
       const vh = typeof window !== 'undefined' ? window.innerHeight : 728;
       const rawX = coords ? coords.x : Math.round((vw - 316) / 2);
-      const rawY = coords ? coords.y : Math.round((vh - 300) / 2);
-      const pos = clampPopoverPos(rawX, rawY, 316, 300);
+      const rawY = coords ? coords.y : Math.round((vh - 360) / 2);
+      const pos = clampPopoverPos(rawX, rawY, 316, 360);
 
       setTileCtx(null);
       setEditPinTitle(item.title);
@@ -1090,6 +1120,10 @@ export const StartView: React.FC = () => {
         return;
       }
 
+      const insideDialog =
+        Boolean(activeEl?.closest('[role="dialog"]')) ||
+        Boolean(document.querySelector('.combo-builder-sheet'));
+
       if (
         e.key === 'Tab' &&
         !searchOpen &&
@@ -1097,7 +1131,11 @@ export const StartView: React.FC = () => {
         !settingsOpen &&
         !addingSpace &&
         !managingSpaceId &&
-        !tileEdit
+        !periphOpen &&
+        !powerOpen &&
+        !tileCtx &&
+        !tileEdit &&
+        !insideDialog
       ) {
         e.preventDefault();
         const idx = allSpaceIds.indexOf(space);
@@ -1130,6 +1168,7 @@ export const StartView: React.FC = () => {
         !addingSpace &&
         !managingSpaceId &&
         !tileEdit &&
+        !insideDialog &&
         isPrintableSearchTrigger(e)
       ) {
         e.preventDefault();
@@ -1378,6 +1417,10 @@ export const StartView: React.FC = () => {
       onClick={() => {
         if (tileCtx) setTileCtx(null);
         if (tileEdit) setTileEdit(null);
+        if (powerOpen) {
+          setPowerOpen(false);
+          setArmedPower(null);
+        }
       }}
     >
       {/* NON-REMOUNTING START CHASSIS (NO key={anim.openSeq}!) */}
@@ -1451,6 +1494,10 @@ export const StartView: React.FC = () => {
             setPowerOpen((v) => !v);
             setArmedPower(null);
           }}
+          onClosePower={() => {
+            setPowerOpen(false);
+            setArmedPower(null);
+          }}
           onPowerAction={handlePowerClick}
           onSetAddingSpace={(open) => {
             setAddingSpace(open);
@@ -1479,6 +1526,10 @@ export const StartView: React.FC = () => {
           className="space-stage"
           onClick={() => {
             if (periphOpen) setPeriphOpen(false);
+            if (powerOpen) {
+              setPowerOpen(false);
+              setArmedPower(null);
+            }
             if (tileCtx) setTileCtx(null);
             if (tileEdit) setTileEdit(null);
           }}

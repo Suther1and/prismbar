@@ -17,6 +17,7 @@ import {
   type SpaceAccentOption,
 } from '../../lib/startLogic';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
+import { useReducedMotion } from '../../lib/useReducedMotion';
 import {
   AppsGridIcon,
   EditIcon,
@@ -63,6 +64,7 @@ export interface StartHeaderProps {
   onToggleDrawer: () => void;
   onToggleSettings: () => void;
   onTogglePower: () => void;
+  onClosePower: () => void;
   onPowerAction: (kind: PowerActionKind) => void;
   onSetAddingSpace: (open: boolean) => void;
   onSetManagingSpaceId: (spaceId: string | null) => void;
@@ -110,6 +112,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onToggleDrawer,
   onToggleSettings,
   onTogglePower,
+  onClosePower,
   onPowerAction,
   onSetAddingSpace,
   onSetManagingSpaceId,
@@ -117,12 +120,14 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onUpdateCustomSpace,
   onDeleteCustomSpace,
 }) => {
+  const reducedMotion = useReducedMotion();
   const navRef = useRef<HTMLElement>(null);
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const createInputRef = useRef<HTMLInputElement>(null);
   const manageInputRef = useRef<HTMLInputElement>(null);
   const spacePopRef = useRef<HTMLDivElement>(null);
   const periphPopRef = useRef<HTMLDivElement>(null);
+  const powerCapsuleRef = useRef<HTMLDivElement>(null);
   const deleteArmTimerRef = useRef<number | null>(null);
 
   const [indicator, setIndicator] = useState<SlidingPillRect>({ left: 0, width: 0, visible: false });
@@ -277,6 +282,19 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     return () => window.removeEventListener('mousedown', onOutsideMouseDown);
   }, [periphOpen, onClosePeriph]);
 
+  // Close power capsule on outside click
+  useEffect(() => {
+    if (!powerOpen) return;
+    const onOutsideMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (powerCapsuleRef.current && target && !powerCapsuleRef.current.contains(target)) {
+        onClosePower();
+      }
+    };
+    window.addEventListener('mousedown', onOutsideMouseDown);
+    return () => window.removeEventListener('mousedown', onOutsideMouseDown);
+  }, [powerOpen, onClosePower]);
+
   const handleSubmitSpace = async () => {
     if (creating) return;
     const check = validateCustomSpaceName(
@@ -410,6 +428,23 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
           ref={navRef}
           className="space-nav"
           aria-label="Пространства"
+          aria-hidden={powerOpen}
+          style={
+            powerOpen
+              ? {
+                  opacity: 0,
+                  pointerEvents: 'none',
+                  transform: reducedMotion ? undefined : 'translate3d(-6px, 0, 0) scale(0.985)',
+                  transition: reducedMotion
+                    ? 'opacity 110ms ease'
+                    : 'opacity 140ms var(--ease-out), transform 140ms var(--ease-out)',
+                }
+              : {
+                  transition: reducedMotion
+                    ? 'opacity 110ms ease'
+                    : 'opacity 160ms var(--ease-out), transform 160ms var(--ease-out)',
+                }
+          }
           onMouseLeave={() => setGhost((prev) => ({ ...prev, visible: false }))}
         >
           <span
@@ -523,7 +558,11 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
             <div className="pwr-spacer" />
           </div>
 
-          <div className={`power-capsule ${powerOpen ? 'open' : ''}`}>
+          <div
+            ref={powerCapsuleRef}
+            className={`power-capsule ${powerOpen ? 'open' : ''}`}
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="power-strip">
               <button type="button" className="pwr-item" onClick={() => onPowerAction('lock')}>
                 <LockIcon className="ic12" />

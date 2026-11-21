@@ -719,39 +719,121 @@ pub fn build_ctrl_v_inputs() -> [INPUT; 4] {
     ]
 }
 
-/// Writes `text` safely to the Windows clipboard, restores focus to `target_hwnd` (or last
-/// tracked external foreground window if `target_hwnd == 0`), and injects `Ctrl+V` via `SendInput`.
-pub fn paste_clipboard_text(target_hwnd: isize, text: &str) -> Result<(), String> {
+fn is_valid_external_hwnd(raw: isize, own_pid: u32) -> bool {
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut _);
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid != 0 && pid != own_pid
+    }
+}
+
+/// Polls until an external (non-TestBar) foreground window owns input focus, up to
+/// `max_attempts` checks spaced by `step_delay_ms`.
+pub fn wait_for_external_foreground<FPoll>(
+    max_attempts: usize,
+    step_delay_ms: u64,
+    mut is_external_fg: FPoll,
+) -> bool
+where
+    FPoll: FnMut() -> bool,
+{
+    let attempts = max_attempts.max(1);
+    for attempt in 0..attempts {
+        if is_external_fg() {
+            return true;
+        }
+        if attempt + 1 < attempts && step_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(step_delay_ms));
+        }
+    }
+    false
+}
+
+fn paste_clipboard_text_with_ops<FWrite, FValid, FFocus, FWaitFg, FSend>(
+    target_hwnd: isize,
+    fallback_hwnd: isize,
+    text: &str,
+    mut write_clip: FWrite,
+    mut is_valid_external: FValid,
+    mut focus_hwnd: FFocus,
+    mut wait_external_fg: FWaitFg,
+    mut send_ctrl_v: FSend,
+) -> Result<(), String>
+where
+    FWrite: FnMut(&str) -> Result<(), String>,
+    FValid: FnMut(isize) -> bool,
+    FFocus: FnMut(isize),
+    FWaitFg: FnMut() -> bool,
+    FSend: FnMut() -> Result<(), String>,
+{
     if text.is_empty() {
         return Err("Пустой текст для вставки".to_string());
     }
-    write_clipboard_text(text)?;
+    // Always write to the Windows clipboard first so the entry is safely copied even if focus fails.
+    write_clip(text)?;
 
-    let resolved_hwnd = if target_hwnd != 0
-        && unsafe { IsWindow(HWND(target_hwnd as *mut _)).as_bool() }
-    {
+    let resolved_hwnd = if target_hwnd != 0 && is_valid_external(target_hwnd) {
         target_hwnd
+    } else if fallback_hwnd != 0 && is_valid_external(fallback_hwnd) {
+        fallback_hwnd
     } else {
-        last_fg_store()
-            .lock()
-            .ok()
-            .map(|g| *g)
-            .filter(|&h| h != 0 && unsafe { IsWindow(HWND(h as *mut _)).as_bool() })
-            .unwrap_or(0)
+        0
     };
 
-    if resolved_hwnd != 0 {
-        focus_or_toggle_window(resolved_hwnd, false);
-        std::thread::sleep(Duration::from_millis(45));
+    if resolved_hwnd == 0 {
+        return Err(
+            "Текст скопирован в буфер, но нет внешнего целевого окна для вставки".to_string(),
+        );
     }
 
-    let inputs = build_ctrl_v_inputs();
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent as usize == inputs.len() {
-        Ok(())
-    } else {
-        Err("Не удалось вставить текст (целевое окно заблокировало ввод)".to_string())
+    focus_hwnd(resolved_hwnd);
+    if !wait_external_fg() {
+        return Err(
+            "Текст скопирован в буфер, но не удалось вернуть фокус целевому окну для вставки"
+                .to_string(),
+        );
     }
+
+    send_ctrl_v()
+}
+
+/// Writes `text` safely to the Windows clipboard, restores focus to `target_hwnd` (or last
+/// tracked external foreground window if `target_hwnd == 0`), verifies `GetForegroundWindow()`
+/// actually left TestBar, and injects `Ctrl+V` via `SendInput`. Never injects blind `Ctrl+V`
+/// if no valid external target window exists or focus never leaves TestBar.
+pub fn paste_clipboard_text(target_hwnd: isize, text: &str) -> Result<(), String> {
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let fallback_hwnd = last_fg_store().lock().ok().map(|g| *g).unwrap_or(0);
+    paste_clipboard_text_with_ops(
+        target_hwnd,
+        fallback_hwnd,
+        text,
+        write_clipboard_text,
+        |h| is_valid_external_hwnd(h, own_pid),
+        |h| focus_or_toggle_window(h, false),
+        || {
+            wait_for_external_foreground(16, 10, || {
+                let fg = unsafe { GetForegroundWindow() };
+                is_valid_external_hwnd(fg.0 as isize, own_pid)
+            })
+        },
+        || {
+            let inputs = build_ctrl_v_inputs();
+            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            if sent as usize == inputs.len() {
+                Ok(())
+            } else {
+                Err("Не удалось вставить текст (целевое окно заблокировало ввод)".to_string())
+            }
+        },
+    )
 }
 
 pub fn start_clipboard_listener<F>(initial_pinned: &[String], on_change: F)
@@ -1820,6 +1902,126 @@ pub fn list_tray_background_apps_cached(
     })
 }
 
+fn resolve_tray_icon_into_cache_mutex(
+    exe_path: &str,
+    hwnd_raw: Option<isize>,
+    cache: &Mutex<IconCache>,
+    icon_sources: &mut Vec<(String, String)>,
+    seen_sources: &mut HashSet<String>,
+) -> Option<String> {
+    let trimmed = exe_path.trim();
+    let hwnd = hwnd_raw
+        .filter(|&h| h != 0)
+        .map(|h| HWND(h as *mut _))
+        .unwrap_or_default();
+
+    if !trimmed.is_empty() && !is_application_frame_host(trimmed) {
+        let key = icon_cache::path_icon_key(trimmed);
+        if seen_sources.insert(key.clone()) {
+            icon_sources.push((key.clone(), trimmed.to_string()));
+        }
+        let (hit, neg) = {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.get(&key).is_some() {
+                (true, false)
+            } else {
+                (false, guard.is_negative_cached(&key))
+            }
+        };
+        if hit {
+            return Some(key);
+        }
+        if !neg {
+            // Run SHGetFileInfoW / SendMessageTimeoutW outside the shared IconCache mutex
+            let extracted =
+                extract_exe_icon_data_uri(trimmed).or_else(|| extract_hwnd_icon_data_uri(hwnd));
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(uri) = extracted {
+                guard.put(key.clone(), uri);
+                return Some(key);
+            }
+            guard.mark_negative_miss(key);
+        }
+    }
+
+    if let Some(raw) = hwnd_raw.filter(|&h| h != 0) {
+        let key = icon_cache::hwnd_key(raw, 0);
+        let (hit, neg) = {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.get(&key).is_some() {
+                (true, false)
+            } else {
+                (false, guard.is_negative_cached(&key))
+            }
+        };
+        if hit {
+            return Some(key);
+        }
+        if neg {
+            return None;
+        }
+        let extracted = extract_hwnd_icon_data_uri(HWND(raw as *mut _));
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        match extracted {
+            Some(uri) => {
+                guard.put(key.clone(), uri);
+                return Some(key);
+            }
+            None => {
+                guard.mark_negative_miss(key);
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// Enumerates tray background apps with user ignore-list filtering using narrow `Mutex<IconCache>`
+/// locking: `EnumWindows` enumeration and any `SHGetFileInfoW`/`SendMessageTimeoutW` icon
+/// extraction run completely outside the shared `IconCache` mutex.
+pub fn list_tray_background_apps_filtered_with_open_mutex(
+    cache: &Mutex<IconCache>,
+    open_taskbar_groups: &[AppWindowGroup],
+    hidden_keys: &[String],
+) -> (Vec<TrayAppInfo>, Vec<(String, String)>) {
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let candidates = enumerate_tray_window_candidates(own_pid);
+    let mut icon_sources = Vec::new();
+    let mut seen_sources = HashSet::new();
+
+    let mut extra_open_groups: Vec<AppWindowGroup> = Vec::new();
+    let effective_open: &[AppWindowGroup] = if open_taskbar_groups.is_empty() {
+        let mut seen_open = HashSet::new();
+        for c in &candidates {
+            if c.is_visible && !c.is_tool_window && !c.has_owner && !c.title.trim().is_empty() {
+                let norm = canonical_tray_exe_key(&c.exe_path);
+                if !norm.is_empty() && seen_open.insert(norm.clone()) {
+                    extra_open_groups.push(AppWindowGroup {
+                        key: norm,
+                        name: friendly_exe_name(&c.exe_path),
+                        exe_path: c.exe_path.clone(),
+                        aumid: None,
+                        icon_key: None,
+                        icon_data: None,
+                        is_active: false,
+                        windows: Vec::new(),
+                    });
+                }
+            }
+        }
+        &extra_open_groups
+    } else {
+        open_taskbar_groups
+    };
+
+    let items = build_tray_background_apps(candidates, effective_open, own_pid, |exe, hwnd| {
+        resolve_tray_icon_into_cache_mutex(exe, hwnd, cache, &mut icon_sources, &mut seen_sources)
+    });
+    let filtered = filter_hidden_tray_apps(items, hidden_keys);
+    (filtered, icon_sources)
+}
+
 /// Enumerates tray background apps with user ignore-list filtering and returns BOTH the filtered
 /// `TrayAppInfo` list AND `(icon_key, exe_path)` icon source pairs so callers can register them
 /// in `AppState.icon_sources` (surviving 256-LRU eviction).
@@ -2595,5 +2797,100 @@ mod tests {
 
         // Live Bluetooth battery probe runs with aligned buffer + BTH/BTHLE enumerators without UB
         let _bats = get_peripheral_batteries();
+    }
+
+    #[test]
+    fn paste_clipboard_guards_missing_target_and_verifies_external_foreground() {
+        // 1. resolved_hwnd == 0 MUST copy text as safe fallback and return Err WITHOUT calling SendInput
+        let mut wrote = String::new();
+        let mut focus_called = false;
+        let mut send_called = false;
+        let res_no_target = paste_clipboard_text_with_ops(
+            0,
+            0,
+            "secret snippet",
+            |t| {
+                wrote = t.to_string();
+                Ok(())
+            },
+            |_| false,
+            |_| focus_called = true,
+            || true,
+            || {
+                send_called = true;
+                Ok(())
+            },
+        );
+        assert!(res_no_target.is_err());
+        assert_eq!(wrote, "secret snippet");
+        assert!(!focus_called);
+        assert!(!send_called, "blind Ctrl+V must never be injected when resolved_hwnd == 0");
+
+        // 2. Foreground never leaves TestBar -> abort WITHOUT calling SendInput
+        let mut focused_hwnd = 0isize;
+        let mut send_called_timeout = false;
+        let res_fg_timeout = paste_clipboard_text_with_ops(
+            0,
+            4242,
+            "hello",
+            |_| Ok(()),
+            |h| h == 4242,
+            |h| focused_hwnd = h,
+            || wait_for_external_foreground(3, 0, || false),
+            || {
+                send_called_timeout = true;
+                Ok(())
+            },
+        );
+        assert!(res_fg_timeout.is_err());
+        assert_eq!(focused_hwnd, 4242);
+        assert!(
+            !send_called_timeout,
+            "Ctrl+V must never be injected if foreground stays on TestBar"
+        );
+
+        // 3. Valid target + foreground switches to external process on 3rd poll -> SendInput runs once
+        let mut polls = 0usize;
+        let mut send_count = 0usize;
+        let res_ok = paste_clipboard_text_with_ops(
+            9001,
+            4242,
+            "paste me",
+            |_| Ok(()),
+            |h| h == 9001,
+            |h| focused_hwnd = h,
+            || {
+                wait_for_external_foreground(5, 0, || {
+                    polls += 1;
+                    polls >= 3
+                })
+            },
+            || {
+                send_count += 1;
+                Ok(())
+            },
+        );
+        assert!(res_ok.is_ok());
+        assert_eq!(focused_hwnd, 9001);
+        assert_eq!(polls, 3);
+        assert_eq!(send_count, 1);
+
+        // 4. Empty text rejects immediately without touching clipboard or SendInput
+        let mut write_called = false;
+        let res_empty = paste_clipboard_text_with_ops(
+            9001,
+            0,
+            "",
+            |_| {
+                write_called = true;
+                Ok(())
+            },
+            |_| true,
+            |_| {},
+            || true,
+            || Ok(()),
+        );
+        assert!(res_empty.is_err());
+        assert!(!write_called);
     }
 }

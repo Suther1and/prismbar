@@ -80,6 +80,7 @@ import {
 import {
   buildPinFromAppContext,
   computePreviewCardWidth,
+  PREVIEW_CARD_HEIGHT,
   PREVIEW_MAX_VISIBLE_CARDS,
   type AppContextPayload,
   type BarContextPayload,
@@ -197,6 +198,7 @@ export const FlyoutView: React.FC = () => {
   const cardRef = useRef<HTMLDivElement | null>(null);
   const ctxActionsRef = useRef<ContextActionEntry[]>([]);
   const ctxFocusIdxRef = useRef<number>(-1);
+  const seekSeqRef = useRef<number>(0);
 
   if (trayCtxItem) {
     lastTrayCtxRef.current = trayCtxItem;
@@ -222,6 +224,11 @@ export const FlyoutView: React.FC = () => {
       cancelAnimationFrame(enterRaf2Ref.current);
       enterRaf2Ref.current = null;
     }
+  }, []);
+
+  const clearPreviewCloseTimers = useCallback(() => {
+    previewCloseTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+    previewCloseTimersRef.current.clear();
   }, []);
 
   const clearOsdTimer = useCallback(() => {
@@ -268,13 +275,20 @@ export const FlyoutView: React.FC = () => {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
         }
-        cancelEnterRafs();
 
         const prevKind = activeKindRef.current;
         const prevPhase = phaseRef.current;
         const isLive = prevPhase === 'entering' || prevPhase === 'open';
         const isInPlaceOsd = r.kind === 'osd' && prevKind === 'osd' && isLive;
         const isInPlacePreview = r.kind === 'preview' && prevKind === 'preview' && isLive;
+
+        // Keep entering -> open double-rAF gate intact during continuous fast OSD scroll or preview scrub
+        if (!((isInPlaceOsd || isInPlacePreview) && prevPhase === 'entering')) {
+          cancelEnterRafs();
+        }
+        if (!isInPlacePreview) {
+          clearPreviewCloseTimers();
+        }
 
         const nextSeq = isInPlaceOsd || isInPlacePreview ? renderSeqRef.current : renderSeqRef.current + 1;
         renderSeqRef.current = nextSeq;
@@ -296,6 +310,7 @@ export const FlyoutView: React.FC = () => {
         setActionError(null);
         setCtxFocusIdx(-1);
         setJumpList([]);
+        seekSeqRef.current += 1;
         setScrubOverrideSec(null);
         setClosingHwnds({});
 
@@ -411,6 +426,7 @@ export const FlyoutView: React.FC = () => {
       onEvent<FlyoutHideEvent | void>('flyout-hide', (ev) => {
         clearOsdTimer();
         cancelEnterRafs();
+        clearPreviewCloseTimers();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
@@ -440,6 +456,7 @@ export const FlyoutView: React.FC = () => {
       onEvent<FlyoutHideEvent | void>('flyout-hide-immediate', () => {
         clearOsdTimer();
         cancelEnterRafs();
+        clearPreviewCloseTimers();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
           exitTimerRef.current = null;
@@ -535,11 +552,10 @@ export const FlyoutView: React.FC = () => {
       if (segReadyRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(segReadyRafRef.current);
       }
-      previewCloseTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
-      previewCloseTimersRef.current.clear();
+      clearPreviewCloseTimers();
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [armOsdAutoClose, cacheThumb, cancelEnterRafs, clearOsdTimer]);
+  }, [armOsdAutoClose, cacheThumb, cancelEnterRafs, clearOsdTimer, clearPreviewCloseTimers]);
 
   // Paint-Sync Step 1: Synchronous DOM commit ACK + exact pre-show height measurement (before ShowWindow)
   useLayoutEffect(() => {
@@ -570,7 +586,7 @@ export const FlyoutView: React.FC = () => {
 
   // Paint-Sync Step 2: Double-rAF promotion from 'entering' -> 'open' after ShowWindow wakes Chromium compositor
   useEffect(() => {
-    if (anim.phase !== 'entering' || !anim.req) return;
+    if (anim.phase !== 'entering') return;
     cancelEnterRafs();
 
     if (typeof requestAnimationFrame !== 'function') {
@@ -587,7 +603,7 @@ export const FlyoutView: React.FC = () => {
     });
 
     return cancelEnterRafs;
-  }, [anim.phase, anim.renderSeq, anim.req, cancelEnterRafs]);
+  }, [anim.phase, anim.renderSeq, cancelEnterRafs]);
 
   // Poll WASAPI live peaks every 130ms STRICTLY while Quick Sound flyout is visibly open (0% idle cost)
   const isSoundVisiblyOpen =
@@ -739,6 +755,8 @@ export const FlyoutView: React.FC = () => {
     audio?.sessions.length,
     audio?.devices.length,
     audio?.inputDevices?.length,
+    devMenuOpen,
+    devMenuPresence.mounted,
     media?.hasSession,
     media?.canSeek,
     alerts.length,
@@ -1193,15 +1211,27 @@ export const FlyoutView: React.FC = () => {
                       magneticDetents={[]}
                       showCenterNotch={false}
                       ariaLabel="Позиция трека"
-                      onChange={(v) => setScrubOverrideSec(v)}
+                      onChange={(v) => {
+                        seekSeqRef.current += 1;
+                        setScrubOverrideSec(v);
+                      }}
                       onCommit={(v) => {
-                        setScrubOverrideSec(null);
+                        const seq = ++seekSeqRef.current;
+                        setScrubOverrideSec(v);
                         seekMedia(v)
                           .then((next) => {
-                            setMedia(next);
-                            setMediaNowMs(Date.now());
+                            if (seekSeqRef.current === seq) {
+                              setMedia(next);
+                              setMediaNowMs(Date.now());
+                              setScrubOverrideSec(null);
+                            }
                           })
-                          .catch((err) => setActionError(formatIpcError(err)));
+                          .catch((err) => {
+                            if (seekSeqRef.current === seq) {
+                              setScrubOverrideSec(null);
+                            }
+                            setActionError(formatIpcError(err));
+                          });
                       }}
                     />
                   ) : (
@@ -1223,50 +1253,60 @@ export const FlyoutView: React.FC = () => {
           )}
 
           {primaryDevs.length > 0 && (
-            <div className="qs-dev-row" onClick={(e) => e.stopPropagation()}>
+            <>
               <div
-                className="seg-bar sliding"
-                style={
-                  {
-                    gridTemplateColumns: `repeat(${primaryDevs.length}, 1fr)`,
-                    ['--seg-count' as string]: primaryDevs.length,
-                    ['--seg-idx' as string]: Math.max(0, activeInPrimaryIdx),
-                  } as React.CSSProperties
-                }
+                className="qs-dev-row"
+                style={devMenuPresence.mounted ? { zIndex: 35 } : undefined}
+                onClick={(e) => e.stopPropagation()}
               >
-                <span
-                  className={`seg-indicator ${segAnimReady ? '' : 'no-anim'}`}
-                  aria-hidden="true"
-                  style={activeInOverflow ? { opacity: 0 } : undefined}
-                />
-                {primaryDevs.map((d) => (
+                <div
+                  className="seg-bar sliding"
+                  style={
+                    {
+                      gridTemplateColumns: `repeat(${primaryDevs.length}, 1fr)`,
+                      ['--seg-count' as string]: primaryDevs.length,
+                      ['--seg-idx' as string]: Math.max(0, activeInPrimaryIdx),
+                    } as React.CSSProperties
+                  }
+                >
+                  <span
+                    className={`seg-indicator ${segAnimReady ? '' : 'no-anim'}`}
+                    aria-hidden="true"
+                    style={activeInOverflow ? { opacity: 0 } : undefined}
+                  />
+                  {primaryDevs.map((d) => (
+                    <button
+                      key={d.id}
+                      type="button"
+                      className={`seg-opt ${d.isDefault ? 'active' : ''}`}
+                      title={d.name}
+                      onClick={() => selectOutputDevice(d.id)}
+                    >
+                      {d.shortName}
+                    </button>
+                  ))}
+                </div>
+
+                {overflowDevs.length > 0 && (
                   <button
-                    key={d.id}
                     type="button"
-                    className={`seg-opt ${d.isDefault ? 'active' : ''}`}
-                    title={d.name}
-                    onClick={() => selectOutputDevice(d.id)}
+                    className={`qs-dev-more-btn ${devMenuOpen || activeInOverflow ? 'open' : ''}`}
+                    title={`Все устройства вывода (${allDevs.length})`}
+                    aria-label="Все устройства вывода"
+                    aria-expanded={devMenuOpen}
+                    onClick={() => setDevMenuOpen((v) => !v)}
                   >
-                    {d.shortName}
+                    <ChevronDownIcon className="ic14" />
                   </button>
-                ))}
+                )}
               </div>
 
-              {overflowDevs.length > 0 && (
-                <button
-                  type="button"
-                  className={`qs-dev-more-btn ${devMenuOpen || activeInOverflow ? 'open' : ''}`}
-                  title={`Все устройства вывода (${allDevs.length})`}
-                  aria-label="Все устройства вывода"
-                  aria-expanded={devMenuOpen}
-                  onClick={() => setDevMenuOpen((v) => !v)}
-                >
-                  <ChevronDownIcon className="ic14" />
-                </button>
-              )}
-
               {devMenuPresence.mounted && overflowDevs.length > 0 && (
-                <div className="qs-dev-dropdown" data-phase={devMenuPresence.phase}>
+                <div
+                  className="qs-dev-list-inflow"
+                  data-phase={devMenuPresence.phase}
+                  onClick={(e) => e.stopPropagation()}
+                >
                   {allDevs.map((d) => (
                     <button
                       key={d.id}
@@ -1281,7 +1321,7 @@ export const FlyoutView: React.FC = () => {
                   ))}
                 </div>
               )}
-            </div>
+            </>
           )}
 
           <div className="qs-mic-row">
@@ -1558,11 +1598,20 @@ export const FlyoutView: React.FC = () => {
 
     const closePreviewWindowAnimated = (hwnd: number) => {
       if (closingHwnds[hwnd]) return;
+      const seq = renderSeqRef.current;
+      const gKey = previewGroupKeyRef.current;
       setClosingHwnds((prev) => ({ ...prev, [hwnd]: true }));
       ipc('close_window_hwnd', { hwnd }).catch(() => {});
 
       const finish = () => {
         previewCloseTimersRef.current.delete(hwnd);
+        if (
+          activeKindRef.current !== 'preview' ||
+          renderSeqRef.current !== seq ||
+          previewGroupKeyRef.current !== gKey
+        ) {
+          return;
+        }
         setClosingHwnds((prev) => {
           const next = { ...prev };
           delete next[hwnd];
@@ -1575,7 +1624,7 @@ export const FlyoutView: React.FC = () => {
           } else {
             ipc('resize_flyout', {
               width: computePreviewCardWidth(nextWins.length),
-              height: 166,
+              height: PREVIEW_CARD_HEIGHT,
             }).catch(() => {});
           }
           return nextWins;
@@ -1989,7 +2038,7 @@ export const FlyoutView: React.FC = () => {
       },
       {
         key: 'bar-mode',
-        label: `Режим панели: ${isEdge ? 'Парящий док' : 'Во всю ширину'}`,
+        label: isEdge ? 'Переключить: Парящий док' : 'Переключить: Во всю ширину',
         icon: <LayoutBarIcon />,
         onActivate: () => runActionAndClose(ipc('set_bar_mode', { mode: nextMode })),
       },

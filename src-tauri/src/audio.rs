@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
@@ -710,6 +711,111 @@ pub fn get_audio_state() -> AudioState {
         }
         Err(_) => AudioState::default(),
     }
+}
+
+/// Narrow-locking counterpart of `attach_session_icons` that acquires `cache` ONLY around
+/// individual cache hits/writes and NEVER holds `Mutex<IconCache>` across `process_aumid`,
+/// UWP icon resolution, or Shell/GDI extraction.
+fn attach_session_icons_mutex<FKey, FExtract>(
+    sessions_with_exe: Vec<(AudioSessionInfo, Option<String>)>,
+    cache: &Mutex<IconCache>,
+    mut resolve_key_source: FKey,
+    mut extract_uri: FExtract,
+) -> (Vec<AudioSessionInfo>, Vec<(String, String)>)
+where
+    FKey: FnMut(u32, &str) -> (String, String, Option<String>),
+    FExtract: FnMut(&str, Option<&str>) -> Option<String>,
+{
+    let mut sessions = Vec::with_capacity(sessions_with_exe.len());
+    let mut sources = Vec::new();
+    let mut seen_source_keys = HashSet::new();
+
+    for (mut session, exe_opt) in sessions_with_exe {
+        if let Some(exe) = exe_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let default_key = icon_cache::path_icon_key(exe);
+            let default_hit = {
+                let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get(&default_key).is_some()
+            };
+            if default_hit {
+                session.icon_key = Some(default_key.clone());
+                if seen_source_keys.insert(default_key.clone()) {
+                    sources.push((default_key, exe.to_string()));
+                }
+            } else {
+                // Run process_aumid / key derivation outside the shared icon_cache lock
+                let (key, src, aumid_opt) = resolve_key_source(session.pid, exe);
+                let (already_cached, neg_cached) = {
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.get(&key).is_some() {
+                        (true, false)
+                    } else {
+                        (false, guard.is_negative_cached(&key))
+                    }
+                };
+                let cached = if already_cached {
+                    true
+                } else if neg_cached {
+                    false
+                } else {
+                    // Run Shell/UWP/GDI extraction outside the shared icon_cache lock
+                    let extracted = extract_uri(exe, aumid_opt.as_deref());
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    match extracted {
+                        Some(uri) => {
+                            guard.put(key.clone(), uri);
+                            true
+                        }
+                        None => {
+                            guard.mark_negative_miss(key.clone());
+                            false
+                        }
+                    }
+                };
+                if cached {
+                    session.icon_key = Some(key.clone());
+                    if seen_source_keys.insert(key.clone()) {
+                        sources.push((key, src));
+                    }
+                }
+            }
+        }
+        sessions.push(session);
+    }
+
+    (sessions, sources)
+}
+
+/// Full WASAPI audio state + per-app native icon resolution using narrow `Mutex<IconCache>`
+/// locking: the entire COM/WASAPI enumeration and any Shell/GDI icon extraction execute
+/// completely outside the shared `IconCache` mutex.
+pub fn get_audio_state_with_icons_mutex(
+    cache: &Mutex<IconCache>,
+) -> Result<(AudioState, Vec<(String, String)>), String> {
+    let (mut state, sessions_with_exe) = collect_audio_state_raw()?;
+    let (sessions, sources) = attach_session_icons_mutex(
+        sessions_with_exe,
+        cache,
+        |pid, exe_path| {
+            if let Some(aumid) = process_aumid(pid) {
+                let key = icon_cache::aumid_key(&aumid);
+                let src = format!("shell:AppsFolder\\{aumid}");
+                (key, src, Some(aumid))
+            } else {
+                let key = icon_cache::path_icon_key(exe_path);
+                (key, exe_path.to_string(), None)
+            }
+        },
+        |exe_path, aumid_opt| {
+            if let Some(aumid) = aumid_opt {
+                extract_uwp_icon_by_aumid(aumid).or_else(|| extract_icon_for_path(exe_path))
+            } else {
+                extract_icon_for_path(exe_path)
+            }
+        },
+    );
+    state.sessions = sessions;
+    Ok((state, sources))
 }
 
 /// Full WASAPI audio state + per-app native icon resolution through `IconCache`.
@@ -1649,5 +1755,65 @@ mod tests {
         for (_, p) in &peaks.session_peaks {
             assert!((0.0..=1.0).contains(p));
         }
+    }
+
+    #[test]
+    fn attach_session_icons_mutex_never_holds_lock_during_key_or_icon_extraction() {
+        let cache = Mutex::new(IconCache::new(64));
+        let input = vec![(
+            AudioSessionInfo {
+                id: "spotify.exe".into(),
+                pid: 42,
+                pids: vec![42],
+                name: "Spotify".into(),
+                volume: 80,
+                muted: false,
+                is_active: true,
+                peak: 0.25,
+                icon_key: None,
+            },
+            Some(r"C:\Apps\Spotify\Spotify.exe".to_string()),
+        )];
+
+        let mut key_unlocked = false;
+        let mut extract_unlocked = false;
+        let mut extract_calls = 0usize;
+
+        let (sessions, sources) = attach_session_icons_mutex(
+            input.clone(),
+            &cache,
+            |_pid, exe| {
+                // Must be able to acquire the mutex inside resolve_key_source (proves lock is NOT held)
+                key_unlocked = cache.try_lock().is_ok();
+                (icon_cache::path_icon_key(exe), exe.to_string(), None)
+            },
+            |_exe, _aumid| {
+                // Must be able to acquire the mutex inside extract_uri (proves lock is NOT held)
+                extract_unlocked = cache.try_lock().is_ok();
+                extract_calls += 1;
+                Some("data:image/png;base64,SPOTIFY".into())
+            },
+        );
+
+        assert!(key_unlocked, "IconCache mutex must not be held during process_aumid/key resolution");
+        assert!(extract_unlocked, "IconCache mutex must not be held during Shell/GDI icon extraction");
+        assert_eq!(extract_calls, 1);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].icon_key.is_some());
+        assert_eq!(sources.len(), 1);
+
+        // Second pass hits cache without re-invoking extraction
+        let mut extract_calls_2 = 0usize;
+        let (sessions_2, _) = attach_session_icons_mutex(
+            input,
+            &cache,
+            |_pid, exe| (icon_cache::path_icon_key(exe), exe.to_string(), None),
+            |_exe, _aumid| {
+                extract_calls_2 += 1;
+                Some("data:image/png;base64,SPOTIFY".into())
+            },
+        );
+        assert_eq!(extract_calls_2, 0);
+        assert_eq!(sessions_2[0].icon_key, sessions[0].icon_key);
     }
 }

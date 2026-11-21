@@ -81,7 +81,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   const glassDepth: GlassDepth = config?.glassDepth ?? 'obsidian';
   const clockShowSeconds = config?.clockShowSeconds ?? false;
   const clockShowWeekday = config?.clockShowWeekday ?? false;
-  const startRememberSpace = config?.startRememberSpace ?? true;
+  const startRememberSpace = config?.startRememberSpace ?? false;
   const hiddenTrayKeys = config?.hiddenTrayKeys ?? [];
 
   const runAction = async (key: string, fn: () => Promise<void>) => {

@@ -1137,6 +1137,64 @@ fn resolve_exe_icon_key_into_cache(exe_path: &str, cache: &mut IconCache) -> Opt
     }
 }
 
+fn resolve_exe_icon_key_into_cache_mutex(
+    exe_path: &str,
+    cache: &Mutex<IconCache>,
+) -> Option<String> {
+    let trimmed = exe_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let key = icon_cache::path_icon_key(trimmed);
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.get(&key).is_some() {
+            return Some(key);
+        }
+        if guard.is_negative_cached(&key) {
+            return None;
+        }
+    }
+    // Perform SHGetFileInfoW / GDI icon extraction outside the shared cache mutex.
+    let extracted = extract_shell_icon_png(trimmed);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match extracted {
+        Some(data_uri) => {
+            guard.put(key.clone(), data_uri);
+            Some(key)
+        }
+        None => {
+            guard.mark_negative_miss(key);
+            None
+        }
+    }
+}
+
+/// Samples lean telemetry with disk headroom, process-to-HWND mapping, and `icon_key`-only entries (`AD-6`),
+/// running CPU/RAM/NVML/disk scans completely outside `cache` and locking `IconCache` only for brief
+/// individual cache hits/writes.
+pub fn sample_telemetry_with_icons_mutex(
+    cache: &Mutex<IconCache>,
+    pid_to_hwnd: &HashMap<u32, isize>,
+) -> (TelemetrySnapshot, Vec<(String, String)>) {
+    let (cpu_name, cpu_pct, ram_used_bytes, ram_total_bytes, samples) =
+        collect_cpu_ram_and_processes();
+    let gpu = query_gpu();
+    let disks = get_disks_headroom_cached();
+
+    build_telemetry_snapshot_with_icons(
+        cpu_name,
+        cpu_pct,
+        ram_used_bytes,
+        ram_total_bytes,
+        gpu,
+        &samples,
+        disks,
+        pid_to_hwnd,
+        |exe| resolve_exe_icon_key_into_cache_mutex(exe, cache),
+    )
+}
+
 /// Samples lean telemetry with disk headroom, process-to-HWND mapping, and `icon_key`-only entries (`AD-6`).
 /// Returns `(snapshot, icon_sources)` so Wave 1B registers `(icon_key, exe_path)` for LRU reload.
 pub fn sample_telemetry_with_icons(

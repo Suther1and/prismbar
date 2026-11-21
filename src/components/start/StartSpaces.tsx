@@ -36,6 +36,7 @@ import {
   EMPTY_TELEMETRY_HISTORY,
   filterClipboardEntries,
   formatDiskSummary,
+  formatGbValue,
   formatKillProcessError,
   formatMediaDuration,
   formatMemoryRatio,
@@ -46,6 +47,7 @@ import {
   getTelemetryLevelClass,
   getTelemetryStatusPill,
   hexColorToRgbString,
+  normalizeSessionVolumeScalar,
   partitionHeroAndCompact,
   PROCESS_KILL_ARM_MS,
   pushTelemetryHistory,
@@ -303,9 +305,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   const [telemHistory, setTelemHistory] = useState<TelemetryHistory>(EMPTY_TELEMETRY_HISTORY);
 
   // Lazy Steam/Epic/GOG cover art cache
+  const mountedRef = useRef(true);
   const [loadedCovers, setLoadedCovers] = useState<Record<string, string>>({});
   const requestedCoversRef = useRef<Set<string>>(new Set());
   const requestedIconsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Inline Game Combo builder sheet
   const [comboBuilderOpen, setComboBuilderOpen] = useState(false);
@@ -525,15 +535,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     [clips, clipQuery],
   );
 
-  // Lazy load game covers when Games space is active
+  // Lazy load game covers when Games space is active (component-lifetime mountedRef avoids self-cancel)
   useEffect(() => {
     if (!startVisible || space !== 'games') return;
-    let cancelled = false;
     const toLoad = displayedGames.filter(
       (g) =>
         !g.coverData &&
         Boolean(g.coverPath) &&
-        !loadedCovers[g.coverPath!] &&
         !requestedCoversRef.current.has(g.coverPath!),
     );
     if (toLoad.length === 0) return;
@@ -543,17 +551,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       requestedCoversRef.current.add(path);
       loadGameCover(path)
         .then((uri) => {
-          if (!cancelled && uri) {
-            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
+          if (!uri || !mountedRef.current) {
+            requestedCoversRef.current.delete(path);
+            return;
           }
+          setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
         })
-        .catch(() => {});
+        .catch(() => {
+          requestedCoversRef.current.delete(path);
+        });
     });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [startVisible, space, displayedGames, loadedCovers]);
+  }, [startVisible, space, displayedGames]);
 
   // Combo picker catalog (installed apps + games)
   const comboPickerOptions = useMemo(() => {
@@ -1008,7 +1016,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         appKey: s.id,
         pid: s.pid,
         pids: s.pids,
-        volume: nextVol,
+        volume: normalizeSessionVolumeScalar(nextVol),
         muted: s.muted ? false : undefined,
       })
         .then(onSetAudio)
@@ -1035,15 +1043,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         .catch(() => onShowToast(`Не удалось переключить звук ${s.name}`));
     };
 
+    const audioDropdownActive = Boolean(options.showDeviceSwitcher && devDropdownPresence.mounted);
+
     return (
       <BentoSpotCard
         bentoIndex={bentoIndex}
-        className="compact-card"
-        style={
-          options.showDeviceSwitcher && devDropdownPresence.mounted
-            ? { overflow: 'visible', zIndex: 25 }
-            : undefined
-        }
+        className={`compact-card${audioDropdownActive ? ' has-open-pop' : ''}`}
+        style={audioDropdownActive ? { overflow: 'visible', zIndex: 25 } : undefined}
       >
         <div className="sec-row" style={{ marginBottom: 8 }}>
           <span className="sec-title">{options.title}</span>
@@ -1234,7 +1240,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           </div>
         </div>
 
-        {hasSession && (
+        {hasSession && durationSec > 0 && (
           <div className="scrub-wrap">
             <span className="scrub-time">{formatMediaDuration(displayedPosSec)}</span>
             {canSeek ? (
@@ -1541,8 +1547,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       <div className="disk-strip">
         {disks.map((d) => {
           const lvl = getTelemetryLevelClass(d.usedPct);
+          const pct = Math.max(0, Math.min(100, Math.round(Number.isFinite(d.usedPct) ? d.usedPct : 0)));
           return (
-            <div key={d.mount} className="disk-chip" title={`${d.mount} (${d.name || 'Диск'}): ${formatDiskSummary(d)}`}>
+            <div
+              key={d.mount}
+              className="disk-chip"
+              title={`${d.mount} (${d.name || 'Диск'}): ${pct}% · ${formatGbValue(d.freeGb)} ГБ свободно`}
+            >
               <div className="disk-chip-top">
                 <span className="disk-mount">
                   <DiskIcon className="ic12" />
@@ -1879,8 +1890,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
             <div className="sec-row">
               <span className="sec-title">Закреплено</span>
-              <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                + Закрепить
+              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                <PlusIcon className="ic12" />
+                <span>Закрепить</span>
               </button>
             </div>
 
@@ -1906,8 +1918,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <div className="space-dock-foot">
               <div className="sec-row" style={{ marginBottom: 8 }}>
                 <span className="sec-title">Быстрый доступ</span>
-                <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                  + Папка / Файл / URL
+                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                  <PlusIcon className="ic12" />
+                  <span>Папка / Файл / URL</span>
                 </button>
               </div>
               {!hasPersonalLinks ? (
@@ -1948,8 +1961,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
             <div className="sec-row">
               <span className="sec-title">Проекты, папки и файлы</span>
-              <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                + Закрепить
+              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                <PlusIcon className="ic12" />
+                <span>Закрепить</span>
               </button>
             </div>
 
@@ -2059,8 +2073,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <div className="space-dock-foot">
               <div className="sec-row" style={{ marginBottom: 8 }}>
                 <span className="sec-title">Рабочие программы</span>
-                <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                  + Добавить
+                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                  <PlusIcon className="ic12" />
+                  <span>Добавить</span>
                 </button>
               </div>
               {workApps.length === 0 ? (
@@ -2093,8 +2108,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           <BentoSpotCard bentoIndex={0} className="space-card-flex">
             <div className="sec-row">
               <span className="sec-title">Творчество и AI</span>
-              <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                + Закрепить
+              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                <PlusIcon className="ic12" />
+                <span>Закрепить</span>
               </button>
             </div>
 
@@ -2120,8 +2136,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <div className="space-dock-foot">
               <div className="sec-row" style={{ marginBottom: 8 }}>
                 <span className="sec-title">Инструменты</span>
-                <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                  + Добавить
+                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                  <PlusIcon className="ic12" />
+                  <span>Добавить</span>
                 </button>
               </div>
               {studioTools.length === 0 ? (
@@ -2178,8 +2195,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   </button>
                 </div>
               </div>
-              <button type="button" className="sec-act" onClick={onOpenDrawer}>
-                + Добавить
+              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+                <PlusIcon className="ic12" />
+                <span>Добавить</span>
               </button>
             </div>
 
@@ -2394,7 +2412,6 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               <div
                 className="combo-builder-sheet"
                 data-phase={comboBuilderPresence.phase}
-                style={{ position: 'absolute', inset: 0, zIndex: 20 }}
                 role="dialog"
                 aria-label="Новая игровая связка"
                 onClick={(e) => e.stopPropagation()}
@@ -2426,7 +2443,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   <div className="combo-picker-row">
                     <select
                       className="qs-input-select"
-                      style={{ height: 30 }}
+                      style={{ height: 28 }}
                       aria-label="Выбрать программу или игру"
                       value={comboPickKey}
                       onChange={(e) => setComboPickKey(e.target.value)}
@@ -2441,7 +2458,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                     <button
                       type="button"
                       className="pin-any-btn"
-                      style={{ height: 30, padding: '0 10px' }}
+                      style={{ height: 28, padding: '0 10px' }}
                       onClick={() => {
                         const found = comboPickerOptions.find((o) => o.key === comboPickKey);
                         if (!found) return;
@@ -2464,7 +2481,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 <div className="combo-picker-row">
                   <input
                     className="url-input"
-                    style={{ flex: 1, height: 30 }}
+                    style={{ flex: 1, height: 28 }}
                     placeholder="Путь к .exe или URL (https://…)"
                     value={comboCustomTarget}
                     onChange={(e) => setComboCustomTarget(e.target.value)}
@@ -2486,7 +2503,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   <button
                     type="button"
                     className="pin-any-btn"
-                    style={{ height: 30, padding: '0 10px' }}
+                    style={{ height: 28, padding: '0 10px' }}
                     onClick={() => {
                       const val = comboCustomTarget.trim();
                       if (!val) return;
@@ -2558,8 +2575,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       <BentoSpotCard bentoIndex={0} className="space-card-flex">
         <div className="sec-row">
           <span className="sec-title">{activeCustomSpace.name}</span>
-          <button type="button" className="sec-act" onClick={onOpenDrawer}>
-            + Закрепить
+          <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+            <PlusIcon className="ic12" />
+            <span>Закрепить</span>
           </button>
         </div>
         {activeCustomSpace.items.length === 0 ? (

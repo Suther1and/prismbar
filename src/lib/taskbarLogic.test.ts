@@ -16,6 +16,7 @@ import {
   getTaskbarRootClassName,
   isSoundFlyoutActive,
   planSoundFeedbackAction,
+  PREVIEW_CARD_HEIGHT,
   PREVIEW_HOVER_COLD_MS,
   PREVIEW_HOVER_WARM_MS,
   resolvePinnedReorderIndices,
@@ -265,8 +266,9 @@ describe('Warm preview scrubbing, hover preemption & flyout payload builders', (
     expect(req.anchorInTaskbar).toBe(true);
     expect(req.anchorXLogical).toBe(320);
     expect(req.monitor).toBe('secondary');
+    expect(PREVIEW_CARD_HEIGHT).toBe(172);
     expect(req.width).toBe(2 * 214 + 20);
-    expect(req.height).toBe(166);
+    expect(req.height).toBe(PREVIEW_CARD_HEIGHT);
     expect((req.payload as PreviewFlyoutPayload).iconKey).toBe('exe:1111222233334444');
 
     // 4 cards vs 6 cards (4 visible + 53px for +2 overflow badge)
