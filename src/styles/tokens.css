@@ -392,15 +392,26 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { box-shadow: 
 .tb-tray-btn.chevron svg { transition: transform 200ms var(--spring), color 130ms ease; }
 .tb-tray-btn.chevron.open svg { transform: rotate(180deg); color: var(--accent); }
 .tb-net-ic, .tb-vol-ic { display: inline-grid; place-items: center; line-height: 0; }
+.tb-sound-btn { min-width: 38px; padding: 0 9px; justify-content: center; gap: 0; }
 .tb-sound-btn.muted .tb-vol-ic, .tb-tray-btn.muted .tb-vol-ic, .tb-net-offline { color: var(--danger); }
+.tb-net-offline-btn {
+  min-width: 34px; padding: 0 8px; justify-content: center; gap: 0;
+  color: var(--danger); background: rgba(var(--danger-rgb), 0.10); border-color: rgba(var(--danger-rgb), 0.24);
+}
+.tb-net-offline-btn:hover { background: rgba(var(--danger-rgb), 0.18); border-color: rgba(var(--danger-rgb), 0.42); }
 
 .tb-lang-btn {
   min-width: 36px; justify-content: center; padding: 0 7px;
   font-family: var(--font-mono); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
 }
-.tb-clock { flex-direction: column; justify-content: center; align-items: flex-end; gap: 1px; line-height: 1.15; padding: 0 9px; }
-.tb-clock-time { font-size: 15px; font-weight: 600; line-height: 1.15; color: var(--t1); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tb-clock-date { font-size: 12px; font-weight: 500; line-height: 1.15; color: var(--t2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tb-clock { flex-direction: column; justify-content: center; align-items: center; text-align: center; gap: 2px; line-height: 1.15; padding: 0 10px; }
+.tb-clock[data-clock-layout="center"] { align-items: center; text-align: center; }
+.tb-clock[data-clock-layout="right"] { align-items: flex-end; text-align: right; }
+.tb-clock[data-clock-layout="single"] { flex-direction: row; align-items: center; justify-content: center; gap: 5px; padding: 0 11px; }
+.tb-clock-time { font-size: 13.5px; font-weight: 600; letter-spacing: 0.015em; line-height: 1.15; color: var(--t1); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tb-clock.time-only .tb-clock-time, .tb-clock-time.time-only { font-size: 14.5px; }
+.tb-clock-date { font-size: 11px; font-weight: 500; line-height: 1.15; color: var(--t2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tb-clock-sep { font-size: 11px; color: var(--t3); line-height: 1; }
 
 .tb-media-pill {
   height: 36px; max-width: 176px; padding: 0 9px 0 6px; border-radius: 10px;

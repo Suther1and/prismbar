@@ -4,12 +4,19 @@ import {
   isNonLaunchableUwpHostExe,
   type AppWindowGroup,
   type AudioMasterState,
+  type ClockDateFormat,
+  type ClockLayout,
   type FlyoutRequest,
+  type MediaState,
   type MergedBarItem,
   type NetworkInfo,
+  type NetworkSnapshot,
   type OpenWindowInfo,
   type PeripheralBattery,
   type PinItem,
+  type TaskbarWidgetId,
+  type TaskbarWidgetSettings,
+  type TaskbarWidgetsPosition,
   type TelemetryState,
 } from './ipc';
 
@@ -45,6 +52,8 @@ const INTERACTIVE_FLYOUT_KINDS = new Set([
   'calendar',
   'weather',
   'battery',
+  'network',
+  'telemetry',
   'context_app',
   'context_bar',
   'ctx_app',
@@ -68,10 +77,31 @@ export const WEATHER_FLYOUT_WIDTH = 340;
 export const WEATHER_FLYOUT_HEIGHT = 404;
 export const BATTERY_FLYOUT_WIDTH = 304;
 export const BATTERY_FLYOUT_HEIGHT = 250;
+export const NETWORK_FLYOUT_WIDTH = 316;
+export const NETWORK_FLYOUT_HEIGHT = 276;
+export const TELEMETRY_FLYOUT_WIDTH = 324;
+export const TELEMETRY_FLYOUT_HEIGHT = 336;
 export const EDGE_CENTERED_MIN_WIDTH = 1180;
 export const DOCK_CHROME_EXTRA_PX = 21; // 16px horizontal padding (8px*2) + 2px border + 3px group gap
 
+export const TIMER_STORAGE_KEY = 'testbar.focus_timer.v1';
+export const TIMER_UPDATED_EVENT = 'testbar:focus-timer-updated';
+
 const WEEKDAYS_JS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'] as const;
+const MONTHS_SHORT_RU = [
+  'янв',
+  'фев',
+  'мар',
+  'апр',
+  'мая',
+  'июн',
+  'июл',
+  'авг',
+  'сен',
+  'окт',
+  'ноя',
+  'дек',
+] as const;
 
 export function resolveTaskbarMonitor(search: string): TaskbarMonitor {
   const params = new URLSearchParams(search);
@@ -172,12 +202,19 @@ export function computeNaturalDockWidth(
   barRectWidth: number,
   appsNaturalWidth = 0,
   trayNaturalWidth = 0,
+  leftWidgetsNaturalWidth = 0,
 ): number | null {
   const safeBarScroll = Number.isFinite(barScrollWidth) && barScrollWidth > 0 ? barScrollWidth + 2 : 0;
   const safeRect = Number.isFinite(barRectWidth) && barRectWidth > 0 ? barRectWidth : 0;
   const safeApps = Number.isFinite(appsNaturalWidth) && appsNaturalWidth > 0 ? appsNaturalWidth : 0;
   const safeTray = Number.isFinite(trayNaturalWidth) && trayNaturalWidth > 0 ? trayNaturalWidth : 0;
-  const groupsTotal = safeApps > 0 && safeTray > 0 ? safeApps + safeTray + DOCK_CHROME_EXTRA_PX : 0;
+  const safeLeft =
+    Number.isFinite(leftWidgetsNaturalWidth) && leftWidgetsNaturalWidth > 0
+      ? leftWidgetsNaturalWidth
+      : 0;
+  const leftExtra = safeLeft > 0 ? safeLeft + 14 : 0;
+  const groupsTotal =
+    safeApps > 0 && safeTray > 0 ? leftExtra + safeApps + safeTray + DOCK_CHROME_EXTRA_PX : 0;
   return computeDockLogicalWidth(Math.max(safeBarScroll, groupsTotal), safeRect);
 }
 
@@ -361,15 +398,26 @@ export function resolvePinnedReorderIndices(
   return { fromIdx, toIdx };
 }
 
+export interface TaskbarClockOptions {
+  showSeconds?: boolean;
+  showWeekday?: boolean;
+  dateFormat?: ClockDateFormat;
+  layout?: ClockLayout;
+}
+
 export interface TaskbarClockDisplay {
   timeStr: string;
   dateStr: string;
+  singleStr: string;
+  layout: ClockLayout;
+  dateFormat: ClockDateFormat;
+  timeOnly: boolean;
   fullTitle: string;
 }
 
 export function formatTaskbarClock(
   date: Date,
-  options?: { showSeconds?: boolean; showWeekday?: boolean },
+  options?: TaskbarClockOptions,
 ): TaskbarClockDisplay {
   const pad2 = (n: number) => String(n).padStart(2, '0');
   const hh = pad2(date.getHours());
@@ -377,16 +425,36 @@ export function formatTaskbarClock(
   const ss = pad2(date.getSeconds());
   const timeStr = options?.showSeconds ? `${hh}:${mm}:${ss}` : `${hh}:${mm}`;
 
-  const dd = pad2(date.getDate());
-  const mo = pad2(date.getMonth() + 1);
-  const yyyy = date.getFullYear();
-  const baseDate = `${dd}.${mo}.${yyyy}`;
+  const dateFormat: ClockDateFormat =
+    options?.dateFormat === 'numeric' || options?.dateFormat === 'none'
+      ? options.dateFormat
+      : 'short';
+  const layout: ClockLayout =
+    options?.layout === 'right' || options?.layout === 'single' ? options.layout : 'center';
+
   const weekday = WEEKDAYS_JS_SHORT_RU[date.getDay()] ?? '';
-  const dateStr = options?.showWeekday && weekday ? `${weekday}, ${baseDate}` : baseDate;
+  let dateStr = '';
+  if (dateFormat === 'numeric') {
+    const dd = pad2(date.getDate());
+    const mo = pad2(date.getMonth() + 1);
+    const yyyy = date.getFullYear();
+    dateStr = options?.showWeekday && weekday ? `${weekday}, ${dd}.${mo}` : `${dd}.${mo}.${yyyy}`;
+  } else if (dateFormat === 'short') {
+    const shortMonth = MONTHS_SHORT_RU[date.getMonth()] ?? '';
+    const baseShort = `${date.getDate()} ${shortMonth}`;
+    dateStr = options?.showWeekday && weekday ? `${weekday}, ${baseShort}` : baseShort;
+  }
+
+  const timeOnly = dateStr.length === 0;
+  const singleStr = dateStr ? `${dateStr} · ${timeStr}` : timeStr;
 
   return {
     timeStr,
     dateStr,
+    singleStr,
+    layout,
+    dateFormat,
+    timeOnly,
     fullTitle: formatSelectedDateHeader(date),
   };
 }
@@ -746,4 +814,246 @@ export function formatMiniTelemetryLabel(
     return `CPU ${cpu}% · RAM ${ram}%`;
   }
   return `CPU ${cpu}%`;
+}
+
+const VALID_TASKBAR_WIDGETS = new Set<TaskbarWidgetId>([
+  'weather',
+  'telemetry',
+  'batteries',
+  'network',
+  'media',
+  'timer',
+]);
+
+/**
+ * Resolves ordered taskbar widgets from `leftWidgets` when non-empty,
+ * falling back cleanly to legacy `showWeather` / `showBatteries` / `showTelemetry` booleans.
+ */
+export function resolveActiveTaskbarWidgets(
+  settings: Partial<TaskbarWidgetSettings> | null | undefined,
+): TaskbarWidgetId[] {
+  if (!settings) return [];
+  const rawList = settings.leftWidgets;
+  if (Array.isArray(rawList) && rawList.length > 0) {
+    const seen = new Set<TaskbarWidgetId>();
+    const out: TaskbarWidgetId[] = [];
+    for (const raw of rawList) {
+      const norm = (typeof raw === 'string' ? raw.trim().toLowerCase() : '') as TaskbarWidgetId;
+      if (VALID_TASKBAR_WIDGETS.has(norm) && !seen.has(norm)) {
+        seen.add(norm);
+        out.push(norm);
+      }
+    }
+    return out;
+  }
+  const fallback: TaskbarWidgetId[] = [];
+  if (settings.showWeather === true) fallback.push('weather');
+  if (settings.showBatteries === true) fallback.push('batteries');
+  if (settings.showTelemetry === true) fallback.push('telemetry');
+  return fallback;
+}
+
+export function resolveTaskbarWidgetsPosition(
+  settings: Pick<TaskbarWidgetSettings, 'widgetsPosition'> | null | undefined,
+): TaskbarWidgetsPosition {
+  return settings?.widgetsPosition === 'right' ? 'right' : 'left';
+}
+
+export function formatNetworkRateCompact(bytesPerSec: number | null | undefined): string {
+  if (
+    bytesPerSec === null ||
+    bytesPerSec === undefined ||
+    !Number.isFinite(bytesPerSec) ||
+    bytesPerSec <= 0
+  ) {
+    return '0 Б/с';
+  }
+  const kb = bytesPerSec / 1024;
+  if (kb < 1) {
+    return `${Math.round(bytesPerSec)} Б/с`;
+  }
+  const mb = kb / 1024;
+  if (mb < 1) {
+    return kb < 10 ? `${kb.toFixed(1)} КБ/с` : `${Math.round(kb)} КБ/с`;
+  }
+  const gb = mb / 1024;
+  if (gb < 1) {
+    return mb < 100 ? `${mb.toFixed(1)} МБ/с` : `${Math.round(mb)} МБ/с`;
+  }
+  return `${gb.toFixed(1)} ГБ/с`;
+}
+
+export interface TaskbarNetworkBadge {
+  online: boolean;
+  kind: 'ethernet' | 'wifi' | 'offline';
+  text: string;
+  rateStr: string;
+  pingStr: string | null;
+  ariaLabel: string;
+}
+
+export function formatTaskbarNetworkBadge(
+  net: NetworkSnapshot | null | undefined,
+): TaskbarNetworkBadge {
+  if (!net) {
+    return {
+      online: true,
+      kind: 'ethernet',
+      text: 'Сеть',
+      rateStr: '—',
+      pingStr: null,
+      ariaLabel: 'Состояние сети',
+    };
+  }
+  if (!net.online) {
+    return {
+      online: false,
+      kind: 'offline',
+      text: 'Нет сети',
+      rateStr: '0 Б/с',
+      pingStr: null,
+      ariaLabel: 'Нет подключения к сети',
+    };
+  }
+  const rawKind = (net.kind ?? '').trim().toLowerCase();
+  const kind: 'ethernet' | 'wifi' =
+    rawKind.includes('wi-fi') || rawKind.includes('wifi') || rawKind.includes('wireless')
+      ? 'wifi'
+      : 'ethernet';
+  const rx = Number.isFinite(net.rxBytesPerSec) ? Math.max(0, net.rxBytesPerSec) : 0;
+  const tx = Number.isFinite(net.txBytesPerSec) ? Math.max(0, net.txBytesPerSec) : 0;
+  const useTx = tx > rx && tx >= 1024;
+  const rateStr = `${useTx ? '↑' : '↓'} ${formatNetworkRateCompact(useTx ? tx : rx)}`;
+  const pingStr =
+    typeof net.pingMs === 'number' && Number.isFinite(net.pingMs) && net.pingMs >= 0
+      ? `${Math.round(net.pingMs)} мс`
+      : null;
+  const text = pingStr ? `${rateStr} · ${pingStr}` : rateStr;
+  const adapter = net.adapterName?.trim() || (kind === 'wifi' ? 'Wi-Fi' : 'Ethernet');
+  const ariaLabel = pingStr
+    ? `${adapter}: ↓ ${formatNetworkRateCompact(rx)}, ↑ ${formatNetworkRateCompact(tx)}, пинг ${pingStr}`
+    : `${adapter}: ↓ ${formatNetworkRateCompact(rx)}, ↑ ${formatNetworkRateCompact(tx)}`;
+  return {
+    online: true,
+    kind,
+    text,
+    rateStr,
+    pingStr,
+    ariaLabel,
+  };
+}
+
+export interface TaskbarMediaSummary {
+  hasSession: boolean;
+  isPlaying: boolean;
+  title: string;
+  ariaLabel: string;
+}
+
+export function formatTaskbarMediaLabel(
+  media: Pick<MediaState, 'hasSession' | 'title' | 'artist' | 'source' | 'isPlaying'> | null | undefined,
+  maxLen = 28,
+): TaskbarMediaSummary {
+  if (!media || !media.hasSession) {
+    return {
+      hasSession: false,
+      isPlaying: false,
+      title: 'Нет медиа',
+      ariaLabel: 'Медиа не воспроизводится',
+    };
+  }
+  const raw =
+    media.title?.trim() ||
+    media.artist?.trim() ||
+    media.source?.trim() ||
+    'Воспроизведение';
+  const clean = raw.replace(/\s+/g, ' ');
+  const cap = Math.max(8, Math.floor(Number.isFinite(maxLen) ? maxLen : 28));
+  const title = clean.length > cap ? `${clean.slice(0, cap - 1).trimEnd()}…` : clean;
+  const status = media.isPlaying ? 'Играет' : 'Пауза';
+  const by = media.artist?.trim() ? ` — ${media.artist.trim()}` : '';
+  return {
+    hasSession: true,
+    isPlaying: Boolean(media.isPlaying),
+    title,
+    ariaLabel: `${status}: ${clean}${by}`,
+  };
+}
+
+export interface FocusTimerSnapshot {
+  running: boolean;
+  totalSec: number;
+  remainingSec: number;
+  endEpochMs: number | null;
+}
+
+export const DEFAULT_FOCUS_TIMER_SNAPSHOT: FocusTimerSnapshot = {
+  running: false,
+  totalSec: 25 * 60,
+  remainingSec: 25 * 60,
+  endEpochMs: null,
+};
+
+export function parseFocusTimerSnapshot(raw: string | null | undefined): FocusTimerSnapshot {
+  if (!raw || !raw.trim()) return { ...DEFAULT_FOCUS_TIMER_SNAPSHOT };
+  try {
+    const parsed = JSON.parse(raw) as Partial<FocusTimerSnapshot> | null;
+    if (!parsed || typeof parsed !== 'object') {
+      return { ...DEFAULT_FOCUS_TIMER_SNAPSHOT };
+    }
+    const totalSec =
+      typeof parsed.totalSec === 'number' && Number.isFinite(parsed.totalSec) && parsed.totalSec > 0
+        ? Math.round(parsed.totalSec)
+        : DEFAULT_FOCUS_TIMER_SNAPSHOT.totalSec;
+    const remainingSec =
+      typeof parsed.remainingSec === 'number' &&
+      Number.isFinite(parsed.remainingSec) &&
+      parsed.remainingSec >= 0
+        ? Math.round(parsed.remainingSec)
+        : totalSec;
+    const endEpochMs =
+      typeof parsed.endEpochMs === 'number' &&
+      Number.isFinite(parsed.endEpochMs) &&
+      parsed.endEpochMs > 0
+        ? parsed.endEpochMs
+        : null;
+    const running = Boolean(parsed.running) && endEpochMs !== null;
+    return {
+      running,
+      totalSec,
+      remainingSec,
+      endEpochMs,
+    };
+  } catch {
+    return { ...DEFAULT_FOCUS_TIMER_SNAPSHOT };
+  }
+}
+
+export function getFocusTimerEffectiveRemainingSec(
+  snap: FocusTimerSnapshot,
+  nowMs = Date.now(),
+): number {
+  if (snap.running && snap.endEpochMs !== null && Number.isFinite(snap.endEpochMs)) {
+    return Math.max(0, Math.ceil((snap.endEpochMs - nowMs) / 1000));
+  }
+  return Math.max(0, Math.round(snap.remainingSec));
+}
+
+export function formatFocusTimerMmSs(seconds: number): string {
+  const safe = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+export function formatTelemetryGb(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return '0';
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+export function getTelemetryUsageTone(pct: number): 'ok' | 'warn' | 'hot' {
+  if (!Number.isFinite(pct) || pct < 70) return 'ok';
+  if (pct < 88) return 'warn';
+  return 'hot';
 }

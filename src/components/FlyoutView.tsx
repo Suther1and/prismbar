@@ -58,6 +58,7 @@ import {
   applyConfigUpdate,
   fetchIconsBatch,
   getAudioPeaks,
+  getNetworkSnapshot,
   getPeripheralBatteries,
   getWeather,
   hideBatteryDevice,
@@ -88,9 +89,11 @@ import {
   type JumpListItem,
   type MediaState,
   type NetworkInfo,
+  type NetworkSnapshot,
   type OpenWindowInfo,
   type PeripheralBattery,
   type SessionAlert,
+  type TelemetryState,
   type TestBarConfig,
   type TrayAppItem,
   type WeatherCityOption,
@@ -100,7 +103,10 @@ import { mergeAudioStateRespectingLocks } from '../lib/startLogic';
 import {
   buildPinFromAppContext,
   computePreviewCardWidth,
+  formatNetworkRateCompact,
+  formatTelemetryGb,
   formatWeatherTempLabel,
+  getTelemetryUsageTone,
   PREVIEW_CARD_HEIGHT,
   PREVIEW_MAX_VISIBLE_CARDS,
   type AppContextPayload,
@@ -111,6 +117,8 @@ import {
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
   BellIcon,
   BluetoothIcon,
   ChargingBoltIcon,
@@ -120,7 +128,10 @@ import {
   ChevronRightIcon,
   ClockRecentIcon,
   CloseWindowIcon,
+  CopyIcon,
+  DiskIcon,
   DropletIcon,
+  EthernetIcon,
   ExternalWindowIcon,
   EyeOffIcon,
   FallbackAppIcon,
@@ -133,6 +144,7 @@ import {
   MusicNoteIcon,
   NativeTrayIcon,
   NextTrackIcon,
+  OfflineIcon,
   PauseIcon,
   PeripheralDeviceIcon,
   PinIcon,
@@ -150,6 +162,7 @@ import {
   UnpinIcon,
   VolIcon,
   WeatherConditionIcon,
+  WifiIcon,
   WindIcon,
   XIcon10,
 } from './Icons';
@@ -249,6 +262,17 @@ function measureCardHeight(el: HTMLElement, kind: FlyoutKind): number | null {
     });
   }
 
+  if (kind === 'telemetry') {
+    const inner = el.querySelector<HTMLElement>('.telem-disks');
+    return computeFlyoutCardHeight({
+      cardScrollHeight: el.scrollHeight,
+      borderY,
+      innerScrollHeight: inner?.scrollHeight,
+      innerClientHeight: inner?.clientHeight,
+      innerMaxHeight: 160,
+    });
+  }
+
   return computeFlyoutCardHeight({
     cardScrollHeight: el.scrollHeight,
     borderY,
@@ -294,6 +318,11 @@ export const FlyoutView: React.FC = () => {
   const [periphBatteries, setPeriphBatteries] = useState<PeripheralBattery[]>([]);
   const [periphHydrated, setPeriphHydrated] = useState<boolean>(false);
   const [periphRefreshing, setPeriphRefreshing] = useState<boolean>(false);
+  const [netSnap, setNetSnap] = useState<NetworkSnapshot | null>(null);
+  const [netPinging, setNetPinging] = useState<boolean>(false);
+  const [netIpCopied, setNetIpCopied] = useState<boolean>(false);
+  const [telemSnap, setTelemSnap] = useState<TelemetryState | null>(null);
+  const [telemRefreshing, setTelemRefreshing] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [ctxFocusIdx, setCtxFocusIdx] = useState<number>(-1);
   const [calDir, setCalDir] = useState<-1 | 0 | 1>(0);
@@ -305,6 +334,7 @@ export const FlyoutView: React.FC = () => {
 
   const exitTimerRef = useRef<number | null>(null);
   const osdTimerRef = useRef<number | null>(null);
+  const netCopyTimerRef = useRef<number | null>(null);
   const segReadyRafRef = useRef<number | null>(null);
   const enterRafRef = useRef<number | null>(null);
   const jumpListTimerRef = useRef<number | null>(null);
@@ -590,6 +620,35 @@ export const FlyoutView: React.FC = () => {
             .catch(() => {
               setPeriphHydrated(true);
             });
+        } else if (r.kind === 'network') {
+          setNetIpCopied(false);
+          setNetPinging(true);
+          getNetworkSnapshot(true)
+            .then((snap) => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'network') {
+                setNetSnap(snap);
+              }
+            })
+            .catch(() => {})
+            .finally(() => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'network') {
+                setNetPinging(false);
+              }
+            });
+        } else if (r.kind === 'telemetry') {
+          setTelemRefreshing(true);
+          ipc<TelemetryState>('get_telemetry')
+            .then((snap) => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'telemetry') {
+                setTelemSnap(snap);
+              }
+            })
+            .catch(() => {})
+            .finally(() => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'telemetry') {
+                setTelemRefreshing(false);
+              }
+            });
         } else if (r.kind === 'preview') {
           const payload = (r.payload ?? {}) as PreviewFlyoutPayload;
           const wins = payload.group?.windows ?? [];
@@ -805,6 +864,12 @@ export const FlyoutView: React.FC = () => {
         setPeriphHydrated(true);
         setPeriphRefreshing(false);
       }),
+      onEvent<TelemetryState>('telemetry-updated', (snap) => {
+        if (snap) {
+          setTelemSnap(snap);
+          setTelemRefreshing(false);
+        }
+      }),
       onEvent<AppWindowGroup[]>('windows-updated', (groups) => {
         if (activeKindRef.current !== 'preview') return;
         const key = previewGroupKeyRef.current;
@@ -862,6 +927,7 @@ export const FlyoutView: React.FC = () => {
       window.removeEventListener('keydown', onKey);
       clearOsdTimer();
       if (exitTimerRef.current !== null) window.clearTimeout(exitTimerRef.current);
+      if (netCopyTimerRef.current !== null) window.clearTimeout(netCopyTimerRef.current);
       if (segReadyRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(segReadyRafRef.current);
       }
@@ -898,7 +964,9 @@ export const FlyoutView: React.FC = () => {
       req.kind === 'quick' ||
       req.kind === 'calendar' ||
       req.kind === 'weather' ||
-      req.kind === 'battery';
+      req.kind === 'battery' ||
+      req.kind === 'network' ||
+      req.kind === 'telemetry';
 
     let measuredCardHeight: number | undefined;
     if (shouldMeasure && cardRef.current) {
@@ -1037,6 +1105,54 @@ export const FlyoutView: React.FC = () => {
     return () => window.clearInterval(id);
   }, [isSoundVisiblyOpen, media?.hasSession, media?.isPlaying]);
 
+  // Live 1.5s RX/TX network polling ONLY while Network flyout is open
+  useEffect(() => {
+    if (anim.phase !== 'open' || anim.req?.kind !== 'network') return;
+    let cancelled = false;
+    let inflight = false;
+    const poll = () => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      getNetworkSnapshot(false)
+        .then((snap) => {
+          if (!cancelled && snap) setNetSnap(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    const timer = window.setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [anim.phase, anim.req?.kind]);
+
+  // Live 2s PC telemetry polling ONLY while Telemetry flyout is open
+  useEffect(() => {
+    if (anim.phase !== 'open' || anim.req?.kind !== 'telemetry') return;
+    let cancelled = false;
+    let inflight = false;
+    const poll = () => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      ipc<TelemetryState>('get_telemetry')
+        .then((snap) => {
+          if (!cancelled && snap) setTelemSnap(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [anim.phase, anim.req?.kind]);
+
   // Hydrate per-app audio session native icons via bounded Rust IconCache
   useEffect(() => {
     const sessions = audio?.sessions ?? [];
@@ -1163,7 +1279,9 @@ export const FlyoutView: React.FC = () => {
       req.kind === 'quick' ||
       req.kind === 'calendar' ||
       req.kind === 'weather' ||
-      req.kind === 'battery';
+      req.kind === 'battery' ||
+      req.kind === 'network' ||
+      req.kind === 'telemetry';
     if (!needsAutoHeight) return;
     const el = cardRef.current;
     if (!el) return;
@@ -1180,7 +1298,9 @@ export const FlyoutView: React.FC = () => {
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
-    const innerScroll = el.querySelector<HTMLElement>('.ctx-scroll, .qs-mixer-scroll, .bat-list');
+    const innerScroll = el.querySelector<HTMLElement>(
+      '.ctx-scroll, .qs-mixer-scroll, .bat-list, .telem-disks',
+    );
     if (innerScroll) ro.observe(innerScroll);
     return () => ro.disconnect();
   }, [
@@ -1210,6 +1330,10 @@ export const FlyoutView: React.FC = () => {
     weatherCityError,
     visibleBatteries.length,
     periphHydrated,
+    netSnap?.online,
+    netSnap?.localIp,
+    telemSnap?.gpuAvailable,
+    telemSnap?.disks?.length,
   ]);
 
   // Dynamic compact tray height (128px min normally, smoothly expands to 184px+ ONLY while tray right-click menu is open)
@@ -2556,6 +2680,356 @@ export const FlyoutView: React.FC = () => {
                         })}
                       </div>
                     )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {actionError && (
+            <div className="ctx-err" role="alert">
+              {actionError}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 4D. NETWORK MONITOR FLYOUT (316px, 16px radius)
+  if (req.kind === 'network') {
+    const isOnline = netSnap ? netSnap.online : true;
+    const rawKind = (netSnap?.kind ?? '').trim().toLowerCase();
+    const isWifi = rawKind.includes('wi-fi') || rawKind.includes('wifi') || rawKind.includes('wireless');
+    const kindLabel = !isOnline ? 'Офлайн' : isWifi ? 'Wi-Fi' : 'Ethernet';
+    const adapterTitle = netSnap?.adapterName?.trim() || (isOnline ? 'Сетевой адаптер' : 'Нет подключения');
+    const localIp = netSnap?.localIp?.trim() || '';
+    const pingMs = netSnap?.pingMs ?? null;
+    const pingHost = netSnap?.pingHost?.trim() || '1.1.1.1';
+    const pingTone =
+      pingMs === null ? '' : pingMs < 40 ? 'ok' : pingMs < 100 ? 'accent' : 'warn';
+
+    const handleProbePing = () => {
+      if (netPinging) return;
+      setActionError(null);
+      setNetPinging(true);
+      getNetworkSnapshot(true)
+        .then((snap) => {
+          if (snap) setNetSnap(snap);
+        })
+        .catch((err) => setActionError(formatIpcError(err)))
+        .finally(() => setNetPinging(false));
+    };
+
+    const handleCopyIp = () => {
+      if (!localIp) return;
+      setActionError(null);
+      ipc('copy_to_clipboard', { text: localIp })
+        .then(() => {
+          setNetIpCopied(true);
+          if (netCopyTimerRef.current !== null) window.clearTimeout(netCopyTimerRef.current);
+          netCopyTimerRef.current = window.setTimeout(() => setNetIpCopied(false), 1600);
+        })
+        .catch((err) => setActionError(formatIpcError(err)));
+    };
+
+    return (
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
+        <div
+          key={anim.renderSeq}
+          ref={cardRef}
+          className="flyout-card net-card"
+          data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
+          style={cardOriginStyle}
+        >
+          <div className="wf-head">
+            <div className="wf-head-meta">
+              <span className="net-head-ic">
+                {!isOnline ? (
+                  <OfflineIcon className="ic16" />
+                ) : isWifi ? (
+                  <WifiIcon className="ic16" />
+                ) : (
+                  <EthernetIcon className="ic16" />
+                )}
+              </span>
+              <span className="wf-title">Сеть</span>
+              <span className={`net-status-badge ${isOnline ? 'online' : 'offline'}`}>
+                <span className="net-status-dot" aria-hidden="true" />
+                <span>{isOnline ? 'Онлайн' : 'Офлайн'}</span>
+              </span>
+            </div>
+            <div className="wf-head-actions">
+              <button
+                type="button"
+                className="wf-icon-btn"
+                title="Параметры сети Windows"
+                aria-label="Параметры сети Windows"
+                onClick={() => {
+                  ipc('launch_item', {
+                    target: 'ms-settings:network',
+                    args: null,
+                    asAdmin: false,
+                    closeStart: false,
+                  }).catch(() => {});
+                  close();
+                }}
+              >
+                <SettingsGearIcon className="ic14" />
+              </button>
+            </div>
+          </div>
+
+          <div className="net-adapter-box">
+            <div className="net-adapter-meta">
+              <span className="net-adapter-lbl">Адаптер</span>
+              <span className="net-adapter-name" title={adapterTitle}>
+                {adapterTitle}
+              </span>
+            </div>
+            <span className="wf-badge count">{kindLabel}</span>
+          </div>
+
+          <div className="net-rate-grid">
+            <div className="net-rate-box rx">
+              <span className="net-rate-lbl">
+                <ArrowDownIcon size={11} />
+                <span>Скачивание</span>
+              </span>
+              <span className="net-rate-val">
+                {formatNetworkRateCompact(isOnline ? netSnap?.rxBytesPerSec : 0)}
+              </span>
+            </div>
+            <div className="net-rate-box tx">
+              <span className="net-rate-lbl">
+                <ArrowUpIcon size={11} />
+                <span>Отдача</span>
+              </span>
+              <span className="net-rate-val">
+                {formatNetworkRateCompact(isOnline ? netSnap?.txBytesPerSec : 0)}
+              </span>
+            </div>
+          </div>
+
+          <div className="net-info-list">
+            <div className="net-info-row">
+              <span className="net-info-lbl">Локальный IPv4</span>
+              <div className="net-info-val-wrap">
+                <span className="net-info-mono">{localIp || '—'}</span>
+                <button
+                  type="button"
+                  className={`net-act-btn ${netIpCopied ? 'copied' : ''}`}
+                  disabled={!localIp}
+                  aria-label="Скопировать IPv4"
+                  title="Скопировать IPv4"
+                  onClick={handleCopyIp}
+                >
+                  {netIpCopied ? <CheckIcon size={12} /> : <CopyIcon className="ic12" />}
+                  <span>{netIpCopied ? 'Скопировано' : 'Копировать'}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="net-info-row">
+              <span className="net-info-lbl" title={`TCP-проверка ${pingHost}`}>
+                Пинг · {pingHost}
+              </span>
+              <div className="net-info-val-wrap">
+                <span className={`net-ping-pill ${pingTone}`}>
+                  {pingMs !== null ? `${pingMs} мс` : '—'}
+                </span>
+                <button
+                  type="button"
+                  className={`net-act-btn ${netPinging ? 'spinning' : ''}`}
+                  disabled={netPinging || !isOnline}
+                  onClick={handleProbePing}
+                >
+                  <RefreshIcon className="ic12" />
+                  <span>Проверить</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {actionError && (
+            <div className="ctx-err" role="alert">
+              {actionError}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 4E. PC TELEMETRY FLYOUT (324px, 16px radius)
+  if (req.kind === 'telemetry') {
+    const cpuPct = Math.max(0, Math.min(100, Math.round(telemSnap?.cpuPct ?? 0)));
+    const ramPct = Math.max(0, Math.min(100, Math.round(telemSnap?.ramPct ?? 0)));
+    const gpuPct = Math.max(0, Math.min(100, Math.round(telemSnap?.gpuPct ?? 0)));
+    const vramPct = Math.max(0, Math.min(100, Math.round(telemSnap?.vramPct ?? 0)));
+    const gpuTemp = Math.round(telemSnap?.gpuTempC ?? 0);
+    const gpuTempTone = gpuTemp >= 80 ? 'hot' : gpuTemp >= 65 ? 'warn' : 'ok';
+    const disks = telemSnap?.disks ?? [];
+
+    const handleRefreshTelemetry = () => {
+      if (telemRefreshing) return;
+      setActionError(null);
+      setTelemRefreshing(true);
+      ipc<TelemetryState>('get_telemetry')
+        .then((snap) => {
+          if (snap) setTelemSnap(snap);
+        })
+        .catch((err) => setActionError(formatIpcError(err)))
+        .finally(() => setTelemRefreshing(false));
+    };
+
+    return (
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
+        <div
+          key={anim.renderSeq}
+          ref={cardRef}
+          className="flyout-card telem-card"
+          data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
+          style={cardOriginStyle}
+        >
+          <div className="wf-head">
+            <div className="wf-head-meta">
+              <span className="wf-title">Монитор ПК</span>
+              {telemSnap && (
+                <span className="wf-badge count">
+                  {Math.round(telemSnap.ramTotalGb)} ГБ ОЗУ
+                </span>
+              )}
+            </div>
+            <div className="wf-head-actions">
+              <button
+                type="button"
+                className="wf-icon-btn"
+                title="Диспетчер задач"
+                aria-label="Диспетчер задач"
+                onClick={() => {
+                  ipc('launch_item', {
+                    target: 'C:\\Windows\\System32\\Taskmgr.exe',
+                    args: null,
+                    asAdmin: false,
+                    closeStart: false,
+                  }).catch(() => {});
+                  close();
+                }}
+              >
+                <TaskmgrIcon className="ic14" />
+              </button>
+              <button
+                type="button"
+                className={`wf-icon-btn ${telemRefreshing ? 'spinning' : ''}`}
+                aria-label="Обновить телеметрию"
+                disabled={telemRefreshing}
+                onClick={handleRefreshTelemetry}
+              >
+                <RefreshIcon className="ic14" />
+              </button>
+            </div>
+          </div>
+
+          <div className="telem-rows">
+            <div className="telem-row">
+              <div className="telem-row-top">
+                <span className="telem-lbl" title={telemSnap?.cpuName || 'Процессор'}>
+                  Процессор
+                  {telemSnap?.cpuName && <span className="telem-sub"> · {telemSnap.cpuName}</span>}
+                </span>
+                <span className="telem-val">{telemSnap ? `${cpuPct}%` : '—'}</span>
+              </div>
+              <div className="telem-bar-track" aria-hidden="true">
+                <div
+                  className={`telem-bar-fill ${getTelemetryUsageTone(cpuPct)}`}
+                  style={{ transform: `scaleX(${cpuPct / 100})` }}
+                />
+              </div>
+            </div>
+
+            <div className="telem-row">
+              <div className="telem-row-top">
+                <span className="telem-lbl">ОЗУ</span>
+                <span className="telem-val">
+                  {telemSnap
+                    ? `${formatTelemetryGb(telemSnap.ramUsedGb)} / ${formatTelemetryGb(telemSnap.ramTotalGb)} ГБ · ${ramPct}%`
+                    : '—'}
+                </span>
+              </div>
+              <div className="telem-bar-track" aria-hidden="true">
+                <div
+                  className={`telem-bar-fill ${getTelemetryUsageTone(ramPct)}`}
+                  style={{ transform: `scaleX(${ramPct / 100})` }}
+                />
+              </div>
+            </div>
+
+            {telemSnap?.gpuAvailable && (
+              <>
+                <div className="telem-row">
+                  <div className="telem-row-top">
+                    <span className="telem-lbl" title={telemSnap.gpuName || 'GPU'}>
+                      GPU
+                      {telemSnap.gpuName && <span className="telem-sub"> · {telemSnap.gpuName}</span>}
+                    </span>
+                    <span className="telem-val">
+                      {gpuTemp > 0 && (
+                        <span className={`telem-temp-chip ${gpuTempTone}`}>{gpuTemp}°C</span>
+                      )}
+                      <span>{gpuPct}%</span>
+                    </span>
+                  </div>
+                  <div className="telem-bar-track" aria-hidden="true">
+                    <div
+                      className={`telem-bar-fill ${getTelemetryUsageTone(gpuPct)}`}
+                      style={{ transform: `scaleX(${gpuPct / 100})` }}
+                    />
+                  </div>
+                </div>
+
+                <div className="telem-row">
+                  <div className="telem-row-top">
+                    <span className="telem-lbl">Видеопамять (VRAM)</span>
+                    <span className="telem-val">
+                      {`${formatTelemetryGb(telemSnap.vramUsedGb)} / ${formatTelemetryGb(telemSnap.vramTotalGb)} ГБ · ${vramPct}%`}
+                    </span>
+                  </div>
+                  <div className="telem-bar-track" aria-hidden="true">
+                    <div
+                      className={`telem-bar-fill ${getTelemetryUsageTone(vramPct)}`}
+                      style={{ transform: `scaleX(${vramPct / 100})` }}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          {disks.length > 0 && (
+            <div className="telem-disks">
+              {disks.map((d, idx) => {
+                const usedPct = Math.max(0, Math.min(100, Math.round(d.usedPct)));
+                return (
+                  <div key={d.mount || `disk-${idx}`} className="telem-disk-row">
+                    <div className="telem-disk-top">
+                      <span className="telem-disk-mount">
+                        <DiskIcon className="ic12" />
+                        <span>{d.mount}</span>
+                        {d.name && <span className="telem-sub">{d.name}</span>}
+                      </span>
+                      <span className="telem-disk-val">
+                        {`${formatTelemetryGb(d.freeGb)} / ${formatTelemetryGb(d.totalGb)} ГБ своб.`}
+                      </span>
+                    </div>
+                    <div className="telem-bar-track sm" aria-hidden="true">
+                      <div
+                        className={`telem-bar-fill ${getTelemetryUsageTone(usedPct)}`}
+                        style={{ transform: `scaleX(${usedPct / 100})` }}
+                      />
+                    </div>
                   </div>
                 );
               })}
