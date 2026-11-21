@@ -1,10 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import type { IndexedApp, IndexedFile, PinItem, SteamGame, TestBarConfig } from './ipc';
+import type {
+  AppWindowGroup,
+  AudioState,
+  ClipboardEntry,
+  FrecencyEntry,
+  IndexedApp,
+  IndexedFile,
+  PinItem,
+  SteamGame,
+  TestBarConfig,
+} from './ipc';
 import {
   buildSearchCorpus,
+  getPrimaryActionLabel,
   isPrintableSearchTrigger,
+  matchSubsequence,
   rankSearchResults,
   resolveSearchLaunchPayload,
+  resolveSearchSecondaryAction,
 } from './searchLogic';
 
 function makePin(overrides: Partial<PinItem> & Pick<PinItem, 'id' | 'title' | 'target'>): PinItem {
@@ -37,6 +50,12 @@ function makeConfig(): TestBarConfig {
         title: 'Telegram',
         subtitle: 'Мессенджер',
         target: 'C:\\Users\\user\\AppData\\Roaming\\Telegram Desktop\\Telegram.exe',
+      }),
+      makePin({
+        id: 'figma-pin',
+        title: 'Figma',
+        subtitle: 'Дизайн',
+        target: 'C:\\Users\\user\\AppData\\Local\\Figma\\Figma.exe',
       }),
     ],
     personalLinks: [
@@ -131,6 +150,15 @@ const sampleApps: IndexedApp[] = [
     iconData: null,
   },
   {
+    id: 'app-vsc',
+    name: 'Visual Studio Code',
+    category: 'Разработка',
+    target: 'C:\\Users\\user\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe',
+    aumid: null,
+    iconKey: null,
+    iconData: null,
+  },
+  {
     id: 'uwp-1',
     name: 'Calculator',
     category: 'Система',
@@ -180,7 +208,65 @@ const sampleFiles: IndexedFile[] = [
   },
 ];
 
-describe('searchLogic corpus, RU<->EN fuzzy ranking & keyboard dispatch', () => {
+const sampleGroups: AppWindowGroup[] = [
+  {
+    key: 'figma.exe',
+    name: 'Figma',
+    exePath: 'C:\\Users\\user\\AppData\\Local\\Figma\\Figma.exe',
+    isActive: false,
+    iconKey: null,
+    iconData: null,
+    windows: [
+      {
+        hwnd: 9001,
+        pid: 412,
+        title: 'Design System v2 — Figma',
+        exePath: 'C:\\Users\\user\\AppData\\Local\\Figma\\Figma.exe',
+        exeName: 'Figma',
+        isActive: false,
+        isMinimized: false,
+      },
+    ],
+  },
+];
+
+const sampleAudio: AudioState = {
+  available: true,
+  masterVolume: 72,
+  masterMuted: false,
+  micMuted: false,
+  devices: [
+    { id: 'dev-speakers', name: 'Realtek Digital Speakers', shortName: 'Колонки', isDefault: true },
+    { id: 'dev-hp', name: 'Sony WH-1000XM5 Headphones', shortName: 'Sony XM5', isDefault: false },
+  ],
+  sessions: [],
+};
+
+const sampleClips: ClipboardEntry[] = [
+  {
+    id: 'c-1',
+    tag: 'HEX',
+    kind: 'hex',
+    text: '#8B96F8',
+    preview: '#8B96F8',
+    color: '#8B96F8',
+    pinned: true,
+    lineCount: 1,
+    charCount: 7,
+  },
+  {
+    id: 'c-2',
+    tag: 'CODE',
+    kind: 'code',
+    text: 'const secret = "obsidian";\nconsole.log(secret);',
+    preview: 'const secret = "obsidian"; console.log(secret);',
+    pinned: false,
+    lineCount: 2,
+    charCount: 47,
+  },
+];
+
+describe('searchLogic corpus, Raycast ranking, open windows, commands, clipboard & bangs', () => {
   it('builds a unified corpus across ALL Spaces, customSpaces, UWP apps, Steam games & user files', () => {
     const corpus = buildSearchCorpus({
       config: makeConfig(),
@@ -193,27 +279,59 @@ describe('searchLogic corpus, RU<->EN fuzzy ranking & keyboard dispatch', () => 
     });
 
     const names = corpus.map((c) => c.name);
-    expect(names).toContain('Telegram'); // personalPins
-    expect(names).toContain('Загрузки'); // personalLinks
-    expect(names).toContain('testbar-workspace'); // workFolders
-    expect(names).toContain('Cursor'); // workApps
-    expect(names).toContain('Photoshop 2025'); // studioPins
-    expect(names).toContain('WizTree'); // studioTools
-    expect(names).toContain('Battle.net'); // gameLaunchers
-    expect(names).toContain('PoE 2 + Trade'); // gameCombos
-    expect(names).toContain('Портфель Акций'); // customSpaces
-    expect(names).toContain('Path of Exile 2'); // Steam games
-    expect(names).toContain('Notion'); // Win32 installed app
-    expect(names).toContain('Calculator'); // UWP packaged app
-    expect(names).toContain('Quarterly-Report-2026.pdf'); // User file
-    expect(names).toContain('Дизайн-Макеты'); // User folder
+    expect(names).toContain('Telegram');
+    expect(names).toContain('Загрузки');
+    expect(names).toContain('testbar-workspace');
+    expect(names).toContain('Cursor');
+    expect(names).toContain('Photoshop 2025');
+    expect(names).toContain('WizTree');
+    expect(names).toContain('Battle.net');
+    expect(names).toContain('PoE 2 + Trade');
+    expect(names).toContain('Портфель Акций');
+    expect(names).toContain('Path of Exile 2');
+    expect(names).toContain('Notion');
+    expect(names).toContain('Calculator');
+    expect(names).toContain('Quarterly-Report-2026.pdf');
+    expect(names).toContain('Дизайн-Макеты');
 
     const calc = corpus.find((c) => c.name === 'Calculator');
     expect(calc?.source).toBe('uwp');
     expect(calc?.iconData).toBe('data:image/png;base64,CALC');
   });
 
-  it('matches RU<->EN wrong-keyboard-layout queries including ntkt -> Telegram and rfkmr -> Calculator', () => {
+  it('prioritizes live open windows ahead of launching duplicate apps and supports focus + Alt+Enter close', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      groups: sampleGroups,
+    });
+
+    const ranked = rankSearchResults(corpus, 'figma');
+    expect(ranked.items.length).toBeGreaterThan(0);
+    expect(ranked.items[0].source).toBe('window');
+    expect(ranked.items[0].hwnd).toBe(9001);
+    expect(ranked.items[0].badge).toEqual({ text: 'Открыто', variant: 'open' });
+    expect(getPrimaryActionLabel(ranked.items[0])).toBe('Перейти');
+
+    expect(resolveSearchLaunchPayload(ranked.items[0], false)).toEqual({
+      command: 'focus_window',
+      args: { hwnd: 9001, toggleMinimize: false },
+    });
+    expect(resolveSearchSecondaryAction(ranked.items[0])).toEqual({
+      type: 'close_window',
+      hwnd: 9001,
+      label: 'Закрыть окно',
+    });
+  });
+
+  it('supports subsequence fuzzy matching (vsc -> Visual Studio Code) with exact highlight indices', () => {
+    const sub = matchSubsequence('Visual Studio Code', 'vsc');
+    expect(sub).not.toBeNull();
+    expect(sub?.indices).toEqual([0, 7, 14]);
+
     const corpus = buildSearchCorpus({
       config: makeConfig(),
       apps: sampleApps,
@@ -222,27 +340,174 @@ describe('searchLogic corpus, RU<->EN fuzzy ranking & keyboard dispatch', () => 
       iconMap: {},
     });
 
+    const ranked = rankSearchResults(corpus, 'vsc');
+    expect(ranked.items[0]?.name).toBe('Visual Studio Code');
+    expect(ranked.matchIndices[ranked.items[0].id]).toEqual([0, 7, 14]);
+  });
+
+  it('boosts frequently launched items via frecency scoring', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: [
+        ...sampleApps,
+        {
+          id: 'app-alpha',
+          name: 'Note Alpha',
+          category: 'Программы',
+          target: 'C:\\Tools\\NoteAlpha.exe',
+          aumid: null,
+          iconKey: null,
+          iconData: null,
+        },
+        {
+          id: 'app-beta',
+          name: 'Note Beta',
+          category: 'Программы',
+          target: 'C:\\Tools\\NoteBeta.exe',
+          aumid: null,
+          iconKey: null,
+          iconData: null,
+        },
+      ],
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+    });
+
+    const now = 1_750_000_000_000;
+    const frecency: Record<string, FrecencyEntry> = {
+      'target:c:\\tools\\notebeta.exe': { count: 24, lastUsedMs: now - 60_000 },
+    };
+
+    const ranked = rankSearchResults(corpus, 'note', 10, frecency, now);
+    expect(ranked.items[0]?.name).toBe('Note Beta');
+  });
+
+  it('matches RU<->EN wrong-keyboard-layout queries across apps, files, and system commands', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      audio: sampleAudio,
+    });
+
     // "ntkt" (EN layout for "теле") -> Telegram
     const tgHit = rankSearchResults(corpus, 'ntkt');
-    expect(tgHit.items.length).toBeGreaterThan(0);
-    expect(tgHit.items[0].name).toBe('Telegram');
+    expect(tgHit.items[0]?.name).toBe('Telegram');
     expect(tgHit.swappedHint).toBe('теле');
 
-    // "rfkmr" (EN layout for "кальк") -> UWP Calculator
-    const calcHit = rankSearchResults(corpus, 'rfkmr');
-    expect(calcHit.items.length).toBeGreaterThan(0);
-    expect(calcHit.items[0].name).toBe('Calculator');
-    expect(calcHit.swappedHint).toBe('кальк');
+    // "rjhpb" (EN layout for "корзи") -> Очистить корзину command
+    const binHit = rankSearchResults(corpus, 'rjhpb');
+    expect(binHit.items[0]?.commandId).toBe('empty_recycle_bin');
+    expect(binHit.swappedHint).toBe('корзи');
+    expect(resolveSearchLaunchPayload(binHit.items[0], false)).toEqual({
+      command: 'empty_recycle_bin',
+      args: {},
+    });
 
-    // "йгфкеукдн" (RU layout for "quarterly") -> user file Quarterly-Report-2026.pdf
+    // "йгфкеукдн" (RU layout for "quarterly") -> user file
     const fileHit = rankSearchResults(corpus, 'йгфкеукдн');
-    expect(fileHit.items.length).toBeGreaterThan(0);
-    expect(fileHit.items[0].name).toBe('Quarterly-Report-2026.pdf');
+    expect(fileHit.items[0]?.name).toBe('Quarterly-Report-2026.pdf');
     expect(fileHit.swappedHint).toBe('quarterly');
 
-    // "gjhnаtkm" or "gjhn" (EN layout for "порт") -> customSpace URL "Портфель Акций"
+    // "gjhn" (EN layout for "порт") -> customSpace URL
     const customHit = rankSearchResults(corpus, 'gjhn');
     expect(customHit.items.some((i) => i.name === 'Портфель Акций')).toBe(true);
+  });
+
+  it('exposes WASAPI audio output switching and bilingual system commands', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      audio: sampleAudio,
+    });
+
+    const hpHit = rankSearchResults(corpus, 'sony');
+    expect(hpHit.items[0]?.source).toBe('audio_device');
+    expect(resolveSearchLaunchPayload(hpHit.items[0], false)).toEqual({
+      command: 'set_audio_device',
+      args: { deviceId: 'dev-hp' },
+    });
+
+    const micHit = rankSearchResults(corpus, 'микрофон');
+    expect(micHit.items[0]?.commandId).toBe('mic_toggle');
+    expect(resolveSearchLaunchPayload(micHit.items[0], false)).toEqual({
+      command: 'set_mic_muted',
+      args: { muted: true },
+    });
+
+    const snipHit = rankSearchResults(corpus, 'скриншот');
+    expect(snipHit.items[0]?.commandId).toBe('screenshot');
+    expect(resolveSearchLaunchPayload(snipHit.items[0], false)).toEqual({
+      command: 'open_screen_snip',
+      args: {},
+    });
+
+    const reindexHit = rankSearchResults(corpus, 'reindex');
+    expect(reindexHit.items[0]?.commandId).toBe('refresh_indexes');
+    expect(resolveSearchLaunchPayload(reindexHit.items[0], false)).toEqual({
+      command: 'refresh_indexes',
+      args: {},
+    });
+  });
+
+  it('supports clipboard prefix search (clip / буфер) and dispatches instant paste', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+      clips: sampleClips,
+    });
+
+    const allClips = rankSearchResults(corpus, 'clip');
+    expect(allClips.mode).toBe('clipboard');
+    expect(allClips.items.length).toBe(2);
+
+    const filtered = rankSearchResults(corpus, 'буфер obsidian');
+    expect(filtered.mode).toBe('clipboard');
+    expect(filtered.items.length).toBe(1);
+    expect(filtered.items[0].source).toBe('clipboard');
+    expect(resolveSearchLaunchPayload(filtered.items[0], false)).toEqual({
+      command: 'paste_clipboard_entry',
+      args: { text: 'const secret = "obsidian";\nconsole.log(secret);' },
+    });
+    expect(resolveSearchSecondaryAction(filtered.items[0])).toEqual({
+      type: 'copy_clipboard',
+      text: 'const secret = "obsidian";\nconsole.log(secret);',
+      label: 'Копировать',
+    });
+  });
+
+  it('supports explicit web bangs (g, yt, gh) and strictly excludes any math calculator', () => {
+    const corpus = buildSearchCorpus({
+      config: makeConfig(),
+      apps: sampleApps,
+      games: sampleGames,
+      files: sampleFiles,
+      iconMap: {},
+    });
+
+    const google = rankSearchResults(corpus, 'g tauri v2');
+    expect(google.mode).toBe('web');
+    expect(google.items[0].target).toBe('https://www.google.com/search?q=tauri%20v2');
+
+    const yt = rankSearchResults(corpus, 'yt synthwave');
+    expect(yt.items[0].target).toBe('https://www.youtube.com/results?search_query=synthwave');
+
+    const gh = rankSearchResults(corpus, 'gh windows-rs');
+    expect(gh.items[0].target).toBe('https://github.com/search?q=windows-rs');
+
+    // User exclusion guardrail: ZERO inline math calculator!
+    expect(rankSearchResults(corpus, '2+2').items).toHaveLength(0);
+    expect(rankSearchResults(corpus, '144 / 12').items).toHaveLength(0);
+    expect(rankSearchResults(corpus, '(18 + 7) * 4').items).toHaveLength(0);
   });
 
   it('ranks prefix and pinned matches above substring matches', () => {
@@ -275,9 +540,9 @@ describe('searchLogic corpus, RU<->EN fuzzy ranking & keyboard dispatch', () => 
     });
 
     const ranked = rankSearchResults(corpus, 'cursor');
-    expect(ranked.items[0].name).toBe('Cursor'); // exact + pinned
-    expect(ranked.items[1].name).toBe('Cursorless Extension'); // prefix
-    expect(ranked.items[2].name).toBe('My Cursor Helper'); // word-start
+    expect(ranked.items[0].name).toBe('Cursor');
+    expect(ranked.items[1].name).toBe('Cursorless Extension');
+    expect(ranked.items[2].name).toBe('My Cursor Helper');
   });
 
   it('dispatches Enter, Ctrl+Enter (admin-safe), and combo payloads accurately', () => {
@@ -299,14 +564,12 @@ describe('searchLogic corpus, RU<->EN fuzzy ranking & keyboard dispatch', () => 
       args: { target: tg.target, args: null, asAdmin: true, closeStart: true },
     });
 
-    // UWP shell:AppsFolder target must never pass runas verb on Ctrl+Enter
     const calc = corpus.find((c) => c.name === 'Calculator')!;
     expect(resolveSearchLaunchPayload(calc, true)).toEqual({
       command: 'launch_item',
       args: { target: calc.target, args: null, asAdmin: false, closeStart: true },
     });
 
-    // Combo item dispatches launch_combo with all targets
     const combo = corpus.find((c) => c.name === 'PoE 2 + Trade')!;
     expect(resolveSearchLaunchPayload(combo, false)).toEqual({
       command: 'launch_combo',

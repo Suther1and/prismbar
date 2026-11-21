@@ -8,16 +8,25 @@ import {
   buildVolumeOsdRequest,
   computeDockLogicalWidth,
   computeNextWheelVolume,
+  computePreviewCardWidth,
+  formatSoundNetworkTooltip,
+  formatTaskbarClock,
+  getPreviewHoverDelayMs,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
   isSoundFlyoutActive,
   planSoundFeedbackAction,
+  PREVIEW_HOVER_COLD_MS,
+  PREVIEW_HOVER_WARM_MS,
+  resolvePinnedReorderIndices,
   resolveTaskbarMonitor,
+  selectWindowToFocusOnTaskbarClick,
   shouldOpenVolumeOsd,
   shouldTriggerPreviewHover,
   VOLUME_OSD_HEIGHT,
   VOLUME_OSD_WIDTH,
   type AppContextPayload,
+  type PreviewFlyoutPayload,
 } from './taskbarLogic';
 
 function makeRunningItem(overrides: Partial<MergedBarItem> = {}): MergedBarItem {
@@ -67,7 +76,7 @@ function makeRunningItem(overrides: Partial<MergedBarItem> = {}): MergedBarItem 
   };
 }
 
-describe('TaskbarView Dock/Edge layout & multi-monitor helpers', () => {
+describe('TaskbarView Dock/Edge layout, states, cycling & pin DnD helpers', () => {
   it('resolves primary vs secondary monitor from query string', () => {
     expect(resolveTaskbarMonitor('?view=taskbar')).toBe('primary');
     expect(resolveTaskbarMonitor('?view=taskbar&monitor=primary')).toBe('primary');
@@ -82,17 +91,14 @@ describe('TaskbarView Dock/Edge layout & multi-monitor helpers', () => {
   });
 
   it('computes unconstrained dock logical width from max(scrollWidth, rectWidth)', () => {
-    // Picks unconstrained scrollWidth when initial window width clips bounding rect
     expect(computeDockLogicalWidth(742.2, 604)).toBe(743);
-    // Picks bounding rect when slightly larger
     expect(computeDockLogicalWidth(500, 512.4)).toBe(513);
-    // Rejects unmounted / sub-200px transient measurements
     expect(computeDockLogicalWidth(0, 0)).toBeNull();
     expect(computeDockLogicalWidth(180, 200)).toBeNull();
     expect(computeDockLogicalWidth(Number.NaN, 420)).toBe(420);
   });
 
-  it('computes item running/active/idle indicator classes', () => {
+  it('computes active, running, minimized & idle indicator classes', () => {
     const active = makeRunningItem();
     expect(getTaskbarItemStateClass(active)).toBe('active');
 
@@ -101,34 +107,157 @@ describe('TaskbarView Dock/Edge layout & multi-monitor helpers', () => {
     });
     expect(getTaskbarItemStateClass(running)).toBe('running');
 
+    const allMinimized = makeRunningItem({
+      group: {
+        ...active.group!,
+        isActive: false,
+        windows: active.group!.windows.map((w) => ({ ...w, isActive: false, isMinimized: true })),
+      },
+    });
+    expect(getTaskbarItemStateClass(allMinimized)).toBe('minimized');
+
     const idle = makeRunningItem({ group: undefined });
     expect(getTaskbarItemStateClass(idle)).toBe('idle');
   });
+
+  it('cycles multi-window groups cleanly on taskbar click without stranding windows #2..N', () => {
+    const item = makeRunningItem();
+    const wins = item.group!.windows;
+
+    // Single window -> toggles focus/minimize
+    expect(selectWindowToFocusOnTaskbarClick([wins[0]])).toEqual({
+      hwnd: 101,
+      toggleMinimize: true,
+    });
+
+    // Multi-window with #0 active -> cycles to #1 (no minimize)
+    expect(selectWindowToFocusOnTaskbarClick(wins)).toEqual({
+      hwnd: 102,
+      toggleMinimize: false,
+    });
+
+    // Multi-window with last window active -> wraps back to #0
+    const lastActive = [
+      { ...wins[0], isActive: false },
+      { ...wins[1], isActive: true },
+    ];
+    expect(selectWindowToFocusOnTaskbarClick(lastActive)).toEqual({
+      hwnd: 101,
+      toggleMinimize: false,
+    });
+
+    // Multi-window with none active -> picks first non-minimized window
+    const noneActive = [
+      { ...wins[0], isActive: false, isMinimized: true },
+      { ...wins[1], isActive: false, isMinimized: false },
+    ];
+    expect(selectWindowToFocusOnTaskbarClick(noneActive)).toEqual({
+      hwnd: 102,
+      toggleMinimize: false,
+    });
+
+    expect(selectWindowToFocusOnTaskbarClick([])).toBeNull();
+  });
+
+  it('resolves drag-and-drop pin indices strictly across pinned taskbar items', () => {
+    const items = [
+      { id: 'pin-a', pinned: true },
+      { id: 'pin-b', pinned: true },
+      { id: 'pin-c', pinned: true },
+      { id: 'run-x', pinned: false },
+    ];
+
+    expect(resolvePinnedReorderIndices(items, 'pin-a', 'pin-c')).toEqual({
+      fromIdx: 0,
+      toIdx: 2,
+    });
+    expect(resolvePinnedReorderIndices(items, 'pin-b', 'pin-a')).toEqual({
+      fromIdx: 1,
+      toIdx: 0,
+    });
+    // Rejects same item or unpinned running items
+    expect(resolvePinnedReorderIndices(items, 'pin-a', 'pin-a')).toBeNull();
+    expect(resolvePinnedReorderIndices(items, 'run-x', 'pin-a')).toBeNull();
+    expect(resolvePinnedReorderIndices(items, 'pin-a', 'run-x')).toBeNull();
+  });
+
+  it('formats taskbar clock with optional seconds, weekday & full Russian date tooltip', () => {
+    // 2026-11-21 09:05:07 is Saturday
+    const d = new Date(2026, 10, 21, 9, 5, 7);
+    expect(formatTaskbarClock(d)).toEqual({
+      timeStr: '09:05',
+      dateStr: '21.11.2026',
+      fullTitle: 'Суббота, 21 ноября 2026',
+    });
+    expect(formatTaskbarClock(d, { showSeconds: true, showWeekday: true })).toEqual({
+      timeStr: '09:05:07',
+      dateStr: 'Сб, 21.11.2026',
+      fullTitle: 'Суббота, 21 ноября 2026',
+    });
+
+    expect(
+      formatSoundNetworkTooltip(
+        {
+          available: true,
+          masterVolume: 68,
+          masterMuted: false,
+          micMuted: false,
+          defaultDeviceShortName: 'Наушники',
+        },
+        { connected: true, kind: 'Ethernet', speedLabel: '1 Гбит/с' },
+      ),
+    ).toBe('Ethernet · 1 Гбит/с · Звук (Наушники): 68%');
+
+    expect(
+      formatSoundNetworkTooltip(
+        {
+          available: true,
+          masterVolume: 40,
+          masterMuted: true,
+          micMuted: false,
+          defaultDeviceShortName: '',
+        },
+        { connected: false, kind: 'Offline', speedLabel: '' },
+      ),
+    ).toBe('Нет сети · Звук: Выкл');
+  });
 });
 
-describe('Preview hover preemption & flyout payload builders', () => {
+describe('Warm preview scrubbing, hover preemption & flyout payload builders', () => {
+  it('uses 180ms cold delay and drops to 25ms warm delay during preview scrub & 300ms post-close grace', () => {
+    expect(PREVIEW_HOVER_COLD_MS).toBe(180);
+    expect(PREVIEW_HOVER_WARM_MS).toBe(25);
+
+    // Cold hover -> 180ms
+    expect(getPreviewHoverDelayMs('', null, 1000)).toBe(180);
+    expect(getPreviewHoverDelayMs('', 500, 1000)).toBe(180);
+
+    // Active preview -> 25ms instant scrub
+    expect(getPreviewHoverDelayMs('preview', null, 1000)).toBe(25);
+
+    // Within 300ms after preview closed -> 25ms warm handoff
+    expect(getPreviewHoverDelayMs('', 800, 1000)).toBe(25);
+    expect(getPreviewHoverDelayMs('', 700, 1000)).toBe(25);
+    expect(getPreviewHoverDelayMs('', 699, 1000)).toBe(180);
+  });
+
   it('preempts hover preview when Start or interactive click flyouts are open', () => {
     const running = makeRunningItem();
     const idle = makeRunningItem({ group: undefined });
 
-    // Normal hover on running app -> allowed
     expect(shouldTriggerPreviewHover(running, false, '')).toBe(true);
-    // Switching directly from one hover preview to another -> allowed
     expect(shouldTriggerPreviewHover(running, false, 'preview')).toBe(true);
     expect(shouldTriggerPreviewHover(running, false, 'osd')).toBe(true);
 
-    // Idle pinned app -> blocked
     expect(shouldTriggerPreviewHover(idle, false, '')).toBe(false);
-    // Start open -> blocked
     expect(shouldTriggerPreviewHover(running, true, '')).toBe(false);
 
-    // Interactive click flyouts must NEVER be preempted by hover preview
     for (const clickFlyout of ['tray', 'sound', 'quick', 'calendar', 'context_app', 'context_bar']) {
       expect(shouldTriggerPreviewHover(running, false, clickFlyout)).toBe(false);
     }
   });
 
-  it('builds gapless non-activating preview requests carrying monitor anchor', () => {
+  it('builds gapless non-activating preview requests carrying monitor anchor & +N overflow width', () => {
     const item = makeRunningItem();
     const req = buildPreviewFlyoutRequest(item, 320, 'secondary');
     expect(req.kind).toBe('preview');
@@ -138,6 +267,11 @@ describe('Preview hover preemption & flyout payload builders', () => {
     expect(req.monitor).toBe('secondary');
     expect(req.width).toBe(2 * 214 + 20);
     expect(req.height).toBe(166);
+    expect((req.payload as PreviewFlyoutPayload).iconKey).toBe('exe:1111222233334444');
+
+    // 4 cards vs 6 cards (4 visible + 53px for +2 overflow badge)
+    expect(computePreviewCardWidth(4)).toBe(4 * 214 + 20);
+    expect(computePreviewCardWidth(6)).toBe(4 * 214 + 20 + 53);
   });
 
   it('builds app context menu payload preserving matchExe, matchAumid, iconKey & args', () => {
@@ -185,7 +319,6 @@ describe('Preview hover preemption & flyout payload builders', () => {
     expect(payload.iconKey).toBe('aumid:abcd1234');
     expect(payload.windows).toHaveLength(1);
 
-    // Pinning from context menu preserves canonical deduplication fields
     const pin = buildPinFromAppContext(payload, 'tb-fixed');
     expect(pin.id).toBe('tb-fixed');
     expect(pin.kind).toBe('app');
@@ -213,21 +346,17 @@ describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => 
     expect(isSoundFlyoutActive('quick')).toBe(true);
     expect(isSoundFlyoutActive('osd')).toBe(false);
 
-    // Allowed when idle, preview, or already showing OSD
     expect(shouldOpenVolumeOsd('')).toBe(true);
     expect(shouldOpenVolumeOsd('preview')).toBe(true);
     expect(shouldOpenVolumeOsd('osd')).toBe(true);
 
-    // Blocked for Quick Sound and all interactive click flyouts
     for (const active of ['sound', 'quick', 'tray', 'calendar', 'context_app', 'context_bar']) {
       expect(shouldOpenVolumeOsd(active)).toBe(false);
     }
 
-    // Open Sound -> updates in place (openOsd = false, req = null)
     const inPlace = planSoundFeedbackAction('sound', 72, false, 640, 'primary');
     expect(inPlace).toEqual({ openOsd: false, volume: 72, muted: false, req: null });
 
-    // Idle -> opens non-activating 176x44 OSD above Sound pill
     const osdPlan = planSoundFeedbackAction('', 72, false, 640, 'secondary');
     expect(osdPlan.openOsd).toBe(true);
     expect(osdPlan.req).toEqual({

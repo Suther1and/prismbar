@@ -55,6 +55,23 @@ export interface CalendarDayCell {
   inCurrentMonth: boolean;
   isToday: boolean;
   isSelected: boolean;
+  isWeekend: boolean;
+}
+
+export function isWeekendColumn(colIndex: number): boolean {
+  const mod = ((colIndex % 7) + 7) % 7;
+  return mod === 5 || mod === 6;
+}
+
+export function computeCalendarSlideDir(
+  prev: CalendarMonthRef,
+  next: CalendarMonthRef,
+): -1 | 0 | 1 {
+  const prevTotal = prev.year * 12 + prev.month;
+  const nextTotal = next.year * 12 + next.month;
+  if (nextTotal > prevTotal) return 1;
+  if (nextTotal < prevTotal) return -1;
+  return 0;
 }
 
 export function isSameCalendarDay(a: Date, b: Date): boolean {
@@ -119,6 +136,7 @@ export function buildCalendarMonthGrid(
 
   for (let i = mondayOffset - 1; i >= 0; i--) {
     const day = daysInPrevMonth - i;
+    const col = cells.length % 7;
     cells.push({
       key: makeDayKey(prevRef.year, prevRef.month, day),
       year: prevRef.year,
@@ -127,10 +145,12 @@ export function buildCalendarMonthGrid(
       inCurrentMonth: false,
       isToday: prevRef.year === todayY && prevRef.month === todayM && day === todayD,
       isSelected: prevRef.year === selY && prevRef.month === selM && day === selD,
+      isWeekend: isWeekendColumn(col),
     });
   }
 
   for (let day = 1; day <= daysInMonth; day++) {
+    const col = cells.length % 7;
     cells.push({
       key: makeDayKey(viewYear, viewMonth, day),
       year: viewYear,
@@ -139,11 +159,13 @@ export function buildCalendarMonthGrid(
       inCurrentMonth: true,
       isToday: viewYear === todayY && viewMonth === todayM && day === todayD,
       isSelected: viewYear === selY && viewMonth === selM && day === selD,
+      isWeekend: isWeekendColumn(col),
     });
   }
 
   let nextDay = 1;
   while (cells.length < CALENDAR_GRID_CELLS) {
+    const col = cells.length % 7;
     cells.push({
       key: makeDayKey(nextRef.year, nextRef.month, nextDay),
       year: nextRef.year,
@@ -152,6 +174,7 @@ export function buildCalendarMonthGrid(
       inCurrentMonth: false,
       isToday: nextRef.year === todayY && nextRef.month === todayM && nextDay === todayD,
       isSelected: nextRef.year === selY && nextRef.month === selM && nextDay === selD,
+      isWeekend: isWeekendColumn(col),
     });
     nextDay += 1;
   }

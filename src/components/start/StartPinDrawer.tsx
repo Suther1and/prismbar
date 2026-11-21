@@ -1,5 +1,7 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { formatIpcError } from '../../lib/flyoutLogic';
 import {
+  iconCache,
   isCacheIconKey,
   type IndexedApp,
   type PinItem,
@@ -11,6 +13,7 @@ import {
   getSpaceDisplayName,
   normalizeUrlPinInput,
 } from '../../lib/startLogic';
+import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import {
   CheckIcon,
   CloseWindowIcon,
@@ -23,6 +26,7 @@ import {
 } from '../Icons';
 
 export interface StartPinDrawerProps {
+  open: boolean;
   space: string;
   config: TestBarConfig | null;
   apps: IndexedApp[];
@@ -35,6 +39,7 @@ export interface StartPinDrawerProps {
 }
 
 export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
+  open,
   space,
   config,
   apps,
@@ -45,13 +50,31 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
   onPinUrl,
   onTogglePinApp,
 }) => {
+  const { mounted, phase } = useAnimatedPresence(open, 115);
+
   const [filterText, setFilterText] = useState('');
   const [drawerCat, setDrawerCat] = useState('Все');
   const [urlPromptOpen, setUrlPromptOpen] = useState(false);
   const [urlValue, setUrlValue] = useState('');
   const [urlTitle, setUrlTitle] = useState('');
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [submittingUrl, setSubmittingUrl] = useState(false);
   const filterInputRef = useRef<HTMLInputElement>(null);
+  const urlInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setUrlPromptOpen(false);
+      setUrlError(null);
+      setSubmittingUrl(false);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (urlPromptOpen) {
+      requestAnimationFrame(() => urlInputRef.current?.focus());
+    }
+  }, [urlPromptOpen]);
 
   const spaceName = getSpaceDisplayName(space, config);
 
@@ -69,25 +92,42 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
   }, [apps, drawerCat, filterText]);
 
   const handleSubmitUrl = async () => {
+    if (submittingUrl) return;
     const normalized = normalizeUrlPinInput(urlValue, urlTitle);
     if (!normalized) {
       setUrlError('Введите корректный адрес сайта');
+      urlInputRef.current?.focus();
       return;
     }
+    setSubmittingUrl(true);
     setUrlError(null);
-    await onPinUrl(normalized.url, normalized.title);
-    setUrlValue('');
-    setUrlTitle('');
-    setUrlPromptOpen(false);
+    try {
+      await onPinUrl(normalized.url, normalized.title);
+      setUrlValue('');
+      setUrlTitle('');
+      setUrlPromptOpen(false);
+    } catch (err) {
+      setUrlError(formatIpcError(err));
+    } finally {
+      setSubmittingUrl(false);
+    }
   };
 
+  if (!mounted) return null;
+
   return (
-    <div className="all-apps-drawer" onClick={(e) => e.stopPropagation()}>
-      {/* Top Bar: Target Space Badge + Live Filter + Clean SVG Close */}
+    <div
+      className="all-apps-drawer"
+      data-phase={phase}
+      role="dialog"
+      aria-label="Все программы и закрепление"
+      onClick={(e) => e.stopPropagation()}
+    >
+      {/* Top Bar: Target Space Badge + Live Filter + Close */}
       <div className="drawer-top-bar">
         <div className="drawer-space-badge">
           <span className="drawer-space-dot" />
-          <span>Закрепить в: <strong>{spaceName}</strong></span>
+          <span>Пространство: <strong>{spaceName}</strong></span>
         </div>
 
         <div className="drawer-filter-wrap">
@@ -138,16 +178,16 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         </button>
       </div>
 
-      {/* Crisp 3-Card Universal Pinning Strip */}
+      {/* Crisp 3-Card Universal Pinning Strip (SVG icon badges, no "+" text prefix) */}
       <div className="pin-strip-grid">
         <button
           type="button"
           className="pin-source-card"
           onClick={() => void onPinFolder()}
         >
-          <span className="pin-source-ic amber"><FolderSvg className="ic18" color="#FBBF24" /></span>
+          <span className="pin-source-ic amber"><FolderSvg className="ic18" color="#F2B44B" /></span>
           <div className="pin-source-meta">
-            <div className="pin-source-title">+ Папку</div>
+            <div className="pin-source-title">Папка</div>
             <div className="pin-source-sub">Любая директория на диске</div>
           </div>
         </button>
@@ -157,9 +197,9 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
           className="pin-source-card"
           onClick={() => void onPinFile()}
         >
-          <span className="pin-source-ic sky"><FileSvg className="ic18" color="#38BDF8" /></span>
+          <span className="pin-source-ic sky"><FileSvg className="ic18" color="#52B8F2" /></span>
           <div className="pin-source-meta">
-            <div className="pin-source-title">+ Файл</div>
+            <div className="pin-source-title">Файл</div>
             <div className="pin-source-sub">Программа, документ или скрипт</div>
           </div>
         </button>
@@ -167,6 +207,7 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         <button
           type="button"
           className={`pin-source-card ${urlPromptOpen ? 'active' : ''}`}
+          aria-expanded={urlPromptOpen}
           onClick={() => {
             setUrlPromptOpen((v) => !v);
             setUrlError(null);
@@ -174,68 +215,79 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         >
           <span className="pin-source-ic violet"><GlobeSvg className="ic18" color="#A78BFA" /></span>
           <div className="pin-source-meta">
-            <div className="pin-source-title">+ Ссылку / Сайт</div>
-            <div className="pin-source-sub">Веб-сервис или локальный URL</div>
+            <div className="pin-source-title">Ссылка</div>
+            <div className="pin-source-sub">Веб-сервис или локальный адрес</div>
           </div>
         </button>
       </div>
 
-      {/* Clean inline URL + optional Title form */}
-      {urlPromptOpen && (
-        <div className="url-inline-form">
-          <input
-            className="url-input url-main"
-            autoFocus
-            placeholder="https://example.com"
-            value={urlValue}
-            onChange={(e) => {
-              setUrlValue(e.target.value);
-              if (urlError) setUrlError(null);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                void handleSubmitUrl();
-              } else if (e.key === 'Escape') {
-                e.preventDefault();
-                e.stopPropagation();
+      {/* Smooth Grid-Row Collapsible Inline URL Form (Zero Teleport!) */}
+      <div className={`url-inline-collapse ${urlPromptOpen ? 'open' : ''}`} aria-hidden={!urlPromptOpen}>
+        <div className="url-inline-collapse-inner">
+          <div className="url-inline-form">
+            <input
+              ref={urlInputRef}
+              className="url-input url-main"
+              tabIndex={urlPromptOpen ? 0 : -1}
+              placeholder="https://example.com"
+              value={urlValue}
+              onChange={(e) => {
+                setUrlValue(e.target.value);
+                if (urlError) setUrlError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleSubmitUrl();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setUrlPromptOpen(false);
+                }
+              }}
+            />
+            <input
+              className="url-input url-title"
+              tabIndex={urlPromptOpen ? 0 : -1}
+              placeholder="Название (необязательно)"
+              maxLength={32}
+              value={urlTitle}
+              onChange={(e) => setUrlTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleSubmitUrl();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setUrlPromptOpen(false);
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="pin-any-btn primary"
+              tabIndex={urlPromptOpen ? 0 : -1}
+              disabled={submittingUrl}
+              onClick={() => void handleSubmitUrl()}
+            >
+              Добавить
+            </button>
+            <button
+              type="button"
+              className="pin-any-btn"
+              tabIndex={urlPromptOpen ? 0 : -1}
+              onClick={() => {
                 setUrlPromptOpen(false);
-              }
-            }}
-          />
-          <input
-            className="url-input url-title"
-            placeholder="Название (необязательно)"
-            maxLength={32}
-            value={urlTitle}
-            onChange={(e) => setUrlTitle(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                void handleSubmitUrl();
-              } else if (e.key === 'Escape') {
-                e.preventDefault();
-                e.stopPropagation();
-                setUrlPromptOpen(false);
-              }
-            }}
-          />
-          <button type="button" className="pin-any-btn primary" onClick={() => void handleSubmitUrl()}>
-            Добавить
-          </button>
-          <button
-            type="button"
-            className="pin-any-btn"
-            onClick={() => {
-              setUrlPromptOpen(false);
-              setUrlError(null);
-            }}
-          >
-            Отмена
-          </button>
-          {urlError && <span className="url-inline-err">{urlError}</span>}
+                setUrlError(null);
+              }}
+            >
+              Отмена
+            </button>
+            {urlError && <span className="url-inline-err">{urlError}</span>}
+          </div>
         </div>
-      )}
+      </div>
 
       {/* Category Filter Pills */}
       <div className="cat-pills">
@@ -251,7 +303,7 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
         ))}
       </div>
 
-      {/* 3-Column Scrollable All Apps Grid (Win32 + UWP, dark slim scrollbar, zero horizontal overflow) */}
+      {/* 3-Column Scrollable All Apps Grid */}
       <div className="drawer-grid">
         {filteredApps.length === 0 ? (
           <div className="drawer-empty">Программы по этому фильтру не найдены</div>
@@ -260,7 +312,11 @@ export const StartPinDrawer: React.FC<StartPinDrawerProps> = ({
             const existingPin = getPinnedItemInSpace(a, space, config);
             const isPinned = existingPin !== null;
             const cacheKey = isCacheIconKey(a.iconKey) ? a.iconKey : null;
-            const resolvedIcon = (cacheKey ? iconMap[cacheKey] : null) || a.iconData || iconMap[a.target] || null;
+            const resolvedIcon =
+              (cacheKey ? iconMap[cacheKey] || iconCache.get(cacheKey) : null) ||
+              a.iconData ||
+              iconMap[a.target] ||
+              null;
             const isUwp = Boolean(a.aumid) || a.target.toLowerCase().startsWith('shell:appsfolder\\');
             return (
               <button

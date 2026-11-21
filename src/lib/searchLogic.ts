@@ -1,6 +1,11 @@
-import { canRunAsAdmin } from './flyoutLogic';
+import { canOpenFileLocation, canRunAsAdmin } from './flyoutLogic';
 import {
+  iconCache,
   isCacheIconKey,
+  type AppWindowGroup,
+  type AudioState,
+  type ClipboardEntry,
+  type FrecencyEntry,
   type IndexedApp,
   type IndexedFile,
   type PinItem,
@@ -9,7 +14,38 @@ import {
 } from './ipc';
 import { collectPhoneticAliases, swapLayout } from './layoutMap';
 
-export type SearchSourceKind = 'pinned' | 'app' | 'uwp' | 'game' | 'folder' | 'file' | 'url' | 'combo';
+export type SearchSourceKind =
+  | 'window'
+  | 'command'
+  | 'audio_device'
+  | 'clipboard'
+  | 'web'
+  | 'pinned'
+  | 'app'
+  | 'uwp'
+  | 'game'
+  | 'folder'
+  | 'file'
+  | 'url'
+  | 'combo';
+
+export type SystemCommandId =
+  | 'audio_device'
+  | 'mic_toggle'
+  | 'empty_recycle_bin'
+  | 'screenshot'
+  | 'refresh_indexes'
+  | 'task_manager'
+  | 'lock'
+  | 'sleep'
+  | 'reboot'
+  | 'shutdown'
+  | 'settings';
+
+export interface SearchBadge {
+  text: string;
+  variant: 'open' | 'cmd' | 'clip';
+}
 
 export interface SearchCorpusItem {
   id: string;
@@ -25,6 +61,15 @@ export interface SearchCorpusItem {
   cacheIconKey?: string | null;
   comboTargets?: string[] | null;
   pinned: boolean;
+  badge?: SearchBadge | null;
+  hwnd?: number | null;
+  commandId?: SystemCommandId | null;
+  deviceId?: string | null;
+  micMuted?: boolean;
+  clipText?: string | null;
+  clipColor?: string | null;
+  keywords?: string[];
+  frecencyKey?: string;
 }
 
 export interface SearchCorpusInput {
@@ -33,16 +78,36 @@ export interface SearchCorpusInput {
   games: SteamGame[];
   files: IndexedFile[];
   iconMap: Record<string, string>;
+  groups?: AppWindowGroup[];
+  audio?: AudioState | null;
+  clips?: ClipboardEntry[];
 }
 
 export interface RankedSearchResult {
   items: SearchCorpusItem[];
   swappedHint: string | null;
   totalMatches: number;
+  matchIndices: Record<string, number[]>;
+  mode?: 'default' | 'clipboard' | 'web';
 }
 
 function normKey(v: string | null | undefined): string {
   return (v ?? '').trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function resolveCachedIconData(
+  iconMap: Record<string, string>,
+  cacheIconKey: string | null | undefined,
+  fallbackTarget?: string,
+  inlineData?: string | null,
+): string | null {
+  if (cacheIconKey) {
+    const mapped = iconMap[cacheIconKey] || iconCache.get(cacheIconKey);
+    if (mapped) return mapped;
+  }
+  if (inlineData) return inlineData;
+  if (fallbackTarget && iconMap[fallbackTarget]) return iconMap[fallbackTarget];
+  return null;
 }
 
 function resolvePinIcon(pin: PinItem, iconMap: Record<string, string>): {
@@ -50,18 +115,241 @@ function resolvePinIcon(pin: PinItem, iconMap: Record<string, string>): {
   cacheIconKey: string | null;
 } {
   const cacheIconKey = isCacheIconKey(pin.iconKey) ? pin.iconKey : null;
-  const iconData =
-    (cacheIconKey ? iconMap[cacheIconKey] : null) ||
-    pin.iconData ||
-    iconMap[pin.target] ||
-    null;
+  const iconData = resolveCachedIconData(iconMap, cacheIconKey, pin.target, pin.iconData);
   return { iconData, cacheIconKey };
 }
 
+function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] {
+  const commands: SearchCorpusItem[] = [];
+
+  for (const dev of audio?.devices ?? []) {
+    commands.push({
+      id: `cmd:audio:${dev.id}`,
+      name: `Звук: ${dev.shortName}`,
+      subtitle: dev.isDefault ? `Активный вывод · ${dev.name}` : `Переключить вывод · ${dev.name}`,
+      category: 'Аудиовывод',
+      target: dev.id,
+      args: null,
+      kind: 'app',
+      source: 'audio_device',
+      iconData: null,
+      iconKey: 'cmd:audio_device',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'audio_device',
+      deviceId: dev.id,
+      keywords: [
+        'звук',
+        'аудио',
+        'вывод',
+        'наушники',
+        'колонки',
+        'динамики',
+        'audio',
+        'sound',
+        'output',
+        'headphones',
+        'speakers',
+        dev.shortName,
+        dev.name,
+      ],
+      frecencyKey: `cmd:audio:${dev.id}`,
+    });
+  }
+
+  const micMuted = Boolean(audio?.micMuted);
+  commands.push(
+    {
+      id: 'cmd:mic_toggle',
+      name: micMuted ? 'Включить микрофон' : 'Выключить микрофон',
+      subtitle: micMuted ? 'Микрофон сейчас выключен' : 'Микрофон сейчас активен',
+      category: 'Аудио',
+      target: 'cmd:mic_toggle',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:mic_toggle',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'mic_toggle',
+      micMuted,
+      keywords: ['микрофон', 'mic', 'mute', 'выключить микрофон', 'включить микрофон', 'голос'],
+      frecencyKey: 'cmd:mic_toggle',
+    },
+    {
+      id: 'cmd:empty_recycle_bin',
+      name: 'Очистить корзину',
+      subtitle: 'Удалить файлы из корзины Windows',
+      category: 'Система',
+      target: 'cmd:empty_recycle_bin',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:empty_recycle_bin',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'empty_recycle_bin',
+      keywords: ['корзина', 'очистить корзину', 'recycle', 'recycle bin', 'trash', 'empty bin'],
+      frecencyKey: 'cmd:empty_recycle_bin',
+    },
+    {
+      id: 'cmd:screenshot',
+      name: 'Сделать скриншот',
+      subtitle: 'Открыть инструмент «Ножницы»',
+      category: 'Система',
+      target: 'ms-screenclip:',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:screenshot',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'screenshot',
+      keywords: ['скриншот', 'снимок', 'экран', 'ножницы', 'screenshot', 'snip', 'capture'],
+      frecencyKey: 'cmd:screenshot',
+    },
+    {
+      id: 'cmd:refresh_indexes',
+      name: 'Обновить индекс приложений',
+      subtitle: 'Пересканировать программы, игры и файлы',
+      category: 'TestBar',
+      target: 'cmd:refresh_indexes',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:refresh_indexes',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'refresh_indexes',
+      keywords: ['обновить индекс', 'пересканировать', 'индекс', 'reindex', 'refresh', 'rescan'],
+      frecencyKey: 'cmd:refresh_indexes',
+    },
+    {
+      id: 'cmd:task_manager',
+      name: 'Диспетчер задач',
+      subtitle: 'Процессы и производительность Windows',
+      category: 'Система',
+      target: 'C:\\Windows\\System32\\Taskmgr.exe',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:task_manager',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'task_manager',
+      keywords: ['диспетчер задач', 'диспетчер', 'процессы', 'taskmgr', 'task manager'],
+      frecencyKey: 'cmd:task_manager',
+    },
+    {
+      id: 'cmd:settings',
+      name: 'Настройки TestBar',
+      subtitle: 'Панель, стекло, мониторы и резервная копия',
+      category: 'TestBar',
+      target: 'cmd:settings',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:settings',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'settings',
+      keywords: ['настройки testbar', 'настройки', 'параметры', 'settings', 'preferences'],
+      frecencyKey: 'cmd:settings',
+    },
+    {
+      id: 'cmd:lock',
+      name: 'Блокировка экрана',
+      subtitle: 'Заблокировать сеанс Windows',
+      category: 'Питание',
+      target: 'cmd:lock',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:lock',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'lock',
+      keywords: ['блокировка', 'заблокировать', 'lock', 'экран'],
+      frecencyKey: 'cmd:lock',
+    },
+    {
+      id: 'cmd:sleep',
+      name: 'Режим сна',
+      subtitle: 'Перевести компьютер в сон',
+      category: 'Питание',
+      target: 'cmd:sleep',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:sleep',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'sleep',
+      keywords: ['сон', 'спящий режим', 'усыпить', 'sleep', 'suspend'],
+      frecencyKey: 'cmd:sleep',
+    },
+    {
+      id: 'cmd:reboot',
+      name: 'Перезагрузка компьютера',
+      subtitle: 'Перезагрузить Windows',
+      category: 'Питание',
+      target: 'cmd:reboot',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:reboot',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'reboot',
+      keywords: ['перезагрузка', 'перезагрузить', 'reboot', 'restart'],
+      frecencyKey: 'cmd:reboot',
+    },
+    {
+      id: 'cmd:shutdown',
+      name: 'Выключение компьютера',
+      subtitle: 'Завершить работу Windows',
+      category: 'Питание',
+      target: 'cmd:shutdown',
+      args: null,
+      kind: 'app',
+      source: 'command',
+      iconData: null,
+      iconKey: 'cmd:shutdown',
+      cacheIconKey: null,
+      pinned: false,
+      badge: { text: 'Команда', variant: 'cmd' },
+      commandId: 'shutdown',
+      keywords: ['выключение', 'выключить', 'завершение работы', 'shutdown', 'power off'],
+      frecencyKey: 'cmd:shutdown',
+    },
+  );
+
+  return commands;
+}
+
 /**
- * Builds the complete Start Menu search corpus spanning ALL Spaces (including personalLinks,
- * workApps, studioTools, gameLaunchers, gameCombos, customSpaces), Steam games, installed
- * `.lnk` + UWP apps, and indexed user files (Desktop/Documents/Downloads).
+ * Builds the complete Start Menu Command Palette corpus spanning live open windows,
+ * bilingual system & WASAPI audio commands, lossless clipboard vault entries,
+ * ALL Spaces, Steam games, installed `.lnk` + UWP apps, and indexed user files.
  */
 export function buildSearchCorpus({
   config,
@@ -69,10 +357,44 @@ export function buildSearchCorpus({
   games,
   files,
   iconMap,
+  groups = [],
+  audio = null,
+  clips = [],
 }: SearchCorpusInput): SearchCorpusItem[] {
   const pool: SearchCorpusItem[] = [];
+  const seenWinHwnds = new Set<number>();
   const seenTargets = new Set<string>();
   const seenNameKind = new Set<string>();
+
+  // 1. Live open windows (kept separate from pin/app dedupe so active windows always jump cleanly)
+  for (const g of groups) {
+    const cacheIconKey = isCacheIconKey(g.iconKey) ? g.iconKey : null;
+    const groupIcon = resolveCachedIconData(iconMap, cacheIconKey, g.exePath, g.iconData);
+    for (const w of g.windows) {
+      if (!w.hwnd || seenWinHwnds.has(w.hwnd)) continue;
+      seenWinHwnds.add(w.hwnd);
+      const cleanTitle = w.title.trim() || g.name.trim();
+      if (!cleanTitle) continue;
+      pool.push({
+        id: `win:${w.hwnd}`,
+        name: cleanTitle,
+        subtitle: g.name,
+        category: g.name,
+        target: w.exePath || g.exePath || '',
+        args: null,
+        kind: 'app',
+        source: 'window',
+        iconData: groupIcon,
+        iconKey: g.iconKey || g.name.toLowerCase(),
+        cacheIconKey,
+        pinned: false,
+        badge: { text: 'Открыто', variant: 'open' },
+        hwnd: w.hwnd,
+        keywords: [g.name, w.exeName, w.isMinimized ? 'свернуто' : 'активно'],
+        frecencyKey: `app:${normKey(w.exePath || g.exePath || g.name)}`,
+      });
+    }
+  }
 
   const pushUnique = (item: SearchCorpusItem) => {
     const cleanName = item.name.trim();
@@ -111,6 +433,7 @@ export function buildSearchCorpus({
         cacheIconKey,
         comboTargets: p.comboTargets ?? null,
         pinned: true,
+        frecencyKey: p.kind === 'combo' ? `combo:${p.id}` : `target:${normKey(p.target) || p.id}`,
       });
     }
   };
@@ -143,13 +466,14 @@ export function buildSearchCorpus({
       iconKey: 'steam',
       cacheIconKey: null,
       pinned: false,
+      frecencyKey: `game:${g.appId}`,
     });
   }
 
   for (const a of apps) {
     const isUwp = Boolean(a.aumid) || a.target.toLowerCase().startsWith('shell:appsfolder\\');
     const cacheIconKey = isCacheIconKey(a.iconKey) ? a.iconKey : null;
-    const iconData = (cacheIconKey ? iconMap[cacheIconKey] : null) || a.iconData || iconMap[a.target] || null;
+    const iconData = resolveCachedIconData(iconMap, cacheIconKey, a.target, a.iconData);
     pushUnique({
       id: `app:${a.id}`,
       name: a.name,
@@ -163,6 +487,7 @@ export function buildSearchCorpus({
       iconKey: a.iconKey || a.name,
       cacheIconKey,
       pinned: false,
+      frecencyKey: `target:${normKey(a.target)}`,
     });
   }
 
@@ -181,15 +506,248 @@ export function buildSearchCorpus({
       iconKey: isFolder ? 'folder' : 'file',
       cacheIconKey: null,
       pinned: false,
+      frecencyKey: `target:${normKey(f.target)}`,
+    });
+  }
+
+  // System & Audio commands
+  for (const cmd of buildSystemCommandItems(audio)) {
+    pool.push(cmd);
+  }
+
+  // Clipboard Vault entries (up to 40)
+  for (const c of clips.slice(0, 40)) {
+    const preview = (c.preview ?? c.text).replace(/\s+/g, ' ').trim();
+    if (!preview) continue;
+    const lineMeta = (c.lineCount ?? 1) > 1 ? ` · ${c.lineCount} стр.` : '';
+    pool.push({
+      id: `clip:${c.id}`,
+      name: preview,
+      subtitle: `${c.pinned ? 'Закреплено' : 'Буфер обмена'}${lineMeta}`,
+      category: c.tag || 'Буфер',
+      target: c.text,
+      args: null,
+      kind: 'file',
+      source: 'clipboard',
+      iconData: null,
+      iconKey: 'cmd:clipboard',
+      cacheIconKey: null,
+      pinned: c.pinned,
+      badge: { text: 'Буфер', variant: 'clip' },
+      clipText: c.text,
+      clipColor: c.color ?? null,
+      keywords: [c.tag, String(c.kind ?? ''), 'буфер', 'clip', 'clipboard'],
+      frecencyKey: `clip:${c.id}`,
     });
   }
 
   return pool;
 }
 
+const WORD_BOUNDARY_RE = /[\s\-_./\\·:()[\]]/;
+
+function isWordBoundaryAt(text: string, idx: number): boolean {
+  if (idx <= 0) return true;
+  const prev = text[idx - 1];
+  const cur = text[idx];
+  if (WORD_BOUNDARY_RE.test(prev)) return true;
+  // CamelCase boundary (e.g. "VSCode", "TestBar")
+  return prev === prev.toLowerCase() && prev !== prev.toUpperCase() && cur === cur.toUpperCase() && cur !== cur.toLowerCase();
+}
+
 function hasWordStartMatch(text: string, term: string): boolean {
-  const words = text.split(/[\s\-_./\\·]+/).filter(Boolean);
+  const words = text.split(/[\s\-_./\\·:()[\]]+/).filter(Boolean);
   return words.some((w) => w.startsWith(term));
+}
+
+export interface SubsequenceMatch {
+  score: number;
+  indices: number[];
+}
+
+/**
+ * Character-subsequence fuzzy matcher prioritizing word-boundary acronyms (`vsc` -> VS Code,
+ * `tg` -> Telegram) and tight consecutive spans, returning exact matched character indices.
+ */
+export function matchSubsequence(originalName: string, termLower: string): SubsequenceMatch | null {
+  if (termLower.length < 2) return null;
+  const nameLower = originalName.toLowerCase();
+  if (termLower.length > nameLower.length) return null;
+
+  // Prefer greedy word-boundary alignment first so "vsc" hits V-S-C initials instead of random middle letters.
+  const indices: number[] = [];
+  let cursor = 0;
+
+  for (let ti = 0; ti < termLower.length; ti++) {
+    const ch = termLower[ti];
+    let boundaryPick = -1;
+    let firstPick = -1;
+
+    for (let ni = cursor; ni < nameLower.length; ni++) {
+      if (nameLower[ni] === ch) {
+        if (firstPick === -1) firstPick = ni;
+        if (isWordBoundaryAt(originalName, ni)) {
+          boundaryPick = ni;
+          break;
+        }
+      }
+    }
+
+    // Also allow immediate continuation of previous matched char
+    const prevIdx = indices.length > 0 ? indices[indices.length - 1] : -1;
+    let chosen = firstPick;
+    if (prevIdx >= 0 && prevIdx + 1 < nameLower.length && nameLower[prevIdx + 1] === ch) {
+      chosen = prevIdx + 1;
+    } else if (boundaryPick !== -1) {
+      chosen = boundaryPick;
+    }
+
+    if (chosen === -1) return null;
+    indices.push(chosen);
+    cursor = chosen + 1;
+  }
+
+  let boundaryHits = 0;
+  let consecutiveRuns = 0;
+  let totalGap = 0;
+
+  for (let i = 0; i < indices.length; i++) {
+    const idx = indices[i];
+    if (isWordBoundaryAt(originalName, idx)) boundaryHits += 1;
+    if (i > 0) {
+      const gap = idx - indices[i - 1] - 1;
+      if (gap === 0) {
+        consecutiveRuns += 1;
+      } else {
+        totalGap += gap;
+      }
+    }
+  }
+
+  const allBoundaryOrConsecutive = boundaryHits + consecutiveRuns >= indices.length;
+  // Reject wildly scattered false positives on long titles/paths
+  if (!allBoundaryOrConsecutive && totalGap > Math.max(8, termLower.length * 3)) {
+    return null;
+  }
+
+  let score = 210 + boundaryHits * 46 + consecutiveRuns * 28 - totalGap * 5;
+  if (indices[0] === 0) score += 35;
+  if (boundaryHits === indices.length) score += 65; // Acronym match (e.g., "vsc" -> Visual Studio Code)
+  return {
+    score: Math.max(150, Math.min(440, score)),
+    indices,
+  };
+}
+
+function findSubstringIndices(textLower: string, termLower: string): number[] | null {
+  if (!termLower) return null;
+  const idx = textLower.indexOf(termLower);
+  if (idx < 0) return null;
+  const out: number[] = [];
+  for (let i = 0; i < termLower.length; i++) {
+    out.push(idx + i);
+  }
+  return out;
+}
+
+export function computeFrecencyBonus(
+  entry: FrecencyEntry | undefined,
+  nowMs: number = Date.now(),
+): number {
+  if (!entry || entry.count <= 0) return 0;
+  const ageMs = Math.max(0, nowMs - (entry.lastUsedMs || 0));
+  const ageDays = ageMs / 86_400_000;
+  const decay = ageDays <= 1 ? 1.0 : ageDays <= 7 ? 0.78 : ageDays <= 30 ? 0.55 : 0.35;
+  return Math.min(200, Math.round(Math.log2(entry.count + 1) * 48 * decay));
+}
+
+interface WebBangSpec {
+  prefix: string;
+  label: string;
+  buildUrl: (query: string) => string;
+}
+
+const WEB_BANGS: readonly WebBangSpec[] = [
+  {
+    prefix: 'g ',
+    label: 'Google',
+    buildUrl: (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}`,
+  },
+  {
+    prefix: 'yt ',
+    label: 'YouTube',
+    buildUrl: (q) => `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`,
+  },
+  {
+    prefix: 'gh ',
+    label: 'GitHub',
+    buildUrl: (q) => `https://github.com/search?q=${encodeURIComponent(q)}`,
+  },
+];
+
+export function parseWebBangQuery(rawQuery: string): SearchCorpusItem | null {
+  const trimmedStart = rawQuery.trimStart();
+  const low = trimmedStart.toLowerCase();
+  for (const bang of WEB_BANGS) {
+    if (low.startsWith(bang.prefix)) {
+      const rest = trimmedStart.slice(bang.prefix.length).trim();
+      if (!rest) return null;
+      return {
+        id: `web:${bang.prefix.trim()}:${rest}`,
+        name: `Найти в ${bang.label}: «${rest}»`,
+        subtitle: bang.buildUrl(rest),
+        category: bang.label,
+        target: bang.buildUrl(rest),
+        args: null,
+        kind: 'url',
+        source: 'web',
+        iconData: null,
+        iconKey: 'url',
+        cacheIconKey: null,
+        pinned: false,
+        badge: { text: bang.label, variant: 'cmd' },
+      };
+    }
+  }
+  return null;
+}
+
+const CLIPBOARD_PREFIXES = ['clip', 'clipboard', 'буфер'];
+
+function parseClipboardPrefixQuery(rawQuery: string): { active: boolean; subQuery: string; swappedPrefix: string | null } {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return { active: false, subQuery: '', swappedPrefix: null };
+
+  const matchPrefix = (candidate: string): { matched: boolean; rest: string } => {
+    for (const p of CLIPBOARD_PREFIXES) {
+      if (candidate === p) return { matched: true, rest: '' };
+      if (candidate.startsWith(`${p} `)) return { matched: true, rest: candidate.slice(p.length).trim() };
+    }
+    return { matched: false, rest: '' };
+  };
+
+  const direct = matchPrefix(q);
+  if (direct.matched) {
+    return { active: true, subQuery: direct.rest, swappedPrefix: null };
+  }
+
+  const firstWord = q.split(/\s+/)[0] ?? '';
+  const swappedFirst = swapLayout(firstWord);
+  if (swappedFirst !== firstWord) {
+    const rest = q.slice(firstWord.length).trim();
+    const swappedCandidate = rest ? `${swappedFirst} ${rest}` : swappedFirst;
+    const sw = matchPrefix(swappedCandidate);
+    if (sw.matched) {
+      return { active: true, subQuery: rest, swappedPrefix: swappedFirst };
+    }
+  }
+
+  return { active: false, subQuery: '', swappedPrefix: null };
+}
+
+interface ScoreTermOutcome {
+  score: number;
+  indices: number[];
 }
 
 function scoreTerm(
@@ -199,31 +757,63 @@ function scoreTerm(
   metaLow: string,
   targetLow: string,
   term: string,
-): number {
+): ScoreTermOutcome {
   let score = 0;
+  let indices: number[] = [];
+
   if (nameLow === term) {
     score = 1000;
+    indices = findSubstringIndices(nameLow, term) ?? [];
+  } else if (item.source === 'window' && aliases.some((a) => a === term)) {
+    score = 1040;
+    indices = findSubstringIndices(nameLow, term) ?? matchSubsequence(item.name, term)?.indices ?? [];
   } else if (nameLow.startsWith(term)) {
-    score = 620;
+    score = 660;
+    indices = findSubstringIndices(nameLow, term) ?? [];
+  } else if (item.source === 'window' && aliases.some((a) => a.startsWith(term))) {
+    score = 720;
+    indices = findSubstringIndices(nameLow, term) ?? matchSubsequence(item.name, term)?.indices ?? [];
   } else if (aliases.some((a) => a === term)) {
-    score = 560;
+    score = 600;
+    indices = findSubstringIndices(nameLow, term) ?? matchSubsequence(item.name, term)?.indices ?? [];
   } else if (aliases.some((a) => a.startsWith(term))) {
-    score = 500;
+    score = 540;
+    indices = findSubstringIndices(nameLow, term) ?? matchSubsequence(item.name, term)?.indices ?? [];
   } else if (hasWordStartMatch(nameLow, term)) {
-    score = 420;
-  } else if (nameLow.includes(term)) {
-    score = 260;
-  } else if (aliases.some((a) => a.includes(term))) {
-    score = 220;
-  } else if (metaLow.includes(term)) {
-    score = 120;
-  } else if (targetLow.includes(term)) {
-    score = 70;
+    score = item.source === 'window' ? 620 : 460;
+    indices = findSubstringIndices(nameLow, term) ?? [];
+  } else {
+    const subIdx = findSubstringIndices(nameLow, term);
+    if (subIdx) {
+      score = 290;
+      indices = subIdx;
+    } else {
+      const fuzzy = matchSubsequence(item.name, term);
+      if (fuzzy) {
+        score = fuzzy.score;
+        indices = fuzzy.indices;
+      } else if (aliases.some((a) => a.includes(term))) {
+        score = 220;
+        indices = matchSubsequence(item.name, term)?.indices ?? [];
+      } else if (metaLow.includes(term)) {
+        score = 130;
+      } else if (item.source !== 'clipboard' && targetLow.includes(term)) {
+        score = 70;
+      }
+    }
   }
 
-  if (score === 0) return 0;
+  if (score === 0) return { score: 0, indices: [] };
 
-  if (item.pinned) score += 80;
+  // Source priority bonuses (Live open windows first!)
+  if (item.source === 'window') {
+    score += 140;
+  } else if (item.source === 'audio_device' || item.source === 'command') {
+    score += 90;
+  } else if (item.pinned) {
+    score += 80;
+  }
+
   if (item.source === 'app' || item.source === 'uwp' || item.source === 'pinned') {
     score += 30;
   } else if (item.source === 'game') {
@@ -232,49 +822,153 @@ function scoreTerm(
     score += 14;
   }
 
-  return score;
+  return { score, indices };
 }
 
 /**
- * Ranks search results with RU<->EN wrong-keyboard-layout matching (`ntkt` -> Telegram),
- * prioritizing exact/prefix > word-start > substring matches and boosting pinned items.
+ * Ranks Command Palette results across open windows, bilingual system/audio commands,
+ * clipboard entries, web bangs (`g `, `yt `, `gh `), pinned spaces, apps, games, and files
+ * with RU<->EN wrong-layout awareness, subsequence fuzzy matching, and frecency boosting.
+ * Strictly excludes any math/calculator evaluation per EXPERIENCE.md Section 3.
  */
 export function rankSearchResults(
   corpus: SearchCorpusItem[],
   rawQuery: string,
-  limit = 10,
+  limit = 12,
+  frecency?: Record<string, FrecencyEntry>,
+  nowMs: number = Date.now(),
 ): RankedSearchResult {
   const q = rawQuery.trim().toLowerCase();
-  if (!q) {
+
+  // 1. Explicit web bangs (`g `, `yt `, `gh `)
+  const webBang = parseWebBangQuery(rawQuery);
+  if (webBang) {
     return {
-      items: corpus.slice(0, limit),
+      items: [webBang],
       swappedHint: null,
-      totalMatches: corpus.length,
+      totalMatches: 1,
+      matchIndices: {},
+      mode: 'web',
     };
   }
 
+  // 2. Empty query: curated overview (live windows first + top frecency/pinned apps; skip noise commands/clips)
+  if (!q) {
+    const openWins = corpus.filter((c) => c.source === 'window').slice(0, 3);
+    const launchables = corpus
+      .filter((c) => c.source !== 'window' && c.source !== 'command' && c.source !== 'audio_device' && c.source !== 'clipboard')
+      .map((item) => ({
+        item,
+        weight:
+          computeFrecencyBonus(frecency?.[item.frecencyKey ?? item.id], nowMs) +
+          (item.pinned ? 60 : 0),
+      }))
+      .sort((a, b) => b.weight - a.weight)
+      .map((e) => e.item);
+
+    const combined = [...openWins, ...launchables].slice(0, limit);
+    return {
+      items: combined,
+      swappedHint: null,
+      totalMatches: openWins.length + launchables.length,
+      matchIndices: {},
+      mode: 'default',
+    };
+  }
+
+  // 3. Explicit clipboard prefix (`clip `, `буфер `)
+  const clipPrefix = parseClipboardPrefixQuery(rawQuery);
+  if (clipPrefix.active) {
+    const clipPool = corpus.filter((c) => c.source === 'clipboard');
+    if (!clipPrefix.subQuery) {
+      return {
+        items: clipPool.slice(0, limit),
+        swappedHint: clipPrefix.swappedPrefix,
+        totalMatches: clipPool.length,
+        matchIndices: {},
+        mode: 'clipboard',
+      };
+    }
+
+    const subQ = clipPrefix.subQuery.toLowerCase();
+    const subSwapped = swapLayout(subQ);
+    const canSubSwap = subSwapped !== subQ;
+    const matchIndices: Record<string, number[]> = {};
+    const scoredClips: Array<{ item: SearchCorpusItem; score: number; usedSwapped: boolean }> = [];
+
+    for (const item of clipPool) {
+      const nameLow = item.name.toLowerCase();
+      const fullLow = (item.clipText ?? item.target).toLowerCase();
+      const directIdx = findSubstringIndices(nameLow, subQ);
+      if (directIdx || fullLow.includes(subQ)) {
+        if (directIdx) matchIndices[item.id] = directIdx;
+        scoredClips.push({ item, score: (directIdx ? 600 : 380) + (item.pinned ? 50 : 0), usedSwapped: false });
+        continue;
+      }
+      if (canSubSwap) {
+        const swIdx = findSubstringIndices(nameLow, subSwapped);
+        if (swIdx || fullLow.includes(subSwapped)) {
+          if (swIdx) matchIndices[item.id] = swIdx;
+          scoredClips.push({ item, score: (swIdx ? 540 : 320) + (item.pinned ? 50 : 0), usedSwapped: true });
+        }
+      }
+    }
+
+    scoredClips.sort((a, b) => b.score - a.score);
+    const top = scoredClips.slice(0, limit);
+    return {
+      items: top.map((e) => e.item),
+      swappedHint: clipPrefix.swappedPrefix ?? (top.some((e) => e.usedSwapped) ? subSwapped : null),
+      totalMatches: scoredClips.length,
+      matchIndices,
+      mode: 'clipboard',
+    };
+  }
+
+  // 4. General multi-source ranked search
   const swapped = swapLayout(q);
   const canSwap = swapped !== q;
 
-  const scored: Array<{ item: SearchCorpusItem; score: number; usedSwapped: boolean }> = [];
+  const scored: Array<{
+    item: SearchCorpusItem;
+    score: number;
+    usedSwapped: boolean;
+    indices: number[];
+  }> = [];
 
   for (const item of corpus) {
+    // Keep general search clean from noisy 1-char clipboard hits
+    if (item.source === 'clipboard' && q.length < 3) {
+      continue;
+    }
+
     const nameLow = item.name.toLowerCase();
     const metaLow = `${item.category} ${item.subtitle}`.toLowerCase();
     const targetLow = item.target.toLowerCase();
-    const aliases = collectPhoneticAliases(nameLow, metaLow, targetLow);
+    const itemKeywords = (item.keywords ?? []).map((k) => k.toLowerCase());
+    const aliases = [...collectPhoneticAliases(nameLow, metaLow, targetLow), ...itemKeywords];
+    const frecBonus = computeFrecencyBonus(frecency?.[item.frecencyKey ?? item.id], nowMs);
 
-    const directScore = scoreTerm(item, nameLow, aliases, metaLow, targetLow, q);
-    if (directScore > 0) {
-      // Direct layout match wins ties over swapped match
-      scored.push({ item, score: directScore + 40, usedSwapped: false });
+    const direct = scoreTerm(item, nameLow, aliases, metaLow, targetLow, q);
+    if (direct.score > 0) {
+      scored.push({
+        item,
+        score: direct.score + 40 + frecBonus,
+        usedSwapped: false,
+        indices: direct.indices,
+      });
       continue;
     }
 
     if (canSwap) {
-      const swappedScore = scoreTerm(item, nameLow, aliases, metaLow, targetLow, swapped);
-      if (swappedScore > 0) {
-        scored.push({ item, score: swappedScore, usedSwapped: true });
+      const sw = scoreTerm(item, nameLow, aliases, metaLow, targetLow, swapped);
+      if (sw.score > 0) {
+        scored.push({
+          item,
+          score: sw.score + frecBonus,
+          usedSwapped: true,
+          indices: sw.indices,
+        });
       }
     }
   }
@@ -287,11 +981,19 @@ export function rankSearchResults(
 
   const top = scored.slice(0, limit);
   const swappedHint = top.length > 0 && top.some((entry) => entry.usedSwapped) ? swapped : null;
+  const matchIndices: Record<string, number[]> = {};
+  for (const entry of top) {
+    if (entry.indices.length > 0) {
+      matchIndices[entry.item.id] = entry.indices;
+    }
+  }
 
   return {
     items: top.map((entry) => entry.item),
     swappedHint,
     totalMatches: scored.length,
+    matchIndices,
+    mode: 'default',
   };
 }
 
@@ -300,18 +1002,81 @@ export type SearchLaunchDispatch =
   | {
       command: 'launch_item';
       args: { target: string; args: string | null; asAdmin: boolean; closeStart: boolean };
-    };
+    }
+  | { command: 'focus_window'; args: { hwnd: number; toggleMinimize: boolean } }
+  | { command: 'set_audio_device'; args: { deviceId: string } }
+  | { command: 'set_mic_muted'; args: { muted: boolean } }
+  | { command: 'empty_recycle_bin'; args: Record<string, never> }
+  | { command: 'open_screen_snip'; args: Record<string, never> }
+  | { command: 'refresh_indexes'; args: Record<string, never> }
+  | { command: 'power_action'; args: { action: 'lock' | 'sleep' | 'reboot' | 'shutdown' } }
+  | { command: 'open_settings'; args: Record<string, never> }
+  | { command: 'paste_clipboard_entry'; args: { text: string } };
 
 export function resolveSearchLaunchPayload(
   item: SearchCorpusItem,
   ctrlKey: boolean,
 ): SearchLaunchDispatch {
+  if (item.source === 'window' && item.hwnd) {
+    return {
+      command: 'focus_window',
+      args: { hwnd: item.hwnd, toggleMinimize: false },
+    };
+  }
+
+  if (item.source === 'clipboard') {
+    return {
+      command: 'paste_clipboard_entry',
+      args: { text: item.clipText ?? item.target },
+    };
+  }
+
+  if (item.source === 'audio_device' && item.deviceId) {
+    return {
+      command: 'set_audio_device',
+      args: { deviceId: item.deviceId },
+    };
+  }
+
+  if (item.source === 'command' && item.commandId) {
+    switch (item.commandId) {
+      case 'mic_toggle':
+        return { command: 'set_mic_muted', args: { muted: !item.micMuted } };
+      case 'empty_recycle_bin':
+        return { command: 'empty_recycle_bin', args: {} };
+      case 'screenshot':
+        return { command: 'open_screen_snip', args: {} };
+      case 'refresh_indexes':
+        return { command: 'refresh_indexes', args: {} };
+      case 'settings':
+        return { command: 'open_settings', args: {} };
+      case 'lock':
+      case 'sleep':
+      case 'reboot':
+      case 'shutdown':
+        return { command: 'power_action', args: { action: item.commandId } };
+      case 'task_manager':
+        return {
+          command: 'launch_item',
+          args: {
+            target: item.target,
+            args: null,
+            asAdmin: ctrlKey,
+            closeStart: true,
+          },
+        };
+      default:
+        break;
+    }
+  }
+
   if (item.kind === 'combo') {
     return {
       command: 'launch_combo',
       args: { targets: item.comboTargets ?? [] },
     };
   }
+
   return {
     command: 'launch_item',
     args: {
@@ -321,6 +1086,44 @@ export function resolveSearchLaunchPayload(
       closeStart: true,
     },
   };
+}
+
+export type SearchSecondaryAction =
+  | { type: 'close_window'; hwnd: number; label: string }
+  | { type: 'open_terminal'; path: string; label: string }
+  | { type: 'open_location'; path: string; label: string }
+  | { type: 'copy_clipboard'; text: string; label: string };
+
+export function resolveSearchSecondaryAction(item: SearchCorpusItem | undefined): SearchSecondaryAction | null {
+  if (!item) return null;
+  if (item.source === 'window' && item.hwnd) {
+    return { type: 'close_window', hwnd: item.hwnd, label: 'Закрыть окно' };
+  }
+  if (item.source === 'clipboard') {
+    return { type: 'copy_clipboard', text: item.clipText ?? item.target, label: 'Копировать' };
+  }
+  if (item.kind === 'folder' && canOpenFileLocation(item.target)) {
+    return { type: 'open_terminal', path: item.target, label: 'Терминал' };
+  }
+  if (
+    item.source !== 'command' &&
+    item.source !== 'audio_device' &&
+    item.source !== 'web' &&
+    canOpenFileLocation(item.target)
+  ) {
+    return { type: 'open_location', path: item.target, label: 'Расположение' };
+  }
+  return null;
+}
+
+export function getPrimaryActionLabel(item: SearchCorpusItem | undefined): string {
+  if (!item) return 'Открыть';
+  if (item.source === 'window') return 'Перейти';
+  if (item.source === 'clipboard') return 'Вставить';
+  if (item.source === 'audio_device') return 'Переключить';
+  if (item.source === 'command') return 'Выполнить';
+  if (item.source === 'web') return 'Найти';
+  return 'Открыть';
 }
 
 export function isPrintableSearchTrigger(

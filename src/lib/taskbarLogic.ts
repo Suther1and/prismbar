@@ -1,4 +1,12 @@
-import type { FlyoutRequest, MergedBarItem, OpenWindowInfo, PinItem } from './ipc';
+import { formatSelectedDateHeader } from './calendarLogic';
+import type {
+  AudioMasterState,
+  FlyoutRequest,
+  MergedBarItem,
+  NetworkInfo,
+  OpenWindowInfo,
+  PinItem,
+} from './ipc';
 
 export type TaskbarMonitor = 'primary' | 'secondary';
 
@@ -19,6 +27,12 @@ export interface BarContextPayload {
   barMode: 'dock' | 'edge';
 }
 
+export interface PreviewFlyoutPayload {
+  group?: MergedBarItem['group'];
+  iconData?: string | null;
+  iconKey?: string;
+}
+
 const INTERACTIVE_FLYOUT_KINDS = new Set([
   'tray',
   'sound',
@@ -30,6 +44,21 @@ const INTERACTIVE_FLYOUT_KINDS = new Set([
   'ctx_taskbar',
 ]);
 
+export const PREVIEW_HOVER_COLD_MS = 180;
+export const PREVIEW_HOVER_WARM_MS = 25;
+export const PREVIEW_WARM_WINDOW_MS = 300;
+export const PREVIEW_MAX_VISIBLE_CARDS = 4;
+export const TASKBAR_LAUNCH_HOP_MS = 880;
+
+export const VOLUME_OSD_WIDTH = 184;
+export const VOLUME_OSD_HEIGHT = 42;
+export const SOUND_FLYOUT_WIDTH = 332;
+export const SOUND_FLYOUT_INITIAL_HEIGHT = 340;
+export const CALENDAR_FLYOUT_WIDTH = 310;
+export const CALENDAR_FLYOUT_INITIAL_HEIGHT = 408;
+
+const WEEKDAYS_JS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'] as const;
+
 export function resolveTaskbarMonitor(search: string): TaskbarMonitor {
   const params = new URLSearchParams(search);
   return params.get('monitor') === 'secondary' ? 'secondary' : 'primary';
@@ -39,10 +68,17 @@ export function getTaskbarRootClassName(barMode?: string | null): string {
   return barMode === 'edge' ? 'tb-root edge' : 'tb-root';
 }
 
-export function getTaskbarItemStateClass(item: Pick<MergedBarItem, 'group'>): 'active' | 'running' | 'idle' {
-  const winCount = item.group?.windows.length ?? 0;
+export type TaskbarItemStateClass = 'active' | 'running' | 'minimized' | 'idle';
+
+export function getTaskbarItemStateClass(item: Pick<MergedBarItem, 'group'>): TaskbarItemStateClass {
+  const windows = item.group?.windows ?? [];
   if (item.group?.isActive) return 'active';
-  if (winCount > 0) return 'running';
+  if (windows.length > 0) {
+    if (windows.every((w) => w.isMinimized)) {
+      return 'minimized';
+    }
+    return 'running';
+  }
   return 'idle';
 }
 
@@ -61,8 +97,120 @@ export function isInteractiveFlyoutActive(activeFlyout: string): boolean {
   return INTERACTIVE_FLYOUT_KINDS.has(activeFlyout);
 }
 
-export const VOLUME_OSD_WIDTH = 176;
-export const VOLUME_OSD_HEIGHT = 44;
+/**
+ * Adaptive preview hover delay: `180ms` on cold hover, dropping to `25ms` when scrubbing
+ * horizontally while preview is already open or within the `300ms` post-close warm window.
+ */
+export function getPreviewHoverDelayMs(
+  activeFlyout: string,
+  lastPreviewCloseMs: number | null,
+  nowMs: number,
+): number {
+  if (activeFlyout === 'preview') {
+    return PREVIEW_HOVER_WARM_MS;
+  }
+  if (
+    lastPreviewCloseMs !== null &&
+    Number.isFinite(lastPreviewCloseMs) &&
+    Number.isFinite(nowMs) &&
+    nowMs >= lastPreviewCloseMs &&
+    nowMs - lastPreviewCloseMs <= PREVIEW_WARM_WINDOW_MS
+  ) {
+    return PREVIEW_HOVER_WARM_MS;
+  }
+  return PREVIEW_HOVER_COLD_MS;
+}
+
+/**
+ * Selects the window to focus when clicking a running taskbar app:
+ * - Single window: focuses or toggles minimize (`toggleMinimize: true`).
+ * - Multiple windows: cycles cleanly to the next window after the active one (or first
+ *   non-minimized window when unfocused) without stranding windows #2..N.
+ */
+export function selectWindowToFocusOnTaskbarClick(
+  windows: readonly OpenWindowInfo[],
+): { hwnd: number; toggleMinimize: boolean } | null {
+  if (windows.length === 0) return null;
+  if (windows.length === 1) {
+    return { hwnd: windows[0].hwnd, toggleMinimize: true };
+  }
+  const activeIdx = windows.findIndex((w) => w.isActive);
+  if (activeIdx >= 0) {
+    const next = windows[(activeIdx + 1) % windows.length];
+    return { hwnd: next.hwnd, toggleMinimize: false };
+  }
+  const firstVisible = windows.find((w) => !w.isMinimized) ?? windows[0];
+  return { hwnd: firstVisible.hwnd, toggleMinimize: false };
+}
+
+/**
+ * Maps two taskbar item IDs onto `config.taskbarPins` indices for drag-and-drop pin reordering.
+ * Unpinned running apps cannot be reordered into the pinned list.
+ */
+export function resolvePinnedReorderIndices(
+  barItems: readonly Pick<MergedBarItem, 'id' | 'pinned'>[],
+  fromId: string,
+  toId: string,
+): { fromIdx: number; toIdx: number } | null {
+  if (!fromId || !toId || fromId === toId) return null;
+  let pinIdx = 0;
+  let fromIdx = -1;
+  let toIdx = -1;
+  for (const item of barItems) {
+    if (!item.pinned) continue;
+    if (item.id === fromId) fromIdx = pinIdx;
+    if (item.id === toId) toIdx = pinIdx;
+    pinIdx += 1;
+  }
+  if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return null;
+  return { fromIdx, toIdx };
+}
+
+export interface TaskbarClockDisplay {
+  timeStr: string;
+  dateStr: string;
+  fullTitle: string;
+}
+
+export function formatTaskbarClock(
+  date: Date,
+  options?: { showSeconds?: boolean; showWeekday?: boolean },
+): TaskbarClockDisplay {
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  const hh = pad2(date.getHours());
+  const mm = pad2(date.getMinutes());
+  const ss = pad2(date.getSeconds());
+  const timeStr = options?.showSeconds ? `${hh}:${mm}:${ss}` : `${hh}:${mm}`;
+
+  const dd = pad2(date.getDate());
+  const mo = pad2(date.getMonth() + 1);
+  const yyyy = date.getFullYear();
+  const baseDate = `${dd}.${mo}.${yyyy}`;
+  const weekday = WEEKDAYS_JS_SHORT_RU[date.getDay()] ?? '';
+  const dateStr = options?.showWeekday && weekday ? `${weekday}, ${baseDate}` : baseDate;
+
+  return {
+    timeStr,
+    dateStr,
+    fullTitle: formatSelectedDateHeader(date),
+  };
+}
+
+export function formatSoundNetworkTooltip(
+  audioMaster: AudioMasterState | null,
+  net: NetworkInfo | null,
+): string {
+  const soundPart = audioMaster?.defaultDeviceShortName
+    ? `Звук (${audioMaster.defaultDeviceShortName}): ${audioMaster.masterMuted ? 'Выкл' : `${audioMaster.masterVolume}%`}`
+    : `Звук: ${audioMaster?.masterMuted ? 'Выкл' : `${audioMaster?.masterVolume ?? 0}%`}`;
+  if (!net) return soundPart;
+  const netPart = net.connected
+    ? net.speedLabel
+      ? `${net.kind} · ${net.speedLabel}`
+      : net.kind
+    : 'Нет сети';
+  return `${netPart} · ${soundPart}`;
+}
 
 export interface VolumeOsdPayload {
   volume: number;
@@ -157,22 +305,37 @@ export function shouldTriggerPreviewHover(
   return Boolean(item.group && item.group.windows.length > 0);
 }
 
+/**
+ * Computes preview card logical width for `windowCount` open windows (4 visible cards +
+ * optional 44px `+N` overflow badge so windows #5+ are never silently hidden).
+ */
+export function computePreviewCardWidth(windowCount: number): number {
+  const safe = Math.max(1, Math.floor(Number.isFinite(windowCount) ? windowCount : 1));
+  const visible = Math.min(safe, PREVIEW_MAX_VISIBLE_CARDS);
+  const overflowExtra = safe > PREVIEW_MAX_VISIBLE_CARDS ? 53 : 0;
+  return visible * 214 + 20 + overflowExtra;
+}
+
 export function buildPreviewFlyoutRequest(
   item: MergedBarItem,
   anchorXLogical: number,
   monitor: TaskbarMonitor,
 ): FlyoutRequest {
-  const count = Math.min(Math.max(item.group?.windows.length ?? 1, 1), 4);
-  const width = count * 214 + 20;
+  const winCount = item.group?.windows.length ?? 1;
+  const payload: PreviewFlyoutPayload = {
+    group: item.group,
+    iconData: item.iconData ?? null,
+    iconKey: item.cacheIconKey || item.iconKey,
+  };
   return {
     kind: 'preview',
     anchorXLogical,
     anchorInTaskbar: true,
-    width,
+    width: computePreviewCardWidth(winCount),
     height: 166,
     noActivate: true,
     monitor,
-    payload: { group: item.group },
+    payload,
   };
 }
 
@@ -199,8 +362,8 @@ export function buildAppContextMenuRequest(
     kind: 'context_app',
     anchorXLogical,
     anchorInTaskbar: true,
-    width: 262,
-    height: hasWins ? 296 : 212,
+    width: 264,
+    height: hasWins ? 320 : 212,
     noActivate: false,
     monitor,
     payload,
