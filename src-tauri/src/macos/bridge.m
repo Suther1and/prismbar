@@ -42,7 +42,7 @@ void tb_mac_configure_start_window(void *ns_window_ptr) {
             }
             [win setOpaque:NO];
             [win setBackgroundColor:[NSColor clearColor]];
-            [win setHasShadow:YES];
+            [win setHasShadow:NO];
             [win setLevel:NSFloatingWindowLevel];
             [win setCollectionBehavior:(
                 NSWindowCollectionBehaviorCanJoinAllSpaces |
@@ -54,6 +54,26 @@ void tb_mac_configure_start_window(void *ns_window_ptr) {
                 [win setAppearance:dark];
             }
             [win setMovable:NO];
+        }
+    });
+}
+
+void tb_mac_show_and_focus_window(void *ns_window_ptr) {
+    if (!ns_window_ptr) {
+        return;
+    }
+    tb_run_on_main_sync(^{
+        @autoreleasepool {
+            NSWindow *win = (__bridge NSWindow *)ns_window_ptr;
+            if (!win) {
+                return;
+            }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+#pragma clang diagnostic pop
+            [win orderFrontRegardless];
+            [win makeKeyAndOrderFront:nil];
         }
     });
 }
@@ -384,7 +404,10 @@ bool tb_mac_activate_pid(int32_t pid) {
             NSRunningApplication *app =
                 [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
             if (app) {
-                ok = [app activateWithOptions:0];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                ok = [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
             }
         }
     });

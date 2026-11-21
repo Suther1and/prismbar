@@ -6,6 +6,7 @@ pub type TbMacKeyEventCallback = extern "C" fn(i32, u16, u64, u64, *mut c_void);
 
 extern "C" {
     pub fn tb_mac_configure_start_window(ns_window_ptr: *mut c_void);
+    pub fn tb_mac_show_and_focus_window(ns_window_ptr: *mut c_void);
     pub fn tb_mac_position_start_window(
         ns_window_ptr: *mut c_void,
         width: f64,
@@ -85,6 +86,16 @@ pub fn configure_start_window(ns_window_ptr: *mut c_void) {
     }
     unsafe {
         tb_mac_configure_start_window(ns_window_ptr);
+    }
+}
+
+/// Activates the accessory app and focuses the Start window on top of other apps.
+pub fn show_and_focus_window(ns_window_ptr: *mut c_void) {
+    if ns_window_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        tb_mac_show_and_focus_window(ns_window_ptr);
     }
 }
 

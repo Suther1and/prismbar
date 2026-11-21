@@ -180,6 +180,7 @@ pub struct MacAppState {
     pub last_show_ms: Arc<AtomicU64>,
     pub modal_picker_depth: Arc<AtomicU32>,
     pub prev_frontmost_pid: Arc<AtomicI32>,
+    pub restore_focus_on_hide: Arc<AtomicBool>,
     pub command_tap: Arc<Mutex<CommandTapMachine>>,
     pub command_tap_started: Arc<AtomicBool>,
     pub tray_icon: Mutex<Option<TrayIcon>>,
@@ -372,6 +373,7 @@ fn show_start(app: &AppHandle) {
     }
 
     let show_gen = st.start_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    st.restore_focus_on_hide.store(false, Ordering::Release);
     st.start_open.store(true, Ordering::Release);
     st.last_show_ms.store(monotonic_ms(), Ordering::Release);
 
@@ -401,6 +403,9 @@ fn show_start(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("start") {
         let _ = win.show();
         let _ = win.set_focus();
+        if let Ok(ns_win) = win.ns_window() {
+            bridge_ffi::show_and_focus_window(ns_win);
+        }
     }
 
     let _ = app.emit_to(
@@ -438,10 +443,29 @@ fn show_start(app: &AppHandle) {
     });
 }
 
-fn hide_start(app: &AppHandle, immediate: bool) {
+fn finish_hide_start(app: &AppHandle) {
+    let st = app.state::<MacAppState>();
+    if st.start_open.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(win) = app.get_webview_window("start") {
+        let _ = win.hide();
+    }
+    if st.restore_focus_on_hide.swap(false, Ordering::AcqRel) {
+        let prev_pid = st.prev_frontmost_pid.load(Ordering::Acquire);
+        let own_pid = std::process::id() as i32;
+        if prev_pid > 0 && prev_pid != own_pid {
+            let _ = bridge_ffi::activate_pid(prev_pid);
+        }
+    }
+}
+
+fn hide_start(app: &AppHandle, immediate: bool, restore_prev_focus: bool) {
     let st = app.state::<MacAppState>();
     let was_open = st.start_open.swap(false, Ordering::AcqRel);
     let hide_gen = st.start_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    st.restore_focus_on_hide
+        .store(restore_prev_focus, Ordering::Release);
 
     if immediate {
         let _ = app.emit(
@@ -453,13 +477,12 @@ fn hide_start(app: &AppHandle, immediate: bool) {
                 immediate: true,
             },
         );
-        if let Some(win) = app.get_webview_window("start") {
-            let _ = win.hide();
-        }
+        finish_hide_start(app);
         return;
     }
 
     if !was_open {
+        st.restore_focus_on_hide.store(false, Ordering::Release);
         return;
     }
 
@@ -487,9 +510,7 @@ fn hide_start(app: &AppHandle, immediate: bool) {
             if st_m.start_gen.load(Ordering::SeqCst) == hide_gen
                 && !st_m.start_open.load(Ordering::Acquire)
             {
-                if let Some(win) = h.get_webview_window("start") {
-                    let _ = win.hide();
-                }
+                finish_hide_start(&h);
             }
         });
     });
@@ -503,6 +524,9 @@ fn apply_toggle_start(app: &AppHandle, force: Option<bool>) {
         if want_open {
             if let Some(win) = app.get_webview_window("start") {
                 let _ = win.set_focus();
+                if let Ok(ns_win) = win.ns_window() {
+                    bridge_ffi::show_and_focus_window(ns_win);
+                }
             }
         }
         return;
@@ -510,7 +534,7 @@ fn apply_toggle_start(app: &AppHandle, force: Option<bool>) {
     if want_open {
         show_start(app);
     } else {
-        hide_start(app, false);
+        hide_start(app, false, true);
     }
 }
 
@@ -814,9 +838,7 @@ fn surface_exit_ack(app: AppHandle, surface: String, gen: u64) {
     let _ = app.run_on_main_thread(move || {
         let st = h.state::<MacAppState>();
         if st.start_gen.load(Ordering::SeqCst) == gen && !st.start_open.load(Ordering::Acquire) {
-            if let Some(win) = h.get_webview_window("start") {
-                let _ = win.hide();
-            }
+            finish_hide_start(&h);
         }
     });
 }
@@ -850,7 +872,7 @@ fn animate_surface_out(
 fn dismiss_overlays(app: AppHandle) {
     let h = app.clone();
     let _ = app.run_on_main_thread(move || {
-        hide_start(&h, false);
+        hide_start(&h, false, true);
     });
 }
 
@@ -1787,7 +1809,7 @@ async fn launch_item(
     if close_start.unwrap_or(false) {
         let h = app.clone();
         let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false);
+            hide_start(&h, false, false);
         });
     }
     tauri::async_runtime::spawn_blocking(move || launcher::launch_item(&target, args.as_deref()))
@@ -1805,7 +1827,7 @@ async fn launch_new_window(
     if close_start.unwrap_or(true) {
         let h = app.clone();
         let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false);
+            hide_start(&h, false, false);
         });
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -1820,7 +1842,7 @@ async fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String
     if targets.iter().any(|t| !t.trim().is_empty()) {
         let h = app.clone();
         let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false);
+            hide_start(&h, false, false);
         });
     }
     tauri::async_runtime::spawn_blocking(move || launcher::launch_combo(&targets))
@@ -1929,7 +1951,7 @@ async fn paste_clipboard_entry(app: AppHandle, text: String) -> Result<(), Strin
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let h = app.clone();
     let dispatched = app.run_on_main_thread(move || {
-        hide_start(&h, true);
+        hide_start(&h, true, false);
         let _ = tx.send(());
     });
     if dispatched.is_ok() {
@@ -2105,7 +2127,7 @@ async fn open_screen_snip(app: AppHandle) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let h = app.clone();
     let dispatched = app.run_on_main_thread(move || {
-        hide_start(&h, true);
+        hide_start(&h, true, false);
         let _ = tx.send(());
     });
     if dispatched.is_ok() {
@@ -2177,6 +2199,7 @@ pub fn run() {
     let last_show_ms = Arc::new(AtomicU64::new(0));
     let modal_picker_depth = Arc::new(AtomicU32::new(0));
     let prev_frontmost_pid = Arc::new(AtomicI32::new(0));
+    let restore_focus_on_hide = Arc::new(AtomicBool::new(false));
     let index_refresh_running = Arc::new(AtomicBool::new(false));
     let command_tap = Arc::new(Mutex::new(CommandTapMachine::new(initial_tap_mode)));
     let command_tap_started = Arc::new(AtomicBool::new(false));
@@ -2193,6 +2216,7 @@ pub fn run() {
         last_show_ms: Arc::clone(&last_show_ms),
         modal_picker_depth: Arc::clone(&modal_picker_depth),
         prev_frontmost_pid: Arc::clone(&prev_frontmost_pid),
+        restore_focus_on_hide: Arc::clone(&restore_focus_on_hide),
         command_tap: Arc::clone(&command_tap),
         command_tap_started: Arc::clone(&command_tap_started),
         tray_icon: Mutex::new(None),
@@ -2375,8 +2399,12 @@ pub fn run() {
                     );
                 }
                 let h_blur = handle.clone();
-                start_win.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::Focused(false) = ev {
+                start_win.on_window_event(move |ev| match ev {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        hide_start(&h_blur, true, true);
+                    }
+                    tauri::WindowEvent::Focused(false) => {
                         let st = h_blur.state::<MacAppState>();
                         if st.modal_picker_depth.load(Ordering::Acquire) > 0 {
                             return;
@@ -2389,8 +2417,9 @@ pub fn run() {
                         if elapsed < START_BLUR_GRACE_MS {
                             return;
                         }
-                        hide_start(&h_blur, false);
+                        hide_start(&h_blur, false, false);
                     }
+                    _ => {}
                 });
             }
 
