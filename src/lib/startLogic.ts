@@ -7,8 +7,13 @@ import type {
   IndexedApp,
   MediaState,
   PinItem,
+  SpaceConfig,
+  SpaceLayoutKind,
+  SpaceWidgetId,
+  TelemetryState,
   TestBarConfig,
   TopProcessInfo,
+  WidgetPreset,
 } from './ipc';
 
 export type StartAnimPhase = 'hidden' | 'arming' | 'open' | 'closing';
@@ -193,12 +198,118 @@ export interface SpaceAccentOption {
   label: string;
 }
 
+export const MAX_MODULAR_SPACES = 12;
+
 export const CUSTOM_SPACE_ACCENTS: readonly SpaceAccentOption[] = [
   { hex: '#818CF8', rgb: '129, 140, 248', label: 'Индиго' },
   { hex: '#38BDF8', rgb: '56, 189, 248', label: 'Кобальт' },
   { hex: '#34D399', rgb: '52, 211, 153', label: 'Изумруд' },
   { hex: '#FB7185', rgb: '251, 113, 133', label: 'Коралл' },
   { hex: '#A78BFA', rgb: '167, 139, 250', label: 'Аметист' },
+] as const;
+
+export const MODULAR_SPACE_ACCENTS: readonly SpaceAccentOption[] = [
+  ...CUSTOM_SPACE_ACCENTS,
+  { hex: '#2DD4BF', rgb: '45, 212, 191', label: 'Бирюза' },
+  { hex: '#FBBF24', rgb: '251, 191, 36', label: 'Янтарь' },
+  { hex: '#F472B6', rgb: '244, 114, 182', label: 'Роза' },
+] as const;
+
+export interface TileColorSwatch {
+  id: string;
+  label: string;
+  hex: string;
+  rgb: string;
+}
+
+export const TILE_COLOR_PALETTE: readonly TileColorSwatch[] = [
+  { id: 'indigo', label: 'Индиго', hex: '#818CF8', rgb: '129, 140, 248' },
+  { id: 'sky', label: 'Кобальт', hex: '#38BDF8', rgb: '56, 189, 248' },
+  { id: 'teal', label: 'Бирюза', hex: '#2DD4BF', rgb: '45, 212, 191' },
+  { id: 'emerald', label: 'Изумруд', hex: '#34D399', rgb: '52, 211, 153' },
+  { id: 'amber', label: 'Янтарь', hex: '#FBBF24', rgb: '251, 191, 36' },
+  { id: 'orange', label: 'Оранж', hex: '#FB923C', rgb: '251, 146, 60' },
+  { id: 'coral', label: 'Коралл', hex: '#FB7185', rgb: '251, 113, 133' },
+  { id: 'rose', label: 'Роза', hex: '#F472B6', rgb: '244, 114, 182' },
+  { id: 'violet', label: 'Аметист', hex: '#A78BFA', rgb: '167, 139, 250' },
+  { id: 'slate', label: 'Графит', hex: '#94A3B8', rgb: '148, 163, 184' },
+] as const;
+
+export type SpaceTemplateId = 'blank' | 'personal' | 'work' | 'studio' | 'games';
+
+export interface SpaceTemplateOption {
+  id: SpaceTemplateId;
+  label: string;
+  accentHex: string;
+  accentRgb: string;
+  layoutKind: SpaceLayoutKind;
+  showHeroRow: boolean;
+  widgets: SpaceWidgetId[];
+}
+
+export const SPACE_TEMPLATES: readonly SpaceTemplateOption[] = [
+  {
+    id: 'blank',
+    label: 'Пустое',
+    accentHex: '#A78BFA',
+    accentRgb: '167, 139, 250',
+    layoutKind: 'grid',
+    showHeroRow: false,
+    widgets: [],
+  },
+  {
+    id: 'personal',
+    label: 'Личное',
+    accentHex: '#818CF8',
+    accentRgb: '129, 140, 248',
+    layoutKind: 'grid',
+    showHeroRow: true,
+    widgets: ['media', 'audio_mixer', 'clipboard'],
+  },
+  {
+    id: 'work',
+    label: 'Работа',
+    accentHex: '#38BDF8',
+    accentRgb: '56, 189, 248',
+    layoutKind: 'grid',
+    showHeroRow: false,
+    widgets: ['pc_health', 'top_processes'],
+  },
+  {
+    id: 'studio',
+    label: 'Студия',
+    accentHex: '#34D399',
+    accentRgb: '52, 211, 153',
+    layoutKind: 'grid',
+    showHeroRow: true,
+    widgets: ['pc_health', 'audio_mixer', 'top_processes'],
+  },
+  {
+    id: 'games',
+    label: 'Игры',
+    accentHex: '#FB7185',
+    accentRgb: '251, 113, 133',
+    layoutKind: 'games',
+    showHeroRow: false,
+    widgets: ['audio_mixer', 'game_combos', 'pc_health'],
+  },
+] as const;
+
+export interface SpaceWidgetOption {
+  id: SpaceWidgetId;
+  label: string;
+  description: string;
+}
+
+export const SPACE_WIDGET_CATALOG: readonly SpaceWidgetOption[] = [
+  { id: 'media', label: 'Медиаплеер', description: 'Управление треками и прогресс' },
+  { id: 'audio_mixer', label: 'Звук и микшер', description: 'Устройства вывода, микрофон и потоки' },
+  { id: 'clipboard', label: 'Буфер обмена', description: 'История копирования и закрепления' },
+  { id: 'pc_health', label: 'Нагрузка ПК', description: 'CPU, RAM, GPU, VRAM и диски' },
+  { id: 'top_processes', label: 'Потребители памяти', description: 'Процессы по ОЗУ и VRAM' },
+  { id: 'game_combos', label: 'Игровые связки', description: 'Запуск наборов программ в 1 клик' },
+  { id: 'weather', label: 'Погода', description: 'Текущая погода и прогноз на 3 дня' },
+  { id: 'batteries', label: 'Батареи устройств', description: 'Заряд мыши, наушников и геймпадов' },
 ] as const;
 
 export const BUILTIN_SPACES = [
@@ -208,11 +319,117 @@ export const BUILTIN_SPACES = [
   { id: 'games', label: 'Игры' },
 ] as const;
 
+function mapLegacyPresetToWidgets(preset: WidgetPreset | undefined): SpaceWidgetId[] {
+  switch (preset) {
+    case 'telemetry_processes':
+      return ['pc_health', 'top_processes'];
+    case 'audio_mic':
+      return ['audio_mixer', 'media'];
+    case 'full_grid':
+      return [];
+    default:
+      return ['media', 'audio_mixer', 'clipboard'];
+  }
+}
+
+/**
+ * Resolves the authoritative modular `SpaceConfig[]` list from `config.spaces`,
+ * synthesizing equivalent entries from legacy v1 fields only when `config.spaces` is missing or empty.
+ */
+export function resolveConfiguredSpaces(config: TestBarConfig | null): SpaceConfig[] {
+  if (config?.spaces && config.spaces.length > 0) {
+    return config.spaces;
+  }
+  const legacySpaces: SpaceConfig[] = [
+    {
+      id: 'personal',
+      name: 'Личное',
+      accentHex: '#818CF8',
+      accentRgb: '129, 140, 248',
+      layoutKind: 'grid',
+      showHeroRow: true,
+      widgets: ['media', 'audio_mixer', 'clipboard'],
+      items: [...(config?.personalPins ?? []), ...(config?.personalLinks ?? [])],
+    },
+    {
+      id: 'work',
+      name: 'Работа',
+      accentHex: '#38BDF8',
+      accentRgb: '56, 189, 248',
+      layoutKind: 'grid',
+      showHeroRow: false,
+      widgets: ['pc_health', 'top_processes'],
+      items: [...(config?.workFolders ?? []), ...(config?.workApps ?? [])],
+    },
+    {
+      id: 'studio',
+      name: 'Студия',
+      accentHex: '#34D399',
+      accentRgb: '52, 211, 153',
+      layoutKind: 'grid',
+      showHeroRow: true,
+      widgets: ['pc_health', 'audio_mixer', 'top_processes'],
+      items: [...(config?.studioPins ?? []), ...(config?.studioTools ?? [])],
+    },
+    {
+      id: 'games',
+      name: 'Игры',
+      accentHex: '#FB7185',
+      accentRgb: '251, 113, 133',
+      layoutKind: 'games',
+      showHeroRow: false,
+      widgets: ['audio_mixer', 'game_combos', 'pc_health'],
+      items: [...(config?.gameLaunchers ?? [])],
+    },
+  ];
+
+  for (const cs of config?.customSpaces ?? []) {
+    legacySpaces.push({
+      id: cs.id,
+      name: cs.name,
+      accentHex: cs.accentHex || '#A78BFA',
+      accentRgb: cs.accentRgb || '167, 139, 250',
+      layoutKind: 'grid',
+      showHeroRow: false,
+      widgets: mapLegacyPresetToWidgets(cs.widgetPreset),
+      items: cs.items ?? [],
+    });
+  }
+
+  return legacySpaces;
+}
+
 export function getSpaceDisplayName(spaceId: string, config: TestBarConfig | null): string {
+  const modular = config?.spaces?.find((s) => s.id === spaceId);
+  if (modular) return modular.name;
   const builtin = BUILTIN_SPACES.find((s) => s.id === spaceId);
   if (builtin) return builtin.label;
   const custom = config?.customSpaces.find((s) => s.id === spaceId);
   return custom?.name ?? 'Пространство';
+}
+
+export function validateSpaceName(
+  raw: string,
+  existingNames: readonly string[],
+  currentName?: string,
+): { ok: true; name: string } | { ok: false; error: string } {
+  const name = raw.trim().replace(/\s+/g, ' ');
+  if (!name) {
+    return { ok: false, error: 'Введите название пространства' };
+  }
+  if (name.length > 18) {
+    return { ok: false, error: 'Максимум 18 символов' };
+  }
+  const low = name.toLowerCase();
+  const currentLow = (currentName ?? '').trim().toLowerCase();
+  const duplicate = existingNames.some((n) => {
+    const clean = n.trim().toLowerCase();
+    return clean === low && clean !== currentLow;
+  });
+  if (duplicate) {
+    return { ok: false, error: 'Такое пространство уже есть' };
+  }
+  return { ok: true, name };
 }
 
 export function validateCustomSpaceName(
@@ -261,6 +478,10 @@ function normAumid(value: string | null | undefined): string {
 
 export function getSpacePinList(spaceId: string, config: TestBarConfig | null): PinItem[] {
   if (!config) return [];
+  if (config.spaces && config.spaces.length > 0) {
+    const sp = config.spaces.find((s) => s.id === spaceId);
+    if (sp) return sp.items;
+  }
   switch (spaceId) {
     case 'personal':
       return [...config.personalPins, ...config.personalLinks];
@@ -342,8 +563,8 @@ function reorderArrayCopy<T>(list: readonly T[], fromIdx: number, toIdx: number)
 }
 
 /**
- * Optimistically reorders a Start space pin list in memory (supporting Hero 0..1 <-> Compact 2..N
- * and custom spaces) so pointer drag-and-drop feels instantaneous before Rust confirms via IPC.
+ * Optimistically reorders a Start space pin list in memory (supporting modular `config.spaces`,
+ * Hero 0..1 <-> Compact 2..N, and legacy spaces) so pointer drag-and-drop feels instantaneous.
  */
 export function applyOptimisticPinReorder(
   config: TestBarConfig | null,
@@ -352,6 +573,16 @@ export function applyOptimisticPinReorder(
   toIdx: number,
 ): TestBarConfig | null {
   if (!config) return null;
+  if (config.spaces && config.spaces.length > 0) {
+    const spIdx = config.spaces.findIndex((s) => s.id === spaceKey);
+    if (spIdx >= 0) {
+      const nextItems = reorderArrayCopy(config.spaces[spIdx].items, fromIdx, toIdx);
+      if (!nextItems) return null;
+      const nextSpaces = config.spaces.slice();
+      nextSpaces[spIdx] = { ...config.spaces[spIdx], items: nextItems };
+      return { ...config, spaces: nextSpaces };
+    }
+  }
   switch (spaceKey) {
     case 'taskbar': {
       const next = reorderArrayCopy(config.taskbarPins, fromIdx, toIdx);
@@ -1149,4 +1380,136 @@ export function validateGameComboInput(
     return { ok: false, error: 'Добавьте минимум 2 цели для связки' };
   }
   return { ok: true, name, steps };
+}
+
+// ===================== WAVE 3B: MODULAR SPACES, CUSTOM TILES & WIDGET BUILDER =====================
+
+export function normalizeRgbTriplet(raw: string | null | undefined): string | null {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(',').map((p) => Number.parseInt(p.trim(), 10));
+  if (parts.length !== 3 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return null;
+  }
+  return `${parts[0]}, ${parts[1]}, ${parts[2]}`;
+}
+
+/**
+ * Resolves a pin's `customColor` (`#RGB`, `#RRGGBB`, or `r,g,b`) into a CSS RGB triplet (`r, g, b`).
+ */
+export function resolveCustomColorRgb(raw: string | null | undefined): string | null {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return null;
+  const asTriplet = normalizeRgbTriplet(trimmed);
+  if (asTriplet) return asTriplet;
+
+  const hex = trimmed.startsWith('#') ? trimmed.slice(1) : trimmed;
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+  if (hex.length === 3) {
+    const r = Number.parseInt(hex[0] + hex[0], 16);
+    const g = Number.parseInt(hex[1] + hex[1], 16);
+    const b = Number.parseInt(hex[2] + hex[2], 16);
+    return `${r}, ${g}, ${b}`;
+  }
+  if (hex.length === 6) {
+    const r = Number.parseInt(hex.slice(0, 2), 16);
+    const g = Number.parseInt(hex.slice(2, 4), 16);
+    const b = Number.parseInt(hex.slice(4, 6), 16);
+    return `${r}, ${g}, ${b}`;
+  }
+  return null;
+}
+
+export function toggleSpaceWidget(
+  current: readonly SpaceWidgetId[],
+  widgetId: SpaceWidgetId,
+): SpaceWidgetId[] {
+  if (current.includes(widgetId)) {
+    return current.filter((w) => w !== widgetId);
+  }
+  return [...current, widgetId];
+}
+
+export function moveSpaceWidget(
+  current: readonly SpaceWidgetId[],
+  widgetId: SpaceWidgetId,
+  direction: 'up' | 'down',
+): SpaceWidgetId[] {
+  const idx = current.indexOf(widgetId);
+  if (idx < 0) return [...current];
+  const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (targetIdx < 0 || targetIdx >= current.length) return [...current];
+  const next = current.slice();
+  const [moved] = next.splice(idx, 1);
+  next.splice(targetIdx, 0, moved);
+  return next;
+}
+
+export function moveSpaceIdInOrder(
+  orderedIds: readonly string[],
+  spaceId: string,
+  direction: 'left' | 'right',
+): string[] | null {
+  const idx = orderedIds.indexOf(spaceId);
+  if (idx < 0) return null;
+  const targetIdx = direction === 'left' ? idx - 1 : idx + 1;
+  if (targetIdx < 0 || targetIdx >= orderedIds.length) return null;
+  const next = orderedIds.slice();
+  const [moved] = next.splice(idx, 1);
+  next.splice(targetIdx, 0, moved);
+  return next;
+}
+
+export function isLowBatteryPercent(percent: number): boolean {
+  return Number.isFinite(percent) && percent < 20;
+}
+
+export function formatPeripheralSourceLabel(source: string | null | undefined): string {
+  const s = (source ?? '').trim().toLowerCase();
+  if (!s || s === 'bluetooth' || s === 'bt') return 'Bluetooth';
+  if (s.includes('razer')) return 'Razer HID';
+  if (s.includes('logitech') || s.includes('hidpp')) return 'Logitech HID';
+  if (s.includes('xinput')) return 'XInput';
+  if (s.includes('usb') || s.includes('hid')) return 'USB HID';
+  return source?.trim() || 'Беспроводное';
+}
+
+export function convertTempFromC(tempC: number, units: 'c' | 'f' = 'c'): number {
+  if (!Number.isFinite(tempC)) return 0;
+  return units === 'f' ? (tempC * 9) / 5 + 32 : tempC;
+}
+
+export function formatStartTemperature(
+  tempC: number,
+  units: 'c' | 'f' = 'c',
+  withUnit = true,
+): string {
+  if (!Number.isFinite(tempC)) {
+    return withUnit ? `—°${units === 'f' ? 'F' : 'C'}` : '—°';
+  }
+  const rounded = Math.round(convertTempFromC(tempC, units));
+  const val = Object.is(rounded, -0) ? 0 : rounded;
+  if (!withUnit) return `${val}°`;
+  return `${val}°${units === 'f' ? 'F' : 'C'}`;
+}
+
+/**
+ * Formats dynamic hardware summary in PC Health header strictly from live `TelemetryState`.
+ */
+export function formatHardwareSummaryLine(
+  telem: Pick<TelemetryState, 'ramTotalGb' | 'gpuAvailable' | 'gpuName' | 'vramTotalGb'> | null,
+): string {
+  if (!telem) return 'Система';
+  const parts: string[] = [];
+  if (Number.isFinite(telem.ramTotalGb) && telem.ramTotalGb > 0) {
+    parts.push(`${Math.round(telem.ramTotalGb)} ГБ ОЗУ`);
+  }
+  if (telem.gpuAvailable && telem.gpuName?.trim()) {
+    const vramPart =
+      Number.isFinite(telem.vramTotalGb) && telem.vramTotalGb > 0
+        ? ` · ${formatGbValue(telem.vramTotalGb)} ГБ`
+        : '';
+    parts.push(`${telem.gpuName.trim()}${vramPart}`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : 'Система';
 }

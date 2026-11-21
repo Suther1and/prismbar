@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import '../../styles/spaces-v3.css';
 import { getActiveDeviceIndex } from '../../lib/flyoutLogic';
 import {
   addGameCombo,
@@ -20,15 +21,17 @@ import {
   type AudioDeviceInfo,
   type AudioState,
   type ClipboardEntry,
-  type CustomSpace,
   type IndexedApp,
   type MediaState,
+  type PeripheralBattery,
   type PinItem,
+  type SpaceConfig,
+  type SpaceWidgetId,
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
   type TopProcessInfo,
-  type WidgetPreset,
+  type WeatherSnapshot,
 } from '../../lib/ipc';
 import {
   buildSparklinePath,
@@ -39,10 +42,14 @@ import {
   filterClipboardEntries,
   formatDiskSummary,
   formatGbValue,
+  formatHardwareSummaryLine,
   formatKillProcessError,
   formatMediaDuration,
   formatMemoryRatio,
+  formatPeripheralSourceLabel,
   formatProcessMetricLine,
+  formatStartTemperature,
+  getBatteryColor,
   getClipboardKindLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
@@ -50,14 +57,19 @@ import {
   getTelemetryStatusPill,
   hasExceededDragThreshold,
   hexColorToRgbString,
+  isLowBatteryPercent,
+  moveSpaceWidget,
   normalizeSessionVolumeScalar,
   partitionHeroAndCompact,
   PROCESS_KILL_ARM_MS,
   pushTelemetryHistory,
   reduceProcessKillClick,
   resolveClipboardKind,
+  resolveCustomColorRgb,
   resolveProcessKillPids,
   selectDisplayedGames,
+  SPACE_WIDGET_CATALOG,
+  toggleSpaceWidget,
   validateGameComboInput,
   type GameLibraryFilter,
   type TelemetryHistory,
@@ -65,10 +77,14 @@ import {
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import { useReducedMotion } from '../../lib/useReducedMotion';
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  ChargingBoltIcon,
   ChevronDownIcon,
   CloseWindowIcon,
   CopyIcon,
   DiskIcon,
+  DropletIcon,
   ExternalArrowIcon,
   FallbackAppIcon,
   FolderSvg,
@@ -77,15 +93,20 @@ import {
   MusicNoteIcon,
   NextTrackIcon,
   PauseIcon,
+  PeripheralDeviceIcon,
   PinIcon,
   PlaySmallIcon,
   PlayTriangleIcon,
   PlusIcon,
   PrevTrackIcon,
+  RefreshIcon,
+  renderCustomTileIcon,
   SearchIcon,
-  TerminalIcon,
+  SlidersIcon,
   TrashIcon,
   VolIcon,
+  WeatherConditionIcon,
+  WindIcon,
   XIcon10,
 } from '../Icons';
 import { ObsidianSlider } from '../ObsidianSlider';
@@ -159,7 +180,6 @@ function sampleAmbientRgbFromDataUrl(dataUrl: string): Promise<string | null> {
             const chroma = max - min;
             const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             if (lum < 22 || lum > 242) continue;
-            // Favor moderately chromatic pixels for subtle obsidian ambient tint
             const w = 1 + (chroma / 255) * 3.5;
             sumR += r * w;
             sumG += g * w;
@@ -176,7 +196,6 @@ function sampleAmbientRgbFromDataUrl(dataUrl: string): Promise<string | null> {
           let g = Math.round(sumG / weightSum);
           let b = Math.round(sumB / weightSum);
 
-          // Lift overly dark samples gently so the 16% radial wash reads cleanly on obsidian
           const avgLum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
           if (avgLum > 1 && avgLum < 96) {
             const boost = Math.min(2.2, 96 / avgLum);
@@ -210,26 +229,36 @@ function isActivateKey(e: React.KeyboardEvent): boolean {
 
 export interface StartSpacesProps {
   space: string;
-  activeCustomSpace: CustomSpace | null;
+  activeSpace: SpaceConfig;
   config: TestBarConfig | null;
   games: SteamGame[];
   audio: AudioState | null;
   media: MediaState | null;
   telem: TelemetryState | null;
   clips: ClipboardEntry[];
+  periphs: PeripheralBattery[];
+  periphsRefreshing?: boolean;
+  weather: WeatherSnapshot | null;
+  weatherRefreshing?: boolean;
   editMode: boolean;
   shiftHeld: boolean;
+  widgetBuilderOpen: boolean;
   isRunning: (item: PinItem) => boolean;
   resolveIconForPin: (item: PinItem) => string | null;
   onLaunchPin: (item: PinItem) => void;
+  onOpenFolder: (path: string) => void;
+  onOpenFolderInExplorer: (path: string) => void;
   onOpenDrawer: () => void;
   onOpenTileContext: (e: React.MouseEvent, item: PinItem, spaceKey: string) => void;
   onSetAudio: (audio: AudioState, fromServer?: boolean) => void;
   onSetMedia: (media: MediaState) => void;
   onSetTelem: (telem: TelemetryState) => void;
   onSetClips: (clips: ClipboardEntry[]) => void;
+  onRefreshWeather: () => Promise<void>;
+  onRefreshPeriphs: () => Promise<void>;
+  onToggleWidgetBuilder: (open: boolean) => void;
+  onSetSpaceWidgets: (spaceId: string, widgets: SpaceWidgetId[]) => Promise<void>;
   onShowToast: (msg: string) => void;
-  // Shared Wave 2B optional props
   startVisible?: boolean;
   startAnimSettled?: boolean;
   onAudioDragStateChange?: (sliderKey: string, dragging: boolean) => void;
@@ -245,24 +274,35 @@ export interface StartSpacesProps {
 
 export const StartSpaces: React.FC<StartSpacesProps> = ({
   space,
-  activeCustomSpace,
+  activeSpace,
   config,
   games,
   audio,
   media,
   telem,
   clips,
+  periphs,
+  periphsRefreshing = false,
+  weather,
+  weatherRefreshing = false,
   editMode,
   shiftHeld,
+  widgetBuilderOpen,
   isRunning,
   resolveIconForPin,
   onLaunchPin,
+  onOpenFolder,
+  onOpenFolderInExplorer,
   onOpenDrawer,
   onOpenTileContext,
   onSetAudio,
   onSetMedia,
   onSetTelem,
   onSetClips,
+  onRefreshWeather,
+  onRefreshPeriphs,
+  onToggleWidgetBuilder,
+  onSetSpaceWidgets,
   onShowToast,
   startVisible = true,
   startAnimSettled = true,
@@ -317,6 +357,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   // Telemetry 60s rolling sparkline ring buffer
   const [telemHistory, setTelemHistory] = useState<TelemetryHistory>(EMPTY_TELEMETRY_HISTORY);
 
+  // Widget Configurator popover
+  const widgetPopRef = useRef<HTMLDivElement>(null);
+  const widgetPopPresence = useAnimatedPresence(widgetBuilderOpen, 95);
+  const [savingWidgets, setSavingWidgets] = useState(false);
+
   // Lazy Steam/Epic/GOG cover art cache
   const mountedRef = useRef(true);
   const [loadedCovers, setLoadedCovers] = useState<Record<string, string>>({});
@@ -340,10 +385,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   const [comboError, setComboError] = useState<string | null>(null);
   const [comboSaving, setComboSaving] = useState(false);
 
-  const customPreset: WidgetPreset = activeCustomSpace?.widgetPreset ?? 'media_clipboard';
-
+  const spaceWidgets = activeSpace.widgets ?? [];
+  const hasWidgets = spaceWidgets.length > 0;
+  const hasAudioWidget = spaceWidgets.includes('audio_mixer');
   const hasAudioDevices = (audio?.devices.length ?? 0) > 0;
   const hasAudioHydrated = audio !== null;
+  const isGamesLayout = activeSpace.layoutKind === 'games';
+  const weatherUnits: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
 
   // Reset transient space-local states on space switch or hide
   useEffect(() => {
@@ -358,6 +406,34 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
     setActiveDrag(null);
   }, [space, startVisible]);
+
+  // Dismiss widget builder on outside click or Escape
+  useEffect(() => {
+    if (!widgetBuilderOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        widgetPopRef.current &&
+        target &&
+        !widgetPopRef.current.contains(target) &&
+        !target.closest?.('.sec-act-widgets')
+      ) {
+        onToggleWidgetBuilder(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onToggleWidgetBuilder(false);
+      }
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [widgetBuilderOpen, onToggleWidgetBuilder]);
 
   // Suppress segmented-pill & slider mount/hydration glide on space switch, Start open, or first audio hydration
   useEffect(() => {
@@ -388,7 +464,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         cancelAnimationFrame(raf2);
       }
     };
-  }, [space, startVisible, startAnimSettled, hasAudioDevices, hasAudioHydrated]);
+  }, [space, startVisible, startAnimSettled, hasAudioDevices, hasAudioHydrated, hasAudioWidget]);
 
   // Cleanup arming, drag & audio throttle timers on unmount
   useEffect(() => {
@@ -493,15 +569,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     return () => window.clearInterval(id);
   }, [startVisible, media?.hasSession, media?.isPlaying, media?.positionSec, media?.lastUpdatedMs]);
 
-  // Visibility-gated 140ms live WASAPI peak poller (waits until Start spring settles, 0% hidden CPU!)
-  const needsAudioPeaks = Boolean(
-    startVisible &&
-      startAnimSettled &&
-      (space === 'personal' ||
-        space === 'studio' ||
-        space === 'games' ||
-        (activeCustomSpace !== null && customPreset === 'audio_mic')),
-  );
+  // Visibility-gated 140ms live WASAPI peak poller (only when audio_mixer widget is active)
+  const needsAudioPeaks = Boolean(startVisible && startAnimSettled && hasAudioWidget);
 
   useEffect(() => {
     if (!needsAudioPeaks) {
@@ -564,20 +633,15 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
   }, [audio?.sessions, telem?.topProcesses, telem?.gpuProcesses, iconMap, onResolveIconKeys]);
 
-  const personalPartition = useMemo(
-    () => partitionHeroAndCompact(config?.personalPins ?? []),
-    [config?.personalPins],
-  );
-  const studioPartition = useMemo(
-    () => partitionHeroAndCompact(config?.studioPins ?? []),
-    [config?.studioPins],
-  );
   const displayedGames = useMemo(
     () => selectDisplayedGames(games, gameFilter),
     [games, gameFilter],
   );
   const studioProcesses = useMemo(
-    () => (telem?.gpuProcesses && telem.gpuProcesses.length > 0 ? telem.gpuProcesses : (telem?.topProcesses ?? [])),
+    () =>
+      telem?.gpuProcesses && telem.gpuProcesses.length > 0
+        ? telem.gpuProcesses
+        : (telem?.topProcesses ?? []),
     [telem?.gpuProcesses, telem?.topProcesses],
   );
   const filteredClips = useMemo(
@@ -585,7 +649,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     [clips, clipQuery],
   );
 
-  // Idle pre-warm top 6 recent Steam covers after boot so the VERY FIRST switch to Games has zero decode hitch
+  // Idle pre-warm top 6 recent Steam covers after boot
   useEffect(() => {
     if (games.length === 0) return;
     const timer = window.setTimeout(() => {
@@ -611,9 +675,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     return () => window.clearTimeout(timer);
   }, [games]);
 
-  // Lazy load remaining game covers AFTER the 190ms space slide finishes so first tab transition never hitches
+  // Lazy load remaining game covers AFTER the 190ms space slide finishes
   useEffect(() => {
-    if (!startVisible || space !== 'games') return;
+    if (!startVisible || !isGamesLayout) return;
     const toLoad = displayedGames.filter(
       (g) =>
         !g.coverData &&
@@ -643,7 +707,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }, 210);
 
     return () => window.clearTimeout(deferTimer);
-  }, [startVisible, space, displayedGames]);
+  }, [startVisible, isGamesLayout, displayedGames]);
 
   // Combo picker catalog (installed apps + games)
   const comboPickerOptions = useMemo(() => {
@@ -764,13 +828,22 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   };
 
   const handlePinTileClick = useCallback(
-    (item: PinItem) => {
+    (item: PinItem, eventShift: boolean) => {
       if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
+        return;
+      }
+      if (editMode) return;
+      if (item.kind === 'folder') {
+        if (eventShift || shiftHeld) {
+          onOpenFolderInExplorer(item.target);
+        } else {
+          onOpenFolder(item.target);
+        }
         return;
       }
       onLaunchPin(item);
     },
-    [onLaunchPin],
+    [editMode, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
   );
 
   // Always-on pointer-based pin reordering (6px threshold, Hero <-> Compact, immune to Tauri v2 dragDropEnabled)
@@ -911,24 +984,72 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     </div>
   );
 
+  const renderTileGlyph = (item: PinItem, size: 'hero' | 'compact' | 'quick') => {
+    const iconSizeClass = size === 'hero' ? 'ic24' : size === 'compact' ? 'ic20' : 'ic18';
+    const imgClass =
+      size === 'hero'
+        ? 'native-ic-lg custom-tile-img'
+        : size === 'compact'
+          ? 'native-ic custom-tile-img'
+          : 'native-ic-sm custom-tile-img';
+
+    if (item.customIcon === 'custom_image' && item.iconData) {
+      return <img src={item.iconData} alt="" className={imgClass} draggable={false} />;
+    }
+    const customSvg = item.customIcon ? renderCustomTileIcon(item.customIcon, iconSizeClass) : null;
+    if (customSvg) {
+      return customSvg;
+    }
+    const nativeIc = resolveIconForPin(item);
+    if (nativeIc) {
+      const nativeClass =
+        size === 'hero' ? 'native-ic-lg' : size === 'compact' ? 'native-ic' : 'native-ic-sm';
+      return <img src={nativeIc} alt="" className={nativeClass} draggable={false} />;
+    }
+    const fallbackPx = size === 'hero' ? 24 : size === 'compact' ? 20 : 17;
+    return (
+      <FallbackAppIcon
+        iconKey={item.iconKey}
+        kind={item.kind}
+        target={item.target}
+        size={fallbackPx}
+      />
+    );
+  };
+
   const renderTile = (item: PinItem, idx: number, spaceKey: string, isHero: boolean) => {
     const running = isRunning(item);
-    const nativeIc = resolveIconForPin(item);
-    const honestAlt = getHonestShiftBadge(item);
+    const customRgb = resolveCustomColorRgb(item.customColor);
+    const isFolder = item.kind === 'folder';
+    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+
+    const tileStyle: React.CSSProperties = {
+      ['--tile-rgb' as string]: customRgb || item.accentRgb || '139,150,248',
+      ...(customRgb ? { ['--tile-custom-rgb' as string]: customRgb } : {}),
+    } as React.CSSProperties;
+
+    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
+    const icBoxCls = [
+      'tile-ic',
+      isFolder && !isCustomImg ? 'is-folder-ic' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
     return (
       <div
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className={`app-tile ${isHero ? 'hero' : 'compact'}${getDragClasses(spaceKey, idx)}`}
-        style={{ ['--tile-rgb' as string]: item.accentRgb || '139,150,248' }}
+        className={`app-tile ${isHero ? 'hero' : 'compact'}${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx)}`}
+        style={tileStyle}
         onMouseMove={trackTilePointer}
         {...makeDragProps(spaceKey, idx, item.title)}
-        onClick={() => handlePinTileClick(item)}
+        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
             e.preventDefault();
-            onLaunchPin(item);
+            handlePinTileClick(item, e.shiftKey);
           }
         }}
         onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
@@ -941,20 +1062,16 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             aria-label={`Открепить ${item.title}`}
             onClick={(e) => {
               e.stopPropagation();
-              ipc('remove_pin', { space: spaceKey, itemId: item.id }).catch(() => {
-                onShowToast('Не удалось открепить элемент');
-              });
+              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
+                .then((updated) => onSetConfig?.(updated))
+                .catch(() => onShowToast('Не удалось открепить элемент'));
             }}
           >
             <XIcon10 />
           </button>
         )}
-        <div className="tile-ic">
-          {nativeIc ? (
-            <img src={nativeIc} alt="" className={isHero ? 'native-ic-lg' : 'native-ic'} draggable={false} />
-          ) : (
-            <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} target={item.target} size={isHero ? 24 : 20} />
-          )}
+        <div className={icBoxCls}>
+          {renderTileGlyph(item, isHero ? 'hero' : 'compact')}
           {running && <span className="run-pill" aria-hidden="true" />}
         </div>
         <div className="tile-meta">
@@ -968,20 +1085,30 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   };
 
   const renderQuickLink = (item: PinItem, idx: number, spaceKey: string) => {
-    const nativeIc = resolveIconForPin(item);
-    const honestAlt = getHonestShiftBadge(item);
+    const customRgb = resolveCustomColorRgb(item.customColor);
+    const isFolder = item.kind === 'folder';
+    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
     return (
       <div
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className={`qlink${getDragClasses(spaceKey, idx)}`}
+        className={`qlink${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx)}`}
+        style={
+          customRgb
+            ? ({
+                ['--tile-custom-rgb' as string]: customRgb,
+                borderColor: `rgba(${customRgb}, 0.34)`,
+                background: `linear-gradient(135deg, rgba(${customRgb}, 0.14), rgba(255, 255, 255, 0.03) 74%)`,
+              } as React.CSSProperties)
+            : undefined
+        }
         {...makeDragProps(spaceKey, idx, item.title)}
-        onClick={() => handlePinTileClick(item)}
+        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
             e.preventDefault();
-            onLaunchPin(item);
+            handlePinTileClick(item, e.shiftKey);
           }
         }}
         onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
@@ -994,19 +1121,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             aria-label={`Открепить ${item.title}`}
             onClick={(e) => {
               e.stopPropagation();
-              ipc('remove_pin', { space: spaceKey, itemId: item.id }).catch(() => {
-                onShowToast('Не удалось открепить элемент');
-              });
+              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
+                .then((updated) => onSetConfig?.(updated))
+                .catch(() => onShowToast('Не удалось открепить элемент'));
             }}
           >
             <XIcon10 />
           </button>
         )}
-        {nativeIc ? (
-          <img src={nativeIc} alt="" className="native-ic-sm" draggable={false} />
-        ) : (
-          <FallbackAppIcon iconKey={item.iconKey} kind={item.kind} target={item.target} size={17} />
-        )}
+        <span style={customRgb ? { color: `rgb(${customRgb})` } : undefined}>
+          {renderTileGlyph(item, 'quick')}
+        </span>
         <div className="qlink-meta">
           <div className="qlink-name">{item.title}</div>
           <div className={`qlink-sub ${shiftHeld && honestAlt ? 'alt-on' : ''}`}>
@@ -1128,7 +1253,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             ipc<AudioState>('set_mic_muted', { muted: !micMuted })
               .then(onSetAudio)
               .catch((err) => {
-                onShowToast(typeof err === 'string' && err.trim() ? err : 'Не удалось переключить микрофон');
+                onShowToast(
+                  typeof err === 'string' && err.trim()
+                    ? err
+                    : 'Не удалось переключить микрофон',
+                );
               })
           }
         >
@@ -1322,7 +1451,6 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
         {options.showSessions && (
           <>
-            {/* Master volume ALWAYS accessible above per-app mixer */}
             <div className={`mix-row qs-master-row ${masterMuted ? 'muted' : ''}`} style={{ marginBottom: 5 }}>
               <button
                 type="button"
@@ -1673,7 +1801,6 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   window.setTimeout(() => setCopiedClipId((cur) => (cur === c.id ? null : cur)), 700);
                 })
                 .catch(() => {
-                  // Fallback to plain copy if paste target unavailable
                   ipc('copy_to_clipboard', { text: c.text })
                     .then(() => onShowToast('Скопировано в буфер'))
                     .catch(() => onShowToast('Не удалось вставить запись'));
@@ -1862,7 +1989,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               <div className="health-row">
                 <div className="health-top">
                   <span className="health-lbl">
-                    VRAM <span className="health-sub">· {telem.gpuName} · {telem.gpuTempC}°C</span>
+                    VRAM <span className="health-sub">· {telem.gpuName || 'GPU'} · {telem.gpuTempC}°C</span>
                   </span>
                   <span className="health-val">
                     {formatMemoryRatio(telem.vramUsedGb, telem.vramTotalGb)}{' '}
@@ -1915,9 +2042,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       <BentoSpotCard bentoIndex={bentoIndex} className="compact-card">
         <div className="sec-row" style={{ marginBottom: 9 }}>
           <span className="sec-title">Нагрузка ПК</span>
-          <span className="health-hw-meta">
-            {telem ? `${Math.round(telem.ramTotalGb)} ГБ${telem.gpuAvailable ? ` · ${telem.gpuName}` : ''}` : 'Система'}
-          </span>
+          <span className="health-hw-meta">{formatHardwareSummaryLine(telem)}</span>
         </div>
         <div className="health-list">
           <div className="health-row">
@@ -1971,7 +2096,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               <div className="health-row">
                 <div className="health-top">
                   <span className="health-lbl">
-                    {telem.gpuName} <span className="health-sub">· {telem.gpuTempC}°C</span>
+                    {telem.gpuName || 'GPU'} <span className="health-sub">· {telem.gpuTempC}°C</span>
                   </span>
                   <span className="health-val">
                     {gpuPct}%{' '}
@@ -2144,6 +2269,509 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
   };
 
+  const renderGameCombosCard = (bentoIndex: number) => {
+    const combos = config?.gameCombos ?? [];
+    return (
+      <BentoSpotCard bentoIndex={bentoIndex} className="combos-card">
+        <div className="sec-row" style={{ marginBottom: 8 }}>
+          <span className="sec-title">Игровые связки</span>
+          <button
+            type="button"
+            className="sec-act sec-act-ic"
+            onClick={() => {
+              setComboError(null);
+              setComboBuilderOpen(true);
+            }}
+          >
+            <PlusIcon className="ic12" />
+            <span>Связка</span>
+          </button>
+        </div>
+
+        <div className="combos-list">
+          {combos.length === 0 ? (
+            <div className="space-empty-inline">
+              <span>Нет игровых связок</span>
+              <button
+                type="button"
+                className="pin-any-btn"
+                onClick={() => {
+                  setComboError(null);
+                  setComboBuilderOpen(true);
+                }}
+              >
+                <PlusIcon className="ic12" />
+                <span>Создать</span>
+              </button>
+            </div>
+          ) : (
+            combos.map((cb, idx) => {
+              const isDelArmed = armedComboDeleteId === cb.id;
+              return (
+                <div
+                  key={cb.id || `combo-${idx}`}
+                  role="button"
+                  tabIndex={0}
+                  className={`consumer-row combo-row${getDragClasses('game_combos', idx)}`}
+                  {...makeDragProps('game_combos', idx, cb.title)}
+                  onClick={() => {
+                    if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
+                      return;
+                    }
+                    onLaunchPin(cb);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target === e.currentTarget && isActivateKey(e)) {
+                      e.preventDefault();
+                      onLaunchPin(cb);
+                    }
+                  }}
+                  onContextMenu={(e) => onOpenTileContext(e, cb, 'game_combos')}
+                >
+                  <span
+                    className="combo-ic"
+                    style={{
+                      background: `rgba(${cb.accentRgb || '242,110,132'}, 0.16)`,
+                      color: `rgb(${cb.accentRgb || '242,110,132'})`,
+                    }}
+                  >
+                    <PlayTriangleIcon size={12} />
+                  </span>
+                  <div className="consumer-meta">
+                    <div className="consumer-name">{cb.title}</div>
+                    <div className="consumer-sub">{cb.subtitle}</div>
+                  </div>
+                  {editMode && (
+                    <button
+                      type="button"
+                      className={`consumer-kill ${isDelArmed ? 'armed' : ''}`}
+                      style={{ opacity: 1 }}
+                      title={isDelArmed ? 'Подтвердить удаление связки' : 'Удалить связку'}
+                      aria-label={isDelArmed ? `Подтвердить удаление ${cb.title}` : `Удалить ${cb.title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteComboClick(cb);
+                      }}
+                    >
+                      {isDelArmed ? <span>Подтвердить</span> : <XIcon10 />}
+                    </button>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Inline Game Combo Builder Sheet */}
+        {comboBuilderPresence.mounted && (
+          <div
+            className="combo-builder-sheet"
+            data-phase={comboBuilderPresence.phase}
+            role="dialog"
+            aria-label="Новая игровая связка"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="space-create-head">
+              <span>Новая связка</span>
+              <button
+                type="button"
+                className="tray-ctx-close"
+                aria-label="Закрыть конструктор связки"
+                onClick={() => setComboBuilderOpen(false)}
+              >
+                <CloseWindowIcon className="ic12" />
+              </button>
+            </div>
+
+            <input
+              className="space-create-input"
+              placeholder="Название (например, Игра + Discord)"
+              maxLength={36}
+              value={comboName}
+              onChange={(e) => {
+                setComboName(e.target.value);
+                if (comboError) setComboError(null);
+              }}
+            />
+
+            {comboPickerOptions.length > 0 && (
+              <div className="combo-picker-row">
+                <select
+                  className="qs-input-select"
+                  style={{ height: 28 }}
+                  aria-label="Выбрать программу или игру"
+                  value={comboPickKey}
+                  onChange={(e) => setComboPickKey(e.target.value)}
+                >
+                  <option value="">Выбрать игру или программу…</option>
+                  {comboPickerOptions.map((opt) => (
+                    <option key={opt.key} value={opt.key}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="pin-any-btn"
+                  style={{ height: 28, padding: '0 10px' }}
+                  onClick={() => {
+                    const found = comboPickerOptions.find((o) => o.key === comboPickKey);
+                    if (!found) return;
+                    if (comboSteps.some((s) => s.target.toLowerCase() === found.target.toLowerCase())) {
+                      return;
+                    }
+                    setComboSteps((prev) => [
+                      ...prev,
+                      { id: `${Date.now()}-${prev.length}`, label: found.label, target: found.target },
+                    ]);
+                    setComboPickKey('');
+                    if (comboError) setComboError(null);
+                  }}
+                >
+                  <PlusIcon className="ic12" />
+                </button>
+              </div>
+            )}
+
+            <div className="combo-picker-row">
+              <input
+                className="url-input"
+                style={{ flex: 1, height: 28 }}
+                placeholder="Путь к .exe или URL (https://…)"
+                value={comboCustomTarget}
+                onChange={(e) => setComboCustomTarget(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const val = comboCustomTarget.trim();
+                    if (!val) return;
+                    const label = val.split(/[\\/]/).filter(Boolean).pop() || val;
+                    setComboSteps((prev) => [
+                      ...prev,
+                      { id: `${Date.now()}-${prev.length}`, label, target: val },
+                    ]);
+                    setComboCustomTarget('');
+                    if (comboError) setComboError(null);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="pin-any-btn"
+                style={{ height: 28, padding: '0 10px' }}
+                onClick={() => {
+                  const val = comboCustomTarget.trim();
+                  if (!val) return;
+                  const label = val.split(/[\\/]/).filter(Boolean).pop() || val;
+                  setComboSteps((prev) => [
+                    ...prev,
+                    { id: `${Date.now()}-${prev.length}`, label, target: val },
+                  ]);
+                  setComboCustomTarget('');
+                  if (comboError) setComboError(null);
+                }}
+              >
+                Добавить
+              </button>
+            </div>
+
+            <div className="combo-step-list">
+              {comboSteps.length === 0 ? (
+                <div className="clip-empty">Добавьте минимум 2 программы, игры или ссылки</div>
+              ) : (
+                comboSteps.map((step, idx) => (
+                  <div key={step.id || `step-${idx}`} className="combo-step-chip">
+                    <span className="clip-txt" title={step.target}>{step.label}</span>
+                    <button
+                      type="button"
+                      className="tray-ctx-close"
+                      aria-label={`Удалить шаг ${step.label}`}
+                      onClick={() => setComboSteps((prev) => prev.filter((x) => x.id !== step.id))}
+                    >
+                      <XIcon10 />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {comboError && <div className="space-create-err">{comboError}</div>}
+
+            <div className="space-create-actions">
+              <button
+                type="button"
+                className="space-create-cancel"
+                onClick={() => setComboBuilderOpen(false)}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                className="space-create-submit"
+                disabled={comboSaving}
+                onClick={() => void handleSaveCombo()}
+              >
+                Сохранить
+              </button>
+            </div>
+          </div>
+        )}
+      </BentoSpotCard>
+    );
+  };
+
+  const renderWeatherCard = (bentoIndex: number) => {
+    const forecastDays = (weather?.daily ?? []).slice(0, 3);
+    const hasData = Boolean(weather && weather.available);
+
+    return (
+      <BentoSpotCard bentoIndex={bentoIndex} className="weather-card">
+        <div className="sec-row" style={{ marginBottom: 8 }}>
+          <div className="weather-head-left">
+            <span className="sec-title">Погода</span>
+            {weather?.city && <span className="weather-city-name">· {weather.city}</span>}
+            {weather?.stale && <span className="weather-stale-pill">Кэш</span>}
+          </div>
+          <button
+            type="button"
+            className={`weather-refresh-btn ${weatherRefreshing ? 'spinning' : ''}`}
+            title="Обновить погоду"
+            aria-label="Обновить погоду"
+            disabled={weatherRefreshing}
+            onClick={() => void onRefreshWeather()}
+          >
+            <RefreshIcon className="ic12" />
+          </button>
+        </div>
+
+        {!weather ? (
+          <div className="weather-empty">Загрузка прогноза погоды…</div>
+        ) : !hasData ? (
+          <div className="weather-empty">
+            {weather.error || 'Погода недоступна. Проверьте подключение к сети.'}
+          </div>
+        ) : (
+          <>
+            <div className="weather-hero">
+              <div className="weather-ic-box">
+                <WeatherConditionIcon condition={weather.conditionIcon} className="ic24" />
+              </div>
+              <div className="weather-temp-col">
+                <div className="weather-temp-main">
+                  {formatStartTemperature(weather.tempC, weatherUnits, true)}
+                </div>
+                <div className="weather-cond-lbl">{weather.conditionLabel}</div>
+              </div>
+              <div className="weather-metrics">
+                <span className="weather-metric-chip" title="Влажность">
+                  <DropletIcon className="ic12" />
+                  <span>{weather.humidity}%</span>
+                </span>
+                <span className="weather-metric-chip" title="Ветер">
+                  <WindIcon className="ic12" />
+                  <span>{Math.round(weather.windKmh)} км/ч</span>
+                </span>
+              </div>
+            </div>
+
+            <div className="weather-feels">
+              Ощущается как {formatStartTemperature(weather.feelsLikeC, weatherUnits, true)}
+            </div>
+
+            {forecastDays.length > 0 && (
+              <div className="weather-daily-grid">
+                {forecastDays.map((day, idx) => (
+                  <div key={day.date || `wday-${idx}`} className="weather-day-chip">
+                    <div className="weather-day-top">
+                      <span>{day.label}</span>
+                      <WeatherConditionIcon condition={day.conditionIcon} className="ic14" />
+                    </div>
+                    <div className="weather-day-temps">
+                      <span className="weather-day-max">
+                        {formatStartTemperature(day.tempMaxC, weatherUnits, false)}
+                      </span>
+                      <span className="weather-day-min">
+                        {formatStartTemperature(day.tempMinC, weatherUnits, false)}
+                      </span>
+                      {day.precipProb > 0 && (
+                        <span className="weather-precip">{day.precipProb}%</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </BentoSpotCard>
+    );
+  };
+
+  const renderBatteriesCard = (bentoIndex: number) => (
+    <BentoSpotCard bentoIndex={bentoIndex} className="batteries-card">
+      <div className="sec-row" style={{ marginBottom: 8 }}>
+        <span className="sec-title">Беспроводные устройства</span>
+        <button
+          type="button"
+          className={`periph-refresh-btn ${periphsRefreshing ? 'spinning' : ''}`}
+          title="Обновить заряд устройств"
+          aria-label="Обновить заряд устройств"
+          disabled={periphsRefreshing}
+          onClick={() => void onRefreshPeriphs()}
+        >
+          <RefreshIcon className="ic12" />
+        </button>
+      </div>
+
+      {periphs.length === 0 ? (
+        <div className="weather-empty">Беспроводные устройства не найдены</div>
+      ) : (
+        <div className="bat-widget-list">
+          {periphs.map((p, idx) => {
+            const isLow = isLowBatteryPercent(p.percent);
+            const subLevels = p.subLevels ?? [];
+            const fillColor = isLow ? '#FB7185' : getBatteryColor(p.percent);
+            return (
+              <div
+                key={p.id || `bat-card-${p.name}-${idx}`}
+                className={`bat-widget-row ${isLow ? 'is-low' : ''}`}
+              >
+                <div className="bat-widget-top">
+                  <span className="bat-widget-ic">
+                    <PeripheralDeviceIcon kind={p.kind} className="ic14" />
+                  </span>
+                  <div className="bat-widget-meta">
+                    <span className="bat-widget-name" title={p.name}>{p.name}</span>
+                    <span className="periph-src-badge">
+                      {formatPeripheralSourceLabel(p.source)}
+                    </span>
+                  </div>
+                  <span
+                    className="bat-widget-pct"
+                    style={{ color: fillColor }}
+                  >
+                    {p.charging && <ChargingBoltIcon className="ic12" />}
+                    <span>{p.percent}%</span>
+                  </span>
+                </div>
+
+                <div className="bat-widget-bar">
+                  <div
+                    className="bat-widget-fill"
+                    style={
+                      {
+                        ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
+                        background: fillColor,
+                      } as React.CSSProperties
+                    }
+                  />
+                </div>
+
+                {subLevels.length > 0 && (
+                  <div className="periph-sub-levels">
+                    {subLevels.map((sub, sIdx) => {
+                      const subLow = isLowBatteryPercent(sub.percent);
+                      return (
+                        <span
+                          key={`${sub.label}-${sIdx}`}
+                          className={`periph-sub-chip ${subLow ? 'is-low' : ''}`}
+                        >
+                          {sub.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                          <span>{sub.label}:</span>
+                          <strong>{sub.percent}%</strong>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </BentoSpotCard>
+  );
+
+  const renderWidgetById = (widgetId: SpaceWidgetId, bentoIndex: number): React.ReactNode => {
+    switch (widgetId) {
+      case 'media':
+        return <React.Fragment key={widgetId}>{renderMediaCard(bentoIndex)}</React.Fragment>;
+      case 'audio_mixer':
+        return (
+          <React.Fragment key={widgetId}>
+            {renderAudioMixerCard(bentoIndex, {
+              title: isGamesLayout ? 'Игровой звук и голос' : 'Звук и микшер',
+              showDeviceSwitcher: !isGamesLayout,
+              showMicToggle: activeSpace.id === 'studio' || isGamesLayout || !spaceWidgets.includes('media'),
+              showSessions:
+                activeSpace.id !== 'studio' || !spaceWidgets.includes('top_processes'),
+            })}
+          </React.Fragment>
+        );
+      case 'clipboard':
+        return <React.Fragment key={widgetId}>{renderClipboardCard(bentoIndex)}</React.Fragment>;
+      case 'pc_health':
+        return (
+          <React.Fragment key={widgetId}>
+            {renderTelemetryCard(bentoIndex, activeSpace.id === 'studio' ? 'headroom' : 'full')}
+          </React.Fragment>
+        );
+      case 'top_processes':
+        return (
+          <React.Fragment key={widgetId}>
+            {renderProcessConsumersCard(
+              bentoIndex,
+              activeSpace.id === 'studio' ? 'gpu' : 'ram',
+              activeSpace.id,
+            )}
+          </React.Fragment>
+        );
+      case 'game_combos':
+        return <React.Fragment key={widgetId}>{renderGameCombosCard(bentoIndex)}</React.Fragment>;
+      case 'weather':
+        return <React.Fragment key={widgetId}>{renderWeatherCard(bentoIndex)}</React.Fragment>;
+      case 'batteries':
+        return <React.Fragment key={widgetId}>{renderBatteriesCard(bentoIndex)}</React.Fragment>;
+      default:
+        return null;
+    }
+  };
+
+  const handleToggleWidget = async (widgetId: SpaceWidgetId) => {
+    if (savingWidgets) return;
+    const nextWidgets = toggleSpaceWidget(spaceWidgets, widgetId);
+    setSavingWidgets(true);
+    try {
+      await onSetSpaceWidgets(activeSpace.id, nextWidgets);
+    } catch {
+      onShowToast('Не удалось обновить виджеты');
+    } finally {
+      setSavingWidgets(false);
+    }
+  };
+
+  const handleMoveWidget = async (widgetId: SpaceWidgetId, direction: 'up' | 'down') => {
+    if (savingWidgets) return;
+    const nextWidgets = moveSpaceWidget(spaceWidgets, widgetId, direction);
+    if (nextWidgets.every((w, i) => w === spaceWidgets[i])) return;
+    setSavingWidgets(true);
+    try {
+      await onSetSpaceWidgets(activeSpace.id, nextWidgets);
+    } catch {
+      onShowToast('Не удалось изменить порядок виджетов');
+    } finally {
+      setSavingWidgets(false);
+    }
+  };
+
+  const orderedWidgetCatalog = useMemo(() => {
+    const enabled = spaceWidgets
+      .map((id) => SPACE_WIDGET_CATALOG.find((w) => w.id === id))
+      .filter((w): w is (typeof SPACE_WIDGET_CATALOG)[number] => Boolean(w));
+    const disabled = SPACE_WIDGET_CATALOG.filter((w) => !spaceWidgets.includes(w.id));
+    return [...enabled, ...disabled];
+  }, [spaceWidgets]);
+
   const dragGhost =
     activeDrag && typeof document !== 'undefined'
       ? createPortal(
@@ -2154,786 +2782,274 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         )
       : null;
 
-  const panelClass = `space-panel${rapidSwitch ? ' rapid' : ''}`;
+  const panelClass = `space-panel space-layout${rapidSwitch ? ' rapid' : ''}${hasWidgets ? '' : ' no-widgets'}`;
   const panelStyle = { ['--space-dir' as string]: spaceDir } as React.CSSProperties;
 
-  /* ===================== SPACE 1: ЛИЧНОЕ ===================== */
-  if (space === 'personal') {
-    const hasPersonalPins = (config?.personalPins.length ?? 0) > 0;
-    const hasPersonalLinks = (config?.personalLinks.length ?? 0) > 0;
+  const renderSpaceActionButtons = () => (
+    <div className="sec-actions">
+      <button
+        type="button"
+        className={`sec-act sec-act-widgets ${widgetBuilderOpen ? 'active' : ''}`}
+        aria-expanded={widgetBuilderOpen}
+        onClick={() => onToggleWidgetBuilder(!widgetBuilderOpen)}
+      >
+        <SlidersIcon className="ic12" />
+        <span>Виджеты</span>
+      </button>
+      <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
+        <PlusIcon className="ic12" />
+        <span>Закрепить</span>
+      </button>
+    </div>
+  );
 
-    return (
-      <>
-      <div key={space} className={panelClass} style={panelStyle}>
-        <div className="bento-col">
-          <BentoSpotCard bentoIndex={0} className="space-card-flex">
-            <div className="sec-row">
-              <span className="sec-title">Закреплено</span>
-              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                <PlusIcon className="ic12" />
-                <span>Закрепить</span>
-              </button>
-            </div>
+  const items = activeSpace.items ?? [];
+  const partitioned = activeSpace.showHeroRow ? partitionHeroAndCompact(items) : null;
 
-            <div className="space-scroll-main">
-              {!hasPersonalPins ? (
-                renderEmptyStrip('Нет закреплённых программ')
-              ) : (
-                <>
-                  {personalPartition.heroes.length > 0 && (
-                    <div className="hero-pair">
-                      {personalPartition.heroes.map((p, i) => renderTile(p, i, 'personal', true))}
-                    </div>
-                  )}
-                  {personalPartition.compact.length > 0 && (
-                    <div className="sub-grid">
-                      {personalPartition.compact.map((p, i) => renderTile(p, i + 2, 'personal', false))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-
-            <div className="space-dock-foot">
-              <div className="sec-row" style={{ marginBottom: 8 }}>
-                <span className="sec-title">Быстрый доступ</span>
-                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                  <PlusIcon className="ic12" />
-                  <span>Папка / Файл / URL</span>
-                </button>
-              </div>
-              {!hasPersonalLinks ? (
-                renderEmptyStrip('Нет папок или ссылок быстрого доступа')
-              ) : (
-                <div className="qlinks-grid qlinks-scroll">
-                  {(config?.personalLinks ?? []).map((l, idx) =>
-                    renderQuickLink(l, idx, 'personal_links'),
-                  )}
-                </div>
-              )}
-            </div>
-          </BentoSpotCard>
-        </div>
-
-        <div className="bento-col">
-          {renderMediaCard(1)}
-          {renderAudioMixerCard(2, {
-            title: 'Звук и микшер',
-            showDeviceSwitcher: true,
-            showMicToggle: false,
-            showSessions: true,
-          })}
-          {renderClipboardCard(3)}
-        </div>
-      </div>
-      {dragGhost}
-      </>
-    );
-  }
-
-  /* ===================== SPACE 2: РАБОТА ===================== */
-  if (space === 'work') {
-    const workFolders = config?.workFolders ?? [];
-    const workApps = config?.workApps ?? [];
-
-    return (
-      <>
-      <div key={space} className={panelClass} style={panelStyle}>
-        <div className="bento-col">
-          <BentoSpotCard bentoIndex={0} className="space-card-flex">
-            <div className="sec-row">
-              <span className="sec-title">Проекты, папки и файлы</span>
-              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                <PlusIcon className="ic12" />
-                <span>Закрепить</span>
-              </button>
-            </div>
-
-            <div className="space-scroll-main">
-              {workFolders.length === 0 ? (
-                renderEmptyStrip('Нет закреплённых папок и проектов')
-              ) : (
-                <div className="folder-hub-grid">
-                  {workFolders.map((f, idx) => {
-                    const honestAlt = getHonestShiftBadge(f);
-                    return (
-                      <div
-                        key={f.id || `wf-${idx}`}
-                        role="button"
-                        tabIndex={0}
-                        className={`folder-card${getDragClasses('work_folders', idx)}`}
-                        {...makeDragProps('work_folders', idx, f.title)}
-                        onClick={() => handlePinTileClick(f)}
-                        onKeyDown={(e) => {
-                          if (e.target === e.currentTarget && isActivateKey(e)) {
-                            e.preventDefault();
-                            onLaunchPin(f);
-                          }
-                        }}
-                        onContextMenu={(e) => onOpenTileContext(e, f, 'work_folders')}
-                      >
-                        {editMode && (
-                          <button
-                            type="button"
-                            className="tile-del"
-                            title="Открепить"
-                            aria-label={`Открепить ${f.title}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              ipc('remove_pin', { space: 'work_folders', itemId: f.id }).catch(() => {
-                                onShowToast('Не удалось открепить папку');
-                              });
-                            }}
-                          >
-                            <XIcon10 />
-                          </button>
-                        )}
-                        <div className="folder-ic-box">
-                          <FolderSvg className="ic18" />
-                        </div>
-                        <div className="tile-meta">
-                          <div className="tile-name">{f.title}</div>
-                          <div className={`tile-sub ${honestAlt ? 'has-alt' : ''}`}>
-                            {shiftHeld && honestAlt ? honestAlt : f.subtitle}
-                          </div>
-                        </div>
-                        {!editMode && (
-                          <div className="folder-acts">
-                            <button
-                              type="button"
-                              className="f-ic-btn"
-                              title="Открыть папку"
-                              aria-label={`Открыть ${f.title}`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                ipc('launch_item', {
-                                  target: f.target,
-                                  asAdmin: false,
-                                  closeStart: true,
-                                }).catch(() => onShowToast('Не удалось открыть папку'));
-                              }}
-                            >
-                              <FolderSvg className="ic14" />
-                            </button>
-                            <button
-                              type="button"
-                              className="f-ic-btn"
-                              title="Открыть в терминале"
-                              aria-label={`Открыть ${f.title} в терминале`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                ipc('open_terminal_at', { path: f.target }).catch(() => {
-                                  onShowToast('Не удалось открыть терминал');
-                                });
-                              }}
-                            >
-                              <TerminalIcon className="ic14" />
-                            </button>
-                            <button
-                              type="button"
-                              className="f-ic-btn"
-                              title="Скопировать путь"
-                              aria-label={`Скопировать путь ${f.title}`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                ipc('copy_to_clipboard', { text: f.target })
-                                  .then(() => onShowToast('Путь скопирован'))
-                                  .catch(() => onShowToast('Не удалось скопировать путь'));
-                              }}
-                            >
-                              <CopyIcon className="ic14" />
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            <div className="space-dock-foot">
-              <div className="sec-row" style={{ marginBottom: 8 }}>
-                <span className="sec-title">Рабочие программы</span>
-                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                  <PlusIcon className="ic12" />
-                  <span>Добавить</span>
-                </button>
-              </div>
-              {workApps.length === 0 ? (
-                renderEmptyStrip('Нет закреплённых рабочих программ')
-              ) : (
-                <div className="qlinks-grid qlinks-scroll">
-                  {workApps.map((a, idx) => renderQuickLink(a, idx, 'work_apps'))}
-                </div>
-              )}
-            </div>
-          </BentoSpotCard>
-        </div>
-
-        <div className="bento-col">
-          {renderTelemetryCard(1, 'full')}
-          {renderProcessConsumersCard(2, 'ram', 'work')}
-        </div>
-      </div>
-      {dragGhost}
-      </>
-    );
-  }
-
-  /* ===================== SPACE 3: СТУДИЯ ===================== */
-  if (space === 'studio') {
-    const hasStudioPins = (config?.studioPins.length ?? 0) > 0;
-    const studioTools = config?.studioTools ?? [];
-
-    return (
-      <>
-      <div key={space} className={panelClass} style={panelStyle}>
-        <div className="bento-col">
-          <BentoSpotCard bentoIndex={0} className="space-card-flex">
-            <div className="sec-row">
-              <span className="sec-title">Творчество и AI</span>
-              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                <PlusIcon className="ic12" />
-                <span>Закрепить</span>
-              </button>
-            </div>
-
-            <div className="space-scroll-main">
-              {!hasStudioPins ? (
-                renderEmptyStrip('Нет программ студии')
-              ) : (
-                <>
-                  {studioPartition.heroes.length > 0 && (
-                    <div className="hero-pair">
-                      {studioPartition.heroes.map((p, i) => renderTile(p, i, 'studio', true))}
-                    </div>
-                  )}
-                  {studioPartition.compact.length > 0 && (
-                    <div className="sub-grid">
-                      {studioPartition.compact.map((p, i) => renderTile(p, i + 2, 'studio', false))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-
-            <div className="space-dock-foot">
-              <div className="sec-row" style={{ marginBottom: 8 }}>
-                <span className="sec-title">Инструменты</span>
-                <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                  <PlusIcon className="ic12" />
-                  <span>Добавить</span>
-                </button>
-              </div>
-              {studioTools.length === 0 ? (
-                renderEmptyStrip('Нет закреплённых инструментов')
-              ) : (
-                <div className="qlinks-grid qlinks-scroll">
-                  {studioTools.map((t, idx) => renderQuickLink(t, idx, 'studio_tools'))}
-                </div>
-              )}
-            </div>
-          </BentoSpotCard>
-        </div>
-
-        <div className="bento-col">
-          {renderTelemetryCard(1, 'headroom')}
-          {renderAudioMixerCard(2, {
-            title: 'Аудио и микрофон',
-            showDeviceSwitcher: true,
-            showMicToggle: true,
-            showSessions: false,
-          })}
-          {renderProcessConsumersCard(3, 'gpu', 'studio')}
-        </div>
-      </div>
-      {dragGhost}
-      </>
-    );
-  }
-
-  /* ===================== SPACE 4: ИГРЫ ===================== */
-  if (space === 'games') {
-    const launchers = config?.gameLaunchers ?? [];
-    const combos = config?.gameCombos ?? [];
-
-    return (
-      <>
-      <div key={space} className={panelClass} style={panelStyle}>
-        <div className="bento-col">
-          <BentoSpotCard bentoIndex={0} className="space-card-flex">
-            <div className="sec-row" style={{ marginBottom: 9 }}>
-              <div className="games-head-left">
-                <span className="sec-title">Игры</span>
-                <div className="mini-tabs">
-                  <button
-                    type="button"
-                    className={`mini-tab ${gameFilter === 'recent' ? 'active' : ''}`}
-                    onClick={() => setGameFilter('recent')}
-                  >
-                    Недавние ({Math.min(4, games.length)})
-                  </button>
-                  <button
-                    type="button"
-                    className={`mini-tab ${gameFilter === 'all' ? 'active' : ''}`}
-                    onClick={() => setGameFilter('all')}
-                  >
-                    Все игры ({games.length})
-                  </button>
-                </div>
-              </div>
-              <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-                <PlusIcon className="ic12" />
-                <span>Добавить</span>
-              </button>
-            </div>
-
-            <div className="games-scroll">
-              {displayedGames.length === 0 ? (
-                <div className="games-empty">
-                  Библиотека игр сканируется или игры не найдены
-                </div>
-              ) : (
-                <div className="games-grid">
-                  {displayedGames.map((g, idx) => {
-                    const coverSrc = g.coverData || (g.coverPath ? loadedCovers[g.coverPath] : null) || null;
-                    const launchGame = () => {
-                      ipc('launch_item', {
-                        target: g.target,
-                        asAdmin: false,
-                        closeStart: true,
-                      }).catch(() => onShowToast(`Не удалось запустить ${g.name}`));
-                    };
-
-                    return (
-                      <div
-                        key={g.appId || `game-${g.name}-${idx}`}
-                        role="button"
-                        tabIndex={0}
-                        className="game-card"
-                        onPointerEnter={(e) => {
-                          if (!reducedMotion) e.currentTarget.classList.add('tilting');
-                        }}
-                        onPointerMove={(e) => {
-                          if (reducedMotion) return;
-                          const rect = e.currentTarget.getBoundingClientRect();
-                          const tilt = computeGameCardTilt(e.clientX, e.clientY, rect, false);
-                          e.currentTarget.style.setProperty('--gx', `${tilt.gxPct}%`);
-                          e.currentTarget.style.setProperty('--gy', `${tilt.gyPct}%`);
-                          e.currentTarget.style.setProperty('--rx', `${tilt.rotateXDeg}deg`);
-                          e.currentTarget.style.setProperty('--ry', `${tilt.rotateYDeg}deg`);
-                        }}
-                        onPointerLeave={(e) => {
-                          e.currentTarget.classList.remove('tilting');
-                          e.currentTarget.style.setProperty('--rx', '0deg');
-                          e.currentTarget.style.setProperty('--ry', '0deg');
-                        }}
-                        onClick={launchGame}
-                        onKeyDown={(e) => {
-                          if (e.target === e.currentTarget && isActivateKey(e)) {
-                            e.preventDefault();
-                            launchGame();
-                          }
-                        }}
-                      >
-                        <div
-                          className="game-bg"
-                          style={{
-                            backgroundImage: coverSrc
-                              ? `url("${coverSrc}")`
-                              : 'linear-gradient(135deg, #1E2434, #0F121A)',
-                          }}
-                        />
-                        <div className="game-grad" />
-                        <div className="game-sheen" />
-                        <span className="game-play">
-                          <PlayTriangleIcon size={10} />
-                          <span>Играть</span>
-                        </span>
-                        <div className="game-info">
-                          <div className="game-title">{g.name}</div>
-                          <div className="game-meta">{g.launcher}</div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            <div className="space-dock-foot">
-              <div className="sec-row" style={{ marginBottom: 7 }}>
-                <span className="sec-title">Лаунчеры и компаньоны</span>
-              </div>
-              {launchers.length === 0 ? (
-                renderEmptyStrip('Нет закреплённых лаунчеров')
-              ) : (
-                <div className="qlinks-grid qlinks-scroll">
-                  {launchers.map((l, idx) => renderQuickLink(l, idx, 'game_launchers'))}
-                </div>
-              )}
-            </div>
-          </BentoSpotCard>
-        </div>
-
-        <div className="bento-col">
-          {renderAudioMixerCard(1, {
-            title: 'Игровой звук и голос',
-            showDeviceSwitcher: false,
-            showMicToggle: true,
-            showSessions: true,
-          })}
-
-          <BentoSpotCard bentoIndex={2} className="combos-card">
-            <div className="sec-row" style={{ marginBottom: 8 }}>
-              <span className="sec-title">Игровые связки</span>
-              <button
-                type="button"
-                className="sec-act sec-act-ic"
-                onClick={() => {
-                  setComboError(null);
-                  setComboBuilderOpen(true);
-                }}
-              >
-                <PlusIcon className="ic12" />
-                <span>Связка</span>
-              </button>
-            </div>
-
-            <div className="combos-list">
-              {combos.length === 0 ? (
-                <div className="space-empty-inline">
-                  <span>Нет игровых связок</span>
-                  <button
-                    type="button"
-                    className="pin-any-btn"
-                    onClick={() => {
-                      setComboError(null);
-                      setComboBuilderOpen(true);
-                    }}
-                  >
-                    <PlusIcon className="ic12" />
-                    <span>Создать</span>
-                  </button>
-                </div>
-              ) : (
-                combos.map((cb, idx) => {
-                  const isDelArmed = armedComboDeleteId === cb.id;
-                  return (
-                    <div
-                      key={cb.id || `combo-${idx}`}
-                      role="button"
-                      tabIndex={0}
-                      className={`consumer-row combo-row${getDragClasses('game_combos', idx)}`}
-                      {...makeDragProps('game_combos', idx, cb.title)}
-                      onClick={() => handlePinTileClick(cb)}
-                      onKeyDown={(e) => {
-                        if (e.target === e.currentTarget && isActivateKey(e)) {
-                          e.preventDefault();
-                          onLaunchPin(cb);
-                        }
-                      }}
-                      onContextMenu={(e) => onOpenTileContext(e, cb, 'game_combos')}
-                    >
-                      <span
-                        className="combo-ic"
-                        style={{
-                          background: `rgba(${cb.accentRgb || '242,110,132'}, 0.16)`,
-                          color: `rgb(${cb.accentRgb || '242,110,132'})`,
-                        }}
-                      >
-                        <PlayTriangleIcon size={12} />
-                      </span>
-                      <div className="consumer-meta">
-                        <div className="consumer-name">{cb.title}</div>
-                        <div className="consumer-sub">{cb.subtitle}</div>
-                      </div>
-                      {editMode && (
-                        <button
-                          type="button"
-                          className={`consumer-kill ${isDelArmed ? 'armed' : ''}`}
-                          style={{ opacity: 1 }}
-                          title={isDelArmed ? 'Подтвердить удаление связки' : 'Удалить связку'}
-                          aria-label={isDelArmed ? `Подтвердить удаление ${cb.title}` : `Удалить ${cb.title}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteComboClick(cb);
-                          }}
-                        >
-                          {isDelArmed ? <span>Подтвердить</span> : <XIcon10 />}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-
-            {telem?.gpuAvailable && (
-              <div className="health-row" style={{ marginTop: 'auto', flexShrink: 0 }}>
-                <div className="health-top" style={{ marginBottom: 5 }}>
-                  <span className="health-lbl">
-                    {telem.gpuName} <span className="health-sub">· {telem.gpuTempC}°C</span>
-                  </span>
-                  <span className="health-val">
-                    {formatMemoryRatio(telem.vramUsedGb, telem.vramTotalGb)}{' '}
-                    <span className={`status-pill ${getGpuTempStatusPill(telem.gpuTempC).cls}`}>
-                      {getGpuTempStatusPill(telem.gpuTempC).label}
-                    </span>
-                  </span>
-                </div>
-                <div className="health-bar-row">
-                  <div className="health-bar">
-                    <div
-                      className={`health-fill ${getTelemetryLevelClass(telem.vramPct)}`}
-                      style={{ width: '100%', ['--pct' as string]: Math.min(1, telem.vramPct / 100) } as React.CSSProperties}
-                    />
-                  </div>
-                  {renderSparklineSvg(telemHistory.vram, telem.vramPct)}
-                </div>
-              </div>
-            )}
-
-            {/* Inline Game Combo Builder Sheet */}
-            {comboBuilderPresence.mounted && (
-              <div
-                className="combo-builder-sheet"
-                data-phase={comboBuilderPresence.phase}
-                role="dialog"
-                aria-label="Новая игровая связка"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div className="space-create-head">
-                  <span>Новая связка</span>
-                  <button
-                    type="button"
-                    className="tray-ctx-close"
-                    aria-label="Закрыть конструктор связки"
-                    onClick={() => setComboBuilderOpen(false)}
-                  >
-                    <CloseWindowIcon className="ic12" />
-                  </button>
-                </div>
-
-                <input
-                  className="space-create-input"
-                  placeholder="Название (например, PoE 2 + Discord)"
-                  maxLength={36}
-                  value={comboName}
-                  onChange={(e) => {
-                    setComboName(e.target.value);
-                    if (comboError) setComboError(null);
-                  }}
-                />
-
-                {comboPickerOptions.length > 0 && (
-                  <div className="combo-picker-row">
-                    <select
-                      className="qs-input-select"
-                      style={{ height: 28 }}
-                      aria-label="Выбрать программу или игру"
-                      value={comboPickKey}
-                      onChange={(e) => setComboPickKey(e.target.value)}
-                    >
-                      <option value="">Выбрать игру или программу…</option>
-                      {comboPickerOptions.map((opt) => (
-                        <option key={opt.key} value={opt.key}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="pin-any-btn"
-                      style={{ height: 28, padding: '0 10px' }}
-                      onClick={() => {
-                        const found = comboPickerOptions.find((o) => o.key === comboPickKey);
-                        if (!found) return;
-                        if (comboSteps.some((s) => s.target.toLowerCase() === found.target.toLowerCase())) {
-                          return;
-                        }
-                        setComboSteps((prev) => [
-                          ...prev,
-                          { id: `${Date.now()}-${prev.length}`, label: found.label, target: found.target },
-                        ]);
-                        setComboPickKey('');
-                        if (comboError) setComboError(null);
-                      }}
-                    >
-                      <PlusIcon className="ic12" />
-                    </button>
-                  </div>
-                )}
-
-                <div className="combo-picker-row">
-                  <input
-                    className="url-input"
-                    style={{ flex: 1, height: 28 }}
-                    placeholder="Путь к .exe или URL (https://…)"
-                    value={comboCustomTarget}
-                    onChange={(e) => setComboCustomTarget(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        const val = comboCustomTarget.trim();
-                        if (!val) return;
-                        const label = val.split(/[\\/]/).filter(Boolean).pop() || val;
-                        setComboSteps((prev) => [
-                          ...prev,
-                          { id: `${Date.now()}-${prev.length}`, label, target: val },
-                        ]);
-                        setComboCustomTarget('');
-                        if (comboError) setComboError(null);
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="pin-any-btn"
-                    style={{ height: 28, padding: '0 10px' }}
-                    onClick={() => {
-                      const val = comboCustomTarget.trim();
-                      if (!val) return;
-                      const label = val.split(/[\\/]/).filter(Boolean).pop() || val;
-                      setComboSteps((prev) => [
-                        ...prev,
-                        { id: `${Date.now()}-${prev.length}`, label, target: val },
-                      ]);
-                      setComboCustomTarget('');
-                      if (comboError) setComboError(null);
-                    }}
-                  >
-                    Добавить
-                  </button>
-                </div>
-
-                <div className="combo-step-list">
-                  {comboSteps.length === 0 ? (
-                    <div className="clip-empty">Добавьте минимум 2 программы, игры или ссылки</div>
-                  ) : (
-                    comboSteps.map((step, idx) => (
-                      <div key={step.id || `step-${idx}`} className="combo-step-chip">
-                        <span className="clip-txt" title={step.target}>{step.label}</span>
-                        <button
-                          type="button"
-                          className="tray-ctx-close"
-                          aria-label={`Удалить шаг ${step.label}`}
-                          onClick={() => setComboSteps((prev) => prev.filter((x) => x.id !== step.id))}
-                        >
-                          <XIcon10 />
-                        </button>
-                      </div>
-                    ))
-                  )}
-                </div>
-
-                {comboError && <div className="space-create-err">{comboError}</div>}
-
-                <div className="space-create-actions">
-                  <button
-                    type="button"
-                    className="space-create-cancel"
-                    onClick={() => setComboBuilderOpen(false)}
-                  >
-                    Отмена
-                  </button>
-                  <button
-                    type="button"
-                    className="space-create-submit"
-                    disabled={comboSaving}
-                    onClick={() => void handleSaveCombo()}
-                  >
-                    Сохранить
-                  </button>
-                </div>
-              </div>
-            )}
-          </BentoSpotCard>
-        </div>
-      </div>
-      {dragGhost}
-      </>
-    );
-  }
-
-  /* ===================== CUSTOM SPACES (4 Widget Presets) ===================== */
-  if (activeCustomSpace) {
-    const isFullGrid = customPreset === 'full_grid';
-
-    const pinsCard = (
-      <BentoSpotCard bentoIndex={0} className="space-card-flex">
-        <div className="sec-row">
-          <span className="sec-title">{activeCustomSpace.name}</span>
-          <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
-            <PlusIcon className="ic12" />
-            <span>Закрепить</span>
-          </button>
-        </div>
-        {activeCustomSpace.items.length === 0 ? (
-          <div className="custom-empty">
-            <div className="custom-empty-title">Пока пусто</div>
-            <div className="custom-empty-sub">
-              Закрепите сюда программы, папки, файлы или ссылки.
-            </div>
-            <button type="button" className="pin-any-btn primary" onClick={onOpenDrawer}>
-              <PlusIcon className="ic12" />
-              <span>Закрепить элементы</span>
+  const leftColumnCard = isGamesLayout ? (
+    <BentoSpotCard bentoIndex={0} className="space-card-flex">
+      <div className="sec-row" style={{ marginBottom: 9 }}>
+        <div className="games-head-left">
+          <span className="sec-title">{activeSpace.name}</span>
+          <div className="mini-tabs">
+            <button
+              type="button"
+              className={`mini-tab ${gameFilter === 'recent' ? 'active' : ''}`}
+              onClick={() => setGameFilter('recent')}
+            >
+              Недавние ({Math.min(4, games.length)})
+            </button>
+            <button
+              type="button"
+              className={`mini-tab ${gameFilter === 'all' ? 'active' : ''}`}
+              onClick={() => setGameFilter('all')}
+            >
+              Все игры ({games.length})
             </button>
           </div>
+        </div>
+        {renderSpaceActionButtons()}
+      </div>
+
+      <div className="games-scroll">
+        {displayedGames.length === 0 ? (
+          <div className="games-empty">Библиотека игр сканируется или игры не найдены</div>
         ) : (
-          <div className="space-scroll-main">
-            <div className={isFullGrid ? 'sub-grid custom-grid-4' : 'sub-grid'}>
-              {activeCustomSpace.items.map((it, i) =>
-                renderTile(it, i, activeCustomSpace.id, false),
-              )}
-            </div>
+          <div className="games-grid">
+            {displayedGames.map((g, idx) => {
+              const coverSrc =
+                g.coverData || (g.coverPath ? loadedCovers[g.coverPath] : null) || null;
+              const launchGame = () => {
+                ipc('launch_item', {
+                  target: g.target,
+                  asAdmin: false,
+                  closeStart: true,
+                }).catch(() => onShowToast(`Не удалось запустить ${g.name}`));
+              };
+
+              return (
+                <div
+                  key={g.appId || `game-${g.name}-${idx}`}
+                  role="button"
+                  tabIndex={0}
+                  className="game-card"
+                  onPointerEnter={(e) => {
+                    if (!reducedMotion) e.currentTarget.classList.add('tilting');
+                  }}
+                  onPointerMove={(e) => {
+                    if (reducedMotion) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const tilt = computeGameCardTilt(e.clientX, e.clientY, rect, false);
+                    e.currentTarget.style.setProperty('--gx', `${tilt.gxPct}%`);
+                    e.currentTarget.style.setProperty('--gy', `${tilt.gyPct}%`);
+                    e.currentTarget.style.setProperty('--rx', `${tilt.rotateXDeg}deg`);
+                    e.currentTarget.style.setProperty('--ry', `${tilt.rotateYDeg}deg`);
+                  }}
+                  onPointerLeave={(e) => {
+                    e.currentTarget.classList.remove('tilting');
+                    e.currentTarget.style.setProperty('--rx', '0deg');
+                    e.currentTarget.style.setProperty('--ry', '0deg');
+                  }}
+                  onClick={launchGame}
+                  onKeyDown={(e) => {
+                    if (e.target === e.currentTarget && isActivateKey(e)) {
+                      e.preventDefault();
+                      launchGame();
+                    }
+                  }}
+                >
+                  <div
+                    className="game-bg"
+                    style={{
+                      backgroundImage: coverSrc
+                        ? `url("${coverSrc}")`
+                        : 'linear-gradient(135deg, #1E2434, #0F121A)',
+                    }}
+                  />
+                  <div className="game-grad" />
+                  <div className="game-sheen" />
+                  <span className="game-play">
+                    <PlayTriangleIcon size={10} />
+                    <span>Играть</span>
+                  </span>
+                  <div className="game-info">
+                    <div className="game-title">{g.name}</div>
+                    <div className="game-meta">{g.launcher}</div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
-      </BentoSpotCard>
-    );
+      </div>
 
-    if (isFullGrid) {
-      return (
-        <>
-          <div key={space} className={`${panelClass} space-panel-single`} style={panelStyle}>
-            {pinsCard}
+      <div className="space-dock-foot">
+        <div className="sec-row" style={{ marginBottom: 7 }}>
+          <span className="sec-title">Лаунчеры и закреплённое</span>
+        </div>
+        {items.length === 0 ? (
+          renderEmptyStrip('Нет закреплённых элементов')
+        ) : (
+          <div className="qlinks-grid qlinks-scroll">
+            {items.map((item, idx) => renderQuickLink(item, idx, activeSpace.id))}
           </div>
-          {dragGhost}
-        </>
-      );
-    }
+        )}
+      </div>
+    </BentoSpotCard>
+  ) : (
+    <BentoSpotCard bentoIndex={0} className="space-card-flex">
+      <div className="sec-row">
+        <span className="sec-title">{activeSpace.name}</span>
+        {renderSpaceActionButtons()}
+      </div>
 
-    return (
-      <>
-        <div key={space} className={panelClass} style={panelStyle}>
-          <div className="bento-col">{pinsCard}</div>
-          <div className="bento-col">
-            {customPreset === 'media_clipboard' && (
-              <>
-                {renderMediaCard(1)}
-                {renderClipboardCard(2)}
-              </>
-            )}
-            {customPreset === 'telemetry_processes' && (
-              <>
-                {renderTelemetryCard(1, 'full')}
-                {renderProcessConsumersCard(2, 'ram', activeCustomSpace.id)}
-              </>
-            )}
-            {customPreset === 'audio_mic' &&
-              renderAudioMixerCard(1, {
-                title: 'Звук и микрофон',
-                showDeviceSwitcher: true,
-                showMicToggle: true,
-                showSessions: true,
-              })}
+      {items.length === 0 ? (
+        <div className="custom-empty">
+          <div className="custom-empty-title">Пока пусто</div>
+          <div className="custom-empty-sub">
+            Закрепите сюда программы, папки, файлы или ссылки.
+          </div>
+          <button type="button" className="pin-any-btn primary" onClick={onOpenDrawer}>
+            <PlusIcon className="ic12" />
+            <span>Закрепить элементы</span>
+          </button>
+        </div>
+      ) : (
+        <div className="space-scroll-main">
+          {partitioned ? (
+            <>
+              {partitioned.heroes.length > 0 && (
+                <div className="hero-pair">
+                  {partitioned.heroes.map((p, i) => renderTile(p, i, activeSpace.id, true))}
+                </div>
+              )}
+              {partitioned.compact.length > 0 && (
+                <div className="sub-grid">
+                  {partitioned.compact.map((p, i) =>
+                    renderTile(p, i + 2, activeSpace.id, false),
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="sub-grid">
+              {items.map((p, i) => renderTile(p, i, activeSpace.id, false))}
+            </div>
+          )}
+        </div>
+      )}
+    </BentoSpotCard>
+  );
+
+  return (
+    <>
+      <div key={space} className={panelClass} style={panelStyle}>
+        <div className="bento-col">{leftColumnCard}</div>
+
+        {hasWidgets && (
+          <div className={`bento-col widgets-col${spaceWidgets.length >= 4 ? ' widgets-scrollable' : ''}`}>
+            {spaceWidgets.map((widgetId, idx) => renderWidgetById(widgetId, idx + 1))}
+          </div>
+        )}
+      </div>
+
+      {widgetPopPresence.mounted && (
+        <div
+          ref={widgetPopRef}
+          className="widget-config-pop"
+          data-phase={widgetPopPresence.phase}
+          role="dialog"
+          aria-label={`Виджеты пространства ${activeSpace.name}`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="space-create-head">
+            <span>Виджеты · {activeSpace.name}</span>
+            <button
+              type="button"
+              className="tray-ctx-close"
+              aria-label="Закрыть настройку виджетов"
+              onClick={() => onToggleWidgetBuilder(false)}
+            >
+              <CloseWindowIcon className="ic12" />
+            </button>
+          </div>
+
+          <div className="widget-cfg-list">
+            {orderedWidgetCatalog.map((opt) => {
+              const enabledIdx = spaceWidgets.indexOf(opt.id);
+              const enabled = enabledIdx >= 0;
+              return (
+                <div
+                  key={opt.id}
+                  className={`widget-cfg-row ${enabled ? 'enabled' : ''}`}
+                >
+                  {enabled && (
+                    <div className="widget-cfg-arrows">
+                      <button
+                        type="button"
+                        className="widget-move-btn"
+                        disabled={savingWidgets || enabledIdx === 0}
+                        title="Выше"
+                        aria-label={`Поднять ${opt.label}`}
+                        onClick={() => void handleMoveWidget(opt.id, 'up')}
+                      >
+                        <ArrowUpIcon size={10} />
+                      </button>
+                      <button
+                        type="button"
+                        className="widget-move-btn"
+                        disabled={savingWidgets || enabledIdx === spaceWidgets.length - 1}
+                        title="Ниже"
+                        aria-label={`Опустить ${opt.label}`}
+                        onClick={() => void handleMoveWidget(opt.id, 'down')}
+                      >
+                        <ArrowDownIcon size={10} />
+                      </button>
+                    </div>
+                  )}
+                  <div className="widget-cfg-meta">
+                    <div className="widget-cfg-name">{opt.label}</div>
+                    <div className="widget-cfg-desc">{opt.description}</div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={enabled}
+                    aria-label={opt.label}
+                    disabled={savingWidgets}
+                    className={`glass-switch ${enabled ? 'on' : ''}`}
+                    onClick={() => void handleToggleWidget(opt.id)}
+                  >
+                    <span className="glass-switch-thumb" />
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </div>
-        {dragGhost}
-      </>
-    );
-  }
+      )}
 
-  return null;
+      {dragGhost}
+    </>
+  );
 };
