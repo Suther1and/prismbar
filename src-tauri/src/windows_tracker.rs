@@ -17,14 +17,19 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
     GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, MonitorFromWindow, ReleaseDC, SelectObject,
-    SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HALFTONE, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+    SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    SRCCOPY,
 };
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, STGM,
+};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
@@ -64,6 +69,16 @@ struct PidMetaEntry {
 
 static FALLBACK_ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
 static PID_META_CACHE: OnceLock<Mutex<HashMap<u32, PidMetaEntry>>> = OnceLock::new();
+static STABLE_GROUP_ORDER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static STABLE_WINDOW_ORDER: OnceLock<Mutex<HashMap<String, Vec<isize>>>> = OnceLock::new();
+/// Serializes cold Win32 Shell icon extractions (`IShellItemImageFactory` / `SHGetFileInfoW`)
+/// outside `IconCache` so concurrent poller/indexer/IPC threads never race on `shell32.dll`'s
+/// internal icon cache or per-thread COM teardown.
+static SHELL_ICON_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn shell_icon_lock() -> &'static Mutex<()> {
+    SHELL_ICON_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn fallback_icon_cache() -> &'static Mutex<IconCache> {
     FALLBACK_ICON_CACHE.get_or_init(|| Mutex::new(IconCache::default()))
@@ -71,6 +86,14 @@ fn fallback_icon_cache() -> &'static Mutex<IconCache> {
 
 fn pid_meta_cache() -> &'static Mutex<HashMap<u32, PidMetaEntry>> {
     PID_META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stable_group_order() -> &'static Mutex<Vec<String>> {
+    STABLE_GROUP_ORDER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn stable_window_order() -> &'static Mutex<HashMap<String, Vec<isize>>> {
+    STABLE_WINDOW_ORDER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -586,6 +609,8 @@ pub fn hicon_to_data_url(hicon: HICON, size: i32) -> Option<String> {
 
         let total_bytes = (size as usize).checked_mul(size as usize)?.checked_mul(4)?;
         std::ptr::write_bytes(bits_ptr as *mut u8, 0, total_bytes);
+        SetStretchBltMode(mem_dc, HALFTONE);
+        let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
         let _ = DrawIconEx(mem_dc, 0, 0, hicon, size, size, 0, None, DI_NORMAL);
 
         let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, total_bytes);
@@ -625,6 +650,13 @@ fn hbitmap_to_data_url(hbm: HBITMAP) -> Option<String> {
 
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let screen_dc = GetDC(HWND::default());
+        if screen_dc.is_invalid() {
+            return None;
+        }
+        let _dc_guard = WindowDcGuard {
+            hwnd: HWND::default(),
+            hdc: screen_dc,
+        };
         let scanlines = GetDIBits(
             screen_dc,
             hbm,
@@ -634,7 +666,6 @@ fn hbitmap_to_data_url(hbm: HBITMAP) -> Option<String> {
             &mut bmi,
             DIB_RGB_COLORS,
         );
-        ReleaseDC(HWND::default(), screen_dc);
         if scanlines == 0 {
             return None;
         }
@@ -644,7 +675,7 @@ fn hbitmap_to_data_url(hbm: HBITMAP) -> Option<String> {
     }
 }
 
-/// Extracts a crisp 64x64 PNG icon for a packaged UWP/MSIX app via
+/// Extracts a crisp 96x96 High-DPI PNG icon for a packaged UWP/MSIX app via
 /// `SHCreateItemFromParsingName("shell:AppsFolder\\<AUMID>")` -> `IShellItemImageFactory::GetImage`
 /// protected by an RAII `ComGuard` (AD-5, AD-7).
 pub fn extract_uwp_icon_by_aumid(aumid: &str) -> Option<String> {
@@ -652,6 +683,7 @@ pub fn extract_uwp_icon_by_aumid(aumid: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    let _shell_guard = lock_unpoisoned(shell_icon_lock());
     let com = ComGuard::init_sta();
     if !com.is_usable() {
         return None;
@@ -668,21 +700,343 @@ pub fn extract_uwp_icon_by_aumid(aumid: &str) -> Option<String> {
     unsafe {
         let factory: IShellItemImageFactory =
             SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
-        let size = SIZE { cx: 64, cy: 64 };
+        let size = SIZE { cx: 96, cy: 96 };
         let hbm = factory
             .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
+            .or_else(|_| factory.GetImage(size, SIIGBF_ICONONLY))
             .or_else(|_| factory.GetImage(size, SIIGBF_BIGGERSIZEOK))
             .ok()?;
         hbitmap_to_data_url(hbm)
     }
 }
 
-fn extract_path_icon_raw(path: &str) -> Option<String> {
-    if path.trim().is_empty() {
+fn expand_common_env_vars(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        if let Some(end) = after_start.find('%') {
+            let var_name = &after_start[..end];
+            if !var_name.is_empty() {
+                if let Ok(val) = std::env::var(var_name) {
+                    out.push_str(&val);
+                    rest = &after_start[end + 1..];
+                    continue;
+                }
+            }
+            out.push('%');
+            out.push_str(var_name);
+            out.push('%');
+            rest = &after_start[end + 1..];
+        } else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn read_registry_default_string(root: HKEY, subkey: &str) -> Option<String> {
+    let subkey_w = wide(subkey);
+    let mut buf_bytes: u32 = 0;
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR::null(),
+            flags,
+            None,
+            None,
+            Some(&mut buf_bytes),
+        )
+    };
+    if status != ERROR_SUCCESS || buf_bytes < 2 || buf_bytes > 16_384 {
         return None;
     }
+    let mut buf = vec![0u16; (buf_bytes as usize + 1) / 2];
+    let status2 = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR::null(),
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            Some(&mut buf_bytes),
+        )
+    };
+    if status2 != ERROR_SUCCESS {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let raw = String::from_utf16_lossy(&buf[..len]);
+    let trimmed = raw.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(expand_common_env_vars(trimmed))
+    }
+}
+
+fn lookup_app_path_registry(exe_name: &str) -> Option<String> {
+    let subkey = format!(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}",
+        exe_name.trim()
+    );
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        if let Some(candidate) = read_registry_default_string(root, &subkey) {
+            let norm = candidate.replace('/', "\\");
+            if Path::new(&norm).exists() {
+                return Some(norm);
+            }
+        }
+    }
+    None
+}
+
+fn lookup_exe_in_path_env(exe_name: &str) -> Option<String> {
+    let clean = exe_name.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(clean);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().replace('/', "\\"));
+            }
+        }
+    }
+    for sys_dir in [r"C:\Windows\System32", r"C:\Windows"] {
+        let candidate = Path::new(sys_dir).join(clean);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// For Squirrel-packaged apps (`...\Discord\Update.exe`, `...\AnthropicClaude\Update.exe`,
+/// `...\SparkDesktop\Update.exe`), locates the real versioned `app-*\<App>.exe` sibling
+/// executable so icon extraction gets the crisp 96x96 app icon instead of Squirrel's stub icon.
+pub fn resolve_squirrel_app_exe(update_exe_path: &Path) -> Option<PathBuf> {
+    let fname = update_exe_path.file_name()?.to_string_lossy();
+    if !fname.eq_ignore_ascii_case("update.exe") {
+        return None;
+    }
+    let parent = update_exe_path.parent()?;
+    let parent_stem = parent
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let mut app_dirs: Vec<PathBuf> = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("app-"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    // Prefer newest version directory first
+    app_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    for dir in app_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut fallback: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let is_exe = p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("exe"))
+                .unwrap_or(false);
+            if !is_exe {
+                continue;
+            }
+            let stem_low = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if stem_low.is_empty()
+                || stem_low.contains("update")
+                || stem_low.contains("squirrel")
+                || stem_low.contains("uninstall")
+                || stem_low.contains("crashpad")
+                || stem_low.contains("helper")
+            {
+                continue;
+            }
+            if !parent_stem.is_empty()
+                && (stem_low == parent_stem
+                    || parent_stem.contains(&stem_low)
+                    || stem_low.contains(&parent_stem))
+            {
+                return Some(p);
+            }
+            if fallback.is_none() {
+                fallback = Some(p);
+            }
+        }
+        if fallback.is_some() {
+            return fallback;
+        }
+    }
+    None
+}
+
+/// Returns `true` when `path` points to a 0-byte Windows App Execution Alias stub under
+/// `\Microsoft\WindowsApps\` (e.g. `wt.exe`), whose shell icon is often a blank generic exe
+/// unless resolved via its UWP `shell:AppsFolder\<AUMID>` entry.
+pub fn is_windows_apps_execution_alias(path: &str) -> bool {
+    let norm = path.trim().trim_matches('"').replace('/', "\\").to_ascii_lowercase();
+    if !norm.contains(r"\microsoft\windowsapps\") || !norm.ends_with(".exe") {
+        return false;
+    }
+    match std::fs::metadata(path.trim().trim_matches('"')) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    }
+}
+
+/// Resolves a local path, Squirrel `Update.exe`, or bare executable name (e.g. `wt.exe`,
+/// `spark`, `discord`, `claude`, `browser.exe`) into an existing canonical backslash path via
+/// filesystem check, Windows Registry `App Paths` (`HKCU`/`HKLM`), and `PATH`.
+pub fn resolve_icon_source_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if trimmed.contains("://")
+        || low.starts_with("ms-")
+        || low.starts_with("shell:")
+        || low.starts_with("mailto:")
+    {
+        return None;
+    }
+
+    let norm = expand_common_env_vars(trimmed).replace('/', "\\");
+    if norm.contains('\\') {
+        let p = Path::new(&norm);
+        if p.exists() {
+            if let Some(real_exe) = resolve_squirrel_app_exe(p) {
+                return Some(real_exe.to_string_lossy().to_string());
+            }
+            return Some(norm);
+        }
+        // Stale absolute path: try resolving its bare executable name via App Paths / PATH
+        if let Some(fname) = p.file_name().map(|s| s.to_string_lossy().to_string()) {
+            if fname.to_ascii_lowercase().ends_with(".exe")
+                && !fname.eq_ignore_ascii_case("update.exe")
+            {
+                if let Some(found) = lookup_app_path_registry(&fname)
+                    .or_else(|| lookup_exe_in_path_env(&fname))
+                {
+                    let fp = Path::new(&found);
+                    if let Some(real_exe) = resolve_squirrel_app_exe(fp) {
+                        return Some(real_exe.to_string_lossy().to_string());
+                    }
+                    return Some(found);
+                }
+            }
+        }
+        return None;
+    }
+
+    // Bare name such as "wt.exe", "spark", "discord", "claude", "browser.exe"
+    let mut candidates = Vec::with_capacity(2);
+    if low.ends_with(".exe") {
+        candidates.push(norm);
+    } else {
+        candidates.push(format!("{norm}.exe"));
+        candidates.push(norm);
+    }
+    for cand in candidates {
+        if let Some(found) =
+            lookup_app_path_registry(&cand).or_else(|| lookup_exe_in_path_env(&cand))
+        {
+            let fp = Path::new(&found);
+            if let Some(real_exe) = resolve_squirrel_app_exe(fp) {
+                return Some(real_exe.to_string_lossy().to_string());
+            }
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Extracts a crystal-clear 96x96 High-DPI native icon via `IShellItemImageFactory::GetImage`
+/// (wrapped in RAII `ComGuard::init_sta()`), falling back to `SHGetFileInfoW` + 64x64 HALFTONE
+/// `hicon_to_data_url` ONLY when `IShellItemImageFactory` fails.
+pub fn extract_path_icon_raw(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("shell:appsfolder\\")
+    {
+        return extract_uwp_icon_by_aumid(trimmed);
+    }
+
+    let resolved = resolve_icon_source_path(trimmed)?;
+
+    // Windows Terminal App Execution Alias stub (`...\WindowsApps\wt.exe`) has 0 bytes and
+    // yields a generic white box unless extracted through its real UWP AppsFolder entry.
+    if is_windows_apps_execution_alias(&resolved)
+        && resolved.to_ascii_lowercase().ends_with(r"\wt.exe")
+    {
+        if let Some(uwp) =
+            extract_uwp_icon_by_aumid("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")
+        {
+            return Some(uwp);
+        }
+    }
+
+    // 1. Primary path: 96x96 native High-DPI icon via IShellItemImageFactory
+    // Keep ComGuard alive across BOTH IShellItemImageFactory and SHGetFileInfoW fallback
+    // (MSDN requires COM initialized for SHGetFileInfoW), serialized by SHELL_ICON_LOCK.
+    let _shell_guard = lock_unpoisoned(shell_icon_lock());
+    let com = ComGuard::init_sta();
+    if com.is_usable() {
+        let w = wide(&resolved);
+        unsafe {
+            if let Ok(factory) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(
+                PCWSTR(w.as_ptr()),
+                None,
+            ) {
+                let size = SIZE { cx: 96, cy: 96 };
+                let img = factory
+                    .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
+                    .or_else(|_| factory.GetImage(size, SIIGBF_ICONONLY));
+                if let Ok(hbm) = img {
+                    if let Some(uri) = hbitmap_to_data_url(hbm) {
+                        return Some(uri);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: SHGetFileInfoW + 64x64 HALFTONE DrawIconEx
     unsafe {
-        let w = wide(path);
+        let w = wide(&resolved);
         let mut shfi = SHFILEINFOW::default();
         let res = SHGetFileInfoW(
             PCWSTR(w.as_ptr()),
@@ -694,7 +1048,7 @@ fn extract_path_icon_raw(path: &str) -> Option<String> {
         if res == 0 || shfi.hIcon.0.is_null() {
             return None;
         }
-        let encoded = hicon_to_data_url(shfi.hIcon, 48);
+        let encoded = hicon_to_data_url(shfi.hIcon, 64);
         let _ = DestroyIcon(shfi.hIcon);
         encoded
     }
@@ -720,7 +1074,7 @@ fn extract_live_window_hicon(hwnd: HWND) -> Option<String> {
                 Some(&mut result),
             );
             if ok.0 != 0 && result != 0 {
-                if let Some(url) = hicon_to_data_url(HICON(result as *mut _), 48) {
+                if let Some(url) = hicon_to_data_url(HICON(result as *mut _), 64) {
                     return Some(url);
                 }
             }
@@ -728,7 +1082,7 @@ fn extract_live_window_hicon(hwnd: HWND) -> Option<String> {
         for idx in [GCLP_HICON, GCLP_HICONSM] {
             let raw = GetClassLongPtrW(hwnd, idx);
             if raw != 0 {
-                if let Some(url) = hicon_to_data_url(HICON(raw as *mut _), 48) {
+                if let Some(url) = hicon_to_data_url(HICON(raw as *mut _), 64) {
                     return Some(url);
                 }
             }
@@ -794,10 +1148,10 @@ pub fn extract_icon_for_path(path: &str) -> Option<String> {
     extract_icon_for_path_cached(path, fallback_icon_cache())
 }
 
-/// Resolves an icon into the unified `IconCache` for an executable path (preferring
-/// `exe:<hash>` via `SHGetFileInfoW`, falling back to `WM_GETICON`/`GCLP_HICON` on `hwnd`,
-/// then `hwnd:<hwnd>:0`). Uses bounded TTL negative caching so iconless/elevated apps
-/// never spam `SHGetFileInfoW` or `SendMessageTimeoutW` on every poller tick.
+/// Resolves an icon into the unified `IconCache` for an executable/shortcut/UWP path
+/// (preferring 96x96 `IShellItemImageFactory` via `extract_path_icon_raw`, falling back to
+/// `SHGetFileInfoW` 64x64 HALFTONE and `WM_GETICON`/`GCLP_HICON` on `hwnd`, then `hwnd:<hwnd>:0`).
+/// Uses bounded TTL negative caching so iconless/elevated apps never thrash on poller ticks.
 pub fn resolve_exe_or_hwnd_icon_key(
     exe_path: &str,
     hwnd_raw: Option<isize>,
@@ -809,7 +1163,28 @@ pub fn resolve_exe_or_hwnd_icon_key(
         .map(|h| HWND(h as *mut _))
         .unwrap_or_default();
 
-    if !trimmed.is_empty() && !is_application_frame_host(trimmed) {
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("shell:appsfolder\\")
+    {
+        let key = icon_cache::aumid_key(trimmed);
+        let neg_hit = {
+            let mut guard = lock_unpoisoned(cache);
+            if guard.get(&key).is_some() {
+                return Some(key);
+            }
+            guard.is_negative_cached(&key)
+        };
+        if !neg_hit {
+            let extracted =
+                extract_uwp_icon_by_aumid(trimmed).or_else(|| extract_live_window_hicon(hwnd));
+            if let Some(uri) = extracted {
+                lock_unpoisoned(cache).put(key.clone(), uri);
+                return Some(key);
+            }
+            lock_unpoisoned(cache).mark_negative_miss(key);
+        }
+    } else if !trimmed.is_empty() && !is_application_frame_host(trimmed) {
         let key = icon_cache::path_icon_key(trimmed);
         let neg_hit = {
             let mut guard = lock_unpoisoned(cache);
@@ -1015,6 +1390,65 @@ where
     groups
 }
 
+/// Keeps taskbar application groups and their preview windows in stable first-seen order so
+/// clicking/focusing a window (which jumps it to top of Win32 `EnumWindows` Z-order) NEVER
+/// teleports unpinned taskbar icons or shuffles preview cards left/right.
+/// - Still-open group keys keep their exact existing slot index.
+/// - Closed group keys are removed cleanly.
+/// - Brand-new group keys are appended strictly at the end.
+/// - Inside each group, existing windows preserve their exact first-seen slot order (brand-new
+///   windows appearing together on first discovery are ordered deterministically by HWND).
+pub fn stabilize_window_groups_order(
+    mut groups: Vec<AppWindowGroup>,
+    group_order: &mut Vec<String>,
+    window_order: &mut HashMap<String, Vec<isize>>,
+) -> Vec<AppWindowGroup> {
+    let active_keys: HashSet<String> = groups.iter().map(|g| g.key.clone()).collect();
+    group_order.retain(|k| active_keys.contains(k));
+
+    let mut known_keys: HashSet<String> = group_order.iter().cloned().collect();
+    for g in &groups {
+        if known_keys.insert(g.key.clone()) {
+            group_order.push(g.key.clone());
+        }
+    }
+
+    let key_index: HashMap<String, usize> = group_order
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.clone(), i))
+        .collect();
+    groups.sort_by_key(|g| key_index.get(&g.key).copied().unwrap_or(usize::MAX));
+
+    window_order.retain(|k, _| active_keys.contains(k));
+    for g in &mut groups {
+        let seen_hwnds = window_order.entry(g.key.clone()).or_default();
+        let active_hwnds: HashSet<isize> = g.windows.iter().map(|w| w.hwnd).collect();
+        seen_hwnds.retain(|h| active_hwnds.contains(h));
+
+        let existing_set: HashSet<isize> = seen_hwnds.iter().copied().collect();
+        let mut new_hwnds: Vec<isize> = g
+            .windows
+            .iter()
+            .map(|w| w.hwnd)
+            .filter(|h| !existing_set.contains(h))
+            .collect();
+        new_hwnds.sort_unstable();
+        new_hwnds.dedup();
+        seen_hwnds.extend(new_hwnds);
+
+        let hwnd_index: HashMap<isize, usize> = seen_hwnds
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| (h, i))
+            .collect();
+        g.windows
+            .sort_by_key(|w| hwnd_index.get(&w.hwnd).copied().unwrap_or(usize::MAX));
+    }
+
+    groups
+}
+
 /// Enumerates open user windows grouped by application and also returns unique
 /// `(icon_key, source_path)` pairs so the host can register every window icon into `icon_sources`
 /// and cleanly recover icons after LRU eviction.
@@ -1157,6 +1591,12 @@ pub fn list_open_window_groups_cached_with_sources(
         }
         Some(resolved)
     });
+
+    let groups = {
+        let mut g_order = lock_unpoisoned(stable_group_order());
+        let mut w_order = lock_unpoisoned(stable_window_order());
+        stabilize_window_groups_order(groups, &mut g_order, &mut w_order)
+    };
 
     (groups, icon_sources)
 }
@@ -2974,5 +3414,190 @@ mod tests {
             assert!(!off);
             let _ = DestroyWindow(hwnd);
         }
+    }
+
+    fn decode_png_dimensions(data_uri: &str) -> (u32, u32) {
+        let b64 = data_uri
+            .strip_prefix("data:image/png;base64,")
+            .expect("expected PNG data URI");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64");
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let reader = decoder.read_info().expect("valid PNG header");
+        (reader.info().width, reader.info().height)
+    }
+
+    #[test]
+    fn high_dpi_96px_shell_icon_extraction_bare_exe_and_squirrel_resolution() {
+        // 1. Explorer extracts a true High-DPI (>= 64px, normally 96x96) PNG via IShellItemImageFactory
+        let explorer_uri = extract_path_icon_raw(r"C:\Windows\explorer.exe")
+            .expect("explorer.exe high-DPI icon must extract");
+        let (w, h) = decode_png_dimensions(&explorer_uri);
+        assert!(
+            w >= 64 && h >= 64,
+            "expected High-DPI icon >= 64x64 (96x96 IShellItemImageFactory), got {w}x{h}"
+        );
+
+        // 2. Forward-slash path normalizes cleanly to backslash for SHCreateItemFromParsingName
+        let fwd_uri = extract_path_icon_raw("C:/Windows/explorer.exe")
+            .expect("forward-slash path must extract cleanly");
+        let (fw, fh) = decode_png_dimensions(&fwd_uri);
+        assert!(fw >= 64 && fh >= 64);
+
+        // 3. Bare executable names resolve via PATH / App Paths (with or without .exe)
+        let resolved_cmd = resolve_icon_source_path("cmd.exe")
+            .expect("bare cmd.exe must resolve via PATH/System32");
+        assert!(resolved_cmd.to_ascii_lowercase().ends_with("cmd.exe"));
+        let resolved_explorer = resolve_icon_source_path("explorer")
+            .expect("bare explorer without .exe must resolve");
+        assert!(resolved_explorer.to_ascii_lowercase().ends_with("explorer.exe"));
+        assert!(extract_path_icon_raw("notepad.exe").is_some());
+
+        // 4. Squirrel Update.exe resolves to newest sibling app-*\<App>.exe for real icon extraction
+        let tmp = std::env::temp_dir().join(format!(
+            "testbar-squirrel-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let discord_root = tmp.join("Discord");
+        std::fs::create_dir_all(discord_root.join("app-1.0.9001")).unwrap();
+        std::fs::create_dir_all(discord_root.join("app-1.0.9168")).unwrap();
+        let update_exe = discord_root.join("Update.exe");
+        std::fs::write(&update_exe, b"stub").unwrap();
+        std::fs::write(discord_root.join("app-1.0.9001").join("Discord.exe"), b"old").unwrap();
+        let newest_exe = discord_root.join("app-1.0.9168").join("Discord.exe");
+        std::fs::write(&newest_exe, b"new").unwrap();
+
+        let resolved_squirrel = resolve_icon_source_path(&update_exe.to_string_lossy())
+            .expect("Squirrel Update.exe must resolve to real app exe");
+        assert_eq!(
+            PathBuf::from(&resolved_squirrel),
+            newest_exe,
+            "Squirrel Update.exe must prefer newest app-*\\Discord.exe"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stabilize_window_groups_order_prevents_z_order_teleporting_and_preview_shuffling() {
+        let make_win = |hwnd: isize, exe: &str, active: bool| OpenWindowInfo {
+            hwnd,
+            pid: hwnd as u32,
+            title: format!("Win {hwnd}"),
+            exe_path: exe.to_string(),
+            exe_name: friendly_exe_name(exe),
+            aumid: None,
+            is_active: active,
+            is_minimized: false,
+            is_topmost: false,
+        };
+        let make_group = |key: &str, wins: Vec<OpenWindowInfo>| AppWindowGroup {
+            key: key.to_string(),
+            name: key.to_string(),
+            exe_path: key.to_string(),
+            aumid: None,
+            icon_key: None,
+            icon_data: None,
+            is_active: wins.iter().any(|w| w.is_active),
+            windows: wins,
+        };
+
+        let mut group_order: Vec<String> = Vec::new();
+        let mut window_order: HashMap<String, Vec<isize>> = HashMap::new();
+
+        // Scan 1: initial Z-order [Chrome(200, 100), Settings(300), Notepad(400)]
+        let scan1 = stabilize_window_groups_order(
+            vec![
+                make_group(
+                    "chrome.exe",
+                    vec![
+                        make_win(200, r"C:\Apps\chrome.exe", true),
+                        make_win(100, r"C:\Apps\chrome.exe", false),
+                    ],
+                ),
+                make_group(
+                    "settings.exe",
+                    vec![make_win(300, r"C:\Apps\settings.exe", false)],
+                ),
+                make_group(
+                    "notepad.exe",
+                    vec![make_win(400, r"C:\Apps\notepad.exe", false)],
+                ),
+            ],
+            &mut group_order,
+            &mut window_order,
+        );
+        let keys1: Vec<&str> = scan1.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys1, vec!["chrome.exe", "settings.exe", "notepad.exe"]);
+        // Multi-window Chrome initially ordered deterministically by HWND [100, 200]
+        let chrome_hwnds1: Vec<isize> = scan1[0].windows.iter().map(|w| w.hwnd).collect();
+        assert_eq!(chrome_hwnds1, vec![100, 200]);
+
+        // Scan 2: user clicks Settings (jumps to Z-order #1) and focuses Chrome window 200 over 100,
+        //         plus Notepad jumps above Chrome! Order MUST NOT change at all!
+        let scan2 = stabilize_window_groups_order(
+            vec![
+                make_group(
+                    "settings.exe",
+                    vec![make_win(300, r"C:\Apps\settings.exe", true)],
+                ),
+                make_group(
+                    "notepad.exe",
+                    vec![make_win(400, r"C:\Apps\notepad.exe", false)],
+                ),
+                make_group(
+                    "chrome.exe",
+                    vec![
+                        make_win(200, r"C:\Apps\chrome.exe", false),
+                        make_win(100, r"C:\Apps\chrome.exe", false),
+                    ],
+                ),
+            ],
+            &mut group_order,
+            &mut window_order,
+        );
+        let keys2: Vec<&str> = scan2.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(
+            keys2,
+            vec!["chrome.exe", "settings.exe", "notepad.exe"],
+            "clicking Settings MUST NOT teleport icons across the taskbar"
+        );
+        let chrome_hwnds2: Vec<isize> = scan2[0].windows.iter().map(|w| w.hwnd).collect();
+        assert_eq!(
+            chrome_hwnds2,
+            vec![100, 200],
+            "Z-order focus change MUST NOT shuffle preview cards"
+        );
+
+        // Scan 3: Settings closes, brand-new Discord opens (at Z-order #1) and Chrome opens 3rd window (hwnd 50)
+        //         -> Chrome stays #0, Notepad stays #1, Discord appends STRICTLY at END (#2),
+        //         and Chrome's new window 50 appends at END of Chrome's previews [100, 200, 50]!
+        let scan3 = stabilize_window_groups_order(
+            vec![
+                make_group(
+                    "discord.exe",
+                    vec![make_win(500, r"C:\Apps\discord.exe", true)],
+                ),
+                make_group(
+                    "notepad.exe",
+                    vec![make_win(400, r"C:\Apps\notepad.exe", false)],
+                ),
+                make_group(
+                    "chrome.exe",
+                    vec![
+                        make_win(50, r"C:\Apps\chrome.exe", false),
+                        make_win(200, r"C:\Apps\chrome.exe", false),
+                        make_win(100, r"C:\Apps\chrome.exe", false),
+                    ],
+                ),
+            ],
+            &mut group_order,
+            &mut window_order,
+        );
+        let keys3: Vec<&str> = scan3.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys3, vec!["chrome.exe", "notepad.exe", "discord.exe"]);
+        let chrome_hwnds3: Vec<isize> = scan3[0].windows.iter().map(|w| w.hwnd).collect();
+        assert_eq!(chrome_hwnds3, vec![100, 200, 50]);
     }
 }

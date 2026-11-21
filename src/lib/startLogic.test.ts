@@ -29,6 +29,7 @@ import {
   getClipboardKindLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
+  getStartChassisAnimClass,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
   hasHonestShiftAction,
@@ -38,7 +39,6 @@ import {
   normalizeSessionVolumeScalar,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
-  promoteStartEntering,
   pushTelemetryHistory,
   pushTelemetrySample,
   RECENT_GAMES_LIMIT,
@@ -72,8 +72,8 @@ function makePin(overrides: Partial<PinItem> & Pick<PinItem, 'id' | 'title' | 't
 }
 
 describe('startLogic animations, unlimited grids, Shift layer, Power & custom spaces', () => {
-  it('drives Paint-Sync StartAnimState phases (hidden -> entering -> open -> closing -> hidden) cleanly', () => {
-    expect(START_EXIT_ANIM_MS).toBe(115);
+  it('drives instant-open StartAnimState phases (hidden -> open -> closing -> hidden) & alternating open-a/open-b replay', () => {
+    expect(START_EXIT_ANIM_MS).toBe(120);
     let st = INITIAL_START_ANIM_STATE;
     expect(st).toEqual({
       phase: 'hidden',
@@ -82,19 +82,10 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       openSeq: 0,
       gen: 0,
     });
+    expect(getStartChassisAnimClass(st)).toBe('');
 
-    // Opening enters 'entering' phase with incremented openSeq & synced gen
+    // Opening enters 'open' immediately at frame 0 with incremented openSeq & synced gen
     st = reduceStartState(st, { open: true, gen: 1 });
-    expect(st).toEqual({
-      phase: 'entering',
-      open: true,
-      closing: false,
-      openSeq: 1,
-      gen: 1,
-    });
-
-    // Promoting on awake rAF flips entering -> open
-    st = promoteStartEntering(st);
     expect(st).toEqual({
       phase: 'open',
       open: true,
@@ -102,8 +93,7 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       openSeq: 1,
       gen: 1,
     });
-    // Idempotent when already open
-    expect(promoteStartEntering(st)).toBe(st);
+    expect(getStartChassisAnimClass(st)).toBe('open-anim open-a');
 
     // Normal close enters 'closing'
     st = reduceStartState(st, false, { gen: 1 });
@@ -114,19 +104,21 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       openSeq: 1,
       gen: 1,
     });
+    expect(getStartChassisAnimClass(st)).toBe('closing');
 
     // Stale gen exit completion is ignored
     expect(completeStartClosing(st, 999)).toBe(st);
 
-    // Reopening mid-close immediately cancels closing and bumps openSeq
+    // Reopening mid-close immediately cancels closing, bumps openSeq, and flips open-a -> open-b
     st = reduceStartState(st, true, { gen: 2 });
     expect(st).toEqual({
-      phase: 'entering',
+      phase: 'open',
       open: true,
       closing: false,
       openSeq: 2,
       gen: 2,
     });
+    expect(getStartChassisAnimClass(st)).toBe('open-anim open-b');
 
     // Immediate preemption goes straight to hidden
     st = reduceStartState(st, { open: false, gen: 3, immediate: true });
@@ -139,7 +131,8 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     });
 
     // Normal close -> completeStartClosing settles to hidden
-    st = promoteStartEntering(reduceStartState(st, { open: true, gen: 4 }));
+    st = reduceStartState(st, { open: true, gen: 4 });
+    expect(getStartChassisAnimClass(st)).toBe('open-anim open-a');
     st = reduceStartState(st, { open: false, gen: 4 });
     st = completeStartClosing(st, 4);
     expect(st.phase).toBe('hidden');
@@ -460,6 +453,8 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     expect(startSpacesSrc).not.toContain('+ Добавить');
     expect(startSpacesSrc).not.toContain('+ Папка / Файл / URL');
     expect(startSpacesSrc).not.toContain("style={{ position: 'absolute', inset: 0, zIndex: 20 }}");
+    expect(startViewSrc).not.toContain('data-glass');
+    expect(startSettingsSrc).not.toContain('glass-preset-grid');
   });
 
   it('normalizes per-app session volume percentages strictly to 0.0..=1.0 WASAPI scalars', () => {

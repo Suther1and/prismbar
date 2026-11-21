@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { formatIpcError } from '../../lib/flyoutLogic';
-import type { GlassDepth, SecondaryTaskbarMode, TestBarConfig } from '../../lib/ipc';
+import type { SecondaryTaskbarMode, TestBarConfig } from '../../lib/ipc';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import {
   CheckIcon,
@@ -20,7 +20,6 @@ export interface StartSettingsOverlayProps {
   onSetSecondaryMode: (mode: SecondaryTaskbarMode) => Promise<void>;
   onSetAutostart: (enable: boolean) => Promise<void>;
   onSetAppearance: (params: {
-    glassDepth?: GlassDepth;
     clockShowSeconds?: boolean;
     clockShowWeekday?: boolean;
     startRememberSpace?: boolean;
@@ -32,12 +31,6 @@ export interface StartSettingsOverlayProps {
   onImportConfig: () => Promise<void>;
   onRestoreWindowsAndExit: () => void;
 }
-
-const GLASS_PRESETS: ReadonlyArray<{ id: GlassDepth; label: string; desc: string }> = [
-  { id: 'crystal', label: 'Кристалл', desc: 'Лёгкая глубина' },
-  { id: 'obsidian', label: 'Обсидиан', desc: 'Баланс стекла' },
-  { id: 'matte', label: 'Матовый', desc: 'Плотный фон' },
-];
 
 const HOTKEY_ROWS: ReadonlyArray<{ keys: string[]; label: string }> = [
   { keys: ['Win'], label: 'Открыть или закрыть «Пуск»' },
@@ -78,7 +71,6 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   const barMode = config?.barMode === 'edge' ? 'edge' : 'dock';
   const secondaryMode: SecondaryTaskbarMode = config?.secondaryTaskbarMode ?? 'testbar';
   const autostart = config?.autostart ?? false;
-  const glassDepth: GlassDepth = config?.glassDepth ?? 'obsidian';
   const clockShowSeconds = config?.clockShowSeconds ?? false;
   const clockShowWeekday = config?.clockShowWeekday ?? false;
   const startRememberSpace = config?.startRememberSpace ?? false;
@@ -108,12 +100,11 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
       <div className="settings-head">
         <div>
           <div className="settings-title">Настройки TestBar</div>
-          <div className="settings-sub">Компоновка панели, материал поверхности, мониторы и системная интеграция</div>
+          <div className="settings-sub">Компоновка панели, поведение, второй монитор и система</div>
         </div>
         <button
           type="button"
           className="hdr-btn"
-          title="Закрыть"
           aria-label="Закрыть настройки"
           onClick={onClose}
         >
@@ -130,11 +121,10 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
       <div className="settings-bento">
         {/* LEFT COLUMN */}
         <div className="set-stack">
-          {/* Card 1: Taskbar Silhouette */}
+          {/* Card 1: Taskbar Layout */}
           <div className="set-card">
             <div className="set-card-head">
               <div className="set-card-title">Расположение панели</div>
-              <div className="set-card-desc">Парящая капсула по центру или классическая полоса на всю ширину</div>
             </div>
             <div className="layout-preview-grid">
               <button
@@ -191,41 +181,17 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
             </div>
           </div>
 
-          {/* Card 2: Strictly Dark Glass Depth & Clock / Start Behavior */}
+          {/* Card 2: Clock & Behavior Switches */}
           <div className="set-card">
             <div className="set-card-head">
-              <div className="set-card-title">Внешний вид и часы</div>
-              <div className="set-card-desc">Глубина тёмного стекла, формат времени и поведение «Пуска»</div>
-            </div>
-
-            <div className="glass-preset-grid" role="radiogroup" aria-label="Глубина стекла">
-              {GLASS_PRESETS.map((preset) => {
-                const active = glassDepth === preset.id;
-                return (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    className={`glass-preset-card ${active ? 'active' : ''}`}
-                    disabled={busyKey === 'glassDepth'}
-                    onClick={() =>
-                      void runAction('glassDepth', () => onSetAppearance({ glassDepth: preset.id }))
-                    }
-                  >
-                    <span className={`gp-swatch ${preset.id}`} aria-hidden="true" />
-                    <span className="set-seg-title">{preset.label}</span>
-                    <span className="set-seg-hint">{preset.desc}</span>
-                  </button>
-                );
-              })}
+              <div className="set-card-title">Часы и поведение</div>
             </div>
 
             <div className="set-toggle-list">
               <div className="set-toggle-row">
                 <div>
                   <div className="set-card-title">Секунды в часах</div>
-                  <div className="set-card-desc">Показывать точное время с секундами на нижней панели</div>
+                  <div className="set-card-desc">Точное время с секундами на панели</div>
                 </div>
                 <button
                   type="button"
@@ -247,7 +213,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
               <div className="set-toggle-row">
                 <div>
                   <div className="set-card-title">День недели в часах</div>
-                  <div className="set-card-desc">Короткий день недели рядом с датой на панели задач</div>
+                  <div className="set-card-desc">Короткий день рядом с датой</div>
                 </div>
                 <button
                   type="button"
@@ -269,7 +235,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
               <div className="set-toggle-row">
                 <div>
                   <div className="set-card-title">Запоминать пространство в «Пуске»</div>
-                  <div className="set-card-desc">Открывать последнюю вкладку вместо возврата в «Личное»</div>
+                  <div className="set-card-desc">Открывать последнюю активную вкладку</div>
                 </div>
                 <button
                   type="button"
@@ -287,25 +253,42 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                   <span className="glass-switch-thumb" />
                 </button>
               </div>
+
+              <div className="set-toggle-row">
+                <div>
+                  <div className="set-card-title">Автозапуск с Windows</div>
+                  <div className="set-card-desc">Запускать TestBar при входе в систему</div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={autostart}
+                  aria-label="Автозапуск с Windows"
+                  disabled={busyKey === 'autostart'}
+                  className={`glass-switch ${autostart ? 'on' : ''}`}
+                  onClick={() => void runAction('autostart', () => onSetAutostart(!autostart))}
+                >
+                  <span className="glass-switch-thumb" />
+                </button>
+              </div>
             </div>
           </div>
         </div>
 
         {/* RIGHT COLUMN */}
         <div className="set-stack">
-          {/* Card 3: Secondary Monitor, Autostart, Index Refresh, Hidden Tray, Backup */}
+          {/* Card 3: Secondary Monitor & Data */}
           <div className="set-card">
             <div className="set-card-head">
-              <div className="set-card-title">Мониторы и система</div>
-              <div className="set-card-desc">Дополнительный экран, автозапуск и управление конфигурацией</div>
+              <div className="set-card-title">Второй монитор и данные</div>
             </div>
 
             <div className="set-seg-3" role="radiogroup" aria-label="Режим второго монитора">
               {(
                 [
-                  ['testbar', 'Панель TestBar', 'Отображать копию TestBar'],
-                  ['native', 'Штатная Windows', 'Не скрывать штатную панель'],
-                  ['hidden', 'Скрывать', 'Чистый второй экран'],
+                  ['testbar', 'Панель TestBar', 'Копия TestBar'],
+                  ['native', 'Штатная Windows', 'Панель Windows'],
+                  ['hidden', 'Скрывать', 'Чистый экран'],
                 ] as const
               ).map(([modeKey, label, hint]) => (
                 <button
@@ -321,26 +304,6 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                   <span className="set-seg-hint">{hint}</span>
                 </button>
               ))}
-            </div>
-
-            <div className="set-toggle-list">
-              <div className="set-toggle-row">
-                <div>
-                  <div className="set-card-title">Автозапуск Windows</div>
-                  <div className="set-card-desc">Запускать TestBar при входе в систему через реестр пользователя</div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={autostart}
-                  aria-label="Автозапуск Windows"
-                  disabled={busyKey === 'autostart'}
-                  className={`glass-switch ${autostart ? 'on' : ''}`}
-                  onClick={() => void runAction('autostart', () => onSetAutostart(!autostart))}
-                >
-                  <span className="glass-switch-thumb" />
-                </button>
-              </div>
             </div>
 
             <div className="set-io-row">
@@ -360,7 +323,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 onClick={() => void runAction('exportConfig', onExportConfig)}
               >
                 <DownloadIcon className="ic14" />
-                <span>Экспорт JSON</span>
+                <span>Экспорт</span>
               </button>
               <button
                 type="button"
@@ -369,14 +332,14 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 onClick={() => void runAction('importConfig', onImportConfig)}
               >
                 <UploadIcon className="ic14" />
-                <span>Импорт JSON</span>
+                <span>Импорт</span>
               </button>
             </div>
 
             {hiddenTrayKeys.length > 0 && (
-              <div>
-                <div className="sec-row" style={{ marginBottom: 6 }}>
-                  <span className="sec-title">Скрытые иконки трея</span>
+              <div className="tray-hidden-wrap">
+                <div className="sec-row" style={{ marginBottom: 4 }}>
+                  <span className="sec-title">Скрытые в трее ({hiddenTrayKeys.length})</span>
                   <button
                     type="button"
                     className="sec-act"
@@ -425,15 +388,14 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
           </div>
         </div>
 
-        {/* Full-Width Emergency Restore Danger Card */}
+        {/* Full-Width Compact Bottom Strip: Emergency Windows Taskbar Restore */}
         <div className="set-card set-danger-card">
           <div className="set-danger-info">
             <span className="set-danger-ic">
-              <RestoreWindowsIcon className="ic18" />
+              <RestoreWindowsIcon className="ic16" />
             </span>
-            <div>
-              <div className="set-card-title">Восстановление</div>
-              <div className="set-card-desc">Мгновенно вернуть стандартную панель задач Windows, рабочую область и завершить TestBar</div>
+            <div className="set-card-desc">
+              Мгновенно вернуть штатную панель задач Windows, рабочую область и завершить TestBar
             </div>
           </div>
           <button
@@ -441,7 +403,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
             className="set-danger-btn"
             onClick={onRestoreWindowsAndExit}
           >
-            Вернуть стандартную панель Windows и выйти
+            Аварийный возврат штатной панели Windows
           </button>
         </div>
       </div>

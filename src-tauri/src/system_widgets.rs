@@ -19,7 +19,6 @@ use windows::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -36,11 +35,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_SPACE,
 };
 use windows::Win32::UI::Shell::{
-    SHEmptyRecycleBinW, SHGetFileInfoW, SHQueryRecycleBinW, ShellExecuteW, SHERB_NOCONFIRMATION,
-    SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHQUERYRBINFO,
+    SHEmptyRecycleBinW, SHQueryRecycleBinW, ShellExecuteW, SHERB_NOCONFIRMATION,
+    SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, EnumWindows, FindWindowW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowW,
     GetClassLongPtrW, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW,
@@ -53,9 +52,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::icon_cache::{self, IconCache};
 use crate::win_shell::wide;
 use crate::windows_tracker::{
-    focus_or_toggle_window, friendly_exe_name, hicon_to_data_url, is_application_frame_host,
-    launch_target_with_args, process_exe_path, resolve_exe_or_hwnd_icon_key,
-    resolve_uwp_core_window_hwnd, terminate_process_pids, AppWindowGroup,
+    extract_path_icon_raw, focus_or_toggle_window, friendly_exe_name, hicon_to_data_url,
+    is_application_frame_host, launch_target_with_args, process_exe_path,
+    resolve_exe_or_hwnd_icon_key, resolve_uwp_core_window_hwnd, terminate_process_pids,
+    AppWindowGroup,
 };
 
 const CF_UNICODETEXT: u32 = 13;
@@ -1442,6 +1442,7 @@ pub fn is_excluded_tray_process(exe_path: &str) -> bool {
         base.as_str(),
         "testbar.exe"
             | "explorer.exe"
+            | "shellhost.exe"
             | "shellexperiencehost.exe"
             | "startmenuexperiencehost.exe"
             | "textinputhost.exe"
@@ -1457,6 +1458,7 @@ pub fn is_excluded_tray_process(exe_path: &str) -> bool {
             | "dllhost.exe"
             | "conhost.exe"
             | "applicationframehost.exe"
+            | "systemsettings.exe"
             | "lockapp.exe"
             | "smartscreen.exe"
             | "msedgewebview2.exe"
@@ -1474,11 +1476,38 @@ pub fn is_excluded_tray_process(exe_path: &str) -> bool {
             | "widgetservice.exe"
             | "phoneexperiencehost.exe"
             | "crossdeviceresume.exe"
+            | "crossdeviceservice.exe"
+            | "yourphone.exe"
             | "gamebar.exe"
             | "gamebarftserver.exe"
+            | "amdrsserv.exe"
+            | "amdow.exe"
+            | "atieclxx.exe"
+            | "atiesrxx.exe"
+            | "cncmd.exe"
             | "nvcontainer.exe"
+            | "nvdisplay.container.exe"
+            | "nvtelemetrycontainer.exe"
+            | "nvsphelper64.exe"
+            | "tabtip.exe"
+            | "tabtip32.exe"
+            | "msctfmonitor.exe"
+            | "credentialuibroker.exe"
+            | "useroobebroker.exe"
+            | "systemsettingsbroker.exe"
+            | "pickerhost.exe"
+            | "openwith.exe"
+            | "consent.exe"
+            | "presentationfontcache.exe"
             | "update.exe"
     ) {
+        return true;
+    }
+
+    if base.starts_with("gamebar")
+        || base.starts_with("amdrsserv")
+        || base.starts_with("widgets")
+    {
         return true;
     }
 
@@ -1581,6 +1610,7 @@ where
         best_hwnd: isize,
         best_pid: u32,
         best_score: i32,
+        has_meaningful_window: bool,
         pids: HashSet<u32>,
     }
 
@@ -1599,6 +1629,9 @@ where
 
         let norm_exe = canonical_tray_exe_key(&c.exe_path);
         let base_exe = exe_basename_lower(&norm_exe);
+        if base_exe.is_empty() {
+            continue;
+        }
         if open_pids.contains(&c.pid)
             || open_exe_paths.contains(&norm_exe)
             || open_exe_bases.contains(&base_exe)
@@ -1612,26 +1645,33 @@ where
         }
 
         let score = score_tray_candidate(&c);
-        match groups.get_mut(&norm_exe) {
+        let meaningful =
+            !c.title.trim().is_empty() || c.has_class_icon || c.has_app_frame_style;
+        // Deduplicate strictly by lowercase executable filename (`base_exe`) so multi-worker
+        // apps never spawn duplicate tray icons across sibling/versioned subdirectories.
+        match groups.get_mut(&base_exe) {
             Some(acc) => {
                 acc.pids.insert(c.pid);
+                acc.has_meaningful_window |= meaningful;
                 if score > acc.best_score {
                     acc.best_score = score;
                     acc.best_hwnd = c.hwnd;
                     acc.best_pid = c.pid;
+                    acc.exe_path = c.exe_path;
                 }
             }
             None => {
                 let mut pids = HashSet::new();
                 pids.insert(c.pid);
                 groups.insert(
-                    norm_exe.clone(),
+                    base_exe.clone(),
                     GroupAcc {
-                        id: norm_exe,
+                        id: base_exe,
                         exe_path: c.exe_path,
                         best_hwnd: c.hwnd,
                         best_pid: c.pid,
                         best_score: score,
+                        has_meaningful_window: meaningful,
                         pids,
                     },
                 );
@@ -1641,13 +1681,18 @@ where
 
     let mut items: Vec<TrayAppItem> = groups
         .into_values()
-        .map(|acc| {
+        .filter_map(|acc| {
             let mut all_pids: Vec<u32> = acc.pids.into_iter().collect();
             all_pids.sort_unstable();
             let hwnd = (acc.best_hwnd != 0).then_some(acc.best_hwnd);
             let name = friendly_exe_name(&acc.exe_path);
             let icon_key = resolve_icon_key(&acc.exe_path, hwnd);
-            TrayAppItem {
+            // Drop noisy headless worker hosts that have neither an extracted icon nor a
+            // titled/framed/iconed window of their own.
+            if icon_key.is_none() && !acc.has_meaningful_window {
+                return None;
+            }
+            Some(TrayAppItem {
                 id: acc.id,
                 hwnd,
                 pid: acc.best_pid,
@@ -1656,7 +1701,7 @@ where
                 exe_path: acc.exe_path,
                 icon_key,
                 icon_data: None,
-            }
+            })
         })
         .collect();
 
@@ -1761,26 +1806,7 @@ fn enumerate_tray_window_candidates(own_pid: u32) -> Vec<RawTrayWindowCandidate>
 }
 
 fn extract_exe_icon_data_uri(path: &str) -> Option<String> {
-    if path.trim().is_empty() {
-        return None;
-    }
-    unsafe {
-        let w = wide(path);
-        let mut shfi = SHFILEINFOW::default();
-        let res = SHGetFileInfoW(
-            PCWSTR(w.as_ptr()),
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            Some(&mut shfi),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        );
-        if res == 0 || shfi.hIcon.0.is_null() {
-            return None;
-        }
-        let encoded = hicon_to_data_url(shfi.hIcon, 48);
-        let _ = DestroyIcon(shfi.hIcon);
-        encoded
-    }
+    extract_path_icon_raw(path)
 }
 
 fn extract_hwnd_icon_data_uri(hwnd: HWND) -> Option<String> {
@@ -1800,7 +1826,7 @@ fn extract_hwnd_icon_data_uri(hwnd: HWND) -> Option<String> {
                 Some(&mut result),
             );
             if ok.0 != 0 && result != 0 {
-                if let Some(url) = hicon_to_data_url(HICON(result as *mut _), 48) {
+                if let Some(url) = hicon_to_data_url(HICON(result as *mut _), 64) {
                     return Some(url);
                 }
             }
@@ -1808,7 +1834,7 @@ fn extract_hwnd_icon_data_uri(hwnd: HWND) -> Option<String> {
         for idx in [GCLP_HICON, GCLP_HICONSM] {
             let raw = GetClassLongPtrW(hwnd, idx);
             if raw != 0 {
-                if let Some(url) = hicon_to_data_url(HICON(raw as *mut _), 48) {
+                if let Some(url) = hicon_to_data_url(HICON(raw as *mut _), 64) {
                     return Some(url);
                 }
             }
@@ -2516,6 +2542,74 @@ mod tests {
         assert_eq!(tg.all_pids, vec![5001, 5002]);
         assert_eq!(tg.icon_key.as_deref(), Some("exe:telegram.exe:502"));
         assert!(tg.icon_data.is_none(), "tray payload must carry icon_key only (AD-6)");
+
+        // Verify newly added Windows shell/GPU worker hosts are strictly excluded
+        for excluded in [
+            r"C:\Windows\SystemApps\ShellHost\ShellHost.exe",
+            r"C:\Program Files\WindowsApps\SystemSettings.exe",
+            r"C:\Program Files\AMD\CNext\AMDRSServ.exe",
+            r"C:\Program Files\WindowsApps\Xbox\GameBarPresenceWriter.exe",
+            r"C:\Program Files\WindowsApps\Widgets.exe",
+            r"C:\Windows\System32\MoUsoCoreWorker.exe",
+        ] {
+            assert!(
+                is_excluded_tray_process(excluded),
+                "noisy host {excluded} must be excluded from tray"
+            );
+        }
+
+        // Verify strict deduplication by lowercase exe filename across DIFFERENT folders
+        // AND dropping of headless untitled/iconless worker processes!
+        let dup_candidates = vec![
+            RawTrayWindowCandidate {
+                hwnd: 801,
+                pid: 8001,
+                exe_path: r"C:\Apps\Foo\bin\MyTray.exe".to_string(),
+                title: "".to_string(),
+                class_name: "Worker".to_string(),
+                is_visible: false,
+                is_tool_window: true,
+                has_owner: true,
+                has_class_icon: false,
+                has_app_frame_style: false,
+            },
+            RawTrayWindowCandidate {
+                hwnd: 802,
+                pid: 8002,
+                exe_path: r"C:\Apps\Foo\v2\mytray.EXE".to_string(),
+                title: "MyTray".to_string(),
+                class_name: "MainWnd".to_string(),
+                is_visible: false,
+                is_tool_window: false,
+                has_owner: false,
+                has_class_icon: true,
+                has_app_frame_style: true,
+            },
+            // Headless iconless blank worker -> dropped when resolve_icon_key returns None
+            RawTrayWindowCandidate {
+                hwnd: 901,
+                pid: 9001,
+                exe_path: r"C:\Apps\Silent\silentdaemon.exe".to_string(),
+                title: "".to_string(),
+                class_name: "HiddenMsg".to_string(),
+                is_visible: false,
+                is_tool_window: true,
+                has_owner: false,
+                has_class_icon: false,
+                has_app_frame_style: false,
+            },
+        ];
+        let deduped = build_tray_background_apps(dup_candidates, &[], own_pid, |exe, _| {
+            if exe_basename_lower(exe) == "mytray.exe" {
+                Some("exe:mytray".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(deduped.len(), 1, "same lowercase exe across dirs must dedup to 1 and blank iconless worker must be dropped");
+        assert_eq!(deduped[0].id, "mytray.exe");
+        assert_eq!(deduped[0].hwnd, Some(802));
+        assert_eq!(deduped[0].all_pids, vec![8001, 8002]);
     }
 
     #[test]

@@ -7,8 +7,11 @@ import {
   buildPreviewFlyoutRequest,
   buildVolumeOsdRequest,
   computeDockLogicalWidth,
+  computeNaturalDockWidth,
   computeNextWheelVolume,
   computePreviewCardWidth,
+  createTaskbarOrderMemory,
+  EDGE_CENTERED_MIN_WIDTH,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
   getPreviewHoverDelayMs,
@@ -24,6 +27,9 @@ import {
   selectWindowToFocusOnTaskbarClick,
   shouldOpenVolumeOsd,
   shouldTriggerPreviewHover,
+  shouldUseEdgeCenteredLayout,
+  SOUND_FLYOUT_WIDTH,
+  stabilizeTaskbarItemsOrder,
   VOLUME_OSD_HEIGHT,
   VOLUME_OSD_WIDTH,
   type AppContextPayload,
@@ -91,12 +97,79 @@ describe('TaskbarView Dock/Edge layout, states, cycling & pin DnD helpers', () =
     expect(getTaskbarRootClassName('edge')).toBe('tb-root edge');
   });
 
-  it('computes unconstrained dock logical width from max(scrollWidth, rectWidth)', () => {
+  it('computes unconstrained dock logical width from max(scrollWidth, rectWidth) & child groups', () => {
+    expect(SOUND_FLYOUT_WIDTH).toBe(336);
     expect(computeDockLogicalWidth(742.2, 604)).toBe(743);
     expect(computeDockLogicalWidth(500, 512.4)).toBe(513);
     expect(computeDockLogicalWidth(0, 0)).toBeNull();
     expect(computeDockLogicalWidth(180, 200)).toBeNull();
     expect(computeDockLogicalWidth(Number.NaN, 420)).toBe(420);
+
+    // Unconstrained apps + tray + chrome prevents yellow-sliver clipping even if bar was narrower
+    expect(computeNaturalDockWidth(598, 600, 540, 225)).toBe(784);
+    expect(computeNaturalDockWidth(700, 702, 400, 200)).toBe(702);
+  });
+
+  it('applies edge-centered layout strictly on wide primary displays (never secondary/narrow vertical)', () => {
+    expect(EDGE_CENTERED_MIN_WIDTH).toBe(1180);
+    expect(shouldUseEdgeCenteredLayout('edge', 'primary', 1920)).toBe(true);
+    expect(shouldUseEdgeCenteredLayout('edge', 'primary', 1180)).toBe(true);
+    expect(shouldUseEdgeCenteredLayout('edge', 'primary', 1080)).toBe(false);
+    expect(shouldUseEdgeCenteredLayout('edge', 'secondary', 1920)).toBe(false);
+    expect(shouldUseEdgeCenteredLayout('edge', 'secondary', 1080)).toBe(false);
+    expect(shouldUseEdgeCenteredLayout('dock', 'primary', 1920)).toBe(false);
+  });
+
+  it('stabilizes unpinned icon slots and multi-window preview order across Z-order clicks', () => {
+    const mem = createTaskbarOrderMemory();
+    const pinA = makeRunningItem({ id: 'pin-a', name: 'Pin A', pinned: true, group: undefined });
+    const unpinned1 = makeRunningItem({
+      id: 'run-settings',
+      name: 'Settings',
+      pinned: false,
+      group: {
+        ...makeRunningItem().group!,
+        key: 'settings',
+        windows: [
+          { ...makeRunningItem().group!.windows[0], hwnd: 10, isActive: false },
+          { ...makeRunningItem().group!.windows[1], hwnd: 20, isActive: true },
+        ],
+      },
+    });
+    const unpinned2 = makeRunningItem({
+      id: 'run-spotify',
+      name: 'Spotify',
+      pinned: false,
+      group: { ...makeRunningItem().group!, key: 'spotify', windows: [makeRunningItem().group!.windows[0]] },
+    });
+
+    // Initial order: pinA, Settings (hw 10, 20), Spotify
+    const first = stabilizeTaskbarItemsOrder([pinA, unpinned1, unpinned2], mem);
+    expect(first.map((i) => i.id)).toEqual(['pin-a', 'run-settings', 'run-spotify']);
+    expect(first[1].group?.windows.map((w) => w.hwnd)).toEqual([10, 20]);
+
+    // Simulated Z-order flip after clicking Spotify + flipping Settings window Z-order:
+    // Order MUST NOT shuffle!
+    const unpinned1Flipped = {
+      ...unpinned1,
+      group: {
+        ...unpinned1.group!,
+        windows: [unpinned1.group!.windows[1], unpinned1.group!.windows[0]],
+      },
+    };
+    const afterClick = stabilizeTaskbarItemsOrder([pinA, unpinned2, unpinned1Flipped], mem);
+    expect(afterClick.map((i) => i.id)).toEqual(['pin-a', 'run-settings', 'run-spotify']);
+    expect(afterClick[1].group?.windows.map((w) => w.hwnd)).toEqual([10, 20]);
+
+    // Closing Settings & opening Telegram appends Telegram strictly at the END
+    const unpinned3 = makeRunningItem({
+      id: 'run-telegram',
+      name: 'Telegram',
+      pinned: false,
+      group: { ...makeRunningItem().group!, key: 'telegram', windows: [makeRunningItem().group!.windows[0]] },
+    });
+    const afterCloseAndOpen = stabilizeTaskbarItemsOrder([pinA, unpinned3, unpinned2], mem);
+    expect(afterCloseAndOpen.map((i) => i.id)).toEqual(['pin-a', 'run-spotify', 'run-telegram']);
   });
 
   it('computes active, running, minimized & idle indicator classes', () => {

@@ -10,7 +10,7 @@ import type {
   TopProcessInfo,
 } from './ipc';
 
-export type StartAnimPhase = 'hidden' | 'entering' | 'open' | 'closing';
+export type StartAnimPhase = 'hidden' | 'open' | 'closing';
 
 export interface StartAnimState {
   phase: StartAnimPhase;
@@ -20,7 +20,7 @@ export interface StartAnimState {
   gen: number;
 }
 
-export const START_EXIT_ANIM_MS = 115;
+export const START_EXIT_ANIM_MS = 120;
 
 export const INITIAL_START_ANIM_STATE: StartAnimState = {
   phase: 'hidden',
@@ -37,8 +37,8 @@ export interface StartStateReduceInput {
 }
 
 /**
- * Transitions Start Menu animation phase without unmounting DOM:
- * - `open: true` -> `'entering'` (with incremented `openSeq` and synced `gen`)
+ * Transitions Start Menu animation phase immediately without unmounting DOM:
+ * - `open: true` -> `'open'` immediately (incrementing `openSeq` to replay `@keyframes startInA/B` at frame 0!)
  * - `open: false, immediate: true` -> `'hidden'` immediately
  * - `open: false` -> `'closing'` (or stays `'hidden'` if already hidden)
  */
@@ -55,7 +55,7 @@ export function reduceStartState(
 
   if (visible) {
     return {
-      phase: 'entering',
+      phase: 'open',
       open: true,
       closing: false,
       openSeq: state.openSeq + 1,
@@ -83,19 +83,19 @@ export function reduceStartState(
 }
 
 /**
- * Promotes an `'entering'` Start Menu surface to `'open'` on the first awake rAF
- * after `surface_commit_ack` + `ShowWindow`.
+ * Alternates `.open-a` / `.open-b` keyed by `openSeq % 2` so Chromium WebView2 replays the
+ * silky 230ms spring open keyframe on every `Win` press without unmounting `.start-chassis`.
  */
-export function promoteStartEntering(state: StartAnimState): StartAnimState {
-  if (state.phase !== 'entering') {
-    return state;
+export function getStartChassisAnimClass(
+  anim: Pick<StartAnimState, 'phase' | 'openSeq'>,
+): string {
+  if (anim.phase === 'open') {
+    return anim.openSeq % 2 === 1 ? 'open-anim open-a' : 'open-anim open-b';
   }
-  return {
-    ...state,
-    phase: 'open',
-    open: true,
-    closing: false,
-  };
+  if (anim.phase === 'closing') {
+    return 'closing';
+  }
+  return '';
 }
 
 /**

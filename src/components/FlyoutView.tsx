@@ -18,6 +18,7 @@ import {
   canRunAsAdmin,
   collectAppContextPids,
   computeCardOriginX,
+  computeFlyoutCardHeight,
   computeNextContextFocusIdx,
   computeTrayFlyoutHeight,
   formatIpcError,
@@ -32,7 +33,7 @@ import {
   partitionAudioDevices,
   PREVIEW_CARD_CLOSE_MS,
   PREVIEW_LEAVE_COMMAND,
-  reduceFlyoutEntered,
+  QS_MIXER_MAX_HEIGHT,
   reduceFlyoutHideComplete,
   reduceFlyoutHideImmediate,
   reduceFlyoutHideStart,
@@ -42,10 +43,10 @@ import {
   shouldShowAppContextActionSeparator,
   syncPreviewWindowsFromGroups,
   TRAY_CARD_WIDTH,
+  TRAY_CTX_OPEN_MIN_HEIGHT,
   type FlyoutAnimState,
 } from '../lib/flyoutLogic';
 import {
-  applyConfigUpdate,
   fetchIconsBatch,
   getAudioPeaks,
   hideTrayApp,
@@ -74,7 +75,6 @@ import {
   type NetworkInfo,
   type OpenWindowInfo,
   type SessionAlert,
-  type TestBarConfig,
   type TrayAppItem,
 } from '../lib/ipc';
 import {
@@ -142,10 +142,61 @@ type ContextBlock =
   | { kind: 'sep'; key: string }
   | { kind: 'action'; entry: ContextActionEntry; actionIdx: number };
 
+function formatCompactNetworkLabel(net: NetworkInfo | null): string {
+  if (!net) return 'Сеть';
+  if (!net.connected) return 'Нет сети';
+  const raw = (net.kind ?? '').trim().toLowerCase();
+  let kindLabel = 'Сеть';
+  if (raw === 'ethernet' || raw.includes('ether') || raw === 'lan') {
+    kindLabel = 'Ethernet';
+  } else if (raw === 'wifi' || raw === 'wi-fi' || raw.includes('wi-fi') || raw.includes('wlan')) {
+    kindLabel = 'Wi-Fi';
+  } else if (raw && raw !== 'offline' && raw !== 'none' && raw !== 'unknown') {
+    const trimmed = net.kind.trim();
+    kindLabel = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  }
+  const speed = (net.speedLabel ?? '').trim();
+  return speed ? `${kindLabel} · ${speed}` : kindLabel;
+}
+
+function measureCardHeight(el: HTMLElement, kind: FlyoutKind): number | null {
+  let borderY = 2;
+  if (typeof getComputedStyle === 'function') {
+    const cs = getComputedStyle(el);
+    const parsed = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+    if (Number.isFinite(parsed) && parsed > 0) borderY = parsed;
+  }
+
+  if (isAppContextKind(kind) || isBarContextKind(kind)) {
+    const inner = el.querySelector<HTMLElement>('.ctx-scroll');
+    return computeFlyoutCardHeight({
+      cardScrollHeight: el.scrollHeight,
+      borderY,
+      innerScrollHeight: inner?.scrollHeight,
+      innerClientHeight: inner?.clientHeight,
+    });
+  }
+
+  if (kind === 'sound' || kind === 'quick') {
+    const inner = el.querySelector<HTMLElement>('.qs-mixer-scroll');
+    return computeFlyoutCardHeight({
+      cardScrollHeight: el.scrollHeight,
+      borderY,
+      innerScrollHeight: inner?.scrollHeight,
+      innerClientHeight: inner?.clientHeight,
+      innerMaxHeight: QS_MIXER_MAX_HEIGHT,
+    });
+  }
+
+  return computeFlyoutCardHeight({
+    cardScrollHeight: el.scrollHeight,
+    borderY,
+  });
+}
+
 export const FlyoutView: React.FC = () => {
   const reducedMotion = useReducedMotion();
 
-  const [config, setConfig] = useState<TestBarConfig | null>(null);
   const [anim, setAnim] = useState<FlyoutAnimState>(INITIAL_FLYOUT_ANIM_STATE);
   const [trayApps, setTrayApps] = useState<TrayAppItem[]>([]);
   const [trayIconMap, setTrayIconMap] = useState<Record<string, string>>({});
@@ -179,8 +230,6 @@ export const FlyoutView: React.FC = () => {
 
   const exitTimerRef = useRef<number | null>(null);
   const osdTimerRef = useRef<number | null>(null);
-  const enterRaf1Ref = useRef<number | null>(null);
-  const enterRaf2Ref = useRef<number | null>(null);
   const segReadyRafRef = useRef<number | null>(null);
   const previewCloseTimersRef = useRef<Map<number, number>>(new Map());
   const thumbCacheRef = useRef<Map<number, string>>(new Map());
@@ -214,17 +263,6 @@ export const FlyoutView: React.FC = () => {
 
   const trayCtxPresence = useAnimatedPresence(Boolean(trayCtxItem), 95);
   const devMenuPresence = useAnimatedPresence(devMenuOpen, 95);
-
-  const cancelEnterRafs = useCallback(() => {
-    if (enterRaf1Ref.current !== null && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(enterRaf1Ref.current);
-      enterRaf1Ref.current = null;
-    }
-    if (enterRaf2Ref.current !== null && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(enterRaf2Ref.current);
-      enterRaf2Ref.current = null;
-    }
-  }, []);
 
   const clearPreviewCloseTimers = useCallback(() => {
     previewCloseTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
@@ -262,14 +300,7 @@ export const FlyoutView: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    ipc<TestBarConfig>('get_config')
-      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
-      .catch(() => {});
-
     const subs = [
-      onEvent<TestBarConfig>('config-updated', (next) =>
-        setConfig((prev) => applyConfigUpdate(prev, next)),
-      ),
       onEvent<FlyoutRequest>('flyout-show', (r) => {
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
@@ -277,15 +308,10 @@ export const FlyoutView: React.FC = () => {
         }
 
         const prevKind = activeKindRef.current;
-        const prevPhase = phaseRef.current;
-        const isLive = prevPhase === 'entering' || prevPhase === 'open';
+        const isLive = phaseRef.current === 'open';
         const isInPlaceOsd = r.kind === 'osd' && prevKind === 'osd' && isLive;
         const isInPlacePreview = r.kind === 'preview' && prevKind === 'preview' && isLive;
 
-        // Keep entering -> open double-rAF gate intact during continuous fast OSD scroll or preview scrub
-        if (!((isInPlaceOsd || isInPlacePreview) && prevPhase === 'entering')) {
-          cancelEnterRafs();
-        }
         if (!isInPlacePreview) {
           clearPreviewCloseTimers();
         }
@@ -425,7 +451,6 @@ export const FlyoutView: React.FC = () => {
       }),
       onEvent<FlyoutHideEvent | void>('flyout-hide', (ev) => {
         clearOsdTimer();
-        cancelEnterRafs();
         clearPreviewCloseTimers();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
@@ -455,7 +480,6 @@ export const FlyoutView: React.FC = () => {
       }),
       onEvent<FlyoutHideEvent | void>('flyout-hide-immediate', () => {
         clearOsdTimer();
-        cancelEnterRafs();
         clearPreviewCloseTimers();
         if (exitTimerRef.current !== null) {
           window.clearTimeout(exitTimerRef.current);
@@ -547,7 +571,6 @@ export const FlyoutView: React.FC = () => {
     return () => {
       window.removeEventListener('keydown', onKey);
       clearOsdTimer();
-      cancelEnterRafs();
       if (exitTimerRef.current !== null) window.clearTimeout(exitTimerRef.current);
       if (segReadyRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(segReadyRafRef.current);
@@ -555,12 +578,12 @@ export const FlyoutView: React.FC = () => {
       clearPreviewCloseTimers();
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [armOsdAutoClose, cacheThumb, cancelEnterRafs, clearOsdTimer, clearPreviewCloseTimers]);
+  }, [armOsdAutoClose, cacheThumb, clearOsdTimer, clearPreviewCloseTimers]);
 
-  // Paint-Sync Step 1: Synchronous DOM commit ACK + exact pre-show height measurement (before ShowWindow)
+  // Synchronous post-commit height measurement ACK (zero show delay; instant atomic resize if >2px diff)
   useLayoutEffect(() => {
     const req = anim.req;
-    if (!req || anim.phase === 'closed' || anim.phase === 'closing') return;
+    if (!req || anim.phase !== 'open') return;
     const gen = req.gen ?? 0;
     if (ackedGenRef.current === gen) return;
     ackedGenRef.current = gen;
@@ -574,8 +597,8 @@ export const FlyoutView: React.FC = () => {
 
     let measuredCardHeight: number | undefined;
     if (shouldMeasure && cardRef.current) {
-      const h = Math.ceil(cardRef.current.scrollHeight);
-      if (h >= 48) {
+      const h = measureCardHeight(cardRef.current, req.kind);
+      if (h !== null) {
         measuredCardHeight = h;
         lastResizedHeightRef.current = h;
       }
@@ -584,30 +607,9 @@ export const FlyoutView: React.FC = () => {
     surfaceCommitAck('flyout', gen, measuredCardHeight).catch(() => {});
   }, [anim.req, anim.phase, anim.renderSeq, anim.scrubSeq]);
 
-  // Paint-Sync Step 2: Double-rAF promotion from 'entering' -> 'open' after ShowWindow wakes Chromium compositor
-  useEffect(() => {
-    if (anim.phase !== 'entering') return;
-    cancelEnterRafs();
-
-    if (typeof requestAnimationFrame !== 'function') {
-      setAnim((prev) => reduceFlyoutEntered(prev));
-      return;
-    }
-
-    enterRaf1Ref.current = requestAnimationFrame(() => {
-      enterRaf1Ref.current = null;
-      enterRaf2Ref.current = requestAnimationFrame(() => {
-        enterRaf2Ref.current = null;
-        setAnim((prev) => reduceFlyoutEntered(prev));
-      });
-    });
-
-    return cancelEnterRafs;
-  }, [anim.phase, anim.renderSeq, cancelEnterRafs]);
-
   // Poll WASAPI live peaks every 130ms STRICTLY while Quick Sound flyout is visibly open (0% idle cost)
   const isSoundVisiblyOpen =
-    (anim.phase === 'open' || anim.phase === 'entering') &&
+    anim.phase === 'open' &&
     (anim.req?.kind === 'sound' || anim.req?.kind === 'quick');
 
   useEffect(() => {
@@ -718,7 +720,6 @@ export const FlyoutView: React.FC = () => {
 
   const req = anim.req;
   const isClosing = anim.phase === 'closing';
-  const glassDepth = config?.glassDepth ?? 'obsidian';
 
   // Auto-fit flyout height for dynamic post-open content (Jump List, audio sessions, media strip, alerts)
   useEffect(() => {
@@ -734,8 +735,8 @@ export const FlyoutView: React.FC = () => {
     if (!el) return;
 
     const syncHeight = () => {
-      const h = Math.ceil(el.scrollHeight);
-      if (h >= 48 && Math.abs(h - lastResizedHeightRef.current) > 2) {
+      const h = measureCardHeight(el, req.kind);
+      if (h !== null && Math.abs(h - lastResizedHeightRef.current) > 2) {
         lastResizedHeightRef.current = h;
         ipc('resize_flyout', { width: null, height: h }).catch(() => {});
       }
@@ -744,6 +745,8 @@ export const FlyoutView: React.FC = () => {
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
+    const innerScroll = el.querySelector<HTMLElement>('.ctx-scroll, .qs-mixer-scroll');
+    if (innerScroll) ro.observe(innerScroll);
     return () => ro.disconnect();
   }, [
     req?.kind,
@@ -759,8 +762,26 @@ export const FlyoutView: React.FC = () => {
     devMenuPresence.mounted,
     media?.hasSession,
     media?.canSeek,
+    media?.durationSec,
     alerts.length,
   ]);
+
+  // Dynamic compact tray height (128px min normally, smoothly expands to 184px+ ONLY while tray right-click menu is open)
+  useEffect(() => {
+    if (!req || req.kind !== 'tray' || anim.phase !== 'open') return;
+    const ctxOpen = Boolean(trayCtxItem);
+    let targetH = computeTrayFlyoutHeight(trayApps.length, ctxOpen);
+    if (ctxOpen && cardRef.current) {
+      const sheet = cardRef.current.querySelector<HTMLElement>('.tray-ctx-sheet');
+      if (sheet && sheet.scrollHeight > 0) {
+        targetH = Math.max(targetH, Math.ceil(sheet.scrollHeight) + 18);
+      }
+    }
+    if (Math.abs(targetH - lastResizedHeightRef.current) > 2) {
+      lastResizedHeightRef.current = targetH;
+      ipc('resize_flyout', { width: TRAY_CARD_WIDTH, height: targetH }).catch(() => {});
+    }
+  }, [req?.kind, anim.phase, anim.renderSeq, trayApps.length, trayCtxItem, actionError]);
 
   const today = useMemo(() => new Date(), [anim.renderSeq]);
   const calCells = useMemo(
@@ -804,14 +825,18 @@ export const FlyoutView: React.FC = () => {
     const headerLabel = formatTrayHeaderLabel(trayHover, trayApps.length);
     const activeCtxTray = trayCtxItem ?? lastTrayCtxRef.current;
 
+    const trayCardStyle: React.CSSProperties | undefined = trayCtxItem
+      ? { ...cardOriginStyle, minHeight: TRAY_CTX_OPEN_MIN_HEIGHT }
+      : cardOriginStyle;
+
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
           className="flyout-card tray-card"
           data-phase={dataPhase}
-          style={cardOriginStyle}
+          style={trayCardStyle}
         >
           <div className="tray-head">
             <span className={`tray-tip-label ${trayHover ? 'hovering' : ''}`} title={headerLabel}>
@@ -833,14 +858,14 @@ export const FlyoutView: React.FC = () => {
             {trayApps.length === 0 ? (
               <div className="tray-empty">Нет фоновых приложений</div>
             ) : (
-              trayApps.map((t) => {
+              trayApps.map((t, idx) => {
                 const iconUri =
                   (t.iconKey ? trayIconMap[t.iconKey] || iconCache.get(t.iconKey) : undefined) ||
                   t.iconData ||
                   null;
                 return (
                   <button
-                    key={t.id}
+                    key={t.id || `tray-${t.pid ?? idx}-${t.name}-${idx}`}
                     type="button"
                     className="tray-cell"
                     onMouseEnter={() => setTrayHover(t.name)}
@@ -989,7 +1014,7 @@ export const FlyoutView: React.FC = () => {
   if (req.kind === 'osd') {
     const pct = osdState.muted ? 0 : osdState.volume;
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1093,8 +1118,17 @@ export const FlyoutView: React.FC = () => {
         .catch((err) => setActionError(formatIpcError(err)));
     };
 
+    const toggleMicMute = () => {
+      setActionError(null);
+      const nextMuted = !(audio?.micMuted ?? false);
+      setAudio((prev) => (prev ? { ...prev, micMuted: nextMuted } : prev));
+      ipc<AudioState>('set_mic_muted', { muted: nextMuted })
+        .then(setAudio)
+        .catch((err) => setActionError(formatIpcError(err)));
+    };
+
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1105,33 +1139,39 @@ export const FlyoutView: React.FC = () => {
             if (devMenuOpen) setDevMenuOpen(false);
           }}
         >
-          <div className="sec-row" style={{ marginBottom: 9 }}>
+          <div className="sec-row" style={{ marginBottom: 8 }}>
             <span className="sec-title">Звук и сеть</span>
-            <button
-              type="button"
-              className={`qs-net-pill ${!netConnected ? 'offline' : ''}`}
-              title="Открыть параметры сети Windows"
-              onClick={() => {
-                ipc('launch_item', {
-                  target: 'ms-settings:network',
-                  args: null,
-                  asAdmin: false,
-                  closeStart: false,
-                }).catch(() => {});
-                close();
-              }}
-            >
-              <span className="qs-net-dot" aria-hidden="true" />
-              <span>
-                {net
-                  ? net.connected
-                    ? net.speedLabel
-                      ? `${net.kind} · ${net.speedLabel}`
-                      : net.kind
-                    : 'Нет сети'
-                  : 'Сеть'}
-              </span>
-            </button>
+            <div className="qs-head-pills">
+              {inputDevices.length <= 1 && (
+                <button
+                  type="button"
+                  className={`qs-mic-btn ${audio?.micMuted ? 'muted' : ''}`}
+                  aria-label={audio?.micMuted ? 'Включить микрофон' : 'Отключить микрофон'}
+                  aria-pressed={Boolean(audio?.micMuted)}
+                  onClick={toggleMicMute}
+                >
+                  <MicIcon className="ic12" muted={audio?.micMuted ?? false} />
+                  <span>{audio?.micMuted ? 'Выкл' : 'Мик'}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className={`qs-net-pill ${!netConnected ? 'offline' : ''}`}
+                aria-label="Открыть параметры сети Windows"
+                onClick={() => {
+                  ipc('launch_item', {
+                    target: 'ms-settings:network',
+                    args: null,
+                    asAdmin: false,
+                    closeStart: false,
+                  }).catch(() => {});
+                  close();
+                }}
+              >
+                <span className="qs-net-dot" aria-hidden="true" />
+                <span>{formatCompactNetworkLabel(net)}</span>
+              </button>
+            </div>
           </div>
 
           {media?.hasSession && (
@@ -1154,7 +1194,6 @@ export const FlyoutView: React.FC = () => {
                   <button
                     type="button"
                     className="m-btn"
-                    title="Предыдущий трек"
                     aria-label="Предыдущий трек"
                     onClick={() =>
                       ipc<MediaState>('media_action', { action: 'prev' })
@@ -1166,8 +1205,7 @@ export const FlyoutView: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    className="m-btn play"
-                    title={media.isPlaying ? 'Пауза' : 'Воспроизвести'}
+                    className="m-btn qs-play-btn"
                     aria-label={media.isPlaying ? 'Пауза' : 'Воспроизвести'}
                     onClick={() =>
                       ipc<MediaState>('media_action', { action: 'toggle' })
@@ -1184,7 +1222,6 @@ export const FlyoutView: React.FC = () => {
                   <button
                     type="button"
                     className="m-btn"
-                    title="Следующий трек"
                     aria-label="Следующий трек"
                     onClick={() =>
                       ipc<MediaState>('media_action', { action: 'next' })
@@ -1274,9 +1311,9 @@ export const FlyoutView: React.FC = () => {
                     aria-hidden="true"
                     style={activeInOverflow ? { opacity: 0 } : undefined}
                   />
-                  {primaryDevs.map((d) => (
+                  {primaryDevs.map((d, idx) => (
                     <button
-                      key={d.id}
+                      key={d.id || `dev-${d.name}-${idx}`}
                       type="button"
                       className={`seg-opt ${d.isDefault ? 'active' : ''}`}
                       title={d.name}
@@ -1291,8 +1328,7 @@ export const FlyoutView: React.FC = () => {
                   <button
                     type="button"
                     className={`qs-dev-more-btn ${devMenuOpen || activeInOverflow ? 'open' : ''}`}
-                    title={`Все устройства вывода (${allDevs.length})`}
-                    aria-label="Все устройства вывода"
+                    aria-label={`Все устройства вывода (${allDevs.length})`}
                     aria-expanded={devMenuOpen}
                     onClick={() => setDevMenuOpen((v) => !v)}
                   >
@@ -1307,9 +1343,9 @@ export const FlyoutView: React.FC = () => {
                   data-phase={devMenuPresence.phase}
                   onClick={(e) => e.stopPropagation()}
                 >
-                  {allDevs.map((d) => (
+                  {allDevs.map((d, idx) => (
                     <button
-                      key={d.id}
+                      key={d.id || `all-dev-${d.name}-${idx}`}
                       type="button"
                       className={`ctx-item ${d.isDefault ? 'focused' : ''}`}
                       title={d.name}
@@ -1324,24 +1360,17 @@ export const FlyoutView: React.FC = () => {
             </>
           )}
 
-          <div className="qs-mic-row">
-            <button
-              type="button"
-              className={`qs-mic-btn ${audio?.micMuted ? 'muted' : ''}`}
-              title={audio?.micMuted ? 'Включить микрофон' : 'Отключить микрофон'}
-              onClick={() => {
-                setActionError(null);
-                const nextMuted = !(audio?.micMuted ?? false);
-                setAudio((prev) => (prev ? { ...prev, micMuted: nextMuted } : prev));
-                ipc<AudioState>('set_mic_muted', { muted: nextMuted })
-                  .then(setAudio)
-                  .catch((err) => setActionError(formatIpcError(err)));
-              }}
-            >
-              <MicIcon className="ic14" muted={audio?.micMuted ?? false} />
-              <span>{audio?.micMuted ? 'Выкл' : 'Микрофон'}</span>
-            </button>
-            {inputDevices.length > 0 && (
+          {inputDevices.length > 1 && (
+            <div className="qs-mic-row">
+              <button
+                type="button"
+                className={`qs-mic-btn ${audio?.micMuted ? 'muted' : ''}`}
+                aria-label={audio?.micMuted ? 'Включить микрофон' : 'Отключить микрофон'}
+                onClick={toggleMicMute}
+              >
+                <MicIcon className="ic14" muted={audio?.micMuted ?? false} />
+                <span>{audio?.micMuted ? 'Выкл' : 'Микрофон'}</span>
+              </button>
               <select
                 className="qs-input-select"
                 aria-label="Устройство записи"
@@ -1354,14 +1383,14 @@ export const FlyoutView: React.FC = () => {
                     .catch((err) => setActionError(formatIpcError(err)));
                 }}
               >
-                {inputDevices.map((d) => (
-                  <option key={d.id} value={d.id}>
+                {inputDevices.map((d, idx) => (
+                  <option key={d.id || `in-dev-${d.name}-${idx}`} value={d.id}>
                     {d.shortName || d.name}
                   </option>
                 ))}
               </select>
-            )}
-          </div>
+            </div>
+          )}
 
           <div className={`mix-row qs-master-row ${audio?.masterMuted ? 'muted' : ''}`}>
             <button
@@ -1390,7 +1419,7 @@ export const FlyoutView: React.FC = () => {
             {sessions.length === 0 ? (
               <div className="qs-empty">Нет активных аудиопотоков</div>
             ) : (
-              sessions.map((s) => {
+              sessions.map((s, idx) => {
                 const iconUri = s.iconKey
                   ? sessionIconMap[s.iconKey] || iconCache.get(s.iconKey) || null
                   : null;
@@ -1398,7 +1427,7 @@ export const FlyoutView: React.FC = () => {
                 const isActiveAudio = s.isActive || livePeak > 0.02;
                 return (
                   <div
-                    key={s.id}
+                    key={s.id || `sess-${s.pid ?? idx}-${s.name}-${idx}`}
                     className={`mix-row ${s.muted ? 'muted' : ''} ${isActiveAudio ? 'active-audio' : ''}`}
                   >
                     <button
@@ -1459,7 +1488,7 @@ export const FlyoutView: React.FC = () => {
     };
 
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1560,8 +1589,8 @@ export const FlyoutView: React.FC = () => {
               <div className="cal-alerts-empty">Нет системных событий</div>
             ) : (
               <div className="cal-alerts-list">
-                {alerts.slice(0, 4).map((a) => (
-                  <div key={a.id} className="cal-alert-row">
+                {alerts.slice(0, 4).map((a, idx) => (
+                  <div key={a.id || `alert-${a.timestampMs ?? idx}-${idx}`} className="cal-alert-row">
                     <span className={`cal-alert-dot ${a.level}`} />
                     <div className="cal-alert-body">
                       <div className="cal-alert-top">
@@ -1640,7 +1669,6 @@ export const FlyoutView: React.FC = () => {
       <div
         className="flyout-root"
         data-space="personal"
-        data-glass={glassDepth}
         data-visible="true"
         onMouseLeave={() => {
           ipc(PREVIEW_LEAVE_COMMAND).catch(() => {});
@@ -1658,9 +1686,9 @@ export const FlyoutView: React.FC = () => {
             className="preview-track"
             style={{ ['--scrub-dir' as string]: anim.scrubDir } as React.CSSProperties}
           >
-            {visibleWins.map((w) => (
+            {visibleWins.map((w, idx) => (
               <div
-                key={w.hwnd}
+                key={w.hwnd ?? `win-${idx}`}
                 className={`wp-item ${w.isActive ? 'active' : ''} ${closingHwnds[w.hwnd] ? 'closing' : ''}`}
                 onClick={() =>
                   ipc('focus_window', { hwnd: w.hwnd, toggleMinimize: false }).catch(() => {})
@@ -1755,14 +1783,16 @@ export const FlyoutView: React.FC = () => {
 
                 <div className="wp-thumb">
                   {thumbs[w.hwnd] ? (
-                    <img src={thumbs[w.hwnd]} alt="" draggable={false} />
+                    <img src={thumbs[w.hwnd]} alt="" className="wp-thumb-img" draggable={false} />
                   ) : (
                     <div className="wp-placeholder">
-                      {previewIconUri ? (
-                        <img src={previewIconUri} alt="" className="native-ic" draggable={false} />
-                      ) : (
-                        <FallbackAppIcon iconKey={w.exeName} size={22} />
-                      )}
+                      <div className="wp-placeholder-badge">
+                        {previewIconUri ? (
+                          <img src={previewIconUri} alt="" className="native-ic" draggable={false} />
+                        ) : (
+                          <FallbackAppIcon iconKey={w.exeName} size={28} />
+                        )}
+                      </div>
                       <span>{w.isMinimized ? 'Свёрнуто' : w.exeName}</span>
                     </div>
                   )}
@@ -1966,7 +1996,7 @@ export const FlyoutView: React.FC = () => {
     ctxActionsRef.current = actions;
 
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1977,39 +2007,41 @@ export const FlyoutView: React.FC = () => {
         >
           <div className="ctx-sec">{p.name}</div>
 
-          {blocks.map((block) => {
-            if (block.kind === 'subsec') {
+          <div className="ctx-scroll">
+            {blocks.map((block) => {
+              if (block.kind === 'subsec') {
+                return (
+                  <div key={block.key} className="ctx-subsec">
+                    {block.label}
+                  </div>
+                );
+              }
+              if (block.kind === 'sep') {
+                return <div key={block.key} className="ctx-sep" />;
+              }
+              const { entry, actionIdx } = block;
               return (
-                <div key={block.key} className="ctx-subsec">
-                  {block.label}
-                </div>
+                <button
+                  key={entry.key}
+                  type="button"
+                  role="menuitem"
+                  className={`ctx-item ${entry.danger ? 'danger' : ''} ${ctxFocusIdx === actionIdx ? 'focused' : ''}`}
+                  title={entry.title}
+                  onMouseEnter={() => setCtxFocusIdx(actionIdx)}
+                  onClick={entry.onActivate}
+                >
+                  {entry.icon}
+                  <span className="ctx-item-label">{entry.label}</span>
+                </button>
               );
-            }
-            if (block.kind === 'sep') {
-              return <div key={block.key} className="ctx-sep" />;
-            }
-            const { entry, actionIdx } = block;
-            return (
-              <button
-                key={entry.key}
-                type="button"
-                role="menuitem"
-                className={`ctx-item ${entry.danger ? 'danger' : ''} ${ctxFocusIdx === actionIdx ? 'focused' : ''}`}
-                title={entry.title}
-                onMouseEnter={() => setCtxFocusIdx(actionIdx)}
-                onClick={entry.onActivate}
-              >
-                {entry.icon}
-                <span className="ctx-item-label">{entry.label}</span>
-              </button>
-            );
-          })}
+            })}
 
-          {actionError && (
-            <div className="ctx-err" role="alert">
-              {actionError}
-            </div>
-          )}
+            {actionError && (
+              <div className="ctx-err" role="alert">
+                {actionError}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -2064,7 +2096,7 @@ export const FlyoutView: React.FC = () => {
     ctxActionsRef.current = barActions;
 
     return (
-      <div className="flyout-root" data-space="personal" data-glass={glassDepth} data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true">
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -2075,38 +2107,40 @@ export const FlyoutView: React.FC = () => {
         >
           <div className="ctx-sec">Панель задач</div>
 
-          {barActions.slice(0, 3).map((entry, idx) => (
+          <div className="ctx-scroll">
+            {barActions.slice(0, 3).map((entry, idx) => (
+              <button
+                key={entry.key}
+                type="button"
+                role="menuitem"
+                className={`ctx-item ${ctxFocusIdx === idx ? 'focused' : ''}`}
+                onMouseEnter={() => setCtxFocusIdx(idx)}
+                onClick={entry.onActivate}
+              >
+                {entry.icon}
+                <span className="ctx-item-label">{entry.label}</span>
+              </button>
+            ))}
+
+            <div className="ctx-sep" />
+
             <button
-              key={entry.key}
               type="button"
               role="menuitem"
-              className={`ctx-item ${ctxFocusIdx === idx ? 'focused' : ''}`}
-              onMouseEnter={() => setCtxFocusIdx(idx)}
-              onClick={entry.onActivate}
+              className={`ctx-item danger ${ctxFocusIdx === 3 ? 'focused' : ''}`}
+              onMouseEnter={() => setCtxFocusIdx(3)}
+              onClick={barActions[3].onActivate}
             >
-              {entry.icon}
-              <span className="ctx-item-label">{entry.label}</span>
+              {barActions[3].icon}
+              <span className="ctx-item-label">{barActions[3].label}</span>
             </button>
-          ))}
 
-          <div className="ctx-sep" />
-
-          <button
-            type="button"
-            role="menuitem"
-            className={`ctx-item danger ${ctxFocusIdx === 3 ? 'focused' : ''}`}
-            onMouseEnter={() => setCtxFocusIdx(3)}
-            onClick={barActions[3].onActivate}
-          >
-            {barActions[3].icon}
-            <span className="ctx-item-label">{barActions[3].label}</span>
-          </button>
-
-          {actionError && (
-            <div className="ctx-err" role="alert">
-              {actionError}
-            </div>
-          )}
+            {actionError && (
+              <div className="ctx-err" role="alert">
+                {actionError}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );

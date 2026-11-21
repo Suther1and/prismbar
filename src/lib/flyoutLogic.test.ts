@@ -9,10 +9,13 @@ import {
   canRunAsAdmin,
   collectAppContextPids,
   computeCardOriginX,
+  computeFlyoutCardHeight,
   computeNextContextFocusIdx,
   computeTrayFlyoutHeight,
   CONTEXT_FLYOUT_EXIT_MS,
   FLYOUT_EXIT_MS,
+  FLYOUT_MAX_CARD_HEIGHT,
+  FLYOUT_ROOT_PAD_LOGICAL,
   formatIpcError,
   formatMediaTime,
   formatTrayHeaderLabel,
@@ -25,7 +28,7 @@ import {
   OSD_AUTO_CLOSE_MS,
   partitionAudioDevices,
   PREVIEW_LEAVE_COMMAND,
-  reduceFlyoutEntered,
+  QS_MIXER_MAX_HEIGHT,
   reduceFlyoutHideComplete,
   reduceFlyoutHideImmediate,
   reduceFlyoutHideStart,
@@ -37,6 +40,7 @@ import {
   syncPreviewWindowsFromGroups,
   TRAY_CARD_WIDTH,
   TRAY_COLUMNS,
+  TRAY_CTX_OPEN_MIN_HEIGHT,
   TRAY_MIN_CARD_HEIGHT,
 } from './flyoutLogic';
 
@@ -69,28 +73,24 @@ function makeWin(hwnd: number, title: string, pid = 1000 + hwnd): OpenWindowInfo
   };
 }
 
-describe('Flyout Paint-Sync animation & preview scrub preservation state machine', () => {
-  it('increments renderSeq on cold open & kind switches, but preserves card mount during preview -> preview scrub', () => {
+describe('Flyout instant-open animation, height measurement & preview scrub preservation', () => {
+  it('opens immediately at frame 0, bumps renderSeq on kind switches, and preserves card mount during preview scrub', () => {
     const p1 = makeReq('preview', {
       anchorXLogical: 180,
       payload: { group: { key: 'app-a', windows: [makeWin(1, 'A')] } },
     });
     const s1 = reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, p1);
-    expect(s1.phase).toBe('entering');
+    expect(s1.phase).toBe('open');
     expect(s1.renderSeq).toBe(1);
     expect(s1.scrubSeq).toBe(0);
     expect(s1.scrubDir).toBe(0);
-
-    const s2 = reduceFlyoutEntered(s1);
-    expect(s2.phase).toBe('open');
-    expect(s2.renderSeq).toBe(1);
 
     // Scrubbing rightward to App B keeps renderSeq = 1 (no flyIn re-bounce) and bumps scrubSeq with dir +1
     const p2 = makeReq('preview', {
       anchorXLogical: 260,
       payload: { group: { key: 'app-b', windows: [makeWin(2, 'B')] } },
     });
-    const sScrubRight = reduceFlyoutShow(s2, p2);
+    const sScrubRight = reduceFlyoutShow(s1, p2);
     expect(sScrubRight.renderSeq).toBe(1);
     expect(sScrubRight.phase).toBe('open');
     expect(sScrubRight.scrubSeq).toBe(1);
@@ -102,22 +102,22 @@ describe('Flyout Paint-Sync animation & preview scrub preservation state machine
     expect(sScrubLeft.scrubSeq).toBe(2);
     expect(sScrubLeft.scrubDir).toBe(-1);
 
-    // Switching straight to a different flyout kind bumps renderSeq and re-enters cleanly
+    // Switching straight to a different flyout kind bumps renderSeq and replays flyIn cleanly
     const s3 = reduceFlyoutShow(sScrubLeft, makeReq('context_app'));
-    expect(s3.phase).toBe('entering');
+    expect(s3.phase).toBe('open');
     expect(s3.renderSeq).toBe(2);
     expect(s3.scrubSeq).toBe(0);
     expect(s3.req?.kind).toBe('context_app');
   });
 
   it('plays closing phase with surface-specific exit timing and handles immediate preemption', () => {
-    expect(FLYOUT_EXIT_MS).toBe(110);
+    expect(FLYOUT_EXIT_MS).toBe(105);
     expect(CONTEXT_FLYOUT_EXIT_MS).toBe(95);
-    expect(getFlyoutExitMs('sound')).toBe(110);
+    expect(getFlyoutExitMs('sound')).toBe(105);
     expect(getFlyoutExitMs('context_app')).toBe(95);
     expect(getFlyoutExitMs('context_bar')).toBe(95);
 
-    const open = reduceFlyoutEntered(reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('sound')));
+    const open = reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('sound'));
     const closing = reduceFlyoutHideStart(open);
     expect(closing.phase).toBe('closing');
     expect(closing.req?.kind).toBe('sound');
@@ -139,34 +139,66 @@ describe('Flyout Paint-Sync animation & preview scrub preservation state machine
   });
 
   it('rapid reopen during closing cancels pending exit cleanly (stale seq ignored)', () => {
-    const open = reduceFlyoutEntered(reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('preview')));
+    const open = reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('preview'));
     const closing = reduceFlyoutHideStart(open);
     expect(closing.renderSeq).toBe(1);
 
     const reopened = reduceFlyoutShow(closing, makeReq('calendar'));
-    expect(reopened.phase).toBe('entering');
+    expect(reopened.phase).toBe('open');
     expect(reopened.renderSeq).toBe(2);
     expect(reopened.req?.kind).toBe('calendar');
 
     // Stale hide timer for seq 1 MUST NOT wipe the reopened flyout!
     const afterStaleTimer = reduceFlyoutHideComplete(reopened, 1);
     expect(afterStaleTimer).toBe(reopened);
-    expect(afterStaleTimer.phase).toBe('entering');
+    expect(afterStaleTimer.phase).toBe('open');
     expect(afterStaleTimer.req?.kind).toBe('calendar');
   });
 
-  it('computes clamped card-local transform-origin X from Rust anchorOriginX', () => {
-    // Window left has 18px root pad; anchorOriginX = 118 -> local 100px
-    expect(computeCardOriginX(118, 300)).toBe(100);
+  it('computes clamped card-local transform-origin X from Rust anchorOriginX & natural card height up to 580px', () => {
+    expect(FLYOUT_ROOT_PAD_LOGICAL).toBe(12);
+    expect(FLYOUT_MAX_CARD_HEIGHT).toBe(580);
+    // Window left has 12px root pad; anchorOriginX = 112 -> local 100px
+    expect(computeCardOriginX(112, 300)).toBe(100);
     // Clamps near left/right card edges
     expect(computeCardOriginX(10, 300)).toBe(16);
     expect(computeCardOriginX(500, 300)).toBe(284);
     expect(computeCardOriginX(null, 300)).toBeNull();
+
+    // Expands Quick Sound card when inner mixer is constrained, capped at QS_MIXER_MAX_HEIGHT (220)
+    expect(
+      computeFlyoutCardHeight({
+        cardScrollHeight: 338,
+        borderY: 2,
+        innerScrollHeight: 180,
+        innerClientHeight: 80,
+        innerMaxHeight: QS_MIXER_MAX_HEIGHT,
+      }),
+    ).toBe(440);
+    expect(
+      computeFlyoutCardHeight({
+        cardScrollHeight: 338,
+        borderY: 2,
+        innerScrollHeight: 400,
+        innerClientHeight: 80,
+        innerMaxHeight: QS_MIXER_MAX_HEIGHT,
+      }),
+    ).toBe(480);
+    // Clamps tall context menus cleanly to 580px ceiling
+    expect(
+      computeFlyoutCardHeight({
+        cardScrollHeight: 318,
+        borderY: 2,
+        innerScrollHeight: 650,
+        innerClientHeight: 280,
+      }),
+    ).toBe(580);
+    expect(computeFlyoutCardHeight({ cardScrollHeight: 20 })).toBeNull();
   });
 });
 
 describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu guards', () => {
-  it('uses close_preview_if_outside and renders upgraded TaskbarView capsule & glass hooks cleanly', () => {
+  it('uses close_preview_if_outside and renders upgraded TaskbarView capsule with zero native title tooltips', () => {
     expect(PREVIEW_LEAVE_COMMAND).toBe('close_preview_if_outside');
 
     const chevronHtml = renderToStaticMarkup(createElement(ChevronLeftIcon));
@@ -176,7 +208,9 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
 
     const tbHtml = renderToStaticMarkup(createElement(TaskbarView));
     expect(tbHtml).toContain('class="tb-root"');
-    expect(tbHtml).toContain('data-glass="obsidian"');
+    expect(tbHtml).not.toContain('data-glass=');
+    expect(tbHtml).not.toContain('title="');
+    expect(tbHtml).toContain('aria-label="Пуск"');
     expect(tbHtml).toContain('data-monitor="primary"');
     expect(tbHtml).toContain('tb-sheen');
     expect(tbHtml).toContain('tb-hover-pill');
@@ -273,22 +307,29 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
 });
 
 describe('Tray 6-column layout, Hide key, OSD, 4+ Audio Devices & Media interpolation', () => {
-  it('computes 6-column tray dimensions invariant to hover/overlay and resolves tray hide keys', () => {
+  it('computes compact 6-column tray dimensions (128px floor, 184px while right-click menu open) and resolves hide keys', () => {
     expect(TRAY_COLUMNS).toBe(6);
-    expect(TRAY_CARD_WIDTH).toBe(248);
+    expect(TRAY_CARD_WIDTH).toBe(244);
 
     expect(formatTrayHeaderLabel('', 0)).toBe('Фоновые приложения');
     expect(formatTrayHeaderLabel('   ', 14)).toBe('Фоновые · 14');
     expect(formatTrayHeaderLabel('Telegram', 14)).toBe('Telegram');
 
-    expect(TRAY_MIN_CARD_HEIGHT).toBe(204);
+    expect(TRAY_MIN_CARD_HEIGHT).toBe(128);
+    expect(TRAY_CTX_OPEN_MIN_HEIGHT).toBe(184);
     expect(computeTrayFlyoutHeight(0)).toBe(TRAY_MIN_CARD_HEIGHT);
     expect(computeTrayFlyoutHeight(6)).toBe(TRAY_MIN_CARD_HEIGHT);
-    expect(computeTrayFlyoutHeight(18)).toBe(TRAY_MIN_CARD_HEIGHT);
-    expect(computeTrayFlyoutHeight(24)).toBe(TRAY_MIN_CARD_HEIGHT);
-    expect(computeTrayFlyoutHeight(30)).toBe(232);
-    expect(computeTrayFlyoutHeight(42)).toBe(270);
-    expect(computeTrayFlyoutHeight(80)).toBe(270);
+    expect(computeTrayFlyoutHeight(12)).toBe(TRAY_MIN_CARD_HEIGHT);
+    expect(computeTrayFlyoutHeight(18)).toBe(160);
+    expect(computeTrayFlyoutHeight(24)).toBe(198);
+    expect(computeTrayFlyoutHeight(30)).toBe(236);
+    expect(computeTrayFlyoutHeight(42)).toBe(274);
+    expect(computeTrayFlyoutHeight(80)).toBe(274);
+
+    // Dynamic expansion ONLY while tray right-click menu is open
+    expect(computeTrayFlyoutHeight(6, true)).toBe(184);
+    expect(computeTrayFlyoutHeight(18, true)).toBe(184);
+    expect(computeTrayFlyoutHeight(24, true)).toBe(198);
 
     expect(
       resolveTrayHideKey({
@@ -303,7 +344,7 @@ describe('Tray 6-column layout, Hide key, OSD, 4+ Audio Devices & Media interpol
   it('updates consecutive OSD wheel ticks in place without bumping renderSeq, but replays enter after closing', () => {
     expect(OSD_AUTO_CLOSE_MS).toBe(1100);
 
-    const openOsd = reduceFlyoutEntered(reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('osd')));
+    const openOsd = reduceFlyoutShow(INITIAL_FLYOUT_ANIM_STATE, makeReq('osd'));
     expect(openOsd.renderSeq).toBe(1);
     expect(openOsd.phase).toBe('open');
 
@@ -316,7 +357,7 @@ describe('Tray 6-column layout, Hide key, OSD, 4+ Audio Devices & Media interpol
     const closing = reduceFlyoutHideStart(updated);
     const reopened = reduceFlyoutShow(closing, nextTickReq);
     expect(reopened.renderSeq).toBe(2);
-    expect(reopened.phase).toBe('entering');
+    expect(reopened.phase).toBe('open');
   });
 
   it('partitions 4+ audio output devices cleanly without dropping devices #4..N', () => {

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { TRAY_CARD_WIDTH } from '../lib/flyoutLogic';
+import { TRAY_CARD_WIDTH, TRAY_MIN_CARD_HEIGHT } from '../lib/flyoutLogic';
 import {
   applyConfigUpdate,
   dismissOverlays,
@@ -27,8 +27,9 @@ import {
   buildPreviewFlyoutRequest,
   CALENDAR_FLYOUT_INITIAL_HEIGHT,
   CALENDAR_FLYOUT_WIDTH,
-  computeDockLogicalWidth,
+  computeNaturalDockWidth,
   computeNextWheelVolume,
+  createTaskbarOrderMemory,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
   getPreviewHoverDelayMs,
@@ -39,8 +40,10 @@ import {
   resolveTaskbarMonitor,
   selectWindowToFocusOnTaskbarClick,
   shouldTriggerPreviewHover,
+  shouldUseEdgeCenteredLayout,
   SOUND_FLYOUT_INITIAL_HEIGHT,
   SOUND_FLYOUT_WIDTH,
+  stabilizeTaskbarItemsOrder,
   TASKBAR_LAUNCH_HOP_MS,
 } from '../lib/taskbarLogic';
 import { useReducedMotion } from '../lib/useReducedMotion';
@@ -76,10 +79,15 @@ export const TaskbarView: React.FC = () => {
   const [launchingIds, setLaunchingIds] = useState<Record<string, true>>({});
   const [dragPinId, setDragPinId] = useState<string | null>(null);
   const [dragOverPinId, setDragOverPinId] = useState<string | null>(null);
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerWidth : 1920,
+  );
 
   const barRef = useRef<HTMLElement>(null);
   const appsScrollRef = useRef<HTMLDivElement>(null);
+  const trayGroupRef = useRef<HTMLDivElement>(null);
   const barRectRef = useRef<DOMRect | null>(null);
+  const orderMemoryRef = useRef(createTaskbarOrderMemory());
   const sheenRef = useRef<HTMLSpanElement>(null);
   const sheenRafRef = useRef<number | null>(null);
   const sheenClientXRef = useRef<number>(0);
@@ -102,7 +110,14 @@ export const TaskbarView: React.FC = () => {
   const showSeconds = Boolean(config?.clockShowSeconds);
   const showWeekday = Boolean(config?.clockShowWeekday);
   const isEdge = config?.barMode === 'edge';
-  const glassDepth = config?.glassDepth ?? 'obsidian';
+  const useEdgeCentered = shouldUseEdgeCenteredLayout(config?.barMode, monitor, viewportWidth);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   // Tick every 1s ONLY when clockShowSeconds is enabled; otherwise align cleanly to minute rollovers.
   useEffect(() => {
@@ -269,9 +284,14 @@ export const TaskbarView: React.FC = () => {
       .catch(() => {});
   }, [groups, config]);
 
-  // Merge pinned apps + running window groups cleanly without duplicates
+  // Merge pinned apps + running window groups cleanly without duplicates, preserving stable
+  // first-seen order for unpinned apps & multi-window groups so clicks NEVER shuffle icons
   const barItems = useMemo<MergedBarItem[]>(
-    () => mergeTaskbarItems(config?.taskbarPins ?? [], groups, iconMap),
+    () =>
+      stabilizeTaskbarItemsOrder(
+        mergeTaskbarItems(config?.taskbarPins ?? [], groups, iconMap),
+        orderMemoryRef.current,
+      ),
     [config, groups, iconMap],
   );
 
@@ -307,20 +327,34 @@ export const TaskbarView: React.FC = () => {
       barRectRef.current = rect;
       if (config?.barMode === 'edge') return;
       const scrollEl = appsScrollRef.current;
-      const hiddenAppsOverflow = scrollEl
-        ? Math.max(0, scrollEl.scrollWidth - scrollEl.clientWidth)
-        : 0;
-      const w = computeDockLogicalWidth(el.scrollWidth + hiddenAppsOverflow, rect.width + hiddenAppsOverflow);
+      const trayEl = trayGroupRef.current;
+      const appsNatural = scrollEl ? scrollEl.scrollWidth : 0;
+      const trayNatural = trayEl ? trayEl.scrollWidth : 0;
+      const w = computeNaturalDockWidth(el.scrollWidth, rect.width, appsNatural, trayNatural);
       if (w !== null) {
         ipc('resize_taskbar_dock', { logicalWidth: w, monitor }).catch(() => {});
       }
     };
     syncSize();
-    if (typeof ResizeObserver === 'undefined') return;
+    const rafId =
+      typeof requestAnimationFrame === 'function' ? requestAnimationFrame(syncSize) : null;
+    if (typeof ResizeObserver === 'undefined') {
+      return () => {
+        if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(rafId);
+        }
+      };
+    }
     const ro = new ResizeObserver(syncSize);
     ro.observe(el);
     if (appsScrollRef.current) ro.observe(appsScrollRef.current);
-    return () => ro.disconnect();
+    if (trayGroupRef.current) ro.observe(trayGroupRef.current);
+    return () => {
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+      }
+      ro.disconnect();
+    };
   }, [barItems.length, config?.barMode, showSeconds, showWeekday, layout, monitor]);
 
   const anchorX = (el: HTMLElement) => {
@@ -658,12 +692,11 @@ export const TaskbarView: React.FC = () => {
     <div
       className={getTaskbarRootClassName(config?.barMode)}
       data-space="personal"
-      data-glass={glassDepth}
       data-monitor={monitor}
     >
       <nav
         ref={barRef}
-        className={`taskbar has-sheen ${isEdge ? 'edge-centered' : ''}`}
+        className={`taskbar has-sheen ${useEdgeCentered ? 'edge-centered' : ''}`}
         onClick={handleBarClick}
         onContextMenu={handleBarCtx}
         onPointerEnter={handleBarPointerEnter}
@@ -671,7 +704,7 @@ export const TaskbarView: React.FC = () => {
       >
         <span ref={sheenRef} className="tb-sheen" aria-hidden="true" />
 
-        {isEdge && <div className="tb-edge-left" aria-hidden="true" />}
+        {useEdgeCentered && <div className="tb-edge-left" aria-hidden="true" />}
 
         <div className="tb-group tb-apps has-hover-pill">
           <div ref={appsScrollRef} className="tb-apps-scroll" onMouseLeave={hideHoverPill}>
@@ -680,7 +713,6 @@ export const TaskbarView: React.FC = () => {
             <button
               type="button"
               className={`tb-btn ${startOpen ? 'start-on' : ''}`}
-              title="Пуск"
               aria-label="Пуск"
               onMouseEnter={(e) => moveHoverPillTo(e.currentTarget)}
               onClick={() => toggleStart(undefined, monitor).catch(() => {})}
@@ -711,7 +743,7 @@ export const TaskbarView: React.FC = () => {
                   key={item.id}
                   type="button"
                   className={btnCls}
-                  title={item.name}
+                  aria-label={item.name}
                   draggable={item.pinned}
                   onClick={() => handleAppClick(item)}
                   onAuxClick={(e) => handleAppAuxClick(e, item)}
@@ -741,15 +773,14 @@ export const TaskbarView: React.FC = () => {
           </div>
         </div>
 
-        <div className="tb-group tb-tray">
+        <div ref={trayGroupRef} className="tb-group tb-tray">
           {!isEdge && <div className="tb-sep" />}
 
           <button
             type="button"
             className={`tb-tray-btn chevron ${activeFlyout === 'tray' ? 'open' : ''}`}
-            title="Фоновые приложения"
             aria-label="Фоновые приложения"
-            onClick={(e) => openFlyoutAt('tray', e.currentTarget, TRAY_CARD_WIDTH, 210, false)}
+            onClick={(e) => openFlyoutAt('tray', e.currentTarget, TRAY_CARD_WIDTH, TRAY_MIN_CARD_HEIGHT, false)}
           >
             <ChevronUpIcon className="ic14" />
           </button>
@@ -757,7 +788,7 @@ export const TaskbarView: React.FC = () => {
           <button
             type="button"
             className="tb-tray-btn tb-lang-btn"
-            title="Раскладка клавиатуры"
+            aria-label={`Раскладка клавиатуры: ${layout}`}
             onClick={() => ipc<string>('switch_keyboard_layout').then(setLayout).catch(() => {})}
           >
             {layout}
@@ -766,7 +797,7 @@ export const TaskbarView: React.FC = () => {
           <button
             type="button"
             className={`tb-tray-btn tb-sound-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''} ${audioMaster?.masterMuted ? 'muted' : ''}`}
-            title={soundTooltip}
+            aria-label={soundTooltip}
             onClick={(e) =>
               openFlyoutAt('sound', e.currentTarget, SOUND_FLYOUT_WIDTH, SOUND_FLYOUT_INITIAL_HEIGHT, false)
             }
@@ -786,7 +817,7 @@ export const TaskbarView: React.FC = () => {
           <button
             type="button"
             className={`tb-tray-btn tb-clock ${activeFlyout === 'calendar' ? 'open' : ''}`}
-            title={clock.fullTitle}
+            aria-label={clock.fullTitle}
             onClick={(e) =>
               openFlyoutAt('calendar', e.currentTarget, CALENDAR_FLYOUT_WIDTH, CALENDAR_FLYOUT_INITIAL_HEIGHT, false)
             }

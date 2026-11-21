@@ -30,12 +30,13 @@ use windows_tracker::{AppWindowGroup, JumpListItem};
 
 const DOCK_WINDOW_LOGICAL_HEIGHT: f64 = 84.0;
 const DOCK_HORIZONTAL_PADDING_LOGICAL: i32 = 36; // 18px left + 18px right transparent shadow margin
-const START_DEFAULT_LOGICAL_WIDTH: f64 = 1140.0 + 2.0 * win_shell::START_ROOT_PAD_LOGICAL; // 1188px (24px shadow pad)
-const START_DEFAULT_LOGICAL_HEIGHT: f64 = 680.0 + 2.0 * win_shell::START_ROOT_PAD_LOGICAL; // 728px (24px shadow pad)
-const FLYOUT_ROOT_PAD_TOTAL_LOGICAL: f64 = 2.0 * win_shell::FLYOUT_ROOT_PAD_LOGICAL; // 36px (18px shadow pad)
-const PAINT_SYNC_SHOW_FAILSAFE_MS: u64 = 22;
-const FLYOUT_EXIT_ANIM_MS: u64 = 135;
-const START_EXIT_ANIM_MS: u64 = 145;
+const START_ROOT_PAD_LOGICAL: f64 = 16.0;
+const START_DEFAULT_LOGICAL_WIDTH: f64 = 1140.0 + 2.0 * START_ROOT_PAD_LOGICAL; // 1172px (16px shadow pad)
+const START_DEFAULT_LOGICAL_HEIGHT: f64 = 680.0 + 2.0 * START_ROOT_PAD_LOGICAL; // 712px (16px shadow pad)
+const FLYOUT_ROOT_PAD_LOGICAL: f64 = 12.0;
+const FLYOUT_ROOT_PAD_TOTAL_LOGICAL: f64 = 2.0 * FLYOUT_ROOT_PAD_LOGICAL; // 24px (12px shadow pad on all 4 sides)
+const FLYOUT_EXIT_ANIM_MS: u64 = 130;
+const START_EXIT_ANIM_MS: u64 = 135;
 const PREVIEW_GLIDE_DURATION_MS: u64 = 115;
 const PERIODIC_REINDEX_INTERVAL_SECS: u64 = 15 * 60;
 const MAX_ICON_SOURCES_ENTRIES: usize = 2048;
@@ -59,17 +60,14 @@ pub struct FlyoutHideEvent {
     pub gen: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingSurfaceShow {
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveSurfaceMetrics {
     pub gen: u64,
     pub rect: PixelRect,
     pub scale_factor: f64,
     pub bottom_anchor_y: i32,
     pub monitor_top: i32,
-    pub activate: bool,
-    pub anchor_x: f64,
-    pub monitor: Option<String>,
-    pub was_already_visible: bool,
+    pub max_h_logical: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,12 +89,12 @@ pub struct AppState {
     pub fullscreen_suppressed: Arc<AtomicBool>,
     pub secondary_fullscreen_suppressed: Arc<AtomicBool>,
     pub taskbar_content_width: Mutex<i32>,
-    pub secondary_taskbar_content_width: Mutex<i32>,
+    pub secondary_taskbar_content_width: Mutex<Option<i32>>,
     pub secondary_taskbar_visible: Arc<AtomicBool>,
     pub last_flyout_req: Mutex<Option<FlyoutRequest>>,
     pub last_flyout_bounds: Mutex<Option<(FlyoutKind, PixelRect)>>,
-    pub pending_start_show: Mutex<Option<PendingSurfaceShow>>,
-    pub pending_flyout_show: Mutex<Option<PendingSurfaceShow>>,
+    pub active_start_metrics: Mutex<Option<ActiveSurfaceMetrics>>,
+    pub active_flyout_metrics: Mutex<Option<ActiveSurfaceMetrics>>,
     pub pending_start_exit: Mutex<Option<PendingSurfaceExit>>,
     pub pending_flyout_exit: Mutex<Option<PendingSurfaceExit>>,
     pub flyout_anim_gen: Arc<AtomicU64>,
@@ -543,16 +541,16 @@ fn compute_start_bounds(mon: win_shell::MonitorRect, sf: f64) -> PixelRect {
     let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
     let mon_w = mon.width.max(0);
     let mon_h = mon.height.max(0);
-    let avail_w = ((mon_w as f64 / sf) - 16.0).max(320.0);
-    let avail_h = ((mon_h as f64 / sf) - 80.0).max(320.0);
+    let avail_w = ((mon_w as f64 / sf) - 24.0).max(320.0);
+    let avail_h = ((mon_h as f64 / sf) - 88.0).max(320.0);
     let logical_w = avail_w.min(START_DEFAULT_LOGICAL_WIDTH);
     let logical_h = avail_h.min(START_DEFAULT_LOGICAL_HEIGHT);
     let max_w_px = (mon_w - 16).max(0);
     let max_h_px = (mon_h - 16).max(0);
     let w_px = ((logical_w * sf).round() as i32).clamp(0, max_w_px);
     let h_px = ((logical_h * sf).round() as i32).clamp(0, max_h_px);
-    // Keep visible chassis at the exact 92px logical clearance above monitor bottom (68 + 24px shadow pad).
-    let bar_gap = (68.0 * sf).round() as i32;
+    // Keep visible chassis at the exact 92px logical clearance above monitor bottom (76 + 16px shadow pad).
+    let bar_gap = (76.0 * sf).round() as i32;
     let x_px = mon.left + (mon_w - w_px) / 2;
     let y_px = (mon.bottom - bar_gap - h_px).max(mon.top + 8);
     PixelRect::new(x_px, y_px, x_px + w_px, y_px + h_px)
@@ -621,6 +619,11 @@ fn position_taskbar_window(app: &AppHandle) {
     apply_webview_bounds(&tb, hwnd, rect.left, rect.top, rect.width(), rect.height());
 }
 
+fn resolve_secondary_taskbar_content_width(state: &AppState) -> i32 {
+    lock_unpoisoned(&state.secondary_taskbar_content_width)
+        .unwrap_or_else(|| *lock_unpoisoned(&state.taskbar_content_width))
+}
+
 fn position_secondary_taskbar_window(app: &AppHandle) {
     let st = app.state::<AppState>();
     if !lock_unpoisoned(&st.coordinator).should_apply_secondary_taskbar_bounds() {
@@ -640,7 +643,7 @@ fn position_secondary_taskbar_window(app: &AppHandle) {
         return;
     };
     let Some(hwnd) = win_hwnd(&tb2) else { return };
-    let logical_w = *lock_unpoisoned(&st.secondary_taskbar_content_width);
+    let logical_w = resolve_secondary_taskbar_content_width(&st);
     let text_scale = win_shell::windows_text_scale_factor();
     let rect = compute_secondary_taskbar_bounds(sec_mon, text_scale, &bar_mode, logical_w);
     apply_webview_bounds(&tb2, hwnd, rect.left, rect.top, rect.width(), rect.height());
@@ -671,7 +674,7 @@ fn sync_secondary_taskbar(app: &AppHandle) {
     let sec_mon = win_shell::secondary_monitor_rects().into_iter().next();
     if sec_mode == config::SECONDARY_TASKBAR_MODE_TESTBAR && sec_allowed {
         if let Some(mon) = sec_mon {
-            let logical_w = *lock_unpoisoned(&st.secondary_taskbar_content_width);
+            let logical_w = resolve_secondary_taskbar_content_width(&st);
             let text_scale = win_shell::windows_text_scale_factor();
             let rect = compute_secondary_taskbar_bounds(mon, text_scale, &bar_mode, logical_w);
             apply_webview_bounds(&tb2, hwnd, rect.left, rect.top, rect.width(), rect.height());
@@ -754,6 +757,12 @@ struct ComputedFlyoutLayout {
     anchor_origin_x: f64,
     bottom_anchor_y: i32,
     monitor_top: i32,
+    max_h_logical: f64,
+}
+
+fn compute_flyout_max_height_logical(mon_h: i32, sf: f64) -> f64 {
+    let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
+    ((mon_h.max(0) as f64 / sf) - 88.0).clamp(240.0, 620.0)
 }
 
 fn compute_flyout_anchor_origin_x(
@@ -764,7 +773,7 @@ fn compute_flyout_anchor_origin_x(
 ) -> f64 {
     let sf = if sf.is_finite() && sf > 0.0 { sf } else { 1.0 };
     let rel = (anchor_screen_x_px - win_left_px) as f64 / sf;
-    let pad = win_shell::FLYOUT_ROOT_PAD_LOGICAL;
+    let pad = FLYOUT_ROOT_PAD_LOGICAL;
     let max_x = (total_w_logical - pad).max(pad);
     rel.clamp(pad, max_x)
 }
@@ -796,8 +805,9 @@ fn compute_flyout_layout(app: &AppHandle, req: &FlyoutRequest) -> ComputedFlyout
         mon.left + (req.anchor_x_logical * sf).round() as i32
     };
 
+    let max_h_logical = compute_flyout_max_height_logical(mon.height, sf);
     let req_w = req.width.clamp(1, 2000) as f64;
-    let req_h = req.height.clamp(1, 2000) as f64;
+    let req_h = (req.height as f64).clamp(48.0, max_h_logical);
     let total_w_logical = req_w + FLYOUT_ROOT_PAD_TOTAL_LOGICAL;
     let total_h_logical = req_h + FLYOUT_ROOT_PAD_TOTAL_LOGICAL;
     let w_px = (total_w_logical * sf).round() as i32;
@@ -805,12 +815,12 @@ fn compute_flyout_layout(app: &AppHandle, req: &FlyoutRequest) -> ComputedFlyout
     let is_edge =
         BarMode::from_config_str(&lock_unpoisoned(&app.state::<AppState>().config).bar_mode)
             == BarMode::Edge;
-    // Account for `.flyout-root`'s 18px bottom shadow pad so Preview sits flush and click flyouts sit 10px above.
+    // Account for `.flyout-root`'s 12px bottom shadow pad so Preview sits flush and click flyouts sit 10px above.
     let gap_logical = match (is_edge, req.kind) {
-        (true, FlyoutKind::Preview) => 34.0,
-        (true, _) => 44.0,
-        (false, FlyoutKind::Preview) => 46.0,
-        (false, _) => 56.0,
+        (true, FlyoutKind::Preview) => 40.0,
+        (true, _) => 50.0,
+        (false, FlyoutKind::Preview) => 52.0,
+        (false, _) => 62.0,
     };
     let bar_gap = (gap_logical * sf).round() as i32;
 
@@ -826,6 +836,7 @@ fn compute_flyout_layout(app: &AppHandle, req: &FlyoutRequest) -> ComputedFlyout
         anchor_origin_x,
         bottom_anchor_y,
         monitor_top: mon.top,
+        max_h_logical,
     }
 }
 
@@ -847,98 +858,91 @@ fn position_flyout_window(
     layout
 }
 
-fn commit_pending_surface_show(
+/// Clean fast-resize handler for `surface_commit_ack`: windows are shown immediately at 0ms
+/// (zero Paint-Sync stall!), and when the frontend reports a `measured_height` differing by
+/// >2px we atomically resize the HWND while keeping its bottom edge anchored.
+fn apply_surface_measured_height(
     app: &AppHandle,
     surface: &str,
     gen: u64,
     measured_height: Option<f64>,
 ) {
+    let Some(mh) = measured_height.filter(|h| h.is_finite()) else {
+        return;
+    };
     let st = app.state::<AppState>();
     match surface {
         "start" => {
-            let pending = {
-                let mut slot = lock_unpoisoned(&st.pending_start_show);
-                if slot.as_ref().is_some_and(|p| p.gen == gen) {
-                    slot.take()
-                } else {
-                    None
-                }
-            };
-            let Some(p) = pending else { return };
-            if st.start_anim_gen.load(Ordering::SeqCst) != gen {
+            if mh < 240.0 || st.start_anim_gen.load(Ordering::SeqCst) != gen {
                 return;
             }
             if !lock_unpoisoned(&st.coordinator).is_start_visible() {
                 return;
             }
+            let metrics = {
+                let slot = lock_unpoisoned(&st.active_start_metrics);
+                slot.filter(|m| m.gen == gen)
+            };
+            let Some(mut m) = metrics else { return };
+            let new_h = ((mh.clamp(240.0, m.max_h_logical) + 2.0 * START_ROOT_PAD_LOGICAL)
+                * m.scale_factor)
+                .round() as i32;
+            if (new_h - m.rect.height()).abs() <= 2 {
+                return;
+            }
+            let new_y = (m.bottom_anchor_y - new_h).max(m.monitor_top + 8);
+            let new_rect = PixelRect::new(m.rect.left, new_y, m.rect.right, new_y + new_h);
+            m.rect = new_rect;
+            *lock_unpoisoned(&st.active_start_metrics) = Some(m);
             if let Some(win) = app.get_webview_window("start") {
                 if let Some(hwnd) = win_hwnd(&win) {
-                    let mut rect = p.rect;
-                    let mut resized = false;
-                    if let Some(mh) = measured_height.filter(|h| h.is_finite() && *h >= 240.0) {
-                        let new_h = ((mh.clamp(240.0, 960.0) + 2.0 * win_shell::START_ROOT_PAD_LOGICAL)
-                            * p.scale_factor)
-                            .round() as i32;
-                        if (new_h - rect.height()).abs() > 2 {
-                            let new_y = (p.bottom_anchor_y - new_h).max(p.monitor_top + 8);
-                            rect = PixelRect::new(rect.left, new_y, rect.right, new_y + new_h);
-                            resized = true;
-                        }
-                    }
-                    if p.was_already_visible || resized {
-                        apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
-                    }
-                    win_shell::set_window_hit_transparent(hwnd, false);
-                    win_shell::set_window_visible(hwnd, true, !p.activate);
-                    if p.activate {
-                        let _ = win.set_focus();
-                    }
+                    apply_webview_bounds(
+                        &win,
+                        hwnd,
+                        new_rect.left,
+                        new_rect.top,
+                        new_rect.width(),
+                        new_rect.height(),
+                    );
                 }
             }
         }
         "flyout" => {
-            let pending = {
-                let mut slot = lock_unpoisoned(&st.pending_flyout_show);
-                if slot.as_ref().is_some_and(|p| p.gen == gen) {
-                    slot.take()
-                } else {
-                    None
-                }
-            };
-            let Some(p) = pending else { return };
-            if st.flyout_anim_gen.load(Ordering::SeqCst) != gen {
+            if mh < 36.0 || st.flyout_anim_gen.load(Ordering::SeqCst) != gen {
                 return;
             }
-            let active_kind = lock_unpoisoned(&st.coordinator).active_flyout();
-            let Some(kind) = active_kind else { return };
-
+            let Some(kind) = lock_unpoisoned(&st.coordinator).active_flyout() else {
+                return;
+            };
+            let metrics = {
+                let slot = lock_unpoisoned(&st.active_flyout_metrics);
+                slot.filter(|m| m.gen == gen)
+            };
+            let Some(mut m) = metrics else { return };
+            let clamped_h = mh.clamp(48.0, m.max_h_logical);
+            let new_h = ((clamped_h + FLYOUT_ROOT_PAD_TOTAL_LOGICAL) * m.scale_factor)
+                .round() as i32;
+            if (new_h - m.rect.height()).abs() <= 2 {
+                return;
+            }
+            let new_y = (m.bottom_anchor_y - new_h).max(m.monitor_top + 8);
+            let new_rect = PixelRect::new(m.rect.left, new_y, m.rect.right, new_y + new_h);
+            m.rect = new_rect;
+            *lock_unpoisoned(&st.active_flyout_metrics) = Some(m);
+            *lock_unpoisoned(&st.last_flyout_bounds) = Some((kind, new_rect));
+            if let Some(req) = lock_unpoisoned(&st.last_flyout_req).as_mut() {
+                req.height = clamped_h.round() as i32;
+            }
             if let Some(fly) = app.get_webview_window("flyout") {
                 if let Some(hwnd) = win_hwnd(&fly) {
-                    let mut rect = p.rect;
-                    let mut resized = false;
-                    if let Some(mh) = measured_height.filter(|h| h.is_finite() && *h >= 36.0) {
-                        let clamped_h = mh.clamp(48.0, 820.0);
-                        let new_h = ((clamped_h + FLYOUT_ROOT_PAD_TOTAL_LOGICAL) * p.scale_factor)
-                            .round() as i32;
-                        if (new_h - rect.height()).abs() > 2 {
-                            let new_y = (p.bottom_anchor_y - new_h).max(p.monitor_top + 8);
-                            rect = PixelRect::new(rect.left, new_y, rect.right, new_y + new_h);
-                            resized = true;
-                            if let Some(req) = lock_unpoisoned(&st.last_flyout_req).as_mut() {
-                                req.height = clamped_h.round() as i32;
-                            }
-                        }
-                    }
-                    if p.was_already_visible || resized {
-                        apply_webview_bounds(&fly, hwnd, rect.left, rect.top, rect.width(), rect.height());
-                    }
-                    *lock_unpoisoned(&st.last_flyout_bounds) = Some((kind, rect));
-                    win_shell::set_flyout_non_activating(!p.activate);
-                    win_shell::set_window_hit_transparent(hwnd, false);
-                    win_shell::set_window_visible(hwnd, true, !p.activate);
-                    if p.activate {
-                        let _ = fly.set_focus();
-                    }
+                    apply_webview_bounds(
+                        &fly,
+                        hwnd,
+                        new_rect.left,
+                        new_rect.top,
+                        new_rect.width(),
+                        new_rect.height(),
+                    );
                 }
             }
         }
@@ -1029,7 +1033,7 @@ fn apply_coordinator_actions(
     if hide_flyout_now {
         *lock_unpoisoned(&st.last_flyout_req) = None;
         *lock_unpoisoned(&st.last_flyout_bounds) = None;
-        *lock_unpoisoned(&st.pending_flyout_show) = None;
+        *lock_unpoisoned(&st.active_flyout_metrics) = None;
         *lock_unpoisoned(&st.pending_flyout_exit) = None;
         win_shell::cancel_window_x_glide();
         let hide_gen = actions
@@ -1047,7 +1051,7 @@ fn apply_coordinator_actions(
     } else if actions.flyout_visible == Some(false) {
         *lock_unpoisoned(&st.last_flyout_req) = None;
         *lock_unpoisoned(&st.last_flyout_bounds) = None;
-        *lock_unpoisoned(&st.pending_flyout_show) = None;
+        *lock_unpoisoned(&st.active_flyout_metrics) = None;
         win_shell::cancel_window_x_glide();
         let hide_gen = actions
             .flyout_anim_gen
@@ -1084,7 +1088,7 @@ fn apply_coordinator_actions(
             && (actions.flyout_visible == Some(true) || actions.taskbar_visible == Some(false)));
 
     if hide_start_now {
-        *lock_unpoisoned(&st.pending_start_show) = None;
+        *lock_unpoisoned(&st.active_start_metrics) = None;
         *lock_unpoisoned(&st.pending_start_exit) = None;
         let hide_gen = actions
             .start_anim_gen
@@ -1106,7 +1110,7 @@ fn apply_coordinator_actions(
             }
         }
     } else if actions.start_visible == Some(false) {
-        *lock_unpoisoned(&st.pending_start_show) = None;
+        *lock_unpoisoned(&st.active_start_metrics) = None;
         let hide_gen = actions
             .start_anim_gen
             .unwrap_or_else(|| st.start_anim_gen.fetch_add(1, Ordering::SeqCst) + 1);
@@ -1170,7 +1174,7 @@ fn apply_coordinator_actions(
         }
     }
 
-    // 3. Emit-Before-Show Paint-Sync for Start Menu
+    // 3. Zero-Lag Instant Show for Start Menu (0ms delay -> CSS @keyframes startIn plays from frame 0!)
     if actions.start_visible == Some(true) {
         capture_external_foreground_hwnd(&st);
         *lock_unpoisoned(&st.pending_start_exit) = None;
@@ -1182,33 +1186,24 @@ fn apply_coordinator_actions(
         let target_mon_req = actions.start_target_monitor.as_deref();
         let (mon, sf, resolved_monitor) = resolve_start_monitor_and_scale(app, target_mon_req);
         let rect = compute_start_bounds(mon, sf);
-        let was_visible = app
-            .get_webview_window("start")
-            .and_then(|w| win_hwnd(&w))
-            .is_some_and(|hwnd| win_shell::get_window_pixel_rect(hwnd).is_some());
 
-        if let Some(win) = app.get_webview_window("start") {
-            if let Some(hwnd) = win_hwnd(&win) {
-                win_shell::set_window_hit_transparent(hwnd, false);
-                if !was_visible {
-                    apply_webview_bounds(&win, hwnd, rect.left, rect.top, rect.width(), rect.height());
-                }
-            }
-        }
-
-        *lock_unpoisoned(&st.pending_start_show) = Some(PendingSurfaceShow {
+        *lock_unpoisoned(&st.active_start_metrics) = Some(ActiveSurfaceMetrics {
             gen: show_gen,
             rect,
             scale_factor: sf,
             bottom_anchor_y: rect.bottom,
             monitor_top: mon.top,
-            activate: true,
-            anchor_x: 0.0,
-            monitor: resolved_monitor.clone(),
-            was_already_visible: was_visible,
+            max_h_logical: 960.0,
         });
 
-        // Emit start-state BEFORE ShowWindow (Paint-Sync Protocol)
+        let start_win = app.get_webview_window("start");
+        let start_hwnd = start_win.as_ref().and_then(win_hwnd);
+        if let (Some(win), Some(hwnd)) = (&start_win, start_hwnd) {
+            win_shell::set_window_hit_transparent(hwnd, false);
+            apply_webview_bounds(win, hwnd, rect.left, rect.top, rect.width(), rect.height());
+        }
+
+        // Emit start-state and immediate cached hydration, then show instantaneously (0ms delay)
         let _ = app.emit(
             "start-state",
             StartStateEvent {
@@ -1218,8 +1213,6 @@ fn apply_coordinator_actions(
                 immediate: false,
             },
         );
-
-        // Hydrate Start immediately on hidden -> visible transition (AD-6)
         let cfg_snapshot = lock_unpoisoned(&st.config).clone();
         let win_snapshot = lock_unpoisoned(&st.last_window_groups).clone();
         let clips_snapshot = system_widgets::get_clipboard_history();
@@ -1229,19 +1222,10 @@ fn apply_coordinator_actions(
         let _ = app.emit_to("start", "clipboard-updated", &clips_snapshot);
         let _ = app.emit_to("start", "media-updated", &media_snapshot);
 
-        // 22ms max Paint-Sync failsafe timer so opening NEVER stalls
-        let h_fail = app.clone();
-        let anim_gen = Arc::clone(&st.start_anim_gen);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(PAINT_SYNC_SHOW_FAILSAFE_MS));
-            if anim_gen.load(Ordering::SeqCst) != show_gen {
-                return;
-            }
-            let h = h_fail.clone();
-            let _ = h_fail.run_on_main_thread(move || {
-                commit_pending_surface_show(&h, "start", show_gen, None);
-            });
-        });
+        if let (Some(win), Some(hwnd)) = (&start_win, start_hwnd) {
+            win_shell::set_window_visible(hwnd, true, false);
+            let _ = win.set_focus();
+        }
 
         let h_hyd = app.clone();
         std::thread::spawn(move || {
@@ -1272,7 +1256,7 @@ fn apply_coordinator_actions(
         });
     }
 
-    // 4. Emit-Before-Show Paint-Sync + Preview Horizontal Glide for Flyout
+    // 4. Zero-Lag Instant Show + Preview Horizontal Glide for Flyout (0ms delay -> CSS @keyframes flyIn plays from frame 0!)
     if actions.flyout_visible == Some(true) {
         *lock_unpoisoned(&st.pending_flyout_exit) = None;
         win_shell::cancel_window_x_glide();
@@ -1289,7 +1273,8 @@ fn apply_coordinator_actions(
             enriched.anchor_origin_x = Some(layout.anchor_origin_x);
             *lock_unpoisoned(&st.last_flyout_req) = Some(enriched.clone());
 
-            let fly_hwnd = app.get_webview_window("flyout").and_then(|w| win_hwnd(&w));
+            let fly_win = app.get_webview_window("flyout");
+            let fly_hwnd = fly_win.as_ref().and_then(win_hwnd);
             let was_visible =
                 fly_hwnd.is_some_and(|hwnd| win_shell::get_window_pixel_rect(hwnd).is_some());
             let prev_bounds = *lock_unpoisoned(&st.last_flyout_bounds);
@@ -1303,8 +1288,17 @@ fn apply_coordinator_actions(
                             && (layout.rect.height() - prev_rect.height()).abs() <= 2
                 );
 
+            *lock_unpoisoned(&st.active_flyout_metrics) = Some(ActiveSurfaceMetrics {
+                gen: show_gen,
+                rect: layout.rect,
+                scale_factor: layout.scale_factor,
+                bottom_anchor_y: layout.bottom_anchor_y,
+                monitor_top: layout.monitor_top,
+                max_h_logical: layout.max_h_logical,
+            });
+            *lock_unpoisoned(&st.last_flyout_bounds) = Some((req.kind, layout.rect));
+
             if is_same_width_preview_scrub {
-                *lock_unpoisoned(&st.pending_flyout_show) = None;
                 if let (Some(hwnd), Some((_, prev_rect))) = (fly_hwnd, prev_bounds) {
                     win_shell::set_flyout_non_activating(non_activating);
                     win_shell::set_window_hit_transparent(hwnd, false);
@@ -1316,58 +1310,31 @@ fn apply_coordinator_actions(
                         PREVIEW_GLIDE_DURATION_MS,
                     );
                 }
-                *lock_unpoisoned(&st.last_flyout_bounds) = Some((req.kind, layout.rect));
                 if actions.emit_flyout_show {
                     let _ = app.emit("flyout-show", &enriched);
                 }
             } else {
-                if let Some(fly) = app.get_webview_window("flyout") {
-                    if let Some(hwnd) = win_hwnd(&fly) {
-                        win_shell::set_flyout_non_activating(non_activating);
-                        win_shell::set_window_hit_transparent(hwnd, false);
-                        if !was_visible {
-                            apply_webview_bounds(
-                                &fly,
-                                hwnd,
-                                layout.rect.left,
-                                layout.rect.top,
-                                layout.rect.width(),
-                                layout.rect.height(),
-                            );
-                        }
-                    }
+                if let (Some(fly), Some(hwnd)) = (&fly_win, fly_hwnd) {
+                    win_shell::set_flyout_non_activating(non_activating);
+                    win_shell::set_window_hit_transparent(hwnd, false);
+                    apply_webview_bounds(
+                        fly,
+                        hwnd,
+                        layout.rect.left,
+                        layout.rect.top,
+                        layout.rect.width(),
+                        layout.rect.height(),
+                    );
                 }
-
-                *lock_unpoisoned(&st.pending_flyout_show) = Some(PendingSurfaceShow {
-                    gen: show_gen,
-                    rect: layout.rect,
-                    scale_factor: layout.scale_factor,
-                    bottom_anchor_y: layout.bottom_anchor_y,
-                    monitor_top: layout.monitor_top,
-                    activate: !non_activating,
-                    anchor_x: layout.anchor_origin_x,
-                    monitor: req.monitor.clone(),
-                    was_already_visible: was_visible,
-                });
-
-                // Emit flyout-show BEFORE ShowWindow (Paint-Sync Protocol)
                 if actions.emit_flyout_show {
                     let _ = app.emit("flyout-show", &enriched);
                 }
-
-                // 22ms max Paint-Sync failsafe timer
-                let h_fail = app.clone();
-                let anim_gen = Arc::clone(&st.flyout_anim_gen);
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(PAINT_SYNC_SHOW_FAILSAFE_MS));
-                    if anim_gen.load(Ordering::SeqCst) != show_gen {
-                        return;
+                if let (Some(fly), Some(hwnd)) = (&fly_win, fly_hwnd) {
+                    win_shell::set_window_visible(hwnd, true, non_activating);
+                    if !non_activating {
+                        let _ = fly.set_focus();
                     }
-                    let h = h_fail.clone();
-                    let _ = h_fail.run_on_main_thread(move || {
-                        commit_pending_surface_show(&h, "flyout", show_gen, None);
-                    });
-                });
+                }
             }
 
             // Hydrate Flyout immediately on hidden -> visible transition (AD-6)
@@ -1672,12 +1639,17 @@ fn resize_taskbar_dock(
     monitor: Option<String>,
 ) {
     if monitor.as_deref() == Some("secondary") {
-        *lock_unpoisoned(&state.secondary_taskbar_content_width) = logical_width;
+        *lock_unpoisoned(&state.secondary_taskbar_content_width) = Some(logical_width);
         position_secondary_taskbar_window(&app);
         return;
     }
     *lock_unpoisoned(&state.taskbar_content_width) = logical_width;
     position_taskbar_window(&app);
+    if lock_unpoisoned(&state.secondary_taskbar_content_width).is_none()
+        && state.secondary_taskbar_visible.load(Ordering::Acquire)
+    {
+        position_secondary_taskbar_window(&app);
+    }
     let actions = lock_unpoisoned(&state.coordinator).on_taskbar_bounds_updated();
     apply_coordinator_actions(&app, &actions, None);
 }
@@ -1708,7 +1680,7 @@ fn open_flyout(app: AppHandle, mut req: FlyoutRequest) {
 
 #[tauri::command]
 fn surface_commit_ack(app: AppHandle, surface: String, gen: u64, measured_height: Option<f64>) {
-    commit_pending_surface_show(&app, &surface, gen, measured_height);
+    apply_surface_measured_height(&app, &surface, gen, measured_height);
 }
 
 #[tauri::command]
@@ -1735,15 +1707,18 @@ fn resize_flyout(app: AppHandle, state: State<AppState>, width: Option<i32>, hei
         if let Some(w) = width {
             req.width = w.clamp(120, 1200);
         }
-        req.height = height.clamp(48, 820);
+        req.height = height.clamp(48, 620);
         req.clone()
     };
     if let Some(fly) = app.get_webview_window("flyout") {
         if let Some(hwnd) = win_hwnd(&fly) {
             let layout = position_flyout_window(&app, &fly, hwnd, &updated_req);
             *lock_unpoisoned(&state.last_flyout_bounds) = Some((kind, layout.rect));
-            if let Some(pending) = lock_unpoisoned(&state.pending_flyout_show).as_mut() {
-                pending.rect = layout.rect;
+            if let Some(metrics) = lock_unpoisoned(&state.active_flyout_metrics).as_mut() {
+                metrics.rect = layout.rect;
+                metrics.bottom_anchor_y = layout.bottom_anchor_y;
+                metrics.monitor_top = layout.monitor_top;
+                metrics.max_h_logical = layout.max_h_logical;
             }
         }
     }
@@ -1813,6 +1788,410 @@ async fn get_icons(app: AppHandle, keys: Vec<String>) -> Result<HashMap<String, 
     .map_err(|e| format!("task join error: {e}"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct PinIconLookupHint {
+    title: String,
+    icon_key: String,
+    match_exe: Option<String>,
+    match_aumid: Option<String>,
+}
+
+fn collect_pin_hints_for_target(cfg: &TestBarConfig, target: &str) -> Vec<PinIconLookupHint> {
+    let needle = target.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hints = Vec::new();
+    let lists: [&[PinItem]; 8] = [
+        &cfg.taskbar_pins,
+        &cfg.personal_pins,
+        &cfg.personal_links,
+        &cfg.work_folders,
+        &cfg.work_apps,
+        &cfg.studio_pins,
+        &cfg.studio_tools,
+        &cfg.game_launchers,
+    ];
+    for list in lists {
+        for pin in list {
+            if pin.target.trim().eq_ignore_ascii_case(needle) {
+                hints.push(PinIconLookupHint {
+                    title: pin.title.clone(),
+                    icon_key: pin.icon_key.clone(),
+                    match_exe: pin.match_exe.clone(),
+                    match_aumid: pin.match_aumid.clone(),
+                });
+            }
+        }
+    }
+    for sp in &cfg.custom_spaces {
+        for pin in &sp.items {
+            if pin.target.trim().eq_ignore_ascii_case(needle) {
+                hints.push(PinIconLookupHint {
+                    title: pin.title.clone(),
+                    icon_key: pin.icon_key.clone(),
+                    match_exe: pin.match_exe.clone(),
+                    match_aumid: pin.match_aumid.clone(),
+                });
+            }
+        }
+    }
+    hints
+}
+
+fn extract_exe_basename_lower(path: &str) -> Option<String> {
+    let norm = path.trim().trim_matches('"').replace('/', "\\");
+    if norm.is_empty() || norm.contains("://") {
+        return None;
+    }
+    let file_name = norm.rsplit('\\').next().unwrap_or(&norm).trim();
+    let low = file_name.to_lowercase();
+    if low.ends_with(".exe") && low.len() > 4 {
+        Some(low)
+    } else {
+        None
+    }
+}
+
+fn extract_target_stem_lower(target: &str) -> String {
+    let t = target.trim().trim_matches('"');
+    let low = t.to_lowercase();
+    if low.starts_with("http://") || low.starts_with("https://") {
+        let after = low
+            .split_once("://")
+            .map(|(_, r)| r)
+            .unwrap_or(&low)
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if after.contains("music.yandex") {
+            return "ymusic".to_string();
+        }
+        if after.contains("claude.ai") {
+            return "claude".to_string();
+        }
+        if after.contains("figma.com") {
+            return "figma".to_string();
+        }
+        return after
+            .strip_prefix("www.")
+            .unwrap_or(after)
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    if low.starts_with("steam://") {
+        return "steam".to_string();
+    }
+    if low.starts_with("ms-screenclip:") {
+        return "snipping".to_string();
+    }
+    let norm = t.replace('/', "\\");
+    let base = norm.rsplit('\\').next().unwrap_or(&norm);
+    base.strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .or_else(|| base.strip_suffix(".lnk"))
+        .or_else(|| base.strip_suffix(".LNK"))
+        .unwrap_or(base)
+        .trim()
+        .to_lowercase()
+}
+
+fn is_brand_icon_key(key: &str) -> bool {
+    matches!(
+        key,
+        "spark"
+            | "claude"
+            | "yandex"
+            | "ymusic"
+            | "discord"
+            | "telegram"
+            | "obsidian"
+            | "steam"
+            | "figma"
+            | "photoshop"
+            | "lightroom"
+            | "obs"
+            | "zen"
+            | "vscode"
+            | "cursor"
+            | "antigravity"
+            | "battlenet"
+            | "unity"
+            | "wiztree"
+    )
+}
+
+fn expand_app_aliases(token: &str, out: &mut Vec<String>) {
+    match token {
+        "wt" | "windowsterminal" | "терминал" | "windows terminal" => {
+            for a in ["windows terminal", "терминал", "windowsterminal"] {
+                out.push(a.to_string());
+            }
+        }
+        "spark" | "sparkdesktop" | "spark mail" => {
+            for a in ["spark", "spark mail", "spark desktop", "sparkdesktop"] {
+                out.push(a.to_string());
+            }
+        }
+        "claude" | "anthropicclaude" => {
+            for a in ["claude", "anthropicclaude"] {
+                out.push(a.to_string());
+            }
+        }
+        "yandex" | "яндекс" | "яндекс браузер" | "yandex browser" | "browser" => {
+            for a in ["яндекс браузер", "yandex browser", "yandex", "яндекс"] {
+                out.push(a.to_string());
+            }
+        }
+        "ymusic" | "я.музыка" | "яндекс музыка" | "yandex music" | "yandexmusic" => {
+            for a in ["яндекс музыка", "yandex music", "yandexmusic"] {
+                out.push(a.to_string());
+            }
+        }
+        "discord" => {
+            out.push("discord".to_string());
+        }
+        "snipping" | "ножницы" => {
+            for a in ["ножницы", "snipping tool", "screensketch"] {
+                out.push(a.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Matches a pin target (e.g. bare exe name, WindowsApps alias, Squirrel Update.exe, UWP app,
+/// or web fallback like `https://claude.ai`) against indexed installed apps (`state.installed_apps`),
+/// returning the best reloadable icon source (`shell:AppsFolder\<AUMID>` or real `.lnk`/`.exe`).
+fn find_matching_indexed_app_icon_source(
+    target: &str,
+    hints: &[PinIconLookupHint],
+    installed_apps: &[IndexedApp],
+) -> Option<String> {
+    if installed_apps.is_empty() {
+        return None;
+    }
+
+    let mut target_exes: Vec<String> = Vec::new();
+    let mut target_aumids: Vec<String> = Vec::new();
+    let mut exact_names: Vec<String> = Vec::new();
+    let mut alias_tokens: Vec<String> = Vec::new();
+
+    if let Some(exe) = extract_exe_basename_lower(target) {
+        if exe != "update.exe" {
+            target_exes.push(exe);
+        }
+    }
+    let stem = extract_target_stem_lower(target);
+    if !stem.is_empty() && stem != "update" {
+        exact_names.push(stem.clone());
+        expand_app_aliases(&stem, &mut alias_tokens);
+    }
+
+    // If target path contains parent app folder name (e.g. `...\Discord\Update.exe` or
+    // `...\SparkDesktop\SparkDesktop.exe`), capture that folder name as an extra signal.
+    let norm_target = target.trim().trim_matches('"').replace('/', "\\");
+    if let Some(parent_name) = std::path::Path::new(&norm_target)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_lowercase())
+    {
+        if !matches!(
+            parent_name.as_str(),
+            "" | "application" | "bin" | "64bit" | "windowsapps" | "system32" | "windows" | "programs"
+        ) {
+            exact_names.push(parent_name.clone());
+            expand_app_aliases(&parent_name, &mut alias_tokens);
+        }
+    }
+
+    for h in hints {
+        if let Some(ref a) = h.match_aumid {
+            let clean = a.trim().to_lowercase();
+            if !clean.is_empty() {
+                target_aumids.push(clean);
+            }
+        }
+        if let Some(ref e) = h.match_exe {
+            let clean = e.trim().to_lowercase();
+            if !clean.is_empty() && clean != "update.exe" {
+                target_exes.push(clean.clone());
+                let estem = clean.strip_suffix(".exe").unwrap_or(&clean);
+                expand_app_aliases(estem, &mut alias_tokens);
+            }
+        }
+        let title_low = h.title.trim().to_lowercase();
+        if !title_low.is_empty() {
+            exact_names.push(title_low.clone());
+            expand_app_aliases(&title_low, &mut alias_tokens);
+        }
+        let ik = h.icon_key.trim().to_lowercase();
+        if is_brand_icon_key(&ik) {
+            exact_names.push(ik.clone());
+            expand_app_aliases(&ik, &mut alias_tokens);
+        }
+    }
+
+    let wants_music = exact_names
+        .iter()
+        .chain(alias_tokens.iter())
+        .any(|t| t.contains("музык") || t.contains("music") || t == "ymusic");
+    let wants_yandex_browser = !wants_music
+        && (target_exes.iter().any(|e| e == "browser.exe")
+            || exact_names
+                .iter()
+                .chain(alias_tokens.iter())
+                .any(|t| t.contains("yandex") || t.contains("яндекс")));
+
+    let mut best_score: i32 = 0;
+    let mut best_source: Option<String> = None;
+
+    for app in installed_apps {
+        let app_name_low = app.name.trim().to_lowercase();
+        let app_aumid_low = app
+            .aumid
+            .as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default();
+        let app_exe_base = extract_exe_basename_lower(&app.target);
+        let app_target_stem = extract_target_stem_lower(&app.target);
+
+        let app_is_music =
+            app_name_low.contains("музык") || app_name_low.contains("music") || app_target_stem.contains("music");
+        if wants_yandex_browser && app_is_music {
+            continue;
+        }
+        if wants_music && !app_is_music && (app_name_low.contains("yandex") || app_name_low.contains("яндекс")) {
+            continue;
+        }
+
+        let mut score: i32 = 0;
+
+        // 1. Exact AUMID match
+        if !app_aumid_low.is_empty() && target_aumids.iter().any(|a| a == &app_aumid_low) {
+            score = score.max(120);
+        }
+
+        // 2. Exact .exe filename match (ignoring generic launcher stubs like update.exe)
+        if let Some(ref app_exe) = app_exe_base {
+            if app_exe != "update.exe" && target_exes.iter().any(|e| e == app_exe) {
+                score = score.max(100);
+            }
+        }
+
+        // 3. Exact display name match
+        if exact_names.iter().any(|n| n == &app_name_low)
+            || alias_tokens.iter().any(|a| a == &app_name_low)
+        {
+            score = score.max(92);
+        }
+
+        // 4. Strong AUMID package token match (e.g. Microsoft.WindowsTerminal, Claude, Readdle.Spark)
+        if !app_aumid_low.is_empty() {
+            for tok in alias_tokens.iter().chain(exact_names.iter()) {
+                if tok.len() >= 4 && !tok.contains(' ') && app_aumid_low.contains(tok.as_str()) {
+                    score = score.max(85);
+                }
+            }
+        }
+
+        // 5. Prefix / word-level match on display name or target stem
+        for tok in alias_tokens.iter().chain(exact_names.iter()) {
+            if tok.len() < 3 {
+                continue;
+            }
+            if app_name_low == *tok
+                || app_name_low.starts_with(&format!("{tok} "))
+                || app_name_low.ends_with(&format!(" {tok}"))
+                || app_target_stem == *tok
+            {
+                score = score.max(76);
+            } else if tok.len() >= 5
+                && (app_name_low.contains(tok.as_str()) || app_target_stem.contains(tok.as_str()))
+            {
+                score = score.max(68);
+            }
+        }
+
+        if score < 65 {
+            continue;
+        }
+        // Slight tie-breaker favoring packaged UWP apps (`shell:AppsFolder\<aumid>`) for crisp 96px tiles
+        if app.aumid.is_some() {
+            score += 2;
+        }
+        if score > best_score {
+            best_score = score;
+            best_source = if let Some(ref aumid) = app.aumid {
+                if aumid.to_ascii_lowercase().starts_with("shell:appsfolder\\") {
+                    Some(aumid.clone())
+                } else {
+                    Some(format!("shell:AppsFolder\\{aumid}"))
+                }
+            } else if !app.target.trim().is_empty() {
+                Some(app.target.clone())
+            } else {
+                None
+            };
+        }
+    }
+
+    best_source
+}
+
+fn find_matching_running_group_icon_source(
+    target: &str,
+    hints: &[PinIconLookupHint],
+    groups: &[AppWindowGroup],
+) -> Option<String> {
+    let mut want_exes: Vec<String> = Vec::new();
+    if let Some(exe) = extract_exe_basename_lower(target) {
+        if exe != "update.exe" {
+            want_exes.push(exe);
+        }
+    }
+    for h in hints {
+        if let Some(ref e) = h.match_exe {
+            let low = e.trim().to_lowercase();
+            if !low.is_empty() && low != "update.exe" {
+                want_exes.push(low);
+            }
+        }
+    }
+    for g in groups {
+        if let Some(ref aumid) = g.aumid {
+            if hints.iter().any(|h| {
+                h.match_aumid
+                    .as_deref()
+                    .is_some_and(|ma| ma.eq_ignore_ascii_case(aumid))
+            }) {
+                return Some(format!("shell:AppsFolder\\{aumid}"));
+            }
+        }
+        if let Some(g_exe) = extract_exe_basename_lower(&g.exe_path) {
+            if want_exes.iter().any(|w| w == &g_exe) {
+                if let Some(ref aumid) = g.aumid {
+                    return Some(format!("shell:AppsFolder\\{aumid}"));
+                }
+                if !g.exe_path.trim().is_empty() {
+                    return Some(g.exe_path.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn icon_cache_key_for_source(src: &str) -> String {
+    if src.trim().to_ascii_lowercase().starts_with("shell:appsfolder\\") {
+        icon_cache::aumid_key(src)
+    } else {
+        icon_cache::path_icon_key(src)
+    }
+}
+
 #[tauri::command]
 async fn resolve_pin_icons(
     app: AppHandle,
@@ -1823,30 +2202,87 @@ async fn resolve_pin_icons(
         let mut out = HashMap::new();
         let mut seen = std::collections::HashSet::new();
         let mut new_sources = Vec::new();
+        let mut needs_index_lookup: Vec<(String, bool)> = Vec::new();
+
         for raw in targets {
             let trimmed = raw.trim();
             if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
                 continue;
             }
             let low = trimmed.to_ascii_lowercase();
-            let is_local_or_uwp = trimmed.contains(":\\")
-                || trimmed.starts_with("\\\\")
-                || low.starts_with("shell:appsfolder\\");
-            if !is_local_or_uwp {
+            let is_winapps_alias = windows_tracker::is_windows_apps_execution_alias(trimmed);
+            let is_uri_scheme =
+                trimmed.contains("://") || low.starts_with("ms-") || low.starts_with("mailto:");
+
+            // Prefer UWP / installed_apps match FIRST for 0-byte WindowsApps aliases (e.g. wt.exe)
+            // and URL fallbacks (e.g. https://claude.ai when Claude Desktop is installed) so they
+            // never get stuck with a blank/missing icon.
+            if is_winapps_alias || is_uri_scheme {
+                needs_index_lookup.push((trimmed.to_string(), is_winapps_alias));
                 continue;
             }
+
             if let Some(uri) =
                 windows_tracker::extract_icon_for_path_cached(trimmed, &state.icon_cache)
             {
-                let key = if low.starts_with("shell:appsfolder\\") {
-                    icon_cache::aumid_key(trimmed)
-                } else {
-                    icon_cache::path_icon_key(trimmed)
-                };
+                let key = icon_cache_key_for_source(trimmed);
                 new_sources.push((key, trimmed.to_string()));
                 out.insert(trimmed.to_string(), uri);
+            } else {
+                needs_index_lookup.push((trimmed.to_string(), false));
             }
         }
+
+        if !needs_index_lookup.is_empty() {
+            // If startup background app indexing is still running and installed_apps is empty,
+            // wait briefly (on this blocking worker thread) so UWP/Squirrel/bare pins resolve on first paint.
+            if lock_unpoisoned(&state.installed_apps).is_empty() {
+                for _ in 0..30 {
+                    if !lock_unpoisoned(&state.installed_apps).is_empty()
+                        || !state.index_refresh_running.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+
+            let apps_snap = lock_unpoisoned(&state.installed_apps).clone();
+            let cfg_snap = lock_unpoisoned(&state.config).clone();
+            let groups_snap = lock_unpoisoned(&state.last_window_groups).clone();
+
+            for (trimmed, is_winapps_alias) in needs_index_lookup {
+                let hints = collect_pin_hints_for_target(&cfg_snap, &trimmed);
+                let matched_source =
+                    find_matching_indexed_app_icon_source(&trimmed, &hints, &apps_snap)
+                        .or_else(|| {
+                            find_matching_running_group_icon_source(&trimmed, &hints, &groups_snap)
+                        });
+
+                if let Some(src) = matched_source {
+                    if let Some(uri) =
+                        windows_tracker::extract_icon_for_path_cached(&src, &state.icon_cache)
+                    {
+                        let key = icon_cache_key_for_source(&src);
+                        new_sources.push((key, src));
+                        out.insert(trimmed, uri);
+                        continue;
+                    }
+                }
+
+                // Last-resort direct extraction for WindowsApps alias if no indexed UWP match existed
+                if is_winapps_alias {
+                    if let Some(uri) =
+                        windows_tracker::extract_icon_for_path_cached(&trimmed, &state.icon_cache)
+                    {
+                        let key = icon_cache_key_for_source(&trimmed);
+                        new_sources.push((key, trimmed.clone()));
+                        out.insert(trimmed, uri);
+                    }
+                }
+            }
+        }
+
         state.register_icon_sources(new_sources);
         out
     })
@@ -3024,12 +3460,12 @@ pub fn run(hide_native: bool) {
         fullscreen_suppressed: Arc::clone(&fullscreen_suppressed),
         secondary_fullscreen_suppressed: Arc::clone(&secondary_fullscreen_suppressed),
         taskbar_content_width: Mutex::new(620),
-        secondary_taskbar_content_width: Mutex::new(620),
+        secondary_taskbar_content_width: Mutex::new(None),
         secondary_taskbar_visible: Arc::clone(&secondary_taskbar_visible),
         last_flyout_req: Mutex::new(None),
         last_flyout_bounds: Mutex::new(None),
-        pending_start_show: Mutex::new(None),
-        pending_flyout_show: Mutex::new(None),
+        active_start_metrics: Mutex::new(None),
+        active_flyout_metrics: Mutex::new(None),
         pending_start_exit: Mutex::new(None),
         pending_flyout_exit: Mutex::new(None),
         flyout_anim_gen: Arc::clone(&flyout_anim_gen),
@@ -3560,12 +3996,12 @@ mod integration_tests {
             fullscreen_suppressed: Arc::new(AtomicBool::new(false)),
             secondary_fullscreen_suppressed: Arc::new(AtomicBool::new(false)),
             taskbar_content_width: Mutex::new(width),
-            secondary_taskbar_content_width: Mutex::new(width),
+            secondary_taskbar_content_width: Mutex::new(None),
             secondary_taskbar_visible: Arc::new(AtomicBool::new(false)),
             last_flyout_req: Mutex::new(None),
             last_flyout_bounds: Mutex::new(None),
-            pending_start_show: Mutex::new(None),
-            pending_flyout_show: Mutex::new(None),
+            active_start_metrics: Mutex::new(None),
+            active_flyout_metrics: Mutex::new(None),
             pending_start_exit: Mutex::new(None),
             pending_flyout_exit: Mutex::new(None),
             flyout_anim_gen: Arc::new(AtomicU64::new(0)),
@@ -3827,7 +4263,7 @@ mod integration_tests {
         assert_eq!(dock_140.width(), 918);
         assert_eq!(dock_140.height(), 118);
 
-        // Start bounds at 1.0x on 1920x1080 -> full 1188x728 logical (1140x680 + 24px shadow pad on all 4 sides)
+        // Start bounds at 1.0x on 1920x1080 -> full 1172x712 logical (1140x680 + 16px shadow pad on all 4 sides)
         let mon_1080 = win_shell::MonitorRect {
             left: 0,
             top: 0,
@@ -3838,15 +4274,15 @@ mod integration_tests {
             dpi: 96,
         };
         let start_100 = compute_start_bounds(mon_1080, 1.0);
-        assert_eq!(start_100.width(), 1188);
-        assert_eq!(start_100.height(), 728);
+        assert_eq!(start_100.width(), 1172);
+        assert_eq!(start_100.height(), 712);
         assert!(start_100.left >= mon_1080.left && start_100.right <= mon_1080.right);
         assert!(start_100.top >= mon_1080.top && start_100.bottom <= mon_1080.bottom);
 
-        // Start bounds at 1.4x on 2560x1440 -> full 1188x728 scaled cleanly
+        // Start bounds at 1.4x on 2560x1440 -> full 1172x712 scaled cleanly
         let start_1440_140 = compute_start_bounds(mon_1440, 1.4);
-        assert_eq!(start_1440_140.width(), (1188.0_f64 * 1.4).round() as i32);
-        assert_eq!(start_1440_140.height(), (728.0_f64 * 1.4).round() as i32);
+        assert_eq!(start_1440_140.width(), (1172.0_f64 * 1.4).round() as i32);
+        assert_eq!(start_1440_140.height(), (712.0_f64 * 1.4).round() as i32);
         assert!(start_1440_140.top >= mon_1440.top + 8);
 
         // Start bounds at 1.4x on 1920x1080 -> clamped cleanly inside monitor bounds
@@ -4591,10 +5027,10 @@ mod integration_tests {
 
     #[test]
     fn paint_sync_anchor_origin_event_shapes_pid_hwnd_map_and_icon_sources_work_cleanly() {
-        // 1. Anchor origin X clamps cleanly within [18, total_w - 18] logical px
+        // 1. Anchor origin X clamps cleanly within [12, total_w - 12] logical px (12px flyout shadow pad)
         assert!((compute_flyout_anchor_origin_x(500, 400, 320.0, 1.0) - 100.0).abs() < 1e-6);
-        assert!((compute_flyout_anchor_origin_x(405, 400, 320.0, 1.0) - 18.0).abs() < 1e-6);
-        assert!((compute_flyout_anchor_origin_x(999, 400, 320.0, 1.0) - 302.0).abs() < 1e-6);
+        assert!((compute_flyout_anchor_origin_x(405, 400, 320.0, 1.0) - 12.0).abs() < 1e-6);
+        assert!((compute_flyout_anchor_origin_x(999, 400, 320.0, 1.0) - 308.0).abs() < 1e-6);
         assert!((compute_flyout_anchor_origin_x(700, 400, 320.0, 1.5) - 200.0).abs() < 1e-6);
 
         // 2. StartStateEvent and FlyoutHideEvent serialize in camelCase
@@ -4668,5 +5104,171 @@ mod integration_tests {
         assert!((normalize_session_volume_scalar(f32::NAN) - 0.0).abs() < 1e-6);
         assert!((normalize_session_volume_scalar(f32::INFINITY) - 0.0).abs() < 1e-6);
         assert!((normalize_session_volume_scalar(f32::NEG_INFINITY) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pin_icon_fallback_matches_installed_apps_flyout_height_clamp_and_secondary_width_default() {
+        // 1. Secondary taskbar content width defaults to primary until Monitor 2 reports its own width
+        let state = make_test_app_state("dock", 740);
+        assert_eq!(resolve_secondary_taskbar_content_width(&state), 740);
+        *state.taskbar_content_width.lock().unwrap() = 510;
+        assert_eq!(resolve_secondary_taskbar_content_width(&state), 510);
+        *state.secondary_taskbar_content_width.lock().unwrap() = Some(480);
+        assert_eq!(resolve_secondary_taskbar_content_width(&state), 480);
+
+        // 2. Flyout max height clamps cleanly in [240, 620] logical px
+        assert!((compute_flyout_max_height_logical(1080, 1.0) - 620.0).abs() < 1e-6);
+        assert!((compute_flyout_max_height_logical(1440, 1.4) - 620.0).abs() < 1e-6);
+        assert!((compute_flyout_max_height_logical(768, 1.25) - 526.4).abs() < 1e-6);
+        assert!((compute_flyout_max_height_logical(300, 1.0) - 240.0).abs() < 1e-6);
+
+        // 3. Pin fallback icon matching against installed_apps covers Spark, Claude, Yandex Browser
+        //    (without colliding with Yandex Music!), Discord, and Windows Terminal (wt.exe)
+        let apps = vec![
+            IndexedApp {
+                id: "uwp-0".into(),
+                name: "Windows Terminal".into(),
+                category: "Разработка".into(),
+                target: r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".into(),
+                aumid: Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".into()),
+                icon_key: Some("aumid:wt".into()),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "uwp-1".into(),
+                name: "Spark".into(),
+                category: "Общение".into(),
+                target: r"shell:AppsFolder\Readdle.SparkDesktop_abc!App".into(),
+                aumid: Some("Readdle.SparkDesktop_abc!App".into()),
+                icon_key: Some("aumid:spark".into()),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "uwp-2".into(),
+                name: "Claude".into(),
+                category: "AI".into(),
+                target: r"shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude".into(),
+                aumid: Some("Claude_pzs8sxrjxfjjc!Claude".into()),
+                icon_key: Some("aumid:claude".into()),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "app-0".into(),
+                name: "Яндекс Браузер".into(),
+                category: "Интернет".into(),
+                target: r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Yandex.lnk".into(),
+                aumid: None,
+                icon_key: Some("file:yandex".into()),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "app-1".into(),
+                name: "Яндекс Музыка".into(),
+                category: "Медиа".into(),
+                target: r"C:\Users\me\AppData\Local\Programs\YandexMusic\Яндекс Музыка.exe".into(),
+                aumid: None,
+                icon_key: Some("exe:ymusic".into()),
+                icon_data: None,
+            },
+            IndexedApp {
+                id: "app-2".into(),
+                name: "Discord".into(),
+                category: "Общение".into(),
+                target: r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Discord Inc\Discord.lnk".into(),
+                aumid: None,
+                icon_key: Some("file:discord".into()),
+                icon_data: None,
+            },
+        ];
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\wt.exe",
+                &[PinIconLookupHint {
+                    title: "Терминал".into(),
+                    icon_key: "warp".into(),
+                    match_exe: Some("wt.exe".into()),
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App")
+        );
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                "https://claude.ai",
+                &[PinIconLookupHint {
+                    title: "Claude".into(),
+                    icon_key: "claude".into(),
+                    match_exe: None,
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude")
+        );
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                "Spark",
+                &[PinIconLookupHint {
+                    title: "Spark Mail".into(),
+                    icon_key: "spark".into(),
+                    match_exe: None,
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"shell:AppsFolder\Readdle.SparkDesktop_abc!App")
+        );
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                "browser.exe",
+                &[PinIconLookupHint {
+                    title: "Яндекс".into(),
+                    icon_key: "yandex".into(),
+                    match_exe: Some("browser.exe".into()),
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Yandex.lnk")
+        );
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                "https://music.yandex.ru",
+                &[PinIconLookupHint {
+                    title: "Я.Музыка".into(),
+                    icon_key: "ymusic".into(),
+                    match_exe: None,
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"C:\Users\me\AppData\Local\Programs\YandexMusic\Яндекс Музыка.exe")
+        );
+
+        assert_eq!(
+            find_matching_indexed_app_icon_source(
+                r"C:\Users\me\AppData\Local\Discord\Update.exe",
+                &[PinIconLookupHint {
+                    title: "Discord".into(),
+                    icon_key: "discord".into(),
+                    match_exe: Some("discord.exe".into()),
+                    match_aumid: None,
+                }],
+                &apps,
+            )
+            .as_deref(),
+            Some(r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Discord Inc\Discord.lnk")
+        );
     }
 }

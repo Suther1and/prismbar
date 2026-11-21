@@ -53,10 +53,12 @@ export const TASKBAR_LAUNCH_HOP_MS = 880;
 
 export const VOLUME_OSD_WIDTH = 184;
 export const VOLUME_OSD_HEIGHT = 42;
-export const SOUND_FLYOUT_WIDTH = 332;
+export const SOUND_FLYOUT_WIDTH = 336;
 export const SOUND_FLYOUT_INITIAL_HEIGHT = 340;
 export const CALENDAR_FLYOUT_WIDTH = 310;
 export const CALENDAR_FLYOUT_INITIAL_HEIGHT = 408;
+export const EDGE_CENTERED_MIN_WIDTH = 1180;
+export const DOCK_CHROME_EXTRA_PX = 19; // 14px horizontal padding + 2px border + 3px group gap
 
 const WEEKDAYS_JS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'] as const;
 
@@ -67,6 +69,21 @@ export function resolveTaskbarMonitor(search: string): TaskbarMonitor {
 
 export function getTaskbarRootClassName(barMode?: string | null): string {
   return barMode === 'edge' ? 'tb-root edge' : 'tb-root';
+}
+
+/**
+ * Applies `.edge-centered` (3-column centered apps layout) strictly on wide primary displays.
+ * Secondary or narrow/vertical monitors render a clean left-to-right flex bar so icons never
+ * stretch awkwardly across narrow screens.
+ */
+export function shouldUseEdgeCenteredLayout(
+  barMode: string | null | undefined,
+  monitor: TaskbarMonitor,
+  viewportWidth: number,
+): boolean {
+  if (barMode !== 'edge') return false;
+  if (monitor === 'secondary') return false;
+  return Number.isFinite(viewportWidth) ? viewportWidth >= EDGE_CENTERED_MIN_WIDTH : true;
 }
 
 export type TaskbarItemStateClass = 'active' | 'running' | 'minimized' | 'idle';
@@ -92,6 +109,131 @@ export function computeDockLogicalWidth(scrollWidth: number, rectWidth: number):
   const safeRect = Number.isFinite(rectWidth) ? rectWidth : 0;
   const measured = Math.ceil(Math.max(safeScroll, safeRect));
   return measured > 200 ? measured : null;
+}
+
+/**
+ * Computes unconstrained border-box dock width combining the capsule's `scrollWidth` (+2px border),
+ * rendered rect width, and unconstrained child group scroll widths so icons never clip into slivers.
+ */
+export function computeNaturalDockWidth(
+  barScrollWidth: number,
+  barRectWidth: number,
+  appsNaturalWidth = 0,
+  trayNaturalWidth = 0,
+): number | null {
+  const safeBarScroll = Number.isFinite(barScrollWidth) && barScrollWidth > 0 ? barScrollWidth + 2 : 0;
+  const safeRect = Number.isFinite(barRectWidth) && barRectWidth > 0 ? barRectWidth : 0;
+  const safeApps = Number.isFinite(appsNaturalWidth) && appsNaturalWidth > 0 ? appsNaturalWidth : 0;
+  const safeTray = Number.isFinite(trayNaturalWidth) && trayNaturalWidth > 0 ? trayNaturalWidth : 0;
+  const groupsTotal = safeApps > 0 && safeTray > 0 ? safeApps + safeTray + DOCK_CHROME_EXTRA_PX : 0;
+  return computeDockLogicalWidth(Math.max(safeBarScroll, groupsTotal), safeRect);
+}
+
+export interface TaskbarOrderMemory {
+  unpinnedIds: string[];
+  windowHwndsByGroup: Map<string, number[]>;
+}
+
+export function createTaskbarOrderMemory(): TaskbarOrderMemory {
+  return {
+    unpinnedIds: [],
+    windowHwndsByGroup: new Map(),
+  };
+}
+
+/**
+ * Stabilizes unpinned taskbar icons AND per-group window order against Z-order churn on click:
+ * - Pinned items always remain first in exact `config.taskbarPins` order.
+ * - Unpinned items preserve their first-seen slot order until closed; new apps append at the end.
+ * - Multi-window groups preserve first-seen HWND order so preview cards and click-cycling never jump.
+ */
+export function stabilizeTaskbarItemsOrder(
+  items: readonly MergedBarItem[],
+  memory: TaskbarOrderMemory,
+): MergedBarItem[] {
+  const pinned: MergedBarItem[] = [];
+  const unpinnedById = new Map<string, MergedBarItem>();
+  const activeGroupKeys = new Set<string>();
+
+  const stabilizeItemWindows = (item: MergedBarItem): MergedBarItem => {
+    const group = item.group;
+    if (!group || group.windows.length === 0) return item;
+    activeGroupKeys.add(group.key);
+
+    if (group.windows.length === 1) {
+      memory.windowHwndsByGroup.set(group.key, [group.windows[0].hwnd]);
+      return item;
+    }
+
+    const byHwnd = new Map<number, OpenWindowInfo>();
+    for (const w of group.windows) {
+      byHwnd.set(w.hwnd, w);
+    }
+
+    const prevOrder = memory.windowHwndsByGroup.get(group.key) ?? [];
+    const nextOrder: number[] = [];
+    const seen = new Set<number>();
+
+    for (const hwnd of prevOrder) {
+      if (byHwnd.has(hwnd) && !seen.has(hwnd)) {
+        nextOrder.push(hwnd);
+        seen.add(hwnd);
+      }
+    }
+    for (const w of group.windows) {
+      if (!seen.has(w.hwnd)) {
+        nextOrder.push(w.hwnd);
+        seen.add(w.hwnd);
+      }
+    }
+
+    memory.windowHwndsByGroup.set(group.key, nextOrder);
+    const orderedWindows = nextOrder.map((h) => byHwnd.get(h)!);
+    const unchanged = orderedWindows.every((w, idx) => w === group.windows[idx]);
+    if (unchanged) return item;
+    return {
+      ...item,
+      group: {
+        ...group,
+        windows: orderedWindows,
+      },
+    };
+  };
+
+  for (const raw of items) {
+    const item = stabilizeItemWindows(raw);
+    if (item.pinned) {
+      pinned.push(item);
+    } else {
+      unpinnedById.set(item.id, item);
+    }
+  }
+
+  for (const key of Array.from(memory.windowHwndsByGroup.keys())) {
+    if (!activeGroupKeys.has(key)) {
+      memory.windowHwndsByGroup.delete(key);
+    }
+  }
+
+  const nextUnpinnedOrder: string[] = [];
+  const seenUnpinned = new Set<string>();
+
+  for (const id of memory.unpinnedIds) {
+    if (unpinnedById.has(id) && !seenUnpinned.has(id)) {
+      nextUnpinnedOrder.push(id);
+      seenUnpinned.add(id);
+    }
+  }
+  for (const id of unpinnedById.keys()) {
+    if (!seenUnpinned.has(id)) {
+      nextUnpinnedOrder.push(id);
+      seenUnpinned.add(id);
+    }
+  }
+
+  memory.unpinnedIds = nextUnpinnedOrder;
+  const stableUnpinned = nextUnpinnedOrder.map((id) => unpinnedById.get(id)!);
+  return [...pinned, ...stableUnpinned];
 }
 
 export function isInteractiveFlyoutActive(activeFlyout: string): boolean {

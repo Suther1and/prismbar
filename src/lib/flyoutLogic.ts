@@ -8,7 +8,7 @@ import type {
   TrayAppItem,
 } from './ipc';
 
-export type FlyoutPhase = 'closed' | 'entering' | 'open' | 'closing';
+export type FlyoutPhase = 'closed' | 'open' | 'closing';
 
 export interface FlyoutAnimState {
   phase: FlyoutPhase;
@@ -18,21 +18,24 @@ export interface FlyoutAnimState {
   req: FlyoutRequest | null;
 }
 
-export const FLYOUT_EXIT_MS = 110;
+export const FLYOUT_EXIT_MS = 105;
 export const CONTEXT_FLYOUT_EXIT_MS = 95;
 export const PREVIEW_LEAVE_COMMAND = 'close_preview_if_outside' as const;
 export const OSD_AUTO_CLOSE_MS = 1100;
 export const PREVIEW_CARD_CLOSE_MS = 105;
 export const AUDIO_PEAK_POLL_MS = 130;
-export const FLYOUT_ROOT_PAD_LOGICAL = 18;
+export const FLYOUT_ROOT_PAD_LOGICAL = 12;
+export const FLYOUT_MAX_CARD_HEIGHT = 580;
+export const QS_MIXER_MAX_HEIGHT = 220;
 
 export const TRAY_COLUMNS = 6;
-export const TRAY_CARD_WIDTH = 248;
+export const TRAY_CARD_WIDTH = 244;
 export const TRAY_CELL_SIZE = 34;
 export const TRAY_GRID_GAP = 4;
 export const TRAY_HEADER_HEIGHT = 24;
 export const TRAY_GRID_MAX_HEIGHT = 224;
-export const TRAY_MIN_CARD_HEIGHT = 204;
+export const TRAY_MIN_CARD_HEIGHT = 128;
+export const TRAY_CTX_OPEN_MIN_HEIGHT = 184;
 
 export const INITIAL_FLYOUT_ANIM_STATE: FlyoutAnimState = {
   phase: 'closed',
@@ -64,14 +67,14 @@ function computeScrubDirection(prevAnchorX: number, nextAnchorX: number): -1 | 0
 }
 
 /**
- * Transitions flyout into `'entering'` with an incremented `renderSeq` so enter choreography
- * plays cleanly on every cold open or kind switch (including rapid reopen cancelling an exit).
+ * Transitions flyout immediately into `'open'` with an incremented `renderSeq` so CSS `@keyframes flyIn`
+ * plays cleanly from frame 0 on every cold open or kind switch (including rapid reopen cancelling an exit).
  * - Consecutive `'osd'` updates update in place without bumping `renderSeq`.
  * - Consecutive `'preview'` scrubs keep `.flyout-card` mounted (no vertical re-bounce!),
  *   bumping `scrubSeq` with directional `scrubDir` when moving across taskbar apps.
  */
 export function reduceFlyoutShow(state: FlyoutAnimState, req: FlyoutRequest): FlyoutAnimState {
-  const isLive = state.phase === 'entering' || state.phase === 'open';
+  const isLive = state.phase === 'open';
 
   if (req.kind === 'osd' && state.req?.kind === 'osd' && isLive) {
     return {
@@ -94,7 +97,7 @@ export function reduceFlyoutShow(state: FlyoutAnimState, req: FlyoutRequest): Fl
   }
 
   return {
-    phase: 'entering',
+    phase: 'open',
     renderSeq: state.renderSeq + 1,
     scrubSeq: 0,
     scrubDir: 0,
@@ -102,11 +105,43 @@ export function reduceFlyoutShow(state: FlyoutAnimState, req: FlyoutRequest): Fl
   };
 }
 
-export function reduceFlyoutEntered(state: FlyoutAnimState): FlyoutAnimState {
-  if (state.phase !== 'entering' || !state.req) {
-    return state;
+/**
+ * Computes unconstrained logical card height for dynamic flyouts (Context Menu, Quick Sound, Calendar)
+ * accounting for card borders and any flex-constrained inner scroll container (`.ctx-scroll` / `.qs-mixer-scroll`),
+ * clamped cleanly to `[48, FLYOUT_MAX_CARD_HEIGHT]`.
+ */
+export function computeFlyoutCardHeight(params: {
+  cardScrollHeight: number;
+  borderY?: number;
+  innerScrollHeight?: number;
+  innerClientHeight?: number;
+  innerMaxHeight?: number;
+  ceiling?: number;
+}): number | null {
+  const base = Number.isFinite(params.cardScrollHeight) ? params.cardScrollHeight : 0;
+  if (base < 48) return null;
+  const borderY =
+    typeof params.borderY === 'number' && Number.isFinite(params.borderY) && params.borderY >= 0
+      ? params.borderY
+      : 2;
+  let extra = 0;
+  if (
+    typeof params.innerScrollHeight === 'number' &&
+    typeof params.innerClientHeight === 'number' &&
+    Number.isFinite(params.innerScrollHeight) &&
+    Number.isFinite(params.innerClientHeight)
+  ) {
+    const desiredInner =
+      typeof params.innerMaxHeight === 'number' && Number.isFinite(params.innerMaxHeight)
+        ? Math.min(params.innerMaxHeight, params.innerScrollHeight)
+        : params.innerScrollHeight;
+    extra = Math.max(0, desiredInner - params.innerClientHeight);
   }
-  return { ...state, phase: 'open' };
+  const ceiling =
+    typeof params.ceiling === 'number' && Number.isFinite(params.ceiling)
+      ? params.ceiling
+      : FLYOUT_MAX_CARD_HEIGHT;
+  return Math.max(48, Math.min(ceiling, Math.ceil(base + borderY + extra)));
 }
 
 /**
@@ -150,7 +185,7 @@ export function reduceFlyoutHideImmediate(state: FlyoutAnimState): FlyoutAnimSta
 }
 
 /**
- * Converts Rust's window-relative `anchorOriginX` (which includes `.flyout-root`'s 18px left pad)
+ * Converts Rust's window-relative `anchorOriginX` (which includes `.flyout-root`'s 12px left pad)
  * into a clamped card-local `transform-origin` X coordinate in logical px.
  */
 export function computeCardOriginX(
@@ -231,18 +266,20 @@ export function formatTrayHeaderLabel(hoveredName: string, totalCount: number): 
 }
 
 /**
- * Computes compact 6-column tray flyout height strictly from item count (completely independent
- * of hover state or right-click overlay), guaranteeing zero vertical jump during interaction.
+ * Computes compact 6-column tray flyout height from item count (`min 128px`),
+ * expanding dynamically to `184px` ONLY while the tray right-click menu is open so normal tray
+ * grids stay ultra-compact and right-clicking renders flush inside `.tray-card`.
  */
-export function computeTrayFlyoutHeight(appCount: number): number {
+export function computeTrayFlyoutHeight(appCount: number, ctxMenuOpen = false): number {
   const safeCount = Math.max(0, Math.floor(appCount));
   const rows = Math.max(1, Math.ceil(safeCount / TRAY_COLUMNS));
   const gridHeight = Math.min(
     TRAY_GRID_MAX_HEIGHT,
     rows * TRAY_CELL_SIZE + Math.max(0, rows - 1) * TRAY_GRID_GAP,
   );
-  // 8px top + 24px fixed header + 6px gap + grid + 8px bottom = grid + 46px
-  return Math.max(TRAY_MIN_CARD_HEIGHT, gridHeight + 46);
+  // 10px top + 24px fixed header + 6px gap + grid + 10px bottom = grid + 50px
+  const floor = ctxMenuOpen ? TRAY_CTX_OPEN_MIN_HEIGHT : TRAY_MIN_CARD_HEIGHT;
+  return Math.max(floor, gridHeight + 50);
 }
 
 /**

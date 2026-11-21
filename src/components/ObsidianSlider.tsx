@@ -246,6 +246,9 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
 
   const rootCls = className ? `obs-slider ${className}` : 'obs-slider';
 
+  const effectivePeak = muted ? 0 : (peakNorm ?? 0);
+  const hasActivePeak = !muted && peakNorm !== null && peakNorm > 0.005;
+
   return (
     <div
       ref={rootRef}
@@ -260,11 +263,12 @@ export const ObsidianSlider: React.FC<ObsidianSliderProps> = ({
       data-muted={muted ? 'true' : 'false'}
       data-detent={detentHit ? 'true' : 'false'}
       data-disabled={disabled ? 'true' : 'false'}
+      data-has-peak={hasActivePeak ? 'true' : 'false'}
       className={rootCls}
       style={
         {
           ['--slider-pct' as string]: pct,
-          ['--slider-peak' as string]: peakNorm ?? 0,
+          ['--slider-peak' as string]: effectivePeak,
         } as React.CSSProperties
       }
       onPointerDown={handlePointerDown}

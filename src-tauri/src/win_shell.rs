@@ -75,6 +75,7 @@ pub const WM_APPBAR_CALLBACK: u32 = WM_APP + 10;
 pub const WM_APPBAR_UPDATE_MODE: u32 = WM_APP + 12;
 pub const HOOK_EVENT_CHANNEL_CAPACITY: usize = 64;
 pub const VK_DUMMY_MASK: u16 = 0xE8;
+pub const TESTBAR_INJECTED_EXTRA_INFO: usize = 0x5442_4152; // "TBAR" tag for our own SendInput masks
 pub const LLKHF_INJECTED_FLAG: u32 = 0x0000_0010;
 pub const LLKHF_LOWER_IL_INJECTED_FLAG: u32 = 0x0000_0002;
 pub const LLKHF_ALTDOWN_FLAG: u32 = 0x0000_0020;
@@ -2151,6 +2152,20 @@ impl WinKeyStateMachine {
         self.lwin_down || self.rwin_down
     }
 
+    pub fn is_win_key_down(&self, vk: u16) -> bool {
+        if vk == VK_LWIN.0 {
+            self.lwin_down
+        } else if vk == VK_RWIN.0 {
+            self.rwin_down
+        } else {
+            false
+        }
+    }
+
+    pub fn is_combo_used(&self) -> bool {
+        self.combo_used
+    }
+
     /// Reconciles tracked Win key flags against physical key state (e.g. after `Win+L`,
     /// UAC, or `Ctrl+Alt+Del` swallowed `Win Up` on the Secure Desktop).
     pub(crate) fn reconcile_physical_win_keys(
@@ -2512,22 +2527,18 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-/// Injects `[0xE8 DOWN, 0xE8 UP, vk KEYUP]` in one atomic batch.
-/// Returns `true` ONLY when Windows accepted every event (`sent as usize == inputs.len()`);
-/// returns `false` if UIPI blocked `SendInput` (e.g. elevated Admin foreground window) so callers
-/// never swallow physical `Win KEYUP` and never leave the `Win` modifier permanently stuck.
-fn send_masked_win_keyup(vk: u16) -> bool {
+/// Injects `[0xE8 DOWN, 0xE8 UP]` (without releasing Win) on a fresh physical lone-Win
+/// `KEYDOWN`, immediately disarming Windows' "lone Win opens native Start" latch while
+/// keeping `VK_LWIN`/`VK_RWIN` held down so `Win+D`/`Win+E`/`Win+L`/`Win+Tab`/etc. work natively.
+fn send_win_down_mask() -> bool {
     unsafe {
-        // Inject [0xE8 DOWN, 0xE8 UP, vk KEYUP] in one atomic batch while swallowing the
-        // physical Win KEYUP via LRESULT(1). This guarantees the mask key strictly precedes
-        // the Win release seen by Explorer so native Windows Start never pops over TestBar.
-        // All 3 events carry LLKHF_INJECTED so our WH_KEYBOARD_LL hook ignores them.
         let inputs = [
             INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
                         wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
+                        dwExtraInfo: TESTBAR_INJECTED_EXTRA_INFO,
                         ..Default::default()
                     },
                 },
@@ -2538,16 +2549,7 @@ fn send_masked_win_keyup(vk: u16) -> bool {
                     ki: KEYBDINPUT {
                         wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
                         dwFlags: KEYEVENTF_KEYUP,
-                        ..Default::default()
-                    },
-                },
-            },
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk),
-                        dwFlags: KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY,
+                        dwExtraInfo: TESTBAR_INJECTED_EXTRA_INFO,
                         ..Default::default()
                     },
                 },
@@ -2558,20 +2560,87 @@ fn send_masked_win_keyup(vk: u16) -> bool {
     }
 }
 
-/// Processes a single low-level keyboard event. Returns `true` ONLY when a lone physical
-/// Win `KEYUP` triggered `ToggleStart`, `send_mask(vk)` succeeded (was NOT blocked by UIPI),
-/// AND `ToggleStart` was successfully enqueued — telling `ll_keyboard_proc` to return
-/// `LRESULT(1)` and swallow the physical `KEYUP`.
-fn dispatch_ll_keyboard_event<FQuery, FMask>(
+/// Injects `[0xE8 DOWN, 0xE8 UP, vk KEYUP]` in one atomic batch tagged with
+/// `TESTBAR_INJECTED_EXTRA_INFO`. Returns `true` ONLY when Windows accepted every event
+/// (`sent as usize == inputs.len()`); returns `false` if UIPI blocked `SendInput` (e.g.
+/// elevated Admin foreground window) so callers never swallow physical `Win KEYUP` and
+/// never leave the `Win` modifier permanently stuck.
+fn send_masked_win_keyup(vk: u16) -> bool {
+    unsafe {
+        // Inject [0xE8 DOWN, 0xE8 UP, vk KEYUP] in one atomic batch while swallowing the
+        // physical Win KEYUP via LRESULT(1). This guarantees the mask key strictly precedes
+        // the Win release seen by Explorer so native Windows Start never pops over TestBar.
+        // All 3 events carry LLKHF_INJECTED + TESTBAR_INJECTED_EXTRA_INFO so our hook never
+        // confuses them with physical presses and can swallow stale injected Win KEYUPs on
+        // rapid double-tap.
+        let win_scan: u16 = if vk == VK_LWIN.0 {
+            0x5B
+        } else if vk == VK_RWIN.0 {
+            0x5C
+        } else {
+            0
+        };
+        let inputs = [
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
+                        dwExtraInfo: TESTBAR_INJECTED_EXTRA_INFO,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(VK_DUMMY_MASK),
+                        dwFlags: KEYEVENTF_KEYUP,
+                        dwExtraInfo: TESTBAR_INJECTED_EXTRA_INFO,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: win_scan,
+                        dwFlags: KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY,
+                        dwExtraInfo: TESTBAR_INJECTED_EXTRA_INFO,
+                        ..Default::default()
+                    },
+                },
+            },
+        ];
+        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        sent as usize == inputs.len()
+    }
+}
+
+/// Processes a single low-level keyboard event. Returns `true` when `ll_keyboard_proc` must
+/// return `LRESULT(1)` to swallow the event:
+/// 1. A stale TestBar-injected `Win KEYUP` arriving AFTER physical Tap-2 `Win KEYDOWN` already
+///    occurred (prevents rapid double-tap from presenting an unmasked `Win DOWN -> Win UP`
+///    pair to `win32k` and popping native Windows Start).
+/// 2. A physical lone `Win KEYUP` after `send_up_mask(vk)` succeeded (was NOT blocked by UIPI),
+///    even if rapid spam temporarily fills the channel — guaranteeing native Start never leaks
+///    and physical `Win KEYUP` is never duplicated.
+fn dispatch_ll_keyboard_event_ex<FQuery, FDownMask, FUpMask>(
     msg: u32,
     vk_code: u32,
     flags: u32,
+    extra_info: usize,
     query_physical: FQuery,
-    send_mask: FMask,
+    send_down_mask: FDownMask,
+    send_up_mask: FUpMask,
 ) -> bool
 where
     FQuery: FnOnce() -> PhysicalKeySnapshot,
-    FMask: FnOnce(u16) -> bool,
+    FDownMask: FnOnce() -> bool,
+    FUpMask: FnOnce(u16) -> bool,
 {
     let transition = match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN => KeyTransition::Down,
@@ -2581,32 +2650,62 @@ where
     let Ok(vk) = u16::try_from(vk_code) else {
         return false;
     };
-    let is_injected_or_mask = (flags & (LLKHF_INJECTED_FLAG | LLKHF_LOWER_IL_INJECTED_FLAG)) != 0
-        || vk == VK_DUMMY_MASK;
+    let is_injected = (flags & (LLKHF_INJECTED_FLAG | LLKHF_LOWER_IL_INJECTED_FLAG)) != 0;
     let is_win = vk == VK_LWIN.0 || vk == VK_RWIN.0;
 
-    let action = HOOK_WIN_KEY_STATE
+    // Guard rapid double-tap race: if Tap 1's injected Win KEYUP arrives AFTER Tap 2's physical
+    // Win KEYDOWN has already been observed, swallow the stale injected KEYUP so win32k never
+    // sees (Tap2 Win DOWN -> Tap1 injected Win UP) without an intervening mask key!
+    if is_injected {
+        if is_win && transition == KeyTransition::Up && extra_info == TESTBAR_INJECTED_EXTRA_INFO {
+            let phys_still_down = HOOK_WIN_KEY_STATE
+                .try_with(|cell| cell.get().is_win_key_down(vk))
+                .unwrap_or(false);
+            if phys_still_down {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if vk == VK_DUMMY_MASK {
+        return false;
+    }
+
+    let (action, send_down_mask_now) = HOOK_WIN_KEY_STATE
         .try_with(|cell| {
             let mut state = cell.get();
-            if !is_injected_or_mask && transition == KeyTransition::Down {
+            if transition == KeyTransition::Down {
                 if state.is_any_win_down() || is_win {
                     let phys = query_physical();
                     if state.is_any_win_down() {
                         state.reconcile_physical_win_keys(phys.lwin_down, phys.rwin_down);
                     }
+                    let was_this_down = is_win && state.is_win_key_down(vk);
                     let act = state.on_key_event(vk, transition, flags);
                     if is_win && phys.modifier_down {
                         state.mark_combo_used();
                     }
+                    let should_mask_down = is_win && !was_this_down && !state.is_combo_used();
                     cell.set(state);
-                    return act;
+                    return (act, should_mask_down);
                 }
             }
             let act = state.on_key_event(vk, transition, flags);
             cell.set(state);
-            act
+            (act, false)
         })
-        .unwrap_or(WinKeyAction::None);
+        .unwrap_or((WinKeyAction::None, false));
+
+    if send_down_mask_now {
+        let has_sender = HOOK_EVENT_SENDER
+            .try_with(|slot| slot.try_borrow().ok().is_some_and(|g| g.is_some()))
+            .unwrap_or(false);
+        if has_sender {
+            let _ = send_down_mask();
+        }
+        return false;
+    }
 
     if action == WinKeyAction::ToggleStart {
         let has_sender = HOOK_EVENT_SENDER
@@ -2618,37 +2717,50 @@ where
         // Verify SendInput succeeds BEFORE enqueuing ToggleStart or swallowing physical Win KEYUP:
         // when an elevated window has focus, UIPI blocks SendInput (returns 0), so returning false
         // passes physical KEYUP through and prevents a permanently stuck Win modifier.
-        if !send_mask(vk) {
+        if !send_up_mask(vk) {
             return false;
         }
-        let result = HOOK_EVENT_SENDER
-            .try_with(|slot| {
-                slot.try_borrow()
-                    .ok()
-                    .and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .map(|sender| sender.try_send(ShellHookEvent::ToggleStart))
-                    })
-                    .unwrap_or(HookEnqueueResult::Disconnected)
-            })
-            .unwrap_or(HookEnqueueResult::Disconnected);
-        if result == HookEnqueueResult::Sent {
-            return true;
-        }
+        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+            if let Ok(guard) = slot.try_borrow() {
+                if let Some(sender) = guard.as_ref() {
+                    let _ = sender.try_send(ShellHookEvent::ToggleStart);
+                }
+            }
+        });
+        // Because send_up_mask(vk) already injected [0xE8 DOWN, 0xE8 UP, vk KEYUP] into the OS
+        // input stream, ALWAYS swallow the physical Win KEYUP so native Windows Start can never
+        // leak (even if rapid spam temporarily filled the event channel).
+        return true;
     }
     false
+}
+
+#[cfg(test)]
+fn dispatch_ll_keyboard_event<FQuery, FMask>(
+    msg: u32,
+    vk_code: u32,
+    flags: u32,
+    query_physical: FQuery,
+    send_mask: FMask,
+) -> bool
+where
+    FQuery: FnOnce() -> PhysicalKeySnapshot,
+    FMask: FnOnce(u16) -> bool,
+{
+    dispatch_ll_keyboard_event_ex(msg, vk_code, flags, 0, query_physical, || true, send_mask)
 }
 
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && lparam.0 != 0 {
         let suppress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            dispatch_ll_keyboard_event(
+            dispatch_ll_keyboard_event_ex(
                 wparam.0 as u32,
                 kb.vkCode,
                 kb.flags.0,
+                kb.dwExtraInfo,
                 query_physical_keys,
+                send_win_down_mask,
                 send_masked_win_keyup,
             )
         }))
@@ -3850,7 +3962,8 @@ mod tests {
         assert_eq!(masked_vks.borrow().len(), 2);
         assert!(rx.try_recv().is_err());
 
-        // 6. When channel is full, try_send returns DroppedFull -> KEYUP NOT swallowed and dropped_count increments
+        // 6. When channel is full, try_send returns DroppedFull (incrementing dropped_count),
+        //    yet physical Win KEYUP is STILL swallowed once send_mask succeeded so native Start never leaks!
         assert_eq!(
             sender.try_send(ShellHookEvent::GlobalMouseDown(1, 1)),
             HookEnqueueResult::Sent
@@ -3861,8 +3974,8 @@ mod tests {
         );
         assert!(!dispatch_ll_keyboard_event(WM_KEYDOWN, lwin, ext, idle_phys, record_mask));
         assert!(
-            !dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
-            "physical Win KEYUP must NOT be swallowed when ToggleStart was dropped on full channel"
+            dispatch_ll_keyboard_event(WM_KEYUP, lwin, ext | up, idle_phys, record_mask),
+            "physical Win KEYUP must STILL be swallowed once send_mask succeeded so native Start never leaks"
         );
         assert_eq!(sender.dropped_count(), 1);
         let _ = rx.try_recv().unwrap();
@@ -3906,6 +4019,153 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(30, 40));
         dispatch_ll_mouse_event(WM_MBUTTONDOWN, 50, 60, true);
         assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::GlobalMouseDown(50, 60));
+    }
+
+    #[test]
+    fn win_key_double_tap_triple_tap_interleaved_injected_and_combos_never_leak_native_start() {
+        use windows::Win32::UI::WindowsAndMessaging::{LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP};
+
+        struct HookTlsResetGuard;
+        impl Drop for HookTlsResetGuard {
+            fn drop(&mut self) {
+                let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                    if let Ok(mut g) = slot.try_borrow_mut() {
+                        *g = None;
+                    }
+                });
+                let _ = HOOK_WIN_KEY_STATE.try_with(|c| c.set(WinKeyStateMachine::new()));
+            }
+        }
+        let _reset = HookTlsResetGuard;
+
+        let ext = LLKHF_EXTENDED.0;
+        let up = LLKHF_UP.0;
+        let inj = LLKHF_INJECTED.0;
+        let lwin = VK_LWIN.0 as u32;
+        let rwin = VK_RWIN.0 as u32;
+        let mask_vk = VK_DUMMY_MASK as u32;
+        let key_d = 0x44u32;
+        let key_l = 0x4Cu32;
+
+        let (sender, rx) = HookEventChannel::with_capacity(16).into_parts();
+        HOOK_WIN_KEY_STATE.with(|c| c.set(WinKeyStateMachine::new()));
+        HOOK_EVENT_SENDER.with(|slot| *slot.borrow_mut() = Some(sender));
+
+        let idle_phys = || PhysicalKeySnapshot::default();
+        let down_masks: Cell<usize> = Cell::new(0);
+        let up_masks: RefCell<Vec<u16>> = RefCell::new(Vec::new());
+        let on_down_mask = || -> bool {
+            down_masks.set(down_masks.get() + 1);
+            true
+        };
+        let on_up_mask = |vk: u16| -> bool {
+            up_masks.borrow_mut().push(vk);
+            true
+        };
+
+        // 1. Rapid double-tap where Tap 1's injected [0xE8 DOWN, 0xE8 UP, LWin UP] arrives AFTER
+        //    Tap 2's physical LWin DOWN!
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYDOWN, lwin, ext, 0, idle_phys, on_down_mask, on_up_mask
+        ));
+        assert_eq!(down_masks.get(), 1);
+        // Tap 1 physical KEYUP -> masked & swallowed
+        assert!(dispatch_ll_keyboard_event_ex(
+            WM_KEYUP, lwin, ext | up, 0, idle_phys, on_down_mask, on_up_mask
+        ));
+        assert_eq!(*up_masks.borrow(), vec![VK_LWIN.0]);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
+
+        // Tap 2 physical LWin DOWN arrives BEFORE Tap 1's injected sequence finishes draining!
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYDOWN, lwin, ext, 0, idle_phys, on_down_mask, on_up_mask
+        ));
+        assert_eq!(down_masks.get(), 2);
+
+        // Now Tap 1's injected 0xE8 DOWN, 0xE8 UP, and stale LWin UP arrive while Tap 2 LWin is DOWN!
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYDOWN, mask_vk, inj, TESTBAR_INJECTED_EXTRA_INFO, idle_phys, on_down_mask, on_up_mask
+        ));
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYUP, mask_vk, inj | up, TESTBAR_INJECTED_EXTRA_INFO, idle_phys, on_down_mask, on_up_mask
+        ));
+        // CRITICAL: stale injected LWin UP MUST be swallowed (return true) while Tap 2 physical LWin is DOWN!
+        assert!(
+            dispatch_ll_keyboard_event_ex(
+                WM_KEYUP, lwin, ext | up | inj, TESTBAR_INJECTED_EXTRA_INFO, idle_phys, on_down_mask, on_up_mask
+            ),
+            "stale injected LWin UP arriving during physical Tap 2 hold MUST be swallowed"
+        );
+        // Third-party injected LWin UP (extra_info == 0) is NOT swallowed
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYUP, lwin, ext | up | inj, 0, idle_phys, on_down_mask, on_up_mask
+        ));
+
+        // Tap 2 physical LWin UP -> STILL cleanly triggers ToggleStart, masks, and swallows!
+        assert!(dispatch_ll_keyboard_event_ex(
+            WM_KEYUP, lwin, ext | up, 0, idle_phys, on_down_mask, on_up_mask
+        ));
+        assert_eq!(*up_masks.borrow(), vec![VK_LWIN.0, VK_LWIN.0]);
+        assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
+
+        // Tap 2's injected LWin UP arrives after physical LWin is up -> passes through cleanly (false)
+        assert!(!dispatch_ll_keyboard_event_ex(
+            WM_KEYUP, lwin, ext | up | inj, TESTBAR_INJECTED_EXTRA_INFO, idle_phys, on_down_mask, on_up_mask
+        ));
+
+        // 2. Rapid triple-tap (LWin, LWin, RWin) with OS key-repeat on tap 2:
+        //    down_mask fires ONCE per physical press (NOT on auto-repeat), every physical UP is swallowed!
+        let down_before = down_masks.get();
+        let up_before = up_masks.borrow().len();
+        for (idx, vk) in [lwin, lwin, rwin].into_iter().enumerate() {
+            assert!(!dispatch_ll_keyboard_event_ex(
+                WM_KEYDOWN, vk, ext, 0, idle_phys, on_down_mask, on_up_mask
+            ));
+            if idx == 1 {
+                // Simulated OS key-repeat while LWin is held physically
+                let held = || PhysicalKeySnapshot {
+                    lwin_down: true,
+                    rwin_down: false,
+                    modifier_down: false,
+                };
+                assert!(!dispatch_ll_keyboard_event_ex(
+                    WM_KEYDOWN, vk, ext, 0, held, on_down_mask, on_up_mask
+                ));
+            }
+            assert!(dispatch_ll_keyboard_event_ex(
+                WM_KEYUP, vk, ext | up, 0, idle_phys, on_down_mask, on_up_mask
+            ));
+            assert_eq!(rx.try_recv().unwrap(), ShellHookEvent::ToggleStart);
+        }
+        assert_eq!(down_masks.get(), down_before + 3, "auto-repeat must not re-fire down_mask");
+        assert_eq!(up_masks.borrow().len(), up_before + 3);
+
+        // 3. Win+D and Win+L combos still work 100% natively (pass through, zero ToggleStart, no up_mask!)
+        let up_before_combos = up_masks.borrow().len();
+        for combo_key in [key_d, key_l] {
+            assert!(!dispatch_ll_keyboard_event_ex(
+                WM_KEYDOWN, lwin, ext, 0, idle_phys, on_down_mask, on_up_mask
+            ));
+            let lwin_held = || PhysicalKeySnapshot {
+                lwin_down: true,
+                rwin_down: false,
+                modifier_down: false,
+            };
+            assert!(!dispatch_ll_keyboard_event_ex(
+                WM_KEYDOWN, combo_key, 0, 0, lwin_held, on_down_mask, on_up_mask
+            ));
+            assert!(!dispatch_ll_keyboard_event_ex(
+                WM_KEYUP, combo_key, up, 0, idle_phys, on_down_mask, on_up_mask
+            ));
+            assert!(
+                !dispatch_ll_keyboard_event_ex(
+                    WM_KEYUP, lwin, ext | up, 0, idle_phys, on_down_mask, on_up_mask
+                ),
+                "Win+combo physical LWin KEYUP must pass through untouched"
+            );
+        }
+        assert_eq!(up_masks.borrow().len(), up_before_combos);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

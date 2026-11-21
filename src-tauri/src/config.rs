@@ -289,13 +289,22 @@ fn detect_app_target(name_key: &str) -> String {
         "spark" => vec![
             local.join(r"SparkDesktop\SparkDesktop.exe"),
             local.join(r"Programs\SparkDesktop\SparkDesktop.exe"),
+            local.join(r"Programs\Spark\Spark.exe"),
+            pf.join(r"SparkDesktop\SparkDesktop.exe"),
         ],
         "obsidian" => vec![
             local.join(r"Programs\obsidian\Obsidian.exe"),
             local.join(r"Obsidian\Obsidian.exe"),
         ],
-        "claude" => vec![local.join(r"AnthropicClaude\claude.exe")],
-        "yandex" => vec![local.join(r"Yandex\YandexBrowser\Application\browser.exe")],
+        "claude" => vec![
+            local.join(r"AnthropicClaude\claude.exe"),
+            local.join(r"Programs\Claude\Claude.exe"),
+        ],
+        "yandex" => vec![
+            local.join(r"Yandex\YandexBrowser\Application\browser.exe"),
+            pf86.join(r"Yandex\YandexBrowser\Application\browser.exe"),
+            pf.join(r"Yandex\YandexBrowser\Application\browser.exe"),
+        ],
         "ymusic" => vec![
             local.join(r"Programs\YandexMusic\Яндекс Музыка.exe"),
             local.join(r"Programs\YandexMusic\YandexMusic.exe"),

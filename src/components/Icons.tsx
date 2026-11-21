@@ -6,41 +6,41 @@ export interface IconProps {
 }
 
 /**
- * Machined frosted-platinum 4-pane Start mark.
- * Base panes render subtle obsidian-platinum shading; `.start-logo-accent` layer illuminates
+ * Razor-sharp 4-pane Start mark with luminous frosted silver/white specular panes.
+ * Base panes render crisp high-contrast silver-white; `.start-logo-accent` illuminates
  * smoothly with `var(--accent)` on hover and `.start-on` via CSS opacity (GPU-only).
  */
 export const StartLogoIcon: React.FC<{ className?: string }> = ({ className = 'ic24' }) => (
   <svg className={`${className} start-logo-svg`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <defs>
-      <linearGradient id="tb_plat_top" x1="3" y1="3" x2="21" y2="12" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#F5F7FC" stopOpacity="0.96" />
-        <stop offset="100%" stopColor="#C3CDDF" stopOpacity="0.86" />
+      <linearGradient id="tb_pane_tl" x1="3.5" y1="3.5" x2="11.1" y2="11.1" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#FFFFFF" stopOpacity="1" />
+        <stop offset="100%" stopColor="#E6EDF9" stopOpacity="0.96" />
       </linearGradient>
-      <linearGradient id="tb_plat_bot" x1="3" y1="12" x2="21" y2="21" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#D3DBE9" stopOpacity="0.84" />
-        <stop offset="100%" stopColor="#9BA7BE" stopOpacity="0.72" />
+      <linearGradient id="tb_pane_mid" x1="3.5" y1="3.5" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#F4F7FD" stopOpacity="0.96" />
+        <stop offset="100%" stopColor="#D3DDF0" stopOpacity="0.88" />
       </linearGradient>
-      <linearGradient id="tb_plat_rim" x1="12" y1="3" x2="12" y2="21" gradientUnits="userSpaceOnUse">
-        <stop offset="0%" stopColor="#FFFFFF" stopOpacity="0.52" />
-        <stop offset="100%" stopColor="#FFFFFF" stopOpacity="0.06" />
+      <linearGradient id="tb_pane_br" x1="12.9" y1="12.9" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stopColor="#E9EFFA" stopOpacity="0.94" />
+        <stop offset="100%" stopColor="#C4D1E7" stopOpacity="0.86" />
       </linearGradient>
     </defs>
 
-    {/* Frosted platinum base */}
+    {/* Luminous frosted silver-white precision panes */}
     <g className="start-logo-base">
-      <rect x="3.2" y="3.2" width="8" height="8" rx="2.3" fill="url(#tb_plat_top)" stroke="url(#tb_plat_rim)" strokeWidth="0.6" />
-      <rect x="12.8" y="3.2" width="8" height="8" rx="2.3" fill="url(#tb_plat_top)" stroke="url(#tb_plat_rim)" strokeWidth="0.6" />
-      <rect x="3.2" y="12.8" width="8" height="8" rx="2.3" fill="url(#tb_plat_bot)" stroke="url(#tb_plat_rim)" strokeWidth="0.6" />
-      <rect x="12.8" y="12.8" width="8" height="8" rx="2.3" fill="url(#tb_plat_bot)" stroke="url(#tb_plat_rim)" strokeWidth="0.6" />
+      <rect x="3.5" y="3.5" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_tl)" />
+      <rect x="12.9" y="3.5" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_mid)" />
+      <rect x="3.5" y="12.9" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_mid)" />
+      <rect x="12.9" y="12.9" width="7.6" height="7.6" rx="1.5" fill="url(#tb_pane_br)" />
     </g>
 
-    {/* Accent specular illumination overlay (faded in via CSS on hover / start-on) */}
+    {/* Luminous Space Accent illumination overlay (faded in via CSS on hover / start-on) */}
     <g className="start-logo-accent">
-      <rect x="3.2" y="3.2" width="8" height="8" rx="2.3" fill="var(--accent)" fillOpacity="0.95" />
-      <rect x="12.8" y="3.2" width="8" height="8" rx="2.3" fill="var(--accent)" fillOpacity="0.78" />
-      <rect x="3.2" y="12.8" width="8" height="8" rx="2.3" fill="var(--accent)" fillOpacity="0.72" />
-      <rect x="12.8" y="12.8" width="8" height="8" rx="2.3" fill="var(--accent)" fillOpacity="0.92" />
+      <rect x="3.5" y="3.5" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="1" />
+      <rect x="12.9" y="3.5" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.88" />
+      <rect x="3.5" y="12.9" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.84" />
+      <rect x="12.9" y="12.9" width="7.6" height="7.6" rx="1.5" fill="var(--accent)" fillOpacity="0.96" />
     </g>
   </svg>
 );

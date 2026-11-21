@@ -724,7 +724,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const honestAlt = getHonestShiftBadge(item);
     return (
       <div
-        key={item.id}
+        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
         className={`app-tile ${isHero ? 'hero' : 'compact'}`}
@@ -779,7 +779,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const honestAlt = getHonestShiftBadge(item);
     return (
       <div
-        key={item.id}
+        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
         className="qlink"
@@ -868,9 +868,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           }
         >
           <span className={`seg-indicator ${segReady ? '' : 'no-anim'}`} aria-hidden="true" />
-          {visibleDevs.map((d) => (
+          {visibleDevs.map((d, idx) => (
             <button
-              key={d.id}
+              key={d.id || `dev-${d.name}-${idx}`}
               type="button"
               className={`seg-opt ${d.isDefault ? 'active' : ''}`}
               title={d.name}
@@ -896,9 +896,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
         {hasOverflow && devDropdownPresence.mounted && (
           <div className="qs-dev-dropdown" data-phase={devDropdownPresence.phase}>
-            {allDevices.map((d) => (
+            {allDevices.map((d, idx) => (
               <button
-                key={d.id}
+                key={d.id || `all-dev-${d.name}-${idx}`}
                 type="button"
                 className={`pp-row ${d.isDefault ? 'active' : ''}`}
                 onClick={() => switchOutput(d.id)}
@@ -974,8 +974,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 .catch(() => onShowToast('Не удалось переключить микрофон'));
             }}
           >
-            {inputDevices.map((d) => (
-              <option key={d.id} value={d.id}>
+            {inputDevices.map((d, idx) => (
+              <option key={d.id || `in-dev-${d.name}-${idx}`} value={d.id}>
                 {d.shortName || d.name}
               </option>
             ))}
@@ -1051,17 +1051,17 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         className={`compact-card${audioDropdownActive ? ' has-open-pop' : ''}`}
         style={audioDropdownActive ? { overflow: 'visible', zIndex: 25 } : undefined}
       >
-        <div className="sec-row" style={{ marginBottom: 8 }}>
+        <div className="sec-row" style={{ marginBottom: 6 }}>
           <span className="sec-title">{options.title}</span>
         </div>
 
         {options.showDeviceSwitcher && renderAudioDeviceBar()}
-        {options.showMicToggle && renderMicToggleRow(options.showSessions ? 8 : 0)}
+        {options.showMicToggle && renderMicToggleRow(options.showSessions ? 6 : 0)}
 
         {options.showSessions && (
           <>
             {/* Master volume ALWAYS accessible above per-app mixer */}
-            <div className={`mix-row qs-master-row ${masterMuted ? 'muted' : ''}`}>
+            <div className={`mix-row qs-master-row ${masterMuted ? 'muted' : ''}`} style={{ marginBottom: 5 }}>
               <button
                 type="button"
                 className="mix-mute"
@@ -1088,13 +1088,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               {sessions.length === 0 ? (
                 <div className="qs-empty">Нет активных аудиопотоков</div>
               ) : (
-                sessions.map((s) => {
+                sessions.map((s, idx) => {
                   const iconUri = resolveIconKeyUri(s.iconKey, null);
                   const livePeak = s.muted ? 0 : (peaks.sessionPeaks[s.id] ?? s.peak ?? 0);
                   const isEmitting = !s.muted && (s.isActive || livePeak > 0.02);
                   return (
                     <div
-                      key={s.id}
+                      key={s.id || `sess-${s.pid ?? idx}-${s.name}-${idx}`}
                       className={`mix-row ${s.muted ? 'muted' : ''} ${isEmitting ? 'active-audio' : ''}`}
                     >
                       <button
@@ -1153,9 +1153,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       >
         {hasSession && sessions.length > 1 && (
           <div className="media-sessions" role="tablist" aria-label="Источники воспроизведения">
-            {sessions.map((s) => (
+            {sessions.map((s, idx) => (
               <button
-                key={s.id}
+                key={s.id || `msess-${s.appName}-${idx}`}
                 type="button"
                 role="tab"
                 aria-selected={s.isCurrent}
@@ -1173,7 +1173,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           </div>
         )}
 
-        <div className="media-top">
+        <div className="media-top" style={hasSession && durationSec <= 0 ? { marginBottom: 0 } : undefined}>
           <div className="album-box">
             {hasSession && media?.thumbnail ? (
               <img src={media.thumbnail} alt="" className="album-art-img" draggable={false} />
@@ -1209,7 +1209,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             </button>
             <button
               type="button"
-              className="m-btn play"
+              className="m-btn play qs-play-btn"
               disabled={!hasSession}
               aria-label={isPlaying ? 'Пауза' : 'Воспроизвести'}
               onClick={() =>
@@ -1285,7 +1285,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   const renderClipboardCard = (bentoIndex: number) => (
     <BentoSpotCard bentoIndex={bentoIndex} className="clip-card">
-      <div className="sec-row" style={{ marginBottom: 7 }}>
+      <div className="sec-row" style={{ marginBottom: 6 }}>
         <span className="sec-title">Буфер обмена</span>
         <div className="sec-actions">
           <button
@@ -1381,7 +1381,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             {clipQuery.trim() ? 'Записи по запросу не найдены' : 'Буфер обмена пока пуст'}
           </div>
         ) : (
-          filteredClips.map((c) => {
+          filteredClips.map((c, idx) => {
             const kind = resolveClipboardKind(c);
             const hexRgb = kind === 'hex' ? hexColorToRgbString(c.color || c.text) : null;
             const swatchColor = c.color || (kind === 'hex' ? c.text.trim() : null);
@@ -1414,7 +1414,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
             return (
               <div
-                key={c.id}
+                key={c.id || `clip-${idx}`}
                 role="button"
                 tabIndex={0}
                 title={c.text}
@@ -1545,12 +1545,12 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     if (disks.length === 0) return null;
     return (
       <div className="disk-strip">
-        {disks.map((d) => {
+        {disks.map((d, idx) => {
           const lvl = getTelemetryLevelClass(d.usedPct);
           const pct = Math.max(0, Math.min(100, Math.round(Number.isFinite(d.usedPct) ? d.usedPct : 0)));
           return (
             <div
-              key={d.mount}
+              key={d.mount || `disk-${idx}`}
               className="disk-chip"
               title={`${d.mount} (${d.name || 'Диск'}): ${pct}% · ${formatGbValue(d.freeGb)} ГБ свободно`}
             >
@@ -1799,7 +1799,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           {list.length === 0 ? (
             <div className="clip-empty">Нет активных процессов</div>
           ) : (
-            list.map((pr) => {
+            list.map((pr, idx) => {
               const metrics = formatProcessMetricLine(pr, mode);
               const iconUri = resolveIconKeyUri(pr.iconKey, pr.iconData);
               const procKey = `${targetSpace}:${pr.name}:${pr.pid}`;
@@ -1815,7 +1815,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
               return (
                 <div
-                  key={`${pr.name}-${pr.pid}`}
+                  key={`${pr.name}-${pr.pid ?? idx}-${idx}`}
                   role={canFocus ? 'button' : undefined}
                   tabIndex={canFocus ? 0 : undefined}
                   title={canFocus ? `Перейти к окну ${pr.name}` : pr.name}
@@ -1976,7 +1976,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                     const honestAlt = getHonestShiftBadge(f);
                     return (
                       <div
-                        key={f.id}
+                        key={f.id || `wf-${idx}`}
                         role="button"
                         tabIndex={0}
                         className="folder-card"
@@ -2208,7 +2208,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                 </div>
               ) : (
                 <div className="games-grid">
-                  {displayedGames.map((g) => {
+                  {displayedGames.map((g, idx) => {
                     const coverSrc = g.coverData || (g.coverPath ? loadedCovers[g.coverPath] : null) || null;
                     const launchGame = () => {
                       ipc('launch_item', {
@@ -2220,7 +2220,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
                     return (
                       <div
-                        key={g.appId}
+                        key={g.appId || `game-${g.name}-${idx}`}
                         role="button"
                         tabIndex={0}
                         className="game-card"
@@ -2334,7 +2334,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   const isDelArmed = armedComboDeleteId === cb.id;
                   return (
                     <div
-                      key={cb.id}
+                      key={cb.id || `combo-${idx}`}
                       role="button"
                       tabIndex={0}
                       className="consumer-row combo-row"
@@ -2524,8 +2524,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   {comboSteps.length === 0 ? (
                     <div className="clip-empty">Добавьте минимум 2 программы, игры или ссылки</div>
                   ) : (
-                    comboSteps.map((step) => (
-                      <div key={step.id} className="combo-step-chip">
+                    comboSteps.map((step, idx) => (
+                      <div key={step.id || `step-${idx}`} className="combo-step-chip">
                         <span className="clip-txt" title={step.target}>{step.label}</span>
                         <button
                           type="button"

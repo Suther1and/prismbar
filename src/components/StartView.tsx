@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { canOpenFileLocation, canRunAsAdmin, formatIpcError } from '../lib/flyoutLogic';
 import {
   applyConfigUpdate,
@@ -20,7 +20,6 @@ import {
   restoreAllTrayApps,
   restoreTrayApp,
   setAppearanceSettings,
-  surfaceCommitAck,
   surfaceExitAck,
   toggleStart,
   updateCustomSpace,
@@ -29,7 +28,6 @@ import {
   type AudioMasterState,
   type AudioState,
   type ClipboardEntry,
-  type GlassDepth,
   type IndexedApp,
   type IndexedFile,
   type MediaState,
@@ -53,8 +51,8 @@ import {
 import {
   buildGameComboLaunchPayload,
   completeStartClosing,
+  getStartChassisAnimClass,
   INITIAL_START_ANIM_STATE,
-  promoteStartEntering,
   reducePowerClick,
   reduceStartState,
   resolvePinAction,
@@ -121,8 +119,8 @@ interface TileCtxAction {
 }
 
 function clampPopoverPos(x: number, y: number, width: number, estHeight: number): { x: number; y: number } {
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 1188;
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 728;
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1172;
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 712;
   return {
     x: Math.max(16, Math.min(x, vw - width - 16)),
     y: Math.max(16, Math.min(y, vh - estHeight - 16)),
@@ -210,12 +208,9 @@ export const StartView: React.FC = () => {
   const [cmdIdx, setCmdIdx] = useState(0);
   const cmdInputRef = useRef<HTMLInputElement>(null);
 
-  // Refs for lifecycle & Paint-Sync coordination
+  // Refs for lifecycle & animation coordination
   const mountedRef = useRef<boolean>(true);
   const latestGenRef = useRef<number>(0);
-  const pendingCommitGenRef = useRef<number | null>(null);
-  const enterRaf1Ref = useRef<number | null>(null);
-  const enterRaf2Ref = useRef<number | null>(null);
   const closeCleanupTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const lastSpaceSwitchTsRef = useRef<number>(0);
@@ -223,22 +218,6 @@ export const StartView: React.FC = () => {
   const spaceRef = useRef<string>(space);
   const secondaryHydratedRef = useRef<boolean>(false);
   const resolvedTargetsRef = useRef<Set<string>>(new Set());
-
-  const cancelEnterRafs = useCallback(() => {
-    if (typeof cancelAnimationFrame !== 'function') {
-      enterRaf1Ref.current = null;
-      enterRaf2Ref.current = null;
-      return;
-    }
-    if (enterRaf1Ref.current !== null) {
-      cancelAnimationFrame(enterRaf1Ref.current);
-      enterRaf1Ref.current = null;
-    }
-    if (enterRaf2Ref.current !== null) {
-      cancelAnimationFrame(enterRaf2Ref.current);
-      enterRaf2Ref.current = null;
-    }
-  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -323,33 +302,6 @@ export const StartView: React.FC = () => {
     ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
   }, []);
 
-  // Paint-Sync commit ACK + double-rAF promotion from 'entering' -> 'open'
-  useLayoutEffect(() => {
-    if (anim.phase !== 'entering') return;
-    if (pendingCommitGenRef.current !== anim.gen) return;
-    const gen = anim.gen;
-    pendingCommitGenRef.current = null;
-
-    surfaceCommitAck('start', gen).catch(() => {});
-
-    cancelEnterRafs();
-
-    if (typeof requestAnimationFrame === 'function') {
-      enterRaf1Ref.current = requestAnimationFrame(() => {
-        enterRaf1Ref.current = null;
-        if (latestGenRef.current !== gen) return;
-        enterRaf2Ref.current = requestAnimationFrame(() => {
-          enterRaf2Ref.current = null;
-          if (latestGenRef.current === gen) {
-            setAnim((prev) => promoteStartEntering(prev));
-          }
-        });
-      });
-    } else if (latestGenRef.current === gen) {
-      setAnim((prev) => promoteStartEntering(prev));
-    }
-  }, [anim.phase, anim.gen, anim.openSeq, cancelEnterRafs]);
-
   useEffect(() => {
     hydrateCoreData();
     const idleTimer = window.setTimeout(() => {
@@ -390,7 +342,6 @@ export const StartView: React.FC = () => {
           window.clearTimeout(closeCleanupTimerRef.current);
           closeCleanupTimerRef.current = null;
         }
-        cancelEnterRafs();
 
         if (ev.open) {
           hydrateSecondaryData();
@@ -401,10 +352,8 @@ export const StartView: React.FC = () => {
             setRapidSwitch(false);
             setSpace('personal');
           }
-          pendingCommitGenRef.current = ev.gen;
           setAnim((prev) => reduceStartState(prev, ev));
         } else {
-          pendingCommitGenRef.current = null;
           setAnim((prev) => reduceStartState(prev, ev));
           if (ev.immediate) {
             resetTransientOverlays();
@@ -445,13 +394,12 @@ export const StartView: React.FC = () => {
       if (closeCleanupTimerRef.current !== null) {
         window.clearTimeout(closeCleanupTimerRef.current);
       }
-      cancelEnterRafs();
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
       }
       subs.forEach((p) => p.then((u) => u()));
     };
-  }, [hydrateCoreData, hydrateSecondaryData, resetTransientOverlays, cancelEnterRafs]);
+  }, [hydrateCoreData, hydrateSecondaryData, resetTransientOverlays]);
 
   // If active custom space was deleted remotely, fall back to 'personal'
   useEffect(() => {
@@ -851,8 +799,8 @@ export const StartView: React.FC = () => {
   // Tile Edit Popover handlers
   const openTileEditPopover = useCallback(
     (item: PinItem, spaceKey: string, coords?: { x: number; y: number }) => {
-      const vw = typeof window !== 'undefined' ? window.innerWidth : 1188;
-      const vh = typeof window !== 'undefined' ? window.innerHeight : 728;
+      const vw = typeof window !== 'undefined' ? window.innerWidth : 1172;
+      const vh = typeof window !== 'undefined' ? window.innerHeight : 712;
       const rawX = coords ? coords.x : Math.round((vw - 316) / 2);
       const rawY = coords ? coords.y : Math.round((vh - 360) / 2);
       const pos = clampPopoverPos(rawX, rawY, 316, 360);
@@ -1405,13 +1353,12 @@ export const StartView: React.FC = () => {
     : undefined;
 
   const startVisible = anim.phase !== 'hidden';
-  const glassDepth: GlassDepth = config?.glassDepth ?? 'obsidian';
+  const startChassisAnimCls = getStartChassisAnimClass(anim);
 
   return (
     <div
       className={`start-root ${editMode ? 'edit-mode' : ''} ${shiftHeld ? 'shift-active' : ''}`}
       data-space={spaceTheme}
-      data-glass={glassDepth}
       data-visible={startVisible ? 'true' : 'false'}
       style={customSpaceStyle}
       onClick={() => {
@@ -1423,8 +1370,11 @@ export const StartView: React.FC = () => {
         }
       }}
     >
-      {/* NON-REMOUNTING START CHASSIS (NO key={anim.openSeq}!) */}
-      <section className="start-chassis" data-phase={anim.phase}>
+      {/* NON-REMOUNTING START CHASSIS — alternates .open-a / .open-b to replay spring keyframes at 0ms */}
+      <section
+        className={`start-chassis ${startChassisAnimCls}`.trim()}
+        data-phase={anim.phase}
+      >
         {/* 2-Layer GPU Opacity Ambient Aura Crossfade */}
         <div
           className={`chassis-aura-layer ${activeAuraSlot === 0 ? 'active' : ''}`}
