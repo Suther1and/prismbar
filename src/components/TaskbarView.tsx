@@ -5,6 +5,7 @@ import {
   applyConfigUpdate,
   dismissOverlays,
   fetchIconsBatch,
+  getNetworkSnapshot,
   getOpenWindows,
   getPeripheralBatteries,
   getWeather,
@@ -20,10 +21,13 @@ import {
   type AudioMasterState,
   type AudioState,
   type FlyoutKind,
+  type MediaState,
   type MergedBarItem,
   type NetworkInfo,
+  type NetworkSnapshot,
   type PeripheralBattery,
   type StartStateEvent,
+  type TaskbarWidgetId,
   type TelemetryState,
   type TestBarConfig,
   type WeatherSnapshot,
@@ -41,17 +45,26 @@ import {
   createTaskbarOrderMemory,
   filterGroupsForMonitor,
   formatBatteryPillSummary,
+  formatFocusTimerMmSs,
   formatMiniTelemetryLabel,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
+  formatTaskbarMediaLabel,
+  formatTaskbarNetworkBadge,
   formatWeatherTempLabel,
+  getFocusTimerEffectiveRemainingSec,
   getPreviewHoverDelayMs,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
+  NETWORK_FLYOUT_HEIGHT,
+  NETWORK_FLYOUT_WIDTH,
+  parseFocusTimerSnapshot,
   planSoundFeedbackAction,
+  resolveActiveTaskbarWidgets,
   resolvePinnedReorderIndices,
   resolveTaskbarItemClick,
   resolveTaskbarMonitor,
+  resolveTaskbarWidgetsPosition,
   selectTaskbarPinsForMonitor,
   shouldTriggerPreviewHover,
   shouldUseEdgeCenteredLayout,
@@ -59,8 +72,13 @@ import {
   SOUND_FLYOUT_WIDTH,
   stabilizeTaskbarItemsOrder,
   TASKBAR_LAUNCH_HOP_MS,
+  TELEMETRY_FLYOUT_HEIGHT,
+  TELEMETRY_FLYOUT_WIDTH,
+  TIMER_STORAGE_KEY,
+  TIMER_UPDATED_EVENT,
   WEATHER_FLYOUT_HEIGHT,
   WEATHER_FLYOUT_WIDTH,
+  type FocusTimerSnapshot,
   type TaskbarMonitor,
 } from '../lib/taskbarLogic';
 import { hasExceededDragThreshold } from '../lib/startLogic';
@@ -69,11 +87,17 @@ import {
   ChargingBoltIcon,
   ChevronUpIcon,
   FallbackAppIcon,
-  NetIcon,
+  MusicNoteIcon,
+  NetworkSpeedIcon,
+  OfflineIcon,
+  PauseIcon,
   PeripheralDeviceIcon,
+  PlaySmallIcon,
   StartLogoIcon,
+  TimerIcon,
   VolIcon,
   WeatherConditionIcon,
+  WifiIcon,
 } from './Icons';
 
 function audioStateToMaster(st: AudioState): AudioMasterState {
@@ -105,10 +129,18 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const [groups, setGroups] = useState<AppWindowGroup[]>([]);
   const [audioMaster, setAudioMaster] = useState<AudioMasterState | null>(null);
   const [net, setNet] = useState<NetworkInfo | null>(null);
+  const [netSnap, setNetSnap] = useState<NetworkSnapshot | null>(null);
+  const [media, setMedia] = useState<MediaState | null>(null);
   const [layout, setLayout] = useState('RU');
   const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
   const [periphs, setPeriphs] = useState<PeripheralBattery[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryState | null>(null);
+  const [timerSnap, setTimerSnap] = useState<FocusTimerSnapshot>(() =>
+    typeof window !== 'undefined'
+      ? parseFocusTimerSnapshot(window.localStorage?.getItem(TIMER_STORAGE_KEY))
+      : parseFocusTimerSnapshot(null),
+  );
+  const [timerNowMs, setTimerNowMs] = useState<number>(() => Date.now());
   const [startOpen, setStartOpen] = useState(false);
   const [activeFlyout, setActiveFlyout] = useState<string>('');
   const [now, setNow] = useState(() => new Date());
@@ -123,6 +155,8 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const barRef = useRef<HTMLElement>(null);
   const appsScrollRef = useRef<HTMLDivElement>(null);
   const trayGroupRef = useRef<HTMLDivElement>(null);
+  const leftWidgetsGroupRef = useRef<HTMLDivElement>(null);
+  const mediaPillRef = useRef<HTMLDivElement>(null);
   const barRectRef = useRef<DOMRect | null>(null);
   const orderMemoryRef = useRef(createTaskbarOrderMemory());
   const sheenRef = useRef<HTMLSpanElement>(null);
@@ -149,12 +183,28 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
   const showSeconds = Boolean(config?.clockShowSeconds);
   const showWeekday = Boolean(config?.clockShowWeekday);
+  const clockDateFormat = config?.clockDateFormat ?? 'short';
+  const clockLayout = config?.clockLayout ?? 'center';
   const isEdge = config?.barMode === 'edge';
   const useEdgeCentered = shouldUseEdgeCenteredLayout(config?.barMode, monitor, viewportWidth);
 
-  const showWeather = !isSecondary && config?.taskbarWidgets?.showWeather === true;
-  const showBatteries = !isSecondary && config?.taskbarWidgets?.showBatteries === true;
-  const showTelemetry = !isSecondary && config?.taskbarWidgets?.showTelemetry === true;
+  const legacyWeatherEnabled = config?.taskbarWidgets?.showWeather === true;
+  const activeWidgets = useMemo<TaskbarWidgetId[]>(() => {
+    if (isSecondary || !config?.taskbarWidgets) return [];
+    return resolveActiveTaskbarWidgets({
+      ...config.taskbarWidgets,
+      showWeather: legacyWeatherEnabled,
+    });
+  }, [isSecondary, config?.taskbarWidgets, legacyWeatherEnabled]);
+  const widgetsPosition = resolveTaskbarWidgetsPosition(config?.taskbarWidgets);
+
+  const showWeather = !isSecondary && activeWidgets.includes('weather');
+  const showBatteries = !isSecondary && activeWidgets.includes('batteries');
+  const showTelemetry = !isSecondary && activeWidgets.includes('telemetry');
+  const showNetwork = !isSecondary && activeWidgets.includes('network');
+  const showMedia = !isSecondary && activeWidgets.includes('media');
+  const showTimer = !isSecondary && activeWidgets.includes('timer');
+
   const weatherUnits: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
   const weatherCityKey = config?.taskbarWidgets?.weatherCity ?? '';
   const weatherLatKey = config?.taskbarWidgets?.weatherLat ?? null;
@@ -177,7 +227,21 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     ? `${periphSummary.device.kind}:${periphSummary.percent}:${periphSummary.charging ? 1 : 0}:${periphSummary.count}`
     : '';
   const telemetryBadgeStr = showTelemetry ? formatMiniTelemetryLabel(telemetry) : '';
-  const hasAnyWidget = showWeather || periphSummary !== null || showTelemetry;
+  const netBadge = useMemo(
+    () => (showNetwork ? formatTaskbarNetworkBadge(netSnap) : null),
+    [showNetwork, netSnap],
+  );
+  const mediaSummary = useMemo(
+    () => (showMedia ? formatTaskbarMediaLabel(media) : null),
+    [showMedia, media],
+  );
+  const effectiveTimerSec = showTimer
+    ? getFocusTimerEffectiveRemainingSec(timerSnap, timerNowMs)
+    : 0;
+  const timerLabel = showTimer ? formatFocusTimerMmSs(effectiveTimerSec) : '';
+  const hasAnyWidget =
+    !isSecondary &&
+    activeWidgets.some((id) => id !== 'batteries' || periphSummary !== null);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -282,7 +346,10 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
   // Primary Weather widget lazy fetch + 15-min refresh + live event updates
   useEffect(() => {
-    if (!showWeather) return;
+    if (!showWeather) {
+      setWeather((prev) => (prev === null ? prev : null));
+      return;
+    }
     let cancelled = false;
     const loadWeather = () => {
       getWeather({ force: false })
@@ -366,6 +433,118 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       unlistenPromise.then((u) => u());
     };
   }, [showTelemetry]);
+
+  // Primary Network Speed & Ping widget: poll get_network_snapshot ONLY when enabled
+  useEffect(() => {
+    if (!showNetwork) {
+      setNetSnap((prev) => (prev === null ? prev : null));
+      return;
+    }
+    let cancelled = false;
+    let inflight = false;
+    let tick = 0;
+    const loadNetSnap = (probePing: boolean) => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      getNetworkSnapshot(probePing)
+        .then((snap) => {
+          if (!cancelled && snap) setNetSnap(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    loadNetSnap(true);
+    const timer = window.setInterval(() => {
+      tick += 1;
+      loadNetSnap(tick % 12 === 0);
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [showNetwork]);
+
+  // Primary Media widget: fetch + poll get_media_state ONLY when enabled
+  useEffect(() => {
+    if (!showMedia) {
+      setMedia((prev) => (prev === null ? prev : null));
+      return;
+    }
+    let cancelled = false;
+    let inflight = false;
+    const loadMedia = () => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      ipc<MediaState>('get_media_state')
+        .then((snap) => {
+          if (!cancelled && snap) setMedia(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    loadMedia();
+    const unlistenPromise = onEvent<MediaState>('media-updated', (snap) => {
+      if (!cancelled && snap) setMedia(snap);
+    });
+    const timer = window.setInterval(loadMedia, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlistenPromise.then((u) => u());
+    };
+  }, [showMedia]);
+
+  // Primary Focus Timer widget: self-contained localStorage + custom event subscription
+  useEffect(() => {
+    if (!showTimer || typeof window === 'undefined') return;
+    const syncFromStorage = () => {
+      try {
+        const next = parseFocusTimerSnapshot(window.localStorage?.getItem(TIMER_STORAGE_KEY));
+        setTimerSnap(next);
+        setTimerNowMs(Date.now());
+      } catch {
+        // Ignore storage read errors
+      }
+    };
+    syncFromStorage();
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === TIMER_STORAGE_KEY) {
+        syncFromStorage();
+      }
+    };
+    const onCustom = (e: Event) => {
+      const detail = (e as CustomEvent<unknown>).detail;
+      if (detail && typeof detail === 'object') {
+        try {
+          setTimerSnap(parseFocusTimerSnapshot(JSON.stringify(detail)));
+          setTimerNowMs(Date.now());
+          return;
+        } catch {
+          // Fallback to storage read
+        }
+      }
+      syncFromStorage();
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener(TIMER_UPDATED_EVENT, onCustom);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener(TIMER_UPDATED_EVENT, onCustom);
+    };
+  }, [showTimer]);
+
+  useEffect(() => {
+    if (!showTimer || !timerSnap.running || typeof window === 'undefined') return;
+    setTimerNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setTimerNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [showTimer, timerSnap.running, timerSnap.endEpochMs]);
 
   // Load real native .exe, WindowsApps aliases, and shell:AppsFolder\ UWP icons for pinned taskbar apps (primary only)
   useEffect(() => {
@@ -557,9 +736,18 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       if (config?.barMode === 'edge') return;
       const scrollEl = appsScrollRef.current;
       const trayEl = trayGroupRef.current;
+      const leftEl = leftWidgetsGroupRef.current;
       const appsNatural = scrollEl ? scrollEl.scrollWidth : 0;
       const trayNatural = trayEl ? trayEl.scrollWidth : 0;
-      const w = computeNaturalDockWidth(el.scrollWidth, rect.width, appsNatural, trayNatural);
+      const leftNatural =
+        widgetsPosition === 'left' && leftEl ? leftEl.scrollWidth : 0;
+      const w = computeNaturalDockWidth(
+        el.scrollWidth,
+        rect.width,
+        appsNatural,
+        trayNatural,
+        leftNatural,
+      );
       if (w !== null) {
         ipc('resize_taskbar_dock', { logicalWidth: w, monitor }).catch(() => {});
       }
@@ -578,6 +766,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     ro.observe(el);
     if (appsScrollRef.current) ro.observe(appsScrollRef.current);
     if (trayGroupRef.current) ro.observe(trayGroupRef.current);
+    if (leftWidgetsGroupRef.current) ro.observe(leftWidgetsGroupRef.current);
     return () => {
       if (rafId !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(rafId);
@@ -589,15 +778,21 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     config?.barMode,
     showSeconds,
     showWeekday,
+    clockDateFormat,
+    clockLayout,
     layout,
     monitor,
-    config?.taskbarWidgets?.showWeather,
-    config?.taskbarWidgets?.showBatteries,
-    config?.taskbarWidgets?.showTelemetry,
+    widgetsPosition,
+    activeWidgets,
     config?.taskbarWidgets?.weatherUnits,
     weatherTempStr,
     periphBadgeKey,
     telemetryBadgeStr,
+    netBadge?.text,
+    mediaSummary?.title,
+    mediaSummary?.hasSession,
+    timerLabel,
+    net,
   ]);
 
   const anchorX = (el: HTMLElement) => {
@@ -705,11 +900,14 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     }
   }, [dragPinId, hideHoverPill]);
 
+  const isHoverGlowOff = () =>
+    typeof document !== 'undefined' && document.documentElement.dataset.hoverGlow === 'off';
+
   const handleBarPointerEnter = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       const rect = e.currentTarget.getBoundingClientRect();
       barRectRef.current = rect;
-      if (!reducedMotion && sheenRef.current) {
+      if (!reducedMotion && !isHoverGlowOff() && sheenRef.current) {
         const localX = e.clientX - rect.left;
         sheenRef.current.style.transform = `translate3d(${Math.round(localX - 120)}px, 0, 0)`;
       }
@@ -719,12 +917,13 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
   const handleBarPointerMove = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      if (reducedMotion) return;
+      if (reducedMotion || isHoverGlowOff()) return;
       sheenClientXRef.current = e.clientX;
       if (sheenRafRef.current !== null) return;
       if (typeof requestAnimationFrame !== 'function') return;
       sheenRafRef.current = requestAnimationFrame(() => {
         sheenRafRef.current = null;
+        if (isHoverGlowOff()) return;
         const sheen = sheenRef.current;
         const bar = barRef.current;
         if (!sheen || !bar) return;
@@ -999,7 +1198,12 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     }
   };
 
-  const clock = formatTaskbarClock(now, { showSeconds, showWeekday });
+  const clock = formatTaskbarClock(now, {
+    showSeconds,
+    showWeekday,
+    dateFormat: clockDateFormat,
+    layout: clockLayout,
+  });
   const soundTooltip = formatSoundNetworkTooltip(audioMaster, net);
   const netConnected = net ? net.connected : true;
   const telemHot = Boolean(
@@ -1010,6 +1214,187 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       telemetry &&
       (telemetry.cpuPct >= 60 || (telemetry.gpuAvailable && telemetry.gpuTempC >= 68)),
   );
+  const timerDone = showTimer && timerSnap.running && effectiveTimerSec === 0;
+
+  const renderWidgetPills = () =>
+    activeWidgets.map((widgetId) => {
+      switch (widgetId) {
+        case 'weather':
+          return (
+            <button
+              key="weather"
+              type="button"
+              className={`tb-tray-btn tb-widget-pill tb-weather-pill ${activeFlyout === 'weather' ? 'open' : ''} ${weather?.stale ? 'stale' : ''}`.trim()}
+              data-condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
+              aria-label={
+                weather?.available
+                  ? `Погода: ${weather.city}, ${weatherTempStr}, ${weather.conditionLabel}`
+                  : 'Погода'
+              }
+              onClick={(e) =>
+                openFlyoutAt(
+                  'weather',
+                  e.currentTarget,
+                  WEATHER_FLYOUT_WIDTH,
+                  WEATHER_FLYOUT_HEIGHT,
+                  false,
+                )
+              }
+            >
+              <WeatherConditionIcon
+                condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
+                className="ic16 tb-weather-ic"
+              />
+              <span className="tb-widget-val">{weatherTempStr}</span>
+            </button>
+          );
+        case 'telemetry':
+          return (
+            <button
+              key="telemetry"
+              type="button"
+              className={`tb-tray-btn tb-widget-pill tb-telem-pill ${activeFlyout === 'telemetry' ? 'open' : ''} ${telemHot ? 'hot' : telemWarm ? 'warm' : ''}`.trim()}
+              aria-label={`Статус ПК: ${telemetryBadgeStr}`}
+              onClick={(e) =>
+                openFlyoutAt(
+                  'telemetry',
+                  e.currentTarget,
+                  TELEMETRY_FLYOUT_WIDTH,
+                  TELEMETRY_FLYOUT_HEIGHT,
+                  false,
+                )
+              }
+            >
+              <span className="tb-telem-dot" aria-hidden="true" />
+              <span className="tb-telem-text">{telemetryBadgeStr}</span>
+            </button>
+          );
+        case 'batteries':
+          if (!periphSummary) return null;
+          return (
+            <button
+              key="batteries"
+              type="button"
+              className={`tb-tray-btn tb-widget-pill tb-bat-pill ${activeFlyout === 'battery' ? 'open' : ''} ${periphSummary.critical ? 'critical' : periphSummary.low ? 'low' : ''}`.trim()}
+              aria-label={periphSummary.ariaLabel}
+              onClick={(e) =>
+                openFlyoutAt(
+                  'battery',
+                  e.currentTarget,
+                  BATTERY_FLYOUT_WIDTH,
+                  BATTERY_FLYOUT_HEIGHT,
+                  false,
+                )
+              }
+            >
+              <PeripheralDeviceIcon
+                kind={periphSummary.device.kind}
+                className="ic16 tb-bat-ic"
+              />
+              <span className="tb-widget-val tb-bat-val">{periphSummary.percentStr}</span>
+              {periphSummary.charging && <ChargingBoltIcon className="ic12 tb-bat-bolt" />}
+            </button>
+          );
+        case 'network':
+          if (!netBadge) return null;
+          return (
+            <button
+              key="network"
+              type="button"
+              className={`tb-tray-btn tb-widget-pill tb-net-pill ${activeFlyout === 'network' ? 'open' : ''} ${!netBadge.online ? 'offline' : ''}`.trim()}
+              aria-label={netBadge.ariaLabel}
+              onClick={(e) =>
+                openFlyoutAt(
+                  'network',
+                  e.currentTarget,
+                  NETWORK_FLYOUT_WIDTH,
+                  NETWORK_FLYOUT_HEIGHT,
+                  false,
+                )
+              }
+            >
+              {!netBadge.online ? (
+                <OfflineIcon className="ic16 tb-net-ic-badge" />
+              ) : netBadge.kind === 'wifi' ? (
+                <WifiIcon className="ic16 tb-net-ic-badge" />
+              ) : (
+                <NetworkSpeedIcon className="ic16 tb-net-ic-badge" />
+              )}
+              <span className="tb-widget-val tb-net-val">{netBadge.text}</span>
+            </button>
+          );
+        case 'media':
+          if (!mediaSummary) return null;
+          return (
+            <div
+              key="media"
+              ref={mediaPillRef}
+              className={`tb-widget-pill tb-media-pill ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''} ${mediaSummary.hasSession ? '' : 'idle'} ${mediaSummary.isPlaying ? 'playing' : ''}`.trim()}
+            >
+              <button
+                type="button"
+                className="tb-media-open-btn"
+                aria-label={mediaSummary.ariaLabel}
+                onClick={(e) =>
+                  openFlyoutAt(
+                    'sound',
+                    mediaPillRef.current ?? e.currentTarget,
+                    SOUND_FLYOUT_WIDTH,
+                    SOUND_FLYOUT_INITIAL_HEIGHT,
+                    false,
+                  )
+                }
+              >
+                {media?.thumbnail && mediaSummary.hasSession ? (
+                  <img
+                    src={media.thumbnail}
+                    alt=""
+                    className="tb-media-pill-art"
+                    draggable={false}
+                  />
+                ) : (
+                  <span className="tb-media-ic">
+                    <MusicNoteIcon className="ic14" />
+                  </span>
+                )}
+                <span className="tb-media-pill-title">{mediaSummary.title}</span>
+              </button>
+              {mediaSummary.hasSession && (
+                <button
+                  type="button"
+                  className="tb-media-play-btn"
+                  aria-label={mediaSummary.isPlaying ? 'Пауза' : 'Воспроизвести'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    ipc<MediaState>('media_action', { action: 'toggle' })
+                      .then((next) => {
+                        if (mountedRef.current && next) setMedia(next);
+                      })
+                      .catch(() => {});
+                  }}
+                >
+                  {mediaSummary.isPlaying ? <PauseIcon size={11} /> : <PlaySmallIcon size={11} />}
+                </button>
+              )}
+            </div>
+          );
+        case 'timer':
+          return (
+            <button
+              key="timer"
+              type="button"
+              className={`tb-tray-btn tb-widget-pill tb-timer-pill ${timerSnap.running ? 'running' : ''} ${timerDone ? 'done' : ''}`.trim()}
+              aria-label={`Таймер фокуса: ${timerLabel}`}
+              onClick={() => toggleStart(undefined, monitor).catch(() => {})}
+            >
+              <TimerIcon className="ic16 tb-timer-ic" />
+              <span className="tb-widget-val tb-timer-val">{timerLabel}</span>
+            </button>
+          );
+        default:
+          return null;
+      }
+    });
 
   const handleRootContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!(e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable="true"]')) {
@@ -1034,7 +1419,27 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       >
         <span ref={sheenRef} className="tb-sheen" aria-hidden="true" />
 
-        {useEdgeCentered && <div className="tb-edge-left" aria-hidden="true" />}
+        {useEdgeCentered && (
+          <div
+            className="tb-edge-left"
+            aria-hidden={!(widgetsPosition === 'left' && hasAnyWidget)}
+          >
+            {widgetsPosition === 'left' && hasAnyWidget && (
+              <div ref={leftWidgetsGroupRef} className="tb-group tb-left-widgets">
+                {renderWidgetPills()}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!useEdgeCentered && widgetsPosition === 'left' && hasAnyWidget && (
+          <>
+            <div ref={leftWidgetsGroupRef} className="tb-group tb-left-widgets">
+              {renderWidgetPills()}
+            </div>
+            <div className="tb-sep tb-widgets-left-sep" aria-hidden="true" />
+          </>
+        )}
 
         <div className="tb-group tb-apps has-hover-pill">
           <div ref={appsScrollRef} className="tb-apps-scroll" onMouseLeave={hideHoverPill}>
@@ -1106,71 +1511,14 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
           {!isSecondary && (
             <>
-              {showWeather && (
-                <button
-                  type="button"
-                  className={`tb-tray-btn tb-widget-pill tb-weather-pill ${activeFlyout === 'weather' ? 'open' : ''} ${weather?.stale ? 'stale' : ''}`.trim()}
-                  data-condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
-                  aria-label={
-                    weather?.available
-                      ? `Погода: ${weather.city}, ${weatherTempStr}, ${weather.conditionLabel}`
-                      : 'Погода'
-                  }
-                  onClick={(e) =>
-                    openFlyoutAt(
-                      'weather',
-                      e.currentTarget,
-                      WEATHER_FLYOUT_WIDTH,
-                      WEATHER_FLYOUT_HEIGHT,
-                      false,
-                    )
-                  }
-                >
-                  <WeatherConditionIcon
-                    condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
-                    className="ic16 tb-weather-ic"
-                  />
-                  <span className="tb-widget-val">{weatherTempStr}</span>
-                </button>
+              {widgetsPosition === 'right' && hasAnyWidget && (
+                <>
+                  <div ref={leftWidgetsGroupRef} className="tb-group tb-left-widgets">
+                    {renderWidgetPills()}
+                  </div>
+                  <div className="tb-sep tb-widget-sep" aria-hidden="true" />
+                </>
               )}
-
-              {showBatteries && periphSummary && (
-                <button
-                  type="button"
-                  className={`tb-tray-btn tb-widget-pill tb-bat-pill ${activeFlyout === 'battery' ? 'open' : ''} ${periphSummary.critical ? 'critical' : periphSummary.low ? 'low' : ''}`.trim()}
-                  aria-label={periphSummary.ariaLabel}
-                  onClick={(e) =>
-                    openFlyoutAt(
-                      'battery',
-                      e.currentTarget,
-                      BATTERY_FLYOUT_WIDTH,
-                      BATTERY_FLYOUT_HEIGHT,
-                      false,
-                    )
-                  }
-                >
-                  <PeripheralDeviceIcon
-                    kind={periphSummary.device.kind}
-                    className="ic16 tb-bat-ic"
-                  />
-                  <span className="tb-widget-val tb-bat-val">{periphSummary.percentStr}</span>
-                  {periphSummary.charging && <ChargingBoltIcon className="ic12 tb-bat-bolt" />}
-                </button>
-              )}
-
-              {showTelemetry && (
-                <button
-                  type="button"
-                  className={`tb-tray-btn tb-widget-pill tb-telem-pill ${telemHot ? 'hot' : telemWarm ? 'warm' : ''}`.trim()}
-                  aria-label={`Статус ПК: ${telemetryBadgeStr}`}
-                  onClick={() => toggleStart(undefined, 'primary').catch(() => {})}
-                >
-                  <span className="tb-telem-dot" aria-hidden="true" />
-                  <span className="tb-telem-text">{telemetryBadgeStr}</span>
-                </button>
-              )}
-
-              {hasAnyWidget && <div className="tb-sep tb-widget-sep" aria-hidden="true" />}
 
               <button
                 type="button"
@@ -1192,6 +1540,27 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
                 {layout}
               </button>
 
+              {!netConnected && (
+                <button
+                  type="button"
+                  className={`tb-tray-btn tb-net-offline-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''}`}
+                  aria-label="Нет подключения к сети"
+                  onClick={(e) =>
+                    openFlyoutAt(
+                      'sound',
+                      e.currentTarget,
+                      SOUND_FLYOUT_WIDTH,
+                      SOUND_FLYOUT_INITIAL_HEIGHT,
+                      false,
+                    )
+                  }
+                >
+                  <span className="tb-net-offline">
+                    <OfflineIcon className="ic18" />
+                  </span>
+                </button>
+              )}
+
               <button
                 type="button"
                 className={`tb-tray-btn tb-sound-btn ${activeFlyout === 'sound' || activeFlyout === 'quick' ? 'open' : ''} ${audioMaster?.masterMuted ? 'muted' : ''}`}
@@ -1202,9 +1571,6 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
                 onWheel={handleSoundWheel}
                 onAuxClick={handleSoundAux}
               >
-                <span className={`tb-net-ic ${!netConnected ? 'tb-net-offline' : ''}`.trim()}>
-                  <NetIcon kind={net?.kind} connected={netConnected} className="ic20" />
-                </span>
                 <span className="tb-vol-ic">
                   <VolIcon muted={audioMaster?.masterMuted} level={audioMaster?.masterVolume} className="ic20" />
                 </span>
@@ -1214,14 +1580,31 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
           <button
             type="button"
-            className={`tb-tray-btn tb-clock ${activeFlyout === 'calendar' ? 'open' : ''}`}
+            className={`tb-tray-btn tb-clock ${activeFlyout === 'calendar' ? 'open' : ''} ${clock.timeOnly ? 'time-only' : ''}`.trim()}
+            data-clock-layout={clock.layout}
             aria-label={clock.fullTitle}
             onClick={(e) =>
               openFlyoutAt('calendar', e.currentTarget, CALENDAR_FLYOUT_WIDTH, CALENDAR_FLYOUT_INITIAL_HEIGHT, false)
             }
           >
-            <span className="tb-clock-time">{clock.timeStr}</span>
-            <span className="tb-clock-date">{clock.dateStr}</span>
+            {clock.layout === 'single' ? (
+              clock.dateStr ? (
+                <>
+                  <span className="tb-clock-date">{clock.dateStr}</span>
+                  <span className="tb-clock-sep" aria-hidden="true">·</span>
+                  <span className="tb-clock-time">{clock.timeStr}</span>
+                </>
+              ) : (
+                <span className="tb-clock-time time-only">{clock.timeStr}</span>
+              )
+            ) : (
+              <>
+                <span className={`tb-clock-time ${clock.timeOnly ? 'time-only' : ''}`.trim()}>
+                  {clock.timeStr}
+                </span>
+                {clock.dateStr && <span className="tb-clock-date">{clock.dateStr}</span>}
+              </>
+            )}
           </button>
         </div>
       </nav>

@@ -1,4 +1,9 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import flyoutViewSrc from '../components/FlyoutView.tsx?raw';
+import { TaskbarView } from '../components/TaskbarView';
+import taskbarViewSrc from '../components/TaskbarView.tsx?raw';
 import { mergeTaskbarItems, type AppWindowGroup, type MergedBarItem } from './ipc';
 import {
   BATTERY_FLYOUT_HEIGHT,
@@ -13,25 +18,38 @@ import {
   computeNextWheelVolume,
   computePreviewCardWidth,
   createTaskbarOrderMemory,
+  DEFAULT_FOCUS_TIMER_SNAPSHOT,
   EDGE_CENTERED_MIN_WIDTH,
   filterGroupsForMonitor,
   formatBatteryPillSummary,
+  formatFocusTimerMmSs,
   formatMiniTelemetryLabel,
+  formatNetworkRateCompact,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
+  formatTaskbarMediaLabel,
+  formatTaskbarNetworkBadge,
+  formatTelemetryGb,
   formatWeatherTempLabel,
+  getFocusTimerEffectiveRemainingSec,
   getPreviewHoverDelayMs,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
+  getTelemetryUsageTone,
   isInteractiveFlyoutActive,
   isSoundFlyoutActive,
+  NETWORK_FLYOUT_HEIGHT,
+  NETWORK_FLYOUT_WIDTH,
+  parseFocusTimerSnapshot,
   planSoundFeedbackAction,
   PREVIEW_CARD_HEIGHT,
   PREVIEW_HOVER_COLD_MS,
   PREVIEW_HOVER_WARM_MS,
+  resolveActiveTaskbarWidgets,
   resolvePinnedReorderIndices,
   resolveTaskbarItemClick,
   resolveTaskbarMonitor,
+  resolveTaskbarWidgetsPosition,
   selectTaskbarPinsForMonitor,
   selectWindowToFocusOnTaskbarClick,
   shouldOpenVolumeOsd,
@@ -39,6 +57,10 @@ import {
   shouldUseEdgeCenteredLayout,
   SOUND_FLYOUT_WIDTH,
   stabilizeTaskbarItemsOrder,
+  TELEMETRY_FLYOUT_HEIGHT,
+  TELEMETRY_FLYOUT_WIDTH,
+  TIMER_STORAGE_KEY,
+  TIMER_UPDATED_EVENT,
   VOLUME_OSD_HEIGHT,
   VOLUME_OSD_WIDTH,
   WEATHER_FLYOUT_HEIGHT,
@@ -309,19 +331,58 @@ describe('TaskbarView Dock/Edge layout, states, cycling & pin DnD helpers', () =
     expect(resolvePinnedReorderIndices(items, 'pin-a', 'run-x')).toBeNull();
   });
 
-  it('formats taskbar clock with optional seconds, weekday & full Russian date tooltip', () => {
+  it('formats taskbar clock across all dateFormat x showWeekday x layout permutations', () => {
     // 2026-11-21 09:05:07 is Saturday
     const d = new Date(2026, 10, 21, 9, 5, 7);
+
+    // Defaults: dateFormat='short', layout='center', showWeekday=false, showSeconds=false
     expect(formatTaskbarClock(d)).toEqual({
       timeStr: '09:05',
-      dateStr: '21.11.2026',
+      dateStr: '21 ноя',
+      singleStr: '21 ноя · 09:05',
+      layout: 'center',
+      dateFormat: 'short',
+      timeOnly: false,
       fullTitle: 'Суббота, 21 ноября 2026',
     });
-    expect(formatTaskbarClock(d, { showSeconds: true, showWeekday: true })).toEqual({
-      timeStr: '09:05:07',
-      dateStr: 'Сб, 21.11.2026',
-      fullTitle: 'Суббота, 21 ноября 2026',
-    });
+
+    const expectedDates: Record<
+      'short' | 'numeric' | 'none',
+      Record<'false' | 'true', string>
+    > = {
+      short: { false: '21 ноя', true: 'Сб, 21 ноя' },
+      numeric: { false: '21.11.2026', true: 'Сб, 21.11' },
+      none: { false: '', true: '' },
+    };
+
+    for (const dateFormat of ['short', 'numeric', 'none'] as const) {
+      for (const showWeekday of [false, true] as const) {
+        for (const layout of ['center', 'right', 'single'] as const) {
+          const expectedDate = expectedDates[dateFormat][String(showWeekday) as 'false' | 'true'];
+          const res = formatTaskbarClock(d, {
+            showSeconds: dateFormat === 'none' && showWeekday,
+            showWeekday,
+            dateFormat,
+            layout,
+          });
+          const expectedTime = dateFormat === 'none' && showWeekday ? '09:05:07' : '09:05';
+          expect(res.timeStr).toBe(expectedTime);
+          expect(res.dateStr).toBe(expectedDate);
+          expect(res.layout).toBe(layout);
+          expect(res.dateFormat).toBe(dateFormat);
+          expect(res.timeOnly).toBe(dateFormat === 'none');
+          expect(res.singleStr).toBe(
+            expectedDate ? `${expectedDate} · ${expectedTime}` : expectedTime,
+          );
+          expect(res.fullTitle).toBe('Суббота, 21 ноября 2026');
+        }
+      }
+    }
+
+    // Specific May formatting check (month index 4 -> 'мая')
+    expect(formatTaskbarClock(new Date(2026, 4, 5, 22, 41), { showWeekday: true }).singleStr).toBe(
+      'Вт, 5 мая · 22:41',
+    );
 
     expect(
       formatSoundNetworkTooltip(
@@ -780,5 +841,222 @@ describe('Taskbar optional widgets: weather, peripheral batteries, mini telemetr
         gpuTempC: 0,
       }),
     ).toBe('CPU 23% · RAM 61%');
+  });
+});
+
+describe('V3.2 Taskbar widgets zone, network/media/timer formatters & network/telemetry flyouts', () => {
+  it('registers network and telemetry flyouts with exact dimensions and OSD/preview preemption', () => {
+    expect(NETWORK_FLYOUT_WIDTH).toBe(316);
+    expect(NETWORK_FLYOUT_HEIGHT).toBe(276);
+    expect(TELEMETRY_FLYOUT_WIDTH).toBe(324);
+    expect(TELEMETRY_FLYOUT_HEIGHT).toBe(336);
+
+    expect(isInteractiveFlyoutActive('network')).toBe(true);
+    expect(isInteractiveFlyoutActive('telemetry')).toBe(true);
+    expect(shouldOpenVolumeOsd('network')).toBe(false);
+    expect(shouldOpenVolumeOsd('telemetry')).toBe(false);
+
+    const running = makeRunningItem();
+    expect(shouldTriggerPreviewHover(running, false, 'network')).toBe(false);
+    expect(shouldTriggerPreviewHover(running, false, 'telemetry')).toBe(false);
+  });
+
+  it('resolves taskbar widgets from leftWidgets or legacy boolean fallback and widgetsPosition', () => {
+    expect(resolveActiveTaskbarWidgets(null)).toEqual([]);
+    expect(resolveActiveTaskbarWidgets(undefined)).toEqual([]);
+    expect(resolveTaskbarWidgetsPosition(null)).toBe('left');
+    expect(resolveTaskbarWidgetsPosition({ widgetsPosition: 'left' })).toBe('left');
+    expect(resolveTaskbarWidgetsPosition({ widgetsPosition: 'right' })).toBe('right');
+
+    // Legacy boolean fallback when leftWidgets is missing or empty
+    expect(
+      resolveActiveTaskbarWidgets({
+        showWeather: true,
+        showBatteries: false,
+        showTelemetry: true,
+        leftWidgets: [],
+      }),
+    ).toEqual(['weather', 'telemetry']);
+
+    // Non-empty leftWidgets overrides booleans, preserves order, deduplicates & drops unknown IDs
+    expect(
+      resolveActiveTaskbarWidgets({
+        showWeather: true,
+        showBatteries: true,
+        showTelemetry: false,
+        leftWidgets: [
+          'network',
+          'media',
+          'timer',
+          'network' as never,
+          'invalid' as never,
+        ],
+      }),
+    ).toEqual(['network', 'media', 'timer']);
+
+    // computeNaturalDockWidth accounts for optional left widgets zone
+    expect(computeNaturalDockWidth(598, 600, 400, 200, 180)).toBe(815);
+  });
+
+  it('formats compact network rates and taskbar network badge across online/offline/wifi/tx states', () => {
+    expect(formatNetworkRateCompact(null)).toBe('0 Б/с');
+    expect(formatNetworkRateCompact(-50)).toBe('0 Б/с');
+    expect(formatNetworkRateCompact(Number.NaN)).toBe('0 Б/с');
+    expect(formatNetworkRateCompact(512)).toBe('512 Б/с');
+    expect(formatNetworkRateCompact(1536)).toBe('1.5 КБ/с');
+    expect(formatNetworkRateCompact(245 * 1024)).toBe('245 КБ/с');
+    expect(formatNetworkRateCompact(12.4 * 1024 * 1024)).toBe('12.4 МБ/с');
+    expect(formatNetworkRateCompact(125 * 1024 * 1024)).toBe('125 МБ/с');
+    expect(formatNetworkRateCompact(1.5 * 1024 * 1024 * 1024)).toBe('1.5 ГБ/с');
+
+    expect(formatTaskbarNetworkBadge(null)).toEqual({
+      online: true,
+      kind: 'ethernet',
+      text: 'Сеть',
+      rateStr: '—',
+      pingStr: null,
+      ariaLabel: 'Состояние сети',
+    });
+
+    expect(
+      formatTaskbarNetworkBadge({
+        online: false,
+        kind: 'offline',
+        adapterName: 'Нет подключения',
+        localIp: '',
+        rxBytesPerSec: 1000,
+        txBytesPerSec: 1000,
+        pingMs: 12,
+        pingHost: '1.1.1.1',
+      }),
+    ).toEqual({
+      online: false,
+      kind: 'offline',
+      text: 'Нет сети',
+      rateStr: '0 Б/с',
+      pingStr: null,
+      ariaLabel: 'Нет подключения к сети',
+    });
+
+    const ethBadge = formatTaskbarNetworkBadge({
+      online: true,
+      kind: 'ethernet',
+      adapterName: 'Ethernet',
+      localIp: '192.168.1.42',
+      rxBytesPerSec: 2 * 1024 * 1024,
+      txBytesPerSec: 256 * 1024,
+      pingMs: 18,
+      pingHost: '1.1.1.1',
+    });
+    expect(ethBadge.kind).toBe('ethernet');
+    expect(ethBadge.text).toBe('↓ 2.0 МБ/с · 18 мс');
+    expect(ethBadge.pingStr).toBe('18 мс');
+
+    const wifiTxBadge = formatTaskbarNetworkBadge({
+      online: true,
+      kind: 'Wi-Fi',
+      adapterName: 'Intel Wi-Fi 6E',
+      localIp: '192.168.1.50',
+      rxBytesPerSec: 120 * 1024,
+      txBytesPerSec: 5 * 1024 * 1024,
+      pingMs: null,
+      pingHost: '1.1.1.1',
+    });
+    expect(wifiTxBadge.kind).toBe('wifi');
+    expect(wifiTxBadge.text).toBe('↑ 5.0 МБ/с');
+    expect(wifiTxBadge.pingStr).toBeNull();
+  });
+
+  it('formats compact media pill labels and self-contained focus timer snapshots', () => {
+    expect(formatTaskbarMediaLabel(null)).toEqual({
+      hasSession: false,
+      isPlaying: false,
+      title: 'Нет медиа',
+      ariaLabel: 'Медиа не воспроизводится',
+    });
+
+    expect(
+      formatTaskbarMediaLabel(
+        {
+          hasSession: true,
+          isPlaying: true,
+          title: '  Very   Long   Synthwave   Track  Title  Here  ',
+          artist: 'Artist',
+          source: 'Spotify',
+        },
+        18,
+      ),
+    ).toEqual({
+      hasSession: true,
+      isPlaying: true,
+      title: 'Very Long Synthwa…',
+      ariaLabel: 'Играет: Very Long Synthwave Track Title Here — Artist',
+    });
+
+    expect(
+      formatTaskbarMediaLabel({
+        hasSession: true,
+        isPlaying: false,
+        title: '',
+        artist: 'Radiohead',
+        source: 'Yandex Music',
+      }),
+    ).toEqual({
+      hasSession: true,
+      isPlaying: false,
+      title: 'Radiohead',
+      ariaLabel: 'Пауза: Radiohead — Radiohead',
+    });
+
+    expect(TIMER_STORAGE_KEY).toBe('testbar.focus_timer.v1');
+    expect(TIMER_UPDATED_EVENT).toBe('testbar:focus-timer-updated');
+    expect(parseFocusTimerSnapshot(null)).toEqual(DEFAULT_FOCUS_TIMER_SNAPSHOT);
+    expect(parseFocusTimerSnapshot('{invalid')).toEqual(DEFAULT_FOCUS_TIMER_SNAPSHOT);
+
+    const parsed = parseFocusTimerSnapshot(
+      JSON.stringify({
+        running: true,
+        totalSec: 1500,
+        remainingSec: 1200,
+        endEpochMs: 100_000,
+      }),
+    );
+    expect(getFocusTimerEffectiveRemainingSec(parsed, 75_500)).toBe(25);
+    expect(getFocusTimerEffectiveRemainingSec(parsed, 120_000)).toBe(0);
+    expect(formatFocusTimerMmSs(0)).toBe('00:00');
+    expect(formatFocusTimerMmSs(65)).toBe('01:05');
+    expect(formatFocusTimerMmSs(1500)).toBe('25:00');
+
+    expect(formatTelemetryGb(15.96)).toBe('16');
+    expect(formatTelemetryGb(12.34)).toBe('12.3');
+    expect(getTelemetryUsageTone(45)).toBe('ok');
+    expect(getTelemetryUsageTone(75)).toBe('warn');
+    expect(getTelemetryUsageTone(90)).toBe('hot');
+  });
+
+  it('enforces clean single sound icon, refined clock attrs, hoverGlow guard & network/telemetry flyouts', () => {
+    const html = renderToStaticMarkup(createElement(TaskbarView));
+    expect(html).toContain('data-clock-layout="center"');
+    expect(html).toContain('tb-clock-date');
+    expect(html).toContain('tb-sound-btn');
+    expect(html).not.toContain('tb-net-ic');
+    expect(html).not.toContain('tb-net-offline-btn');
+    expect(html).not.toContain('tb-timer-pill');
+
+    expect(taskbarViewSrc).toContain('OfflineIcon');
+    expect(taskbarViewSrc).toContain("dataset.hoverGlow === 'off'");
+    expect(taskbarViewSrc).toContain('resolveActiveTaskbarWidgets');
+    expect(taskbarViewSrc).toContain('resolveTaskbarWidgetsPosition');
+    expect(taskbarViewSrc).toContain("'telemetry'");
+    expect(taskbarViewSrc).toContain("'network'");
+    expect(taskbarViewSrc).toContain('TIMER_STORAGE_KEY');
+    expect(taskbarViewSrc).toContain('TIMER_UPDATED_EVENT');
+
+    expect(flyoutViewSrc).toContain("req.kind === 'network'");
+    expect(flyoutViewSrc).toContain("req.kind === 'telemetry'");
+    expect(flyoutViewSrc).toContain('getNetworkSnapshot');
+    expect(flyoutViewSrc).toContain('Проверить');
+    expect(flyoutViewSrc).toContain('Локальный IPv4');
+    expect(flyoutViewSrc).toContain('Монитор ПК');
   });
 });
