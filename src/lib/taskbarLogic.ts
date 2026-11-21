@@ -6,7 +6,9 @@ import type {
   MergedBarItem,
   NetworkInfo,
   OpenWindowInfo,
+  PeripheralBattery,
   PinItem,
+  TelemetryState,
 } from './ipc';
 
 export type TaskbarMonitor = 'primary' | 'secondary';
@@ -39,6 +41,8 @@ const INTERACTIVE_FLYOUT_KINDS = new Set([
   'sound',
   'quick',
   'calendar',
+  'weather',
+  'battery',
   'context_app',
   'context_bar',
   'ctx_app',
@@ -58,6 +62,10 @@ export const SOUND_FLYOUT_WIDTH = 336;
 export const SOUND_FLYOUT_INITIAL_HEIGHT = 340;
 export const CALENDAR_FLYOUT_WIDTH = 310;
 export const CALENDAR_FLYOUT_INITIAL_HEIGHT = 408;
+export const WEATHER_FLYOUT_WIDTH = 340;
+export const WEATHER_FLYOUT_HEIGHT = 404;
+export const BATTERY_FLYOUT_WIDTH = 304;
+export const BATTERY_FLYOUT_HEIGHT = 250;
 export const EDGE_CENTERED_MIN_WIDTH = 1180;
 export const DOCK_CHROME_EXTRA_PX = 21; // 16px horizontal padding (8px*2) + 2px border + 3px group gap
 
@@ -630,4 +638,102 @@ export function buildPinFromAppContext(payload: AppContextPayload, id = `tb-${Da
     matchExe: payload.matchExe ?? null,
     matchAumid: payload.aumid ?? null,
   };
+}
+
+export interface BatteryPillSummary {
+  device: PeripheralBattery;
+  percent: number;
+  percentStr: string;
+  charging: boolean;
+  low: boolean;
+  critical: boolean;
+  count: number;
+  ariaLabel: string;
+}
+
+/**
+ * Formats rounded Celsius or Fahrenheit temperature label for taskbar & flyout pills (`14°`, `57°`, `—°`).
+ */
+export function formatWeatherTempLabel(
+  tempC: number | null | undefined,
+  units: 'c' | 'f' | string | null | undefined = 'c',
+): string {
+  if (tempC === null || tempC === undefined || !Number.isFinite(tempC)) {
+    return '—°';
+  }
+  const useFahrenheit = typeof units === 'string' && units.trim().toLowerCase() === 'f';
+  const raw = useFahrenheit ? (tempC * 9) / 5 + 32 : tempC;
+  const rounded = Math.round(raw);
+  const safe = Object.is(rounded, -0) ? 0 : rounded;
+  return `${safe}°`;
+}
+
+/**
+ * Picks the lowest-charge connected wireless peripheral for the compact taskbar battery pill.
+ */
+export function formatBatteryPillSummary(
+  periphs: readonly PeripheralBattery[] | null | undefined,
+): BatteryPillSummary | null {
+  if (!periphs || periphs.length === 0) return null;
+  const active = periphs.filter((p) => p && p.connected !== false);
+  if (active.length === 0) return null;
+
+  const clampPct = (val: number) =>
+    Number.isFinite(val) ? Math.max(0, Math.min(100, Math.round(val))) : 0;
+
+  let chosen = active[0];
+  let chosenPct = clampPct(chosen.percent);
+
+  for (let i = 1; i < active.length; i += 1) {
+    const candidate = active[i];
+    const pct = clampPct(candidate.percent);
+    if (pct < chosenPct || (pct === chosenPct && chosen.charging && !candidate.charging)) {
+      chosen = candidate;
+      chosenPct = pct;
+    }
+  }
+
+  const charging = Boolean(chosen.charging);
+  const low = chosenPct < 20;
+  const critical = chosenPct <= 10;
+  const percentStr = `${chosenPct}%`;
+  const chargeNote = charging ? ' (заряжается)' : '';
+  const ariaLabel =
+    active.length > 1
+      ? `${chosen.name}: ${percentStr}${chargeNote}. Всего устройств: ${active.length}`
+      : `${chosen.name}: ${percentStr}${chargeNote}`;
+
+  return {
+    device: chosen,
+    percent: chosenPct,
+    percentStr,
+    charging,
+    low,
+    critical,
+    count: active.length,
+    ariaLabel,
+  };
+}
+
+/**
+ * Formats compact monospace taskbar telemetry label (`CPU 14% · 46°` when GPU temp is available).
+ */
+export function formatMiniTelemetryLabel(
+  telemetry:
+    | Pick<TelemetryState, 'cpuPct' | 'ramPct' | 'gpuAvailable' | 'gpuTempC'>
+    | null
+    | undefined,
+): string {
+  if (!telemetry) return 'CPU —%';
+  const cpu = Number.isFinite(telemetry.cpuPct)
+    ? Math.max(0, Math.min(100, Math.round(telemetry.cpuPct)))
+    : 0;
+  if (telemetry.gpuAvailable && Number.isFinite(telemetry.gpuTempC) && telemetry.gpuTempC > 0) {
+    return `CPU ${cpu}% · ${Math.round(telemetry.gpuTempC)}°`;
+  }
+  if (Number.isFinite(telemetry.ramPct)) {
+    const ram = Math.max(0, Math.min(100, Math.round(telemetry.ramPct)));
+    return `CPU ${cpu}% · RAM ${ram}%`;
+  }
+  return `CPU ${cpu}%`;
 }

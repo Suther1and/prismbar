@@ -6,6 +6,7 @@ import type {
   MediaState,
   OpenWindowInfo,
   TrayAppItem,
+  WeatherCityOption,
 } from './ipc';
 
 export type FlyoutPhase = 'closed' | 'open' | 'closing';
@@ -27,6 +28,8 @@ export const AUDIO_PEAK_POLL_MS = 130;
 export const FLYOUT_ROOT_PAD_LOGICAL = 16;
 export const FLYOUT_MAX_CARD_HEIGHT = 580;
 export const QS_MIXER_MAX_HEIGHT = 220;
+export const BATTERY_LIST_MAX_HEIGHT = 360;
+export const WEATHER_CITY_RESULTS_MAX_HEIGHT = 132;
 
 export const TRAY_COLUMNS = 6;
 export const TRAY_CARD_WIDTH = 244;
@@ -417,4 +420,80 @@ export function computeNextContextFocusIdx(
     return delta > 0 ? 0 : itemCount - 1;
   }
   return (currentIdx + delta + itemCount) % itemCount;
+}
+
+/**
+ * Maps raw peripheral battery `source` tags (`bluetooth`, `razer_hid`, `logitech_hidpp`, `xinput`)
+ * to clean UI badge labels.
+ */
+export function formatPeripheralSourceLabel(source: string | null | undefined): string {
+  const norm = (source ?? '').trim().toLowerCase();
+  if (!norm) return 'Беспроводное';
+  if (norm === 'bluetooth' || norm === 'bt') return 'Bluetooth';
+  if (norm === 'xinput') return 'XInput';
+  if (norm === 'razer_hid' || norm === 'logitech_hidpp' || norm.includes('hid')) {
+    return 'USB HID';
+  }
+  return source!.trim();
+}
+
+export interface WeatherTempBarRange {
+  leftPct: number;
+  widthPct: number;
+}
+
+/**
+ * Computes normalized `[leftPct, widthPct]` percentages for a day's min..max temperature pill
+ * inside the 5-day forecast range track.
+ */
+export function computeWeatherTempBarRange(
+  dayMinC: number,
+  dayMaxC: number,
+  weekMinC: number,
+  weekMaxC: number,
+): WeatherTempBarRange {
+  if (
+    !Number.isFinite(dayMinC) ||
+    !Number.isFinite(dayMaxC) ||
+    !Number.isFinite(weekMinC) ||
+    !Number.isFinite(weekMaxC)
+  ) {
+    return { leftPct: 0, widthPct: 100 };
+  }
+  const span = weekMaxC - weekMinC;
+  if (span <= 0.01) {
+    return { leftPct: 0, widthPct: 100 };
+  }
+  const lo = Math.min(dayMinC, dayMaxC);
+  const hi = Math.max(dayMinC, dayMaxC);
+  const rawLeft = ((lo - weekMinC) / span) * 100;
+  const rawRight = ((hi - weekMinC) / span) * 100;
+  const leftPct = Math.max(0, Math.min(88, Math.round(rawLeft * 10) / 10));
+  const widthPct = Math.max(12, Math.min(100 - leftPct, Math.round((rawRight - rawLeft) * 10) / 10));
+  return { leftPct, widthPct };
+}
+
+export function formatWeatherWindLabel(windKmh: number | null | undefined): string {
+  if (windKmh === null || windKmh === undefined || !Number.isFinite(windKmh)) {
+    return '— км/ч';
+  }
+  return `${Math.max(0, Math.round(windKmh))} км/ч`;
+}
+
+export function formatCityOptionSubtitle(
+  option: Pick<WeatherCityOption, 'admin1' | 'country'> & { name?: string },
+): string {
+  const seen = new Set<string>();
+  const baseName = (option.name ?? '').trim().toLowerCase();
+  if (baseName) seen.add(baseName);
+  const parts: string[] = [];
+  for (const raw of [option.admin1, option.country]) {
+    const trimmed = (raw ?? '').trim();
+    if (!trimmed) continue;
+    const low = trimmed.toLowerCase();
+    if (seen.has(low)) continue;
+    seen.add(low);
+    parts.push(trimmed);
+  }
+  return parts.join(', ');
 }

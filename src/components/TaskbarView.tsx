@@ -1,10 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import '../styles/widgets.css';
 import { TRAY_CARD_WIDTH, TRAY_MIN_CARD_HEIGHT } from '../lib/flyoutLogic';
 import {
   applyConfigUpdate,
   dismissOverlays,
   fetchIconsBatch,
   getOpenWindows,
+  getPeripheralBatteries,
+  getWeather,
   iconCache,
   ipc,
   isCacheIconKey,
@@ -19,10 +22,15 @@ import {
   type FlyoutKind,
   type MergedBarItem,
   type NetworkInfo,
+  type PeripheralBattery,
   type StartStateEvent,
+  type TelemetryState,
   type TestBarConfig,
+  type WeatherSnapshot,
 } from '../lib/ipc';
 import {
+  BATTERY_FLYOUT_HEIGHT,
+  BATTERY_FLYOUT_WIDTH,
   buildAppContextMenuRequest,
   buildBarContextMenuRequest,
   buildPreviewFlyoutRequest,
@@ -32,8 +40,11 @@ import {
   computeNextWheelVolume,
   createTaskbarOrderMemory,
   filterGroupsForMonitor,
+  formatBatteryPillSummary,
+  formatMiniTelemetryLabel,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
+  formatWeatherTempLabel,
   getPreviewHoverDelayMs,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
@@ -48,11 +59,22 @@ import {
   SOUND_FLYOUT_WIDTH,
   stabilizeTaskbarItemsOrder,
   TASKBAR_LAUNCH_HOP_MS,
+  WEATHER_FLYOUT_HEIGHT,
+  WEATHER_FLYOUT_WIDTH,
   type TaskbarMonitor,
 } from '../lib/taskbarLogic';
 import { hasExceededDragThreshold } from '../lib/startLogic';
 import { useReducedMotion } from '../lib/useReducedMotion';
-import { ChevronUpIcon, FallbackAppIcon, NetIcon, StartLogoIcon, VolIcon } from './Icons';
+import {
+  ChargingBoltIcon,
+  ChevronUpIcon,
+  FallbackAppIcon,
+  NetIcon,
+  PeripheralDeviceIcon,
+  StartLogoIcon,
+  VolIcon,
+  WeatherConditionIcon,
+} from './Icons';
 
 function audioStateToMaster(st: AudioState): AudioMasterState {
   const active = st.devices.find((d) => d.isDefault);
@@ -84,6 +106,9 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const [audioMaster, setAudioMaster] = useState<AudioMasterState | null>(null);
   const [net, setNet] = useState<NetworkInfo | null>(null);
   const [layout, setLayout] = useState('RU');
+  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
+  const [periphs, setPeriphs] = useState<PeripheralBattery[]>([]);
+  const [telemetry, setTelemetry] = useState<TelemetryState | null>(null);
   const [startOpen, setStartOpen] = useState(false);
   const [activeFlyout, setActiveFlyout] = useState<string>('');
   const [now, setNow] = useState(() => new Date());
@@ -126,6 +151,27 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const showWeekday = Boolean(config?.clockShowWeekday);
   const isEdge = config?.barMode === 'edge';
   const useEdgeCentered = shouldUseEdgeCenteredLayout(config?.barMode, monitor, viewportWidth);
+
+  const showWeather = !isSecondary && config?.taskbarWidgets?.showWeather !== false;
+  const showBatteries = !isSecondary && config?.taskbarWidgets?.showBatteries === true;
+  const showTelemetry = !isSecondary && config?.taskbarWidgets?.showTelemetry === true;
+  const weatherUnits: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
+  const weatherCityKey = config?.taskbarWidgets?.weatherCity ?? '';
+  const weatherLatKey = config?.taskbarWidgets?.weatherLat ?? null;
+  const weatherLonKey = config?.taskbarWidgets?.weatherLon ?? null;
+
+  const weatherTempStr = showWeather
+    ? formatWeatherTempLabel(weather?.available ? weather.tempC : null, weatherUnits)
+    : '';
+  const periphSummary = useMemo(
+    () => (showBatteries ? formatBatteryPillSummary(periphs) : null),
+    [showBatteries, periphs],
+  );
+  const periphBadgeKey = periphSummary
+    ? `${periphSummary.device.kind}:${periphSummary.percent}:${periphSummary.charging ? 1 : 0}:${periphSummary.count}`
+    : '';
+  const telemetryBadgeStr = showTelemetry ? formatMiniTelemetryLabel(telemetry) : '';
+  const hasAnyWidget = showWeather || periphSummary !== null || showTelemetry;
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -227,6 +273,93 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       subs.forEach((p) => p.then((u) => u()));
     };
   }, [monitor, isSecondary]);
+
+  // Primary Weather widget lazy fetch + 15-min refresh + live event updates
+  useEffect(() => {
+    if (!showWeather) return;
+    let cancelled = false;
+    const loadWeather = () => {
+      getWeather({ force: false })
+        .then((snap) => {
+          if (!cancelled) setWeather(snap);
+        })
+        .catch(() => {});
+    };
+    loadWeather();
+    const unlistenPromise = onEvent<WeatherSnapshot>('weather-updated', (snap) => {
+      if (!cancelled && snap) setWeather(snap);
+    });
+    const timer = window.setInterval(loadWeather, 15 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlistenPromise.then((u) => u());
+    };
+  }, [showWeather, weatherCityKey, weatherLatKey, weatherLonKey]);
+
+  // Primary Batteries widget: fetch + poll ONLY when enabled
+  useEffect(() => {
+    if (!showBatteries) {
+      setPeriphs((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    let cancelled = false;
+    let inflight = false;
+    const loadPeriphs = () => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      getPeripheralBatteries()
+        .then((items) => {
+          if (!cancelled && Array.isArray(items)) setPeriphs(items);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    loadPeriphs();
+    const unlistenPromise = onEvent<PeripheralBattery[]>('peripherals-updated', (items) => {
+      if (!cancelled && Array.isArray(items)) setPeriphs(items);
+    });
+    const timer = window.setInterval(loadPeriphs, 30 * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlistenPromise.then((u) => u());
+    };
+  }, [showBatteries]);
+
+  // Primary Mini PC Status widget: fetch & poll get_telemetry ONLY when enabled
+  useEffect(() => {
+    if (!showTelemetry) {
+      setTelemetry((prev) => (prev === null ? prev : null));
+      return;
+    }
+    let cancelled = false;
+    let inflight = false;
+    const loadTelemetry = () => {
+      if (cancelled || inflight) return;
+      inflight = true;
+      ipc<TelemetryState>('get_telemetry')
+        .then((snap) => {
+          if (!cancelled && snap) setTelemetry(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inflight = false;
+        });
+    };
+    loadTelemetry();
+    const unlistenPromise = onEvent<TelemetryState>('telemetry-updated', (snap) => {
+      if (!cancelled && snap) setTelemetry(snap);
+    });
+    const timer = window.setInterval(loadTelemetry, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlistenPromise.then((u) => u());
+    };
+  }, [showTelemetry]);
 
   // Load real native .exe, WindowsApps aliases, and shell:AppsFolder\ UWP icons for pinned taskbar apps (primary only)
   useEffect(() => {
@@ -444,7 +577,21 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       }
       ro.disconnect();
     };
-  }, [barItems.length, config?.barMode, showSeconds, showWeekday, layout, monitor]);
+  }, [
+    barItems.length,
+    config?.barMode,
+    showSeconds,
+    showWeekday,
+    layout,
+    monitor,
+    config?.taskbarWidgets?.showWeather,
+    config?.taskbarWidgets?.showBatteries,
+    config?.taskbarWidgets?.showTelemetry,
+    config?.taskbarWidgets?.weatherUnits,
+    weatherTempStr,
+    periphBadgeKey,
+    telemetryBadgeStr,
+  ]);
 
   const anchorX = (el: HTMLElement) => {
     const r = el.getBoundingClientRect();
@@ -818,6 +965,14 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const clock = formatTaskbarClock(now, { showSeconds, showWeekday });
   const soundTooltip = formatSoundNetworkTooltip(audioMaster, net);
   const netConnected = net ? net.connected : true;
+  const telemHot = Boolean(
+    telemetry && (telemetry.cpuPct >= 85 || (telemetry.gpuAvailable && telemetry.gpuTempC >= 80)),
+  );
+  const telemWarm = Boolean(
+    !telemHot &&
+      telemetry &&
+      (telemetry.cpuPct >= 60 || (telemetry.gpuAvailable && telemetry.gpuTempC >= 68)),
+  );
 
   return (
     <div
@@ -907,6 +1062,72 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
           {!isSecondary && (
             <>
+              {showWeather && (
+                <button
+                  type="button"
+                  className={`tb-tray-btn tb-widget-pill tb-weather-pill ${activeFlyout === 'weather' ? 'open' : ''} ${weather?.stale ? 'stale' : ''}`.trim()}
+                  data-condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
+                  aria-label={
+                    weather?.available
+                      ? `Погода: ${weather.city}, ${weatherTempStr}, ${weather.conditionLabel}`
+                      : 'Погода'
+                  }
+                  onClick={(e) =>
+                    openFlyoutAt(
+                      'weather',
+                      e.currentTarget,
+                      WEATHER_FLYOUT_WIDTH,
+                      WEATHER_FLYOUT_HEIGHT,
+                      false,
+                    )
+                  }
+                >
+                  <WeatherConditionIcon
+                    condition={weather?.available ? weather.conditionIcon : 'partly-cloudy-day'}
+                    className="ic16 tb-weather-ic"
+                  />
+                  <span className="tb-widget-val">{weatherTempStr}</span>
+                </button>
+              )}
+
+              {showBatteries && periphSummary && (
+                <button
+                  type="button"
+                  className={`tb-tray-btn tb-widget-pill tb-bat-pill ${activeFlyout === 'battery' ? 'open' : ''} ${periphSummary.critical ? 'critical' : periphSummary.low ? 'low' : ''}`.trim()}
+                  aria-label={periphSummary.ariaLabel}
+                  onClick={(e) =>
+                    openFlyoutAt(
+                      'battery',
+                      e.currentTarget,
+                      BATTERY_FLYOUT_WIDTH,
+                      BATTERY_FLYOUT_HEIGHT,
+                      false,
+                    )
+                  }
+                >
+                  <PeripheralDeviceIcon
+                    kind={periphSummary.device.kind}
+                    className="ic16 tb-bat-ic"
+                  />
+                  <span className="tb-widget-val tb-bat-val">{periphSummary.percentStr}</span>
+                  {periphSummary.charging && <ChargingBoltIcon className="ic12 tb-bat-bolt" />}
+                </button>
+              )}
+
+              {showTelemetry && (
+                <button
+                  type="button"
+                  className={`tb-tray-btn tb-widget-pill tb-telem-pill ${telemHot ? 'hot' : telemWarm ? 'warm' : ''}`.trim()}
+                  aria-label={`Статус ПК: ${telemetryBadgeStr}`}
+                  onClick={() => toggleStart(undefined, 'primary').catch(() => {})}
+                >
+                  <span className="tb-telem-dot" aria-hidden="true" />
+                  <span className="tb-telem-text">{telemetryBadgeStr}</span>
+                </button>
+              )}
+
+              {hasAnyWidget && <div className="tb-sep tb-widget-sep" aria-hidden="true" />}
+
               <button
                 type="button"
                 className={`tb-tray-btn chevron ${activeFlyout === 'tray' ? 'open' : ''}`}
