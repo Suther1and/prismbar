@@ -10,16 +10,21 @@ import {
 } from '../../lib/appearance';
 import { formatCityOptionSubtitle, formatIpcError } from '../../lib/flyoutLogic';
 import {
+  openAccessibilitySettings,
+  quitApp,
   restoreAllBatteryDevices,
   restoreBatteryDevice,
   searchWeatherCities,
   setAppearanceSettings,
+  setMacSettings,
   setSpaceWidgets,
   setTaskbarWidgets,
   type ClockDateFormat,
   type ClockLayout,
+  type MacCommandKeyMode,
+  type MacTerminalApp,
+  type MacWindowPosition,
   type SecondaryTaskbarMode,
-  type SpaceConfig,
   type SpaceWidgetId,
   type TaskbarWidgetId,
   type TaskbarWidgetsPosition,
@@ -27,6 +32,12 @@ import {
   type TileSize,
   type WeatherCityOption,
 } from '../../lib/ipc';
+import {
+  detectPlatform,
+  getAvailableSpaceWidgetIds,
+  type AppPlatform,
+} from '../../lib/platform';
+import { resolveConfiguredSpaces } from '../../lib/startLogic';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import {
   AppsGridIcon,
@@ -66,6 +77,11 @@ export interface StartSettingsOverlayProps {
   onExportConfig: () => Promise<void>;
   onImportConfig: () => Promise<void>;
   onRestoreWindowsAndExit: () => void;
+  platform?: AppPlatform;
+  accessibilityTrusted?: boolean | null;
+  onOpenAccessibilitySettings?: () => Promise<void>;
+  onSetMacSettings?: (params: Parameters<typeof setMacSettings>[0]) => Promise<void>;
+  onQuitApp?: () => void;
 }
 
 type SettingsTabId = 'appearance' | 'bar' | 'start' | 'devices' | 'system';
@@ -212,6 +228,45 @@ const HOTKEY_ROWS: ReadonlyArray<{ keys: string[]; label: string }> = [
   { keys: ['Ctrl', 'Alt', 'Shift', 'Esc'], label: 'Возврат штатной панели Windows' },
 ];
 
+const MAC_HOTKEY_ROWS: ReadonlyArray<{ keys: string[]; label: string }> = [
+  { keys: ['⌘'], label: 'Открыть или закрыть «Пуск»' },
+  { keys: ['⌘ / Ctrl', '1–9'], label: 'Переход к пространству по номеру' },
+  { keys: ['Tab'], label: 'Переключение пространств' },
+  { keys: ['Shift'], label: 'Альтернативные действия на плитках' },
+  { keys: ['Esc'], label: 'Закрыть окно или модалку' },
+];
+
+const MAC_COMMAND_KEY_OPTIONS: ReadonlyArray<{
+  id: MacCommandKeyMode;
+  label: string;
+  hint: string;
+}> = [
+  { id: 'any', label: 'Любой ⌘', hint: 'Левый или правый' },
+  { id: 'left', label: 'Левый ⌘', hint: 'Только левый' },
+  { id: 'right', label: 'Правый ⌘', hint: 'Только правый' },
+  { id: 'disabled', label: 'Выкл', hint: 'Не перехватывать' },
+];
+
+const MAC_WINDOW_POSITION_OPTIONS: ReadonlyArray<{
+  id: MacWindowPosition;
+  label: string;
+  hint: string;
+}> = [
+  { id: 'center', label: 'По центру', hint: 'Как Spotlight' },
+  { id: 'bottom', label: 'Снизу над Dock', hint: 'Классический вид' },
+];
+
+const MAC_TERMINAL_OPTIONS: ReadonlyArray<{
+  id: MacTerminalApp;
+  label: string;
+}> = [
+  { id: 'auto', label: 'Авто' },
+  { id: 'terminal', label: 'Terminal' },
+  { id: 'iterm', label: 'iTerm' },
+  { id: 'warp', label: 'Warp' },
+  { id: 'ghostty', label: 'Ghostty' },
+];
+
 const EN_TO_RU_MAP: Record<string, string> = {
   q: 'й', w: 'ц', e: 'у', r: 'к', t: 'е', y: 'н', u: 'г', i: 'ш', o: 'щ', p: 'з',
   '[': 'х', ']': 'ъ', a: 'ф', s: 'ы', d: 'в', f: 'а', g: 'п', h: 'р', j: 'о', k: 'л',
@@ -294,67 +349,6 @@ function formatClockSamplePreview(
   return `${time} / ${date}`;
 }
 
-function resolveStudioSpaces(config: TestBarConfig | null): SpaceConfig[] {
-  if (config?.spaces && config.spaces.length > 0) {
-    return config.spaces;
-  }
-  const base: SpaceConfig[] = [
-    {
-      id: 'personal',
-      name: 'Личное',
-      accentHex: '#818CF8',
-      accentRgb: '129, 140, 248',
-      layoutKind: 'grid',
-      showHeroRow: true,
-      widgets: ['media', 'audio_mixer', 'clipboard'],
-      items: [...(config?.personalPins ?? []), ...(config?.personalLinks ?? [])],
-    },
-    {
-      id: 'work',
-      name: 'Работа',
-      accentHex: '#38BDF8',
-      accentRgb: '56, 189, 248',
-      layoutKind: 'grid',
-      showHeroRow: false,
-      widgets: ['pc_health', 'top_processes'],
-      items: [...(config?.workFolders ?? []), ...(config?.workApps ?? [])],
-    },
-    {
-      id: 'studio',
-      name: 'Студия',
-      accentHex: '#34D399',
-      accentRgb: '52, 211, 153',
-      layoutKind: 'grid',
-      showHeroRow: true,
-      widgets: ['pc_health', 'audio_mixer', 'top_processes'],
-      items: [...(config?.studioPins ?? []), ...(config?.studioTools ?? [])],
-    },
-    {
-      id: 'games',
-      name: 'Игры',
-      accentHex: '#FB7185',
-      accentRgb: '251, 113, 133',
-      layoutKind: 'games',
-      showHeroRow: false,
-      widgets: ['audio_mixer', 'game_combos', 'pc_health'],
-      items: [...(config?.gameLaunchers ?? [])],
-    },
-  ];
-  for (const cs of config?.customSpaces ?? []) {
-    base.push({
-      id: cs.id,
-      name: cs.name,
-      accentHex: cs.accentHex || '#A78BFA',
-      accentRgb: cs.accentRgb || '167, 139, 250',
-      layoutKind: 'grid',
-      showHeroRow: false,
-      widgets: ['media', 'audio_mixer'],
-      items: cs.items ?? [],
-    });
-  }
-  return base;
-}
-
 function hexToRgbTriplet(hex: string): string {
   const clean = hex.replace('#', '');
   if (clean.length !== 6) return '16, 19, 28';
@@ -387,7 +381,36 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   onExportConfig,
   onImportConfig,
   onRestoreWindowsAndExit,
+  platform,
+  accessibilityTrusted = null,
+  onOpenAccessibilitySettings = openAccessibilitySettings,
+  onSetMacSettings = (params) => setMacSettings(params).then(() => {}),
+  onQuitApp,
 }) => {
+  const effectivePlatform = platform ?? detectPlatform();
+  const isMac = effectivePlatform === 'macos';
+  const tabsList = useMemo(
+    () =>
+      SETTINGS_TABS.filter((tab) => !(isMac && tab.id === 'bar')).map((tab) => {
+        if (!isMac) return tab;
+        if (tab.id === 'devices') {
+          return {
+            ...tab,
+            label: 'Устройства',
+            title: 'Устройства',
+            subtitle: 'Управление скрытыми устройствами и батареями периферии',
+          };
+        }
+        if (tab.id === 'system') {
+          return {
+            ...tab,
+            subtitle: 'Автозапуск, профиль конфигурации и выход из TestBar',
+          };
+        }
+        return tab;
+      }),
+    [isMac],
+  );
   const { mounted, phase } = useAnimatedPresence(open, 115);
 
   const [activeTab, setActiveTab] = useState<SettingsTabId>('appearance');
@@ -421,7 +444,8 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   }, [open]);
 
   useEffect(() => {
-    if (!open || (activeTab !== 'bar' && !searchQuery.trim())) return;
+    const weatherTab: SettingsTabId = isMac ? 'start' : 'bar';
+    if (!open || (activeTab !== weatherTab && !searchQuery.trim())) return;
     const trimmed = cityQuery.trim();
     if (trimmed.length < 2) {
       citySearchSeqRef.current += 1;
@@ -451,7 +475,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
         });
     }, 260);
     return () => window.clearTimeout(timer);
-  }, [open, activeTab, searchQuery, cityQuery]);
+  }, [open, activeTab, searchQuery, cityQuery, isMac]);
 
   const appearance = resolveAppearanceState(config);
   const barMode = config?.barMode === 'edge' ? 'edge' : 'dock';
@@ -491,8 +515,18 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
     tw?.widgetsPosition === 'right' ? 'right' : 'left';
   const weatherCity = tw?.weatherCity?.trim() ?? '';
   const weatherUnits: 'c' | 'f' = tw?.weatherUnits === 'f' ? 'f' : 'c';
+  const macCommandKey: MacCommandKeyMode = config?.macCommandKey ?? 'any';
+  const macWindowPosition: MacWindowPosition = config?.macWindowPosition ?? 'center';
+  const macTerminalApp: MacTerminalApp = config?.macTerminalApp ?? 'auto';
+  const supportedSpaceWidgetLabels = useMemo(() => {
+    const allowed = new Set(getAvailableSpaceWidgetIds(effectivePlatform));
+    return INLINE_SPACE_WIDGET_LABELS.filter((w) => allowed.has(w.id));
+  }, [effectivePlatform]);
 
-  const spacesList = useMemo(() => resolveStudioSpaces(config), [config]);
+  const spacesList = useMemo(
+    () => resolveConfiguredSpaces(config, effectivePlatform),
+    [config, effectivePlatform],
+  );
 
   const activeThemeMeta =
     THEME_PRESETS.find((t) => t.id === appearance.themePreset) ?? THEME_PRESETS[0];
@@ -633,13 +667,15 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                   </div>
                 </div>
               </div>
-              <div className="studio-pv-dock" aria-hidden="true">
-                <span className="studio-pv-dot accent" />
-                <span className="studio-pv-dot" />
-                <span className="studio-pv-dot" />
-                <span className="studio-pv-sep" />
-                <span className="studio-pv-clock" />
-              </div>
+              {!isMac && (
+                <div className="studio-pv-dock" aria-hidden="true">
+                  <span className="studio-pv-dot accent" />
+                  <span className="studio-pv-dot" />
+                  <span className="studio-pv-dot" />
+                  <span className="studio-pv-sep" />
+                  <span className="studio-pv-clock" />
+                </div>
+              )}
             </div>
 
             <div className="studio-pv-meta">
@@ -900,7 +936,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
               <div>
                 <div className="set-row-title">Подсветка при наведении и от курсора</div>
                 <div className="set-row-desc">
-                  Световой блик за указателем мыши на плитках, карточках и панели задач
+                  Световой блик за указателем мыши на плитках{isMac ? ' и карточках' : ', карточках и панели задач'}
                 </div>
               </div>
               <button
@@ -1061,14 +1097,16 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
     },
     {
       id: 'bar-weather',
-      section: 'bar',
+      section: isMac ? 'start' : 'bar',
       keywords:
         'погода город поиск автоопределение цельсий фаренгейт температура градусы weather city units celsius fahrenheit',
       render: () => (
         <div className="set-group" key="bar-weather">
           <div className="studio-group-head">
             <span className="set-group-title">Погода и город</span>
-            <span className="studio-accent-name">Для шапки «Пуска» и панели задач</span>
+            <span className="studio-accent-name">
+              {isMac ? 'Для шапки и виджета «Погода»' : 'Для шапки «Пуска» и панели задач'}
+            </span>
           </div>
           <div className="set-weather-config">
             <div className="set-weather-row">
@@ -1327,6 +1365,133 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
       ),
     },
     {
+      id: 'mac-command-key',
+      section: 'start',
+      keywords:
+        'command cmd клавиша открытия универсальный доступ accessibility позиция окна по центру снизу dock терминал terminal iterm warp ghostty macos',
+      render: () => (
+        <div className="set-group" key="mac-command-key">
+          <div className="set-group-title">Управление на Mac</div>
+          <div className="set-toggle-list">
+            <div>
+              <div className="set-row-title" style={{ marginBottom: 7 }}>
+                Клавиша открытия (⌘ Command)
+              </div>
+              <div
+                className="studio-seg-4"
+                role="radiogroup"
+                aria-label="Клавиша открытия Command"
+              >
+                {MAC_COMMAND_KEY_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={macCommandKey === opt.id}
+                    disabled={busyKey === 'mac:commandKey'}
+                    className={`set-seg-card ${macCommandKey === opt.id ? 'active' : ''}`}
+                    onClick={() =>
+                      void runAction('mac:commandKey', () =>
+                        onSetMacSettings({ macCommandKey: opt.id }),
+                      )
+                    }
+                  >
+                    <span className="set-seg-title">{opt.label}</span>
+                    <span className="set-seg-hint">{opt.hint}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="set-toggle-row">
+              <div>
+                <div className="set-row-title">Разрешение ⌘ (Универсальный доступ)</div>
+                <div className="set-row-desc">
+                  Нужно для одиночного нажатия ⌘ Command без удержания сочетаний
+                </div>
+              </div>
+              <div className="mac-ax-status-controls">
+                <span
+                  className={`mac-ax-status-pill ${accessibilityTrusted === true ? 'trusted' : 'pending'}`}
+                >
+                  {accessibilityTrusted === true ? 'Разрешено' : 'Нужен доступ'}
+                </span>
+                <button
+                  type="button"
+                  className="pin-any-btn"
+                  disabled={busyKey === 'mac:axSettings'}
+                  onClick={() =>
+                    void runAction('mac:axSettings', onOpenAccessibilitySettings)
+                  }
+                >
+                  Открыть настройки
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <div className="set-row-title" style={{ marginBottom: 7 }}>
+                Позиция окна
+              </div>
+              <div
+                className="studio-seg-2"
+                role="radiogroup"
+                aria-label="Позиция окна TestBar"
+              >
+                {MAC_WINDOW_POSITION_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={macWindowPosition === opt.id}
+                    disabled={busyKey === 'mac:windowPosition'}
+                    className={`set-seg-card ${macWindowPosition === opt.id ? 'active' : ''}`}
+                    onClick={() =>
+                      void runAction('mac:windowPosition', () =>
+                        onSetMacSettings({ macWindowPosition: opt.id }),
+                      )
+                    }
+                  >
+                    <span className="set-seg-title">{opt.label}</span>
+                    <span className="set-seg-hint">{opt.hint}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="set-row-title" style={{ marginBottom: 7 }}>
+                Терминал по умолчанию
+              </div>
+              <div
+                className="studio-seg-5"
+                role="radiogroup"
+                aria-label="Терминал по умолчанию"
+              >
+                {MAC_TERMINAL_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={macTerminalApp === opt.id}
+                    disabled={busyKey === 'mac:terminalApp'}
+                    className={`set-seg-card ${macTerminalApp === opt.id ? 'active' : ''}`}
+                    onClick={() =>
+                      void runAction('mac:terminalApp', () =>
+                        onSetMacSettings({ macTerminalApp: opt.id }),
+                      )
+                    }
+                  >
+                    <span className="set-seg-title">{opt.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      ),
+    },
+    {
       id: 'start-behavior',
       section: 'start',
       keywords:
@@ -1339,7 +1504,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
               <div>
                 <div className="set-row-title">Запоминать активное пространство</div>
                 <div className="set-row-desc">
-                  Открывать последнюю выбранную вкладку при нажатии Win
+                  Открывать последнюю выбранную вкладку при нажатии {isMac ? '⌘' : 'Win'}
                 </div>
               </div>
               <button
@@ -1391,9 +1556,13 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
 
             <div className="set-toggle-row">
               <div>
-                <div className="set-row-title">Индекс программ и игр</div>
+                <div className="set-row-title">
+                  {isMac ? 'Индекс программ и файлов' : 'Индекс программ и игр'}
+                </div>
                 <div className="set-row-desc">
-                  Пересканировать установленные приложения и библиотеки
+                  {isMac
+                    ? 'Пересканировать установленные приложения и индексируемые папки'
+                    : 'Пересканировать установленные приложения и библиотеки'}
                 </div>
               </div>
               <button
@@ -1456,7 +1625,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
 
                   {!onOpenSpaceWidgets && isExpanded && (
                     <div className="studio-space-widget-chips">
-                      {INLINE_SPACE_WIDGET_LABELS.map((w) => {
+                      {supportedSpaceWidgetLabels.map((w) => {
                         const active = sp.widgets.includes(w.id);
                         return (
                           <button
@@ -1489,12 +1658,12 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
     {
       id: 'start-hotkeys',
       section: 'start',
-      keywords: 'горячие клавиши сочетания win ctrl tab shift esc hotkeys shortcuts',
+      keywords: 'горячие клавиши сочетания win cmd ctrl tab shift esc hotkeys shortcuts',
       render: () => (
         <div className="set-group" key="start-hotkeys">
           <div className="set-group-title">Горячие клавиши</div>
           <div className="hotkey-table">
-            {HOTKEY_ROWS.map((row) => (
+            {(isMac ? MAC_HOTKEY_ROWS : HOTKEY_ROWS).map((row) => (
               <div key={row.label} className="hotkey-row">
                 <span className="hotkey-desc">{row.label}</span>
                 <span className="hotkey-keys">
@@ -1620,7 +1789,9 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
           <div className="set-toggle-list">
             <div className="set-toggle-row">
               <div>
-                <div className="set-row-title">Автозапуск с Windows</div>
+                <div className="set-row-title">
+                  {isMac ? 'Автозапуск TestBar' : 'Автозапуск с Windows'}
+                </div>
                 <div className="set-row-desc">
                   Запускать TestBar автоматически при входе в систему
                 </div>
@@ -1629,7 +1800,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 type="button"
                 role="switch"
                 aria-checked={autostart}
-                aria-label="Автозапуск с Windows"
+                aria-label={isMac ? 'Автозапуск TestBar' : 'Автозапуск с Windows'}
                 disabled={busyKey === 'autostart'}
                 className={`glass-switch ${autostart ? 'on' : ''}`}
                 onClick={() => void runAction('autostart', () => onSetAutostart(!autostart))}
@@ -1673,33 +1844,60 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
     {
       id: 'system-recovery',
       section: 'system',
-      keywords: 'восстановление вернуть штатную панель windows закрыть выход recovery exit',
+      keywords: isMac
+        ? 'выход закрыть завершить приложение quit exit'
+        : 'восстановление вернуть штатную панель windows закрыть выход recovery exit',
       render: () => (
         <div className="set-recovery-row" key="system-recovery">
-          <div className="set-recovery-meta">
-            <RestoreWindowsIcon className="ic14" />
-            <div>
-              <div className="set-row-title">Восстановление</div>
-              <div className="set-row-desc">Вернуть штатную панель Windows и закрыть TestBar</div>
-            </div>
-          </div>
-          <button
-            type="button"
-            className="set-recovery-btn"
-            onClick={onRestoreWindowsAndExit}
-          >
-            Вернуть Windows
-          </button>
+          {isMac ? (
+            <>
+              <div className="set-recovery-meta">
+                <CloseWindowIcon className="ic14" />
+                <div>
+                  <div className="set-row-title">Выход из приложения</div>
+                  <div className="set-row-desc">Полностью завершить фоновую работу TestBar</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="set-recovery-btn danger"
+                onClick={() => (onQuitApp ? onQuitApp() : void quitApp())}
+              >
+                Выйти из TestBar
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="set-recovery-meta">
+                <RestoreWindowsIcon className="ic14" />
+                <div>
+                  <div className="set-row-title">Восстановление</div>
+                  <div className="set-row-desc">Вернуть штатную панель Windows и закрыть TestBar</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="set-recovery-btn"
+                onClick={onRestoreWindowsAndExit}
+              >
+                Вернуть Windows
+              </button>
+            </>
+          )}
         </div>
       ),
     },
   ];
 
+  const availableBlocks = isMac
+    ? studioBlocks.filter((block) => block.section !== 'bar' && block.id !== 'devices-tray')
+    : studioBlocks.filter((block) => block.id !== 'mac-command-key');
+
   const trimmedSearch = searchQuery.trim();
   const isSearching = trimmedSearch.length > 0;
   const matchedBlocks = isSearching
-    ? studioBlocks.filter((block) => matchesSearchKeywords(block.keywords, trimmedSearch))
-    : studioBlocks.filter((block) => block.section === activeTab);
+    ? availableBlocks.filter((block) => matchesSearchKeywords(block.keywords, trimmedSearch))
+    : availableBlocks.filter((block) => block.section === activeTab);
 
   const matchCountsBySection = new Map<SettingsTabId, number>();
   if (isSearching) {
@@ -1711,7 +1909,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
     }
   }
 
-  const activeMeta = SETTINGS_TABS.find((t) => t.id === activeTab) ?? SETTINGS_TABS[0];
+  const activeMeta = tabsList.find((t) => t.id === activeTab) ?? tabsList[0];
 
   if (!mounted) return null;
 
@@ -1761,7 +1959,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
           </div>
 
           <nav className="set-nav" role="tablist" aria-orientation="vertical">
-            {SETTINGS_TABS.map((tab) => {
+            {tabsList.map((tab) => {
               const isActive = !isSearching && tab.id === activeTab;
               const hitCount = matchCountsBySection.get(tab.id) ?? 0;
               return (
@@ -1854,7 +2052,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 if (!isSearching) {
                   return block.render();
                 }
-                const tabMeta = SETTINGS_TABS.find((t) => t.id === block.section);
+                const tabMeta = tabsList.find((t) => t.id === block.section);
                 return (
                   <div key={block.id} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                     {tabMeta && (

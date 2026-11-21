@@ -15,6 +15,7 @@ import {
   type TestBarConfig,
 } from './ipc';
 import { collectPhoneticAliases, swapLayout } from './layoutMap';
+import { detectPlatform, type AppPlatform } from './platform';
 
 export type SearchSourceKind =
   | 'window'
@@ -85,6 +86,7 @@ export interface SearchCorpusInput {
   groups?: AppWindowGroup[];
   audio?: AudioState | null;
   clips?: ClipboardEntry[];
+  platform?: AppPlatform;
 }
 
 export interface RankedSearchResult {
@@ -123,48 +125,52 @@ function resolvePinIcon(pin: PinItem, iconMap: Record<string, string>): {
   return { iconData, cacheIconKey };
 }
 
-function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] {
+function buildSystemCommandItems(
+  audio?: AudioState | null,
+  platform: AppPlatform = 'windows',
+): SearchCorpusItem[] {
+  const isMac = platform === 'macos';
   const commands: SearchCorpusItem[] = [];
 
-  for (const dev of audio?.devices ?? []) {
-    commands.push({
-      id: `cmd:audio:${dev.id}`,
-      name: `Звук: ${dev.shortName}`,
-      subtitle: dev.isDefault ? `Активный вывод · ${dev.name}` : `Переключить вывод · ${dev.name}`,
-      category: 'Аудиовывод',
-      target: dev.id,
-      args: null,
-      kind: 'app',
-      source: 'audio_device',
-      iconData: null,
-      iconKey: 'cmd:audio_device',
-      cacheIconKey: null,
-      pinned: false,
-      badge: { text: 'Команда', variant: 'cmd' },
-      commandId: 'audio_device',
-      deviceId: dev.id,
-      keywords: [
-        'звук',
-        'аудио',
-        'вывод',
-        'наушники',
-        'колонки',
-        'динамики',
-        'audio',
-        'sound',
-        'output',
-        'headphones',
-        'speakers',
-        dev.shortName,
-        dev.name,
-      ],
-      frecencyKey: `cmd:audio:${dev.id}`,
-    });
-  }
+  if (!isMac) {
+    for (const dev of audio?.devices ?? []) {
+      commands.push({
+        id: `cmd:audio:${dev.id}`,
+        name: `Звук: ${dev.shortName}`,
+        subtitle: dev.isDefault ? `Активный вывод · ${dev.name}` : `Переключить вывод · ${dev.name}`,
+        category: 'Аудиовывод',
+        target: dev.id,
+        args: null,
+        kind: 'app',
+        source: 'audio_device',
+        iconData: null,
+        iconKey: 'cmd:audio_device',
+        cacheIconKey: null,
+        pinned: false,
+        badge: { text: 'Команда', variant: 'cmd' },
+        commandId: 'audio_device',
+        deviceId: dev.id,
+        keywords: [
+          'звук',
+          'аудио',
+          'вывод',
+          'наушники',
+          'колонки',
+          'динамики',
+          'audio',
+          'sound',
+          'output',
+          'headphones',
+          'speakers',
+          dev.shortName,
+          dev.name,
+        ],
+        frecencyKey: `cmd:audio:${dev.id}`,
+      });
+    }
 
-  const micMuted = Boolean(audio?.micMuted);
-  commands.push(
-    {
+    const micMuted = Boolean(audio?.micMuted);
+    commands.push({
       id: 'cmd:mic_toggle',
       name: micMuted ? 'Включить микрофон' : 'Выключить микрофон',
       subtitle: micMuted ? 'Микрофон сейчас выключен' : 'Микрофон сейчас активен',
@@ -182,11 +188,14 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
       micMuted,
       keywords: ['микрофон', 'mic', 'mute', 'выключить микрофон', 'включить микрофон', 'голос'],
       frecencyKey: 'cmd:mic_toggle',
-    },
+    });
+  }
+
+  commands.push(
     {
       id: 'cmd:empty_recycle_bin',
       name: 'Очистить корзину',
-      subtitle: 'Удалить файлы из корзины Windows',
+      subtitle: isMac ? 'Удалить файлы из Корзины' : 'Удалить файлы из корзины Windows',
       category: 'Система',
       target: 'cmd:empty_recycle_bin',
       args: null,
@@ -204,9 +213,9 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:screenshot',
       name: 'Сделать скриншот',
-      subtitle: 'Открыть инструмент «Ножницы»',
+      subtitle: isMac ? 'Выбрать область экрана и скопировать' : 'Открыть инструмент «Ножницы»',
       category: 'Система',
-      target: 'ms-screenclip:',
+      target: isMac ? 'cmd:screenshot' : 'ms-screenclip:',
       args: null,
       kind: 'app',
       source: 'command',
@@ -222,7 +231,7 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:refresh_indexes',
       name: 'Обновить индекс приложений',
-      subtitle: 'Пересканировать программы, игры и файлы',
+      subtitle: isMac ? 'Пересканировать программы и файлы' : 'Пересканировать программы, игры и файлы',
       category: 'TestBar',
       target: 'cmd:refresh_indexes',
       args: null,
@@ -237,7 +246,10 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
       keywords: ['обновить индекс', 'пересканировать', 'индекс', 'reindex', 'refresh', 'rescan'],
       frecencyKey: 'cmd:refresh_indexes',
     },
-    {
+  );
+
+  if (!isMac) {
+    commands.push({
       id: 'cmd:task_manager',
       name: 'Диспетчер задач',
       subtitle: 'Процессы и производительность Windows',
@@ -254,11 +266,16 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
       commandId: 'task_manager',
       keywords: ['диспетчер задач', 'диспетчер', 'процессы', 'taskmgr', 'task manager'],
       frecencyKey: 'cmd:task_manager',
-    },
+    });
+  }
+
+  commands.push(
     {
       id: 'cmd:settings',
       name: 'Настройки TestBar',
-      subtitle: 'Панель, стекло, мониторы и резервная копия',
+      subtitle: isMac
+        ? 'Оформление, клавиша Command, позиция и профиль'
+        : 'Панель, стекло, мониторы и резервная копия',
       category: 'TestBar',
       target: 'cmd:settings',
       args: null,
@@ -276,7 +293,7 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:lock',
       name: 'Блокировка экрана',
-      subtitle: 'Заблокировать сеанс Windows',
+      subtitle: isMac ? 'Заблокировать экран Mac' : 'Заблокировать сеанс Windows',
       category: 'Питание',
       target: 'cmd:lock',
       args: null,
@@ -294,7 +311,7 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:sleep',
       name: 'Режим сна',
-      subtitle: 'Перевести компьютер в сон',
+      subtitle: isMac ? 'Перевести Mac в режим сна' : 'Перевести компьютер в сон',
       category: 'Питание',
       target: 'cmd:sleep',
       args: null,
@@ -312,7 +329,7 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:reboot',
       name: 'Перезагрузка компьютера',
-      subtitle: 'Перезагрузить Windows',
+      subtitle: isMac ? 'Перезагрузить Mac' : 'Перезагрузить Windows',
       category: 'Питание',
       target: 'cmd:reboot',
       args: null,
@@ -330,7 +347,7 @@ function buildSystemCommandItems(audio?: AudioState | null): SearchCorpusItem[] 
     {
       id: 'cmd:shutdown',
       name: 'Выключение компьютера',
-      subtitle: 'Завершить работу Windows',
+      subtitle: isMac ? 'Завершить работу Mac' : 'Завершить работу Windows',
       category: 'Питание',
       target: 'cmd:shutdown',
       args: null,
@@ -611,7 +628,9 @@ export function buildSearchCorpus({
   groups = [],
   audio = null,
   clips = [],
+  platform = detectPlatform(),
 }: SearchCorpusInput): SearchCorpusItem[] {
+  const isMac = platform === 'macos';
   const pool: SearchCorpusItem[] = [];
   const seenWinHwnds = new Set<number>();
   const seenTargets = new Set<string>();
@@ -696,7 +715,9 @@ export function buildSearchCorpus({
       for (const sp of config.spaces) {
         addPinList(sp.items, sp.name);
       }
-      addPinList(config.gameCombos, 'Игры · Связка');
+      if (!isMac) {
+        addPinList(config.gameCombos, 'Игры · Связка');
+      }
     } else {
       addPinList(config.personalPins, 'Личное');
       addPinList(config.personalLinks, 'Быстрый доступ');
@@ -704,31 +725,35 @@ export function buildSearchCorpus({
       addPinList(config.workApps, 'Работа');
       addPinList(config.studioPins, 'Студия');
       addPinList(config.studioTools, 'Студия · Инструмент');
-      addPinList(config.gameLaunchers, 'Игры · Лаунчер');
-      addPinList(config.gameCombos, 'Игры · Связка');
+      if (!isMac) {
+        addPinList(config.gameLaunchers, 'Игры · Лаунчер');
+        addPinList(config.gameCombos, 'Игры · Связка');
+      }
       for (const cs of config.customSpaces) {
         addPinList(cs.items, cs.name);
       }
     }
   }
 
-  for (const g of games) {
-    pushUnique({
-      id: `game:${g.appId}`,
-      name: g.name,
-      subtitle: g.launcher || 'Steam',
-      category: 'Игра · Steam',
-      target: g.target,
-      args: null,
-      kind: 'app',
-      source: 'game',
-      iconData: g.coverData ?? null,
-      iconKey: 'steam',
-      cacheIconKey: null,
-      matchAumid: null,
-      pinned: false,
-      frecencyKey: `game:${g.appId}`,
-    });
+  if (!isMac) {
+    for (const g of games) {
+      pushUnique({
+        id: `game:${g.appId}`,
+        name: g.name,
+        subtitle: g.launcher || 'Steam',
+        category: 'Игра · Steam',
+        target: g.target,
+        args: null,
+        kind: 'app',
+        source: 'game',
+        iconData: g.coverData ?? null,
+        iconKey: 'steam',
+        cacheIconKey: null,
+        matchAumid: null,
+        pinned: false,
+        frecencyKey: `game:${g.appId}`,
+      });
+    }
   }
 
   for (const a of apps) {
@@ -736,29 +761,62 @@ export function buildSearchCorpus({
     const targetLow = a.target.trim().toLowerCase();
     // Skip raw unpinned UWP Settings entry so curated `Параметры Windows` (ms-settings:) doesn't duplicate
     if (
-      aumidLow === WIN_SETTINGS_APP_AUMID ||
-      targetLow === `shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`
+      !isMac &&
+      (aumidLow === WIN_SETTINGS_APP_AUMID ||
+        targetLow === `shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`)
     ) {
       continue;
     }
-    const isUwp = Boolean(a.aumid) || targetLow.startsWith('shell:appsfolder\\');
+    const isMacPrefs = isMac && targetLow.startsWith('x-apple.systempreferences:');
+    const isUwp = !isMac && (Boolean(a.aumid) || targetLow.startsWith('shell:appsfolder\\'));
     const cacheIconKey = isCacheIconKey(a.iconKey) ? a.iconKey : null;
     const iconData = resolveCachedIconData(iconMap, cacheIconKey, a.target, a.iconData);
     pushUnique({
       id: `app:${a.id}`,
       name: a.name,
-      subtitle: isUwp ? `${a.category} · UWP` : a.category,
-      category: isUwp ? `${a.category} · UWP` : a.category,
+      subtitle: isMacPrefs ? 'Системные настройки macOS' : isUwp ? `${a.category} · UWP` : a.category,
+      category: isMacPrefs ? 'Настройки macOS' : isUwp ? `${a.category} · UWP` : a.category,
       target: a.target,
       args: null,
       kind: 'app',
-      source: isUwp ? 'uwp' : 'app',
+      source: isMacPrefs ? 'win_settings' : isUwp ? 'uwp' : 'app',
       iconData,
       iconKey: a.iconKey || a.name,
       cacheIconKey,
       matchAumid: a.aumid ?? null,
       pinned: false,
+      badge: isMacPrefs ? { text: 'Параметры', variant: 'cmd' } : null,
+      keywords: isMacPrefs
+        ? ['настройки', 'системные настройки', 'system settings', 'preferences', a.name, a.category]
+        : undefined,
       frecencyKey: `target:${normKey(a.target)}`,
+    });
+  }
+
+  if (isMac) {
+    pushUnique({
+      id: 'cmd:activity_monitor',
+      name: 'Мониторинг системы',
+      subtitle: 'Процессы, память и нагрузка Mac',
+      category: 'Утилиты',
+      target: '/System/Applications/Utilities/Activity Monitor.app',
+      args: null,
+      kind: 'app',
+      source: 'app',
+      iconData: null,
+      iconKey: 'cmd:task_manager',
+      cacheIconKey: null,
+      pinned: false,
+      keywords: [
+        'мониторинг системы',
+        'мониторинг',
+        'activity monitor',
+        'диспетчер задач',
+        'процессы',
+        'память',
+        'task manager',
+      ],
+      frecencyKey: 'target:/system/applications/utilities/activity monitor.app',
     });
   }
 
@@ -782,19 +840,21 @@ export function buildSearchCorpus({
   }
 
   // System & Audio commands
-  for (const cmd of buildSystemCommandItems(audio)) {
+  for (const cmd of buildSystemCommandItems(audio, platform)) {
     pool.push(cmd);
   }
 
   // Windows 11 Settings, Network & System management tools
-  const hasPinnedWinSettings =
-    seenTargets.has(`app:shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`) ||
-    seenTargets.has('app:ms-settings:');
-  for (const ws of buildWindowsSettingsItems()) {
-    if (ws.id === 'winset:settings' && hasPinnedWinSettings) {
-      continue;
+  if (!isMac) {
+    const hasPinnedWinSettings =
+      seenTargets.has(`app:shell:appsfolder\\${WIN_SETTINGS_APP_AUMID}`) ||
+      seenTargets.has('app:ms-settings:');
+    for (const ws of buildWindowsSettingsItems()) {
+      if (ws.id === 'winset:settings' && hasPinnedWinSettings) {
+        continue;
+      }
+      pushUnique(ws);
     }
-    pushUnique(ws);
   }
 
   // Clipboard Vault entries (up to 40)
@@ -1307,6 +1367,7 @@ export type SearchLaunchDispatch =
 export function resolveSearchLaunchPayload(
   item: SearchCorpusItem,
   ctrlKey: boolean,
+  platform: AppPlatform = detectPlatform(),
 ): SearchLaunchDispatch {
   if (item.source === 'window' && item.hwnd) {
     return {
@@ -1352,7 +1413,7 @@ export function resolveSearchLaunchPayload(
           args: {
             target: item.target,
             args: null,
-            asAdmin: ctrlKey,
+            asAdmin: platform !== 'macos' && ctrlKey,
             closeStart: true,
           },
         };
@@ -1373,7 +1434,7 @@ export function resolveSearchLaunchPayload(
     args: {
       target: item.target,
       args: item.args ?? null,
-      asAdmin: ctrlKey && item.source !== 'win_settings' && canRunAsAdmin(item.target),
+      asAdmin: ctrlKey && item.source !== 'win_settings' && canRunAsAdmin(item.target, platform),
       closeStart: true,
     },
   };
@@ -1402,6 +1463,7 @@ function extractAppsFolderAumid(target: string): string {
 export function buildPinFromSearchItem(
   item: SearchCorpusItem,
   id = `pin-${Date.now()}`,
+  platform: AppPlatform = detectPlatform(),
 ): PinItem | null {
   if (
     item.source === 'clipboard' ||
@@ -1493,9 +1555,10 @@ export function buildPinFromSearchItem(
       ? exeBase
       : null;
   const canElevate =
+    platform !== 'macos' &&
     item.source !== 'win_settings' &&
     item.commandId !== 'settings' &&
-    canRunAsAdmin(resolvedTarget);
+    canRunAsAdmin(resolvedTarget, platform);
 
   return {
     id,
@@ -1528,7 +1591,10 @@ export type SearchSecondaryAction =
   | { type: 'open_location'; path: string; label: string }
   | { type: 'copy_clipboard'; text: string; label: string };
 
-export function resolveSearchSecondaryAction(item: SearchCorpusItem | undefined): SearchSecondaryAction | null {
+export function resolveSearchSecondaryAction(
+  item: SearchCorpusItem | undefined,
+  platform: AppPlatform = detectPlatform(),
+): SearchSecondaryAction | null {
   if (!item) return null;
   if (item.source === 'window' && item.hwnd) {
     return { type: 'close_window', hwnd: item.hwnd, label: 'Закрыть окно' };
@@ -1546,7 +1612,11 @@ export function resolveSearchSecondaryAction(item: SearchCorpusItem | undefined)
     item.source !== 'web' &&
     canOpenFileLocation(item.target)
   ) {
-    return { type: 'open_location', path: item.target, label: 'Расположение' };
+    return {
+      type: 'open_location',
+      path: item.target,
+      label: platform === 'macos' ? 'Показать в Finder' : 'Расположение',
+    };
   }
   return null;
 }

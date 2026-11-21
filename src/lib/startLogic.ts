@@ -1,4 +1,12 @@
 import { canRunAsAdmin } from './flyoutLogic';
+import {
+  detectPlatform,
+  getAvailableSpaceWidgetIds,
+  getSupportedSpaceWidgetCatalog,
+  SPACE_WIDGET_CATALOG,
+  type AppPlatform,
+  type SpaceWidgetOption,
+} from './platform';
 import type {
   AudioState,
   ClipboardEntry,
@@ -299,26 +307,26 @@ export const SPACE_TEMPLATES: readonly SpaceTemplateOption[] = [
   },
 ] as const;
 
-export interface SpaceWidgetOption {
-  id: SpaceWidgetId;
-  label: string;
-  description: string;
+export { SPACE_WIDGET_CATALOG, type SpaceWidgetOption };
+
+export function getSpaceWidgetCatalog(
+  platform: AppPlatform = 'windows',
+): readonly SpaceWidgetOption[] {
+  return getSupportedSpaceWidgetCatalog(platform);
 }
 
-export const SPACE_WIDGET_CATALOG: readonly SpaceWidgetOption[] = [
-  { id: 'media', label: 'Медиаплеер', description: 'Управление треками и прогресс' },
-  { id: 'audio_mixer', label: 'Звук и микшер', description: 'Устройства вывода, микрофон и потоки' },
-  { id: 'clipboard', label: 'Буфер обмена', description: 'История копирования и закрепления' },
-  { id: 'pc_health', label: 'Нагрузка ПК', description: 'CPU, RAM, GPU, VRAM и диски' },
-  { id: 'top_processes', label: 'Потребители памяти', description: 'Процессы по ОЗУ и VRAM' },
-  { id: 'game_combos', label: 'Игровые связки', description: 'Запуск наборов программ в 1 клик' },
-  { id: 'weather', label: 'Погода', description: 'Текущая погода и прогноз на 3 дня' },
-  { id: 'batteries', label: 'Батареи устройств', description: 'Заряд мыши, наушников и геймпадов' },
-  { id: 'notes', label: 'Заметки и дела', description: 'Быстрые записи и чек-лист задач' },
-  { id: 'timer', label: 'Таймер фокуса', description: 'Обратный отсчёт и пресеты времени' },
-  { id: 'network', label: 'Сеть и пинг', description: 'Скорость трафика, IP и задержка' },
-  { id: 'quick_toggles', label: 'Быстрые тумблеры', description: 'Микрофон, питание, скриншот и корзина' },
-] as const;
+export function getSpaceTemplates(
+  platform: AppPlatform = 'windows',
+): readonly SpaceTemplateOption[] {
+  if (platform !== 'macos') {
+    return SPACE_TEMPLATES;
+  }
+  const allowed = new Set<SpaceWidgetId>(getAvailableSpaceWidgetIds(platform));
+  return SPACE_TEMPLATES.filter((t) => t.id !== 'games').map((t) => ({
+    ...t,
+    widgets: t.widgets.filter((w) => allowed.has(w)),
+  }));
+}
 
 export const BUILTIN_SPACES = [
   { id: 'personal', label: 'Личное' },
@@ -344,9 +352,25 @@ function mapLegacyPresetToWidgets(preset: WidgetPreset | undefined): SpaceWidget
  * Resolves the authoritative modular `SpaceConfig[]` list from `config.spaces`,
  * synthesizing equivalent entries from legacy v1 fields only when `config.spaces` is missing or empty.
  */
-export function resolveConfiguredSpaces(config: TestBarConfig | null): SpaceConfig[] {
+export function resolveConfiguredSpaces(
+  config: TestBarConfig | null,
+  platform: AppPlatform = 'windows',
+): SpaceConfig[] {
+  const allowedWidgets = new Set<SpaceWidgetId>(getAvailableSpaceWidgetIds(platform));
+  const filterWidgets = (list: readonly SpaceWidgetId[]): SpaceWidgetId[] =>
+    platform === 'macos' ? list.filter((id) => allowedWidgets.has(id)) : [...list];
+
   if (config?.spaces && config.spaces.length > 0) {
-    return config.spaces;
+    if (platform !== 'macos') {
+      return config.spaces;
+    }
+    return config.spaces.map((sp) => ({
+      ...sp,
+      widgets: filterWidgets(sp.widgets ?? []),
+      ...(Array.isArray(sp.headerWidgets)
+        ? { headerWidgets: sp.headerWidgets.filter((hw) => allowedWidgets.has(hw.id)) }
+        : {}),
+    }));
   }
   const legacySpaces: SpaceConfig[] = [
     {
@@ -356,7 +380,7 @@ export function resolveConfiguredSpaces(config: TestBarConfig | null): SpaceConf
       accentRgb: '129, 140, 248',
       layoutKind: 'grid',
       showHeroRow: true,
-      widgets: ['media', 'audio_mixer', 'clipboard'],
+      widgets: filterWidgets(['media', 'audio_mixer', 'clipboard']),
       items: [...(config?.personalPins ?? []), ...(config?.personalLinks ?? [])],
     },
     {
@@ -366,29 +390,33 @@ export function resolveConfiguredSpaces(config: TestBarConfig | null): SpaceConf
       accentRgb: '56, 189, 248',
       layoutKind: 'grid',
       showHeroRow: false,
-      widgets: ['pc_health', 'top_processes'],
+      widgets: filterWidgets(['pc_health', 'top_processes']),
       items: [...(config?.workFolders ?? []), ...(config?.workApps ?? [])],
     },
     {
       id: 'studio',
-      name: 'Студия',
+      name: platform === 'macos' ? 'Утилиты' : 'Студия',
       accentHex: '#34D399',
       accentRgb: '52, 211, 153',
       layoutKind: 'grid',
       showHeroRow: true,
-      widgets: ['pc_health', 'audio_mixer', 'top_processes'],
+      widgets: filterWidgets(['pc_health', 'audio_mixer', 'top_processes']),
       items: [...(config?.studioPins ?? []), ...(config?.studioTools ?? [])],
     },
-    {
-      id: 'games',
-      name: 'Игры',
-      accentHex: '#FB7185',
-      accentRgb: '251, 113, 133',
-      layoutKind: 'games',
-      showHeroRow: false,
-      widgets: ['audio_mixer', 'game_combos', 'pc_health'],
-      items: [...(config?.gameLaunchers ?? [])],
-    },
+    ...(platform === 'macos'
+      ? []
+      : [
+          {
+            id: 'games',
+            name: 'Игры',
+            accentHex: '#FB7185',
+            accentRgb: '251, 113, 133',
+            layoutKind: 'games' as const,
+            showHeroRow: false,
+            widgets: filterWidgets(['audio_mixer', 'game_combos', 'pc_health']),
+            items: [...(config?.gameLaunchers ?? [])],
+          },
+        ]),
   ];
 
   for (const cs of config?.customSpaces ?? []) {
@@ -399,7 +427,7 @@ export function resolveConfiguredSpaces(config: TestBarConfig | null): SpaceConf
       accentRgb: cs.accentRgb || '167, 139, 250',
       layoutKind: 'grid',
       showHeroRow: false,
-      widgets: mapLegacyPresetToWidgets(cs.widgetPreset),
+      widgets: filterWidgets(mapLegacyPresetToWidgets(cs.widgetPreset)),
       items: cs.items ?? [],
     });
   }
@@ -789,7 +817,7 @@ export function findMatchingInstalledAppForPin(
     const byTarget = apps.find((a) => normTarget(a.target) === pTarget);
     if (byTarget) return byTarget;
   }
-  if (pMatchExe || (pBase && pBase.endsWith('.exe'))) {
+  if (pMatchExe || (pBase && (pBase.endsWith('.exe') || pBase.endsWith('.app')))) {
     const wantedExe = pMatchExe || pBase;
     const byExe = apps.find((a) => {
       const aTarget = normTarget(a.target);
@@ -835,13 +863,18 @@ function mergeArgs(baseArgs: string | null | undefined, extraArg: string): strin
  * Resolves the exact action for a Start Menu tile click, making the `Shift` second layer
  * 100% functional and faithful to every displayed `altAction` badge.
  */
-export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPinAction {
+export function resolvePinAction(
+  item: PinItem,
+  shiftHeld: boolean,
+  platform: AppPlatform = detectPlatform(),
+): ResolvedPinAction {
   if (item.kind === 'combo') {
     return { type: 'combo', targets: (item.comboTargets ?? []).filter((t) => Boolean(t.trim())) };
   }
 
   const baseArgs = item.args?.trim() || null;
-  const baseAsAdmin = item.kind === 'app' && Boolean(item.runAsAdmin) && canRunAsAdmin(item.target);
+  const baseAsAdmin =
+    item.kind === 'app' && Boolean(item.runAsAdmin) && canRunAsAdmin(item.target, platform);
 
   if (!shiftHeld) {
     return {
@@ -877,9 +910,16 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
   // 3. Private / Incognito browser window
   if (alt.includes('приват') || alt.includes('инкогнито') || alt.includes('inprivate')) {
     let flag = '--incognito';
-    if (exe === 'zen.exe' || exe === 'firefox.exe' || iconLow.includes('zen')) {
+    if (
+      exe === 'zen.exe' ||
+      exe === 'firefox.exe' ||
+      exe === 'zen.app' ||
+      exe === 'firefox.app' ||
+      iconLow.includes('zen') ||
+      iconLow.includes('firefox')
+    ) {
       flag = '--private-window';
-    } else if (exe === 'msedge.exe') {
+    } else if (exe === 'msedge.exe' || exe === 'microsoft edge.app') {
       flag = '--inprivate';
     }
     return {
@@ -900,12 +940,23 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
       exe === 'code.exe' ||
       exe === 'cursor.exe' ||
       exe === 'antigravity.exe' ||
+      exe === 'visual studio code.app' ||
+      exe === 'code.app' ||
+      exe === 'cursor.app' ||
+      exe === 'antigravity.app' ||
       iconLow.includes('vscode') ||
       iconLow.includes('cursor') ||
       iconLow.includes('antigravity')
     ) {
       flag = '--new-window';
-    } else if (exe === 'zen.exe' || exe === 'firefox.exe' || iconLow.includes('zen')) {
+    } else if (
+      exe === 'zen.exe' ||
+      exe === 'firefox.exe' ||
+      exe === 'zen.app' ||
+      exe === 'firefox.app' ||
+      iconLow.includes('zen') ||
+      iconLow.includes('firefox')
+    ) {
       flag = '--new-window';
     }
     return {
@@ -923,7 +974,7 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
       type: 'launch',
       target: item.target,
       args: baseArgs,
-      asAdmin: canRunAsAdmin(item.target),
+      asAdmin: canRunAsAdmin(item.target, platform),
       closeStart: true,
     };
   }
@@ -938,18 +989,29 @@ export function resolvePinAction(item: PinItem, shiftHeld: boolean): ResolvedPin
   };
 }
 
+export function getFolderShiftLabel(platform: AppPlatform = detectPlatform()): string {
+  return platform === 'macos' ? 'Finder' : 'Проводник Windows';
+}
+
 /**
  * Returns the displayed Shift badge label ONLY when `resolvePinAction(item, true)` produces a
  * genuinely distinct real action (different type, elevated UAC, or distinct CLI flag).
  * Eliminates deceptive/decorative Shift labels on tiles whose fallback is an identical launch.
  */
-export function getHonestShiftBadge(item: PinItem): string | null {
+export function getHonestShiftBadge(
+  item: PinItem,
+  platform: AppPlatform = detectPlatform(),
+): string | null {
   if (item.kind === 'combo') return null;
   const label = (item.altLabel?.trim() || item.altAction?.trim() || '');
   if (!label) return null;
 
-  const base = resolvePinAction(item, false);
-  const alt = resolvePinAction(item, true);
+  if (item.kind === 'folder' && platform === 'macos' && /^проводник\s*windows$/i.test(label)) {
+    return 'Finder';
+  }
+
+  const base = resolvePinAction(item, false, platform);
+  const alt = resolvePinAction(item, true, platform);
 
   if (alt.type === 'copy_path' || alt.type === 'terminal') {
     return label;
@@ -966,8 +1028,11 @@ export function getHonestShiftBadge(item: PinItem): string | null {
   return null;
 }
 
-export function hasHonestShiftAction(item: PinItem): boolean {
-  return getHonestShiftBadge(item) !== null;
+export function hasHonestShiftAction(
+  item: PinItem,
+  platform: AppPlatform = detectPlatform(),
+): boolean {
+  return getHonestShiftBadge(item, platform) !== null;
 }
 
 export type PowerActionKind = 'lock' | 'sleep' | 'reboot' | 'shutdown';

@@ -44,6 +44,12 @@ import {
   type WeatherSnapshot,
 } from '../../lib/ipc';
 import {
+  detectPlatform,
+  getAvailableSpaceWidgetIds,
+  getSupportedSpaceWidgetCatalog,
+  type AppPlatform,
+} from '../../lib/platform';
+import {
   buildGameComboLaunchPayload,
   buildSparklinePath,
   computeGameCardTilt,
@@ -63,6 +69,7 @@ import {
   formatStartTemperature,
   getBatteryColor,
   getClipboardKindLabel,
+  getFolderShiftLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
   getSpaceWidgetPlacement,
@@ -85,7 +92,6 @@ import {
   selectDisplayedGames,
   setHeaderWidgetSide,
   setSpaceWidgetPlacement,
-  SPACE_WIDGET_CATALOG,
   validateGameComboInput,
   type GameLibraryFilter,
   type MovePinInSpaceParams,
@@ -310,12 +316,14 @@ export interface StartSpacesProps {
   onOptimisticMovePin?: (params: MovePinInSpaceParams) => void;
   onHideBatteryDevice?: (id: string) => void;
   onEditPin?: (item: PinItem, spaceKey: string) => void;
+  platform?: AppPlatform;
 }
 
 export interface StandaloneWidgetCardProps {
   widgetId: SpaceWidgetId;
   bentoIndex?: number;
   mode?: 'card' | 'popover';
+  platform?: AppPlatform;
   spaceId?: string;
   activeSpace?: SpaceConfig;
   config?: TestBarConfig | null;
@@ -352,6 +360,7 @@ export interface StandaloneWidgetCardProps {
 }
 
 interface UseSpaceWidgetCardsParams {
+  platform?: AppPlatform;
   space: string;
   config: TestBarConfig | null;
   games: SteamGame[];
@@ -399,6 +408,7 @@ interface UseSpaceWidgetCardsParams {
 }
 
 function useSpaceWidgetCards({
+  platform,
   space,
   config,
   games,
@@ -438,6 +448,8 @@ function useSpaceWidgetCards({
   makeDragProps,
   suppressClickUntilRef,
 }: UseSpaceWidgetCardsParams) {
+  const effectivePlatform = platform ?? detectPlatform();
+  const isMac = effectivePlatform === 'macos';
   const [copiedClipId, setCopiedClipId] = useState<string | null>(null);
   const [killError, setKillError] = useState<{ space: string; message: string } | null>(null);
 
@@ -502,7 +514,7 @@ function useSpaceWidgetCards({
   useEffect(() => {
     setSegReady(false);
     setSliderAnimReady(false);
-    if (!startVisible || !startAnimSettled || !hasAudioHydrated) {
+    if (!startVisible || !startAnimSettled || (!isMac && !hasAudioHydrated)) {
       return;
     }
     let raf2 = 0;
@@ -629,7 +641,7 @@ function useSpaceWidgetCards({
   }, [startVisible, media?.hasSession, media?.isPlaying, media?.positionSec, media?.lastUpdatedMs]);
 
   // Visibility-gated 140ms live WASAPI peak poller (only when audio_mixer widget is active)
-  const needsAudioPeaks = Boolean(startVisible && startAnimSettled && hasAudioWidget);
+  const needsAudioPeaks = Boolean(!isMac && startVisible && startAnimSettled && hasAudioWidget);
 
   useEffect(() => {
     if (!needsAudioPeaks) {
@@ -1848,13 +1860,21 @@ function useSpaceWidgetCards({
               className="sec-act sec-act-ic"
               onClick={() =>
                 ipc('launch_item', {
-                  target: 'C:\\Windows\\System32\\Taskmgr.exe',
+                  target: isMac
+                    ? '/System/Applications/Utilities/Activity Monitor.app'
+                    : 'C:\\Windows\\System32\\Taskmgr.exe',
                   asAdmin: false,
                   closeStart: true,
-                }).catch(() => onShowToast('Не удалось открыть диспетчер задач'))
+                }).catch(() =>
+                  onShowToast(
+                    isMac
+                      ? 'Не удалось открыть Мониторинг системы'
+                      : 'Не удалось открыть диспетчер задач',
+                  ),
+                )
               }
             >
-              <span>Диспетчер</span>
+              <span>{isMac ? 'Мониторинг' : 'Диспетчер'}</span>
               <ExternalArrowIcon />
             </button>
           )}
@@ -2405,6 +2425,12 @@ function useSpaceWidgetCards({
     bentoIndex: number,
     mode: 'card' | 'popover' = 'card',
   ): React.ReactNode => {
+    if (
+      isMac &&
+      (widgetId === 'media' || widgetId === 'audio_mixer' || widgetId === 'game_combos')
+    ) {
+      return null;
+    }
     switch (widgetId) {
       case 'media':
         return <React.Fragment key={widgetId}>{renderMediaCard(bentoIndex)}</React.Fragment>;
@@ -2481,6 +2507,7 @@ function useSpaceWidgetCards({
             key={widgetId}
             mode={mode}
             bentoIndex={bentoIndex}
+            platform={effectivePlatform}
             audio={audio}
             quickToggles={quickToggles}
             onSetAudio={onSetAudio}
@@ -2505,6 +2532,7 @@ export const StandaloneWidgetCard: React.FC<StandaloneWidgetCardProps> = ({
   widgetId,
   bentoIndex = 1,
   mode = 'popover',
+  platform,
   spaceId,
   activeSpace,
   config = null,
@@ -2539,9 +2567,12 @@ export const StandaloneWidgetCard: React.FC<StandaloneWidgetCardProps> = ({
   onLaunchPin,
   onOpenTileContext,
 }) => {
+  const effectivePlatform = platform ?? detectPlatform();
+  const isMac = effectivePlatform === 'macos';
   const suppressClickUntilRef = useRef<number>(0);
   const resolvedSpaceId = spaceId ?? activeSpace?.id ?? '';
-  const isGamesLayout = activeSpace?.layoutKind === 'games' || resolvedSpaceId === 'games';
+  const isGamesLayout =
+    !isMac && (activeSpace?.layoutKind === 'games' || resolvedSpaceId === 'games');
   const spaceWidgets = useMemo(() => [widgetId], [widgetId]);
 
   const fallbackLaunchPin = useCallback(
@@ -2571,6 +2602,7 @@ export const StandaloneWidgetCard: React.FC<StandaloneWidgetCardProps> = ({
   }, []);
 
   const { renderWidgetById } = useSpaceWidgetCards({
+    platform: effectivePlatform,
     space: resolvedSpaceId,
     config,
     games,
@@ -2670,7 +2702,18 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   onOptimisticReorder,
   onOptimisticMovePin,
   onHideBatteryDevice,
+  platform,
 }) => {
+  const effectivePlatform = platform ?? detectPlatform();
+  const isMac = effectivePlatform === 'macos';
+  const supportedWidgetIds = useMemo(
+    () => new Set(getAvailableSpaceWidgetIds(effectivePlatform)),
+    [effectivePlatform],
+  );
+  const supportedWidgetCatalog = useMemo(
+    () => getSupportedSpaceWidgetCatalog(effectivePlatform),
+    [effectivePlatform],
+  );
   const reducedMotion = useReducedMotion();
 
   const [gameFilter, setGameFilter] = useState<GameLibraryFilter>('recent');
@@ -2700,13 +2743,16 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     };
   }, []);
 
-  const spaceWidgets = activeSpace.widgets ?? [];
-  const spaceHeaderWidgets = useMemo(
-    () => resolveSpaceHeaderWidgets(activeSpace),
-    [activeSpace],
-  );
+  const spaceWidgets = useMemo(() => {
+    const raw = activeSpace.widgets ?? [];
+    return isMac ? raw.filter((id) => supportedWidgetIds.has(id)) : raw;
+  }, [activeSpace.widgets, isMac, supportedWidgetIds]);
+  const spaceHeaderWidgets = useMemo(() => {
+    const raw = resolveSpaceHeaderWidgets(activeSpace);
+    return isMac ? raw.filter((hw) => supportedWidgetIds.has(hw.id)) : raw;
+  }, [activeSpace, isMac, supportedWidgetIds]);
   const hasWidgets = spaceWidgets.length > 0;
-  const isGamesLayout = activeSpace.layoutKind === 'games';
+  const isGamesLayout = !isMac && activeSpace.layoutKind === 'games';
 
   // Reset active pointer drag on space switch or hide
   useEffect(() => {
@@ -3118,7 +3164,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const isFolder = item.kind === 'folder';
     const isFile = item.kind === 'file';
     const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+    const honestAlt = isFolder
+      ? getFolderShiftLabel(effectivePlatform)
+      : getHonestShiftBadge(item, effectivePlatform);
 
     const tileStyle: React.CSSProperties = {
       ['--tile-rgb' as string]: customRgb || item.accentRgb || '139,150,248',
@@ -3191,7 +3239,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const isFile = item.kind === 'file';
     const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
     const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+    const honestAlt = isFolder
+      ? getFolderShiftLabel(effectivePlatform)
+      : getHonestShiftBadge(item, effectivePlatform);
     const qIcCls = [
       'qlink-ic',
       isFolder && !isCustomImg ? 'is-folder-ic' : '',
@@ -3248,6 +3298,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   };
 
   const { renderWidgetById } = useSpaceWidgetCards({
+    platform: effectivePlatform,
     space,
     config,
     games,
@@ -3357,20 +3408,20 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   const orderedWidgetCatalog = useMemo(() => {
     const sideEnabled = spaceWidgets
-      .map((id) => SPACE_WIDGET_CATALOG.find((w) => w.id === id))
-      .filter((w): w is (typeof SPACE_WIDGET_CATALOG)[number] => Boolean(w));
+      .map((id) => supportedWidgetCatalog.find((w) => w.id === id))
+      .filter((w): w is (typeof supportedWidgetCatalog)[number] => Boolean(w));
     const sideSet = new Set(spaceWidgets);
     const topEnabled = spaceHeaderWidgets
       .filter((hw) => !sideSet.has(hw.id))
-      .map((hw) => SPACE_WIDGET_CATALOG.find((w) => w.id === hw.id))
-      .filter((w): w is (typeof SPACE_WIDGET_CATALOG)[number] => Boolean(w));
+      .map((hw) => supportedWidgetCatalog.find((w) => w.id === hw.id))
+      .filter((w): w is (typeof supportedWidgetCatalog)[number] => Boolean(w));
     const activeSet = new Set<SpaceWidgetId>([
       ...spaceWidgets,
       ...spaceHeaderWidgets.map((hw) => hw.id),
     ]);
-    const disabled = SPACE_WIDGET_CATALOG.filter((w) => !activeSet.has(w.id));
+    const disabled = supportedWidgetCatalog.filter((w) => !activeSet.has(w.id));
     return [...sideEnabled, ...topEnabled, ...disabled];
-  }, [spaceWidgets, spaceHeaderWidgets]);
+  }, [spaceWidgets, spaceHeaderWidgets, supportedWidgetCatalog]);
 
   const dragGhost =
     activeDrag && typeof document !== 'undefined'

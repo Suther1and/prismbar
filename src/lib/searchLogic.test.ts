@@ -783,4 +783,91 @@ describe('searchLogic corpus, Raycast ranking, open windows, commands, clipboard
     expect(buildPinFromSearchItem(audioItem)).toBeNull();
     expect(buildPinFromSearchItem(webItem)).toBeNull();
   });
+
+  it('builds macOS search corpus without Taskmgr/ms-settings/audio and strips admin altAction', () => {
+    const macCorpus = buildSearchCorpus({
+      platform: 'macos',
+      apps: [
+        {
+          id: 'mac-safari',
+          name: 'Safari',
+          target: '/Applications/Safari.app',
+          category: 'Браузеры',
+          iconKey: 'safari',
+          iconData: null,
+        },
+        {
+          id: 'mac-ax',
+          name: 'Универсальный доступ',
+          target: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+          category: 'Системные настройки',
+          iconKey: 'settings',
+          iconData: null,
+        },
+      ],
+      files: [
+        {
+          id: 'mac-f-1',
+          name: 'notes.md',
+          kind: 'file',
+          location: 'Документы',
+          target: '/Users/alex/Documents/notes.md',
+          modifiedTs: 1_700_000_000,
+        },
+        {
+          id: 'mac-d-1',
+          name: 'Desktop',
+          kind: 'folder',
+          location: 'Домашняя папка',
+          target: '/Users/alex/Desktop',
+          modifiedTs: 1_700_000_000,
+        },
+      ],
+      config: null,
+      games: [],
+      iconMap: {},
+      groups: [],
+      audio: null,
+      clips: [],
+    });
+
+    expect(macCorpus.some((c) => c.target.includes('Taskmgr.exe'))).toBe(false);
+    expect(macCorpus.some((c) => c.target.startsWith('ms-settings:'))).toBe(false);
+    expect(macCorpus.some((c) => c.commandId === 'mic_toggle')).toBe(false);
+    expect(
+      macCorpus.some(
+        (c) =>
+          c.target === '/System/Applications/Utilities/Activity Monitor.app' &&
+          c.name === 'Мониторинг системы',
+      ),
+    ).toBe(true);
+
+    const sysPref = macCorpus.find((c) => c.target.startsWith('x-apple.systempreferences:'))!;
+    expect(sysPref.source).toBe('win_settings');
+    expect(sysPref.badge?.text).toBe('Параметры');
+
+    const safari = macCorpus.find((c) => c.name === 'Safari')!;
+    expect(resolveSearchSecondaryAction(safari, 'macos')).toEqual({
+      type: 'open_location',
+      label: 'Показать в Finder',
+      path: '/Applications/Safari.app',
+    });
+
+    const noteFile = macCorpus.find((c) => c.name === 'notes.md')!;
+    expect(resolveSearchSecondaryAction(noteFile, 'macos')).toEqual({
+      type: 'open_location',
+      label: 'Показать в Finder',
+      path: '/Users/alex/Documents/notes.md',
+    });
+
+    const folder = macCorpus.find((c) => c.name === 'Desktop' && c.kind === 'folder')!;
+    expect(resolveSearchSecondaryAction(folder, 'macos')).toEqual({
+      type: 'open_terminal',
+      label: 'Терминал',
+      path: '/Users/alex/Desktop',
+    });
+
+    const macPin = buildPinFromSearchItem(safari, 'pin-safari', 'macos');
+    expect(macPin?.altAction).toBe('');
+  });
 });

@@ -143,6 +143,14 @@ export type SecondaryTaskbarMode = 'testbar' | 'native' | 'hidden';
 export type GlassDepth = 'crystal' | 'obsidian' | 'matte' | 'solid';
 export type BackdropMode = 'dcomp' | 'swca' | 'none';
 export type SnapZone = 'left' | 'right' | 'maximize' | 'restore' | 'center';
+export type MacCommandKeyMode = 'any' | 'left' | 'right' | 'disabled';
+export type MacWindowPosition = 'center' | 'bottom';
+export type MacTerminalApp = 'auto' | 'terminal' | 'iterm' | 'warp' | 'ghostty';
+
+export interface PlatformInfo {
+  platform: 'windows' | 'macos';
+  accessibilityTrusted: boolean;
+}
 
 export interface FrecencyEntry {
   count: number;
@@ -168,6 +176,9 @@ export interface TestBarConfig {
   clockLayout?: ClockLayout;
   startRememberSpace?: boolean;
   defaultTileSize?: TileSize;
+  macCommandKey?: MacCommandKeyMode;
+  macWindowPosition?: MacWindowPosition;
+  macTerminalApp?: MacTerminalApp;
   quickNotes?: QuickNotesState;
   hiddenTrayKeys?: string[];
   hiddenBatteryIds?: string[];
@@ -1562,4 +1573,32 @@ export function exportConfigDialog(): Promise<string | null> {
 
 export function importConfigDialog(): Promise<TestBarConfig | null> {
   return ipc<TestBarConfig | null>('import_config_dialog');
+}
+
+export function getPlatformInfo(): Promise<PlatformInfo> {
+  return ipc<PlatformInfo>('get_platform_info');
+}
+
+export function getAccessibilityStatus(): Promise<boolean> {
+  return ipc<boolean>('get_accessibility_status');
+}
+
+export function openAccessibilitySettings(): Promise<void> {
+  return ipc<void>('open_accessibility_settings');
+}
+
+export function setMacSettings(params: {
+  macCommandKey?: MacCommandKeyMode;
+  macWindowPosition?: MacWindowPosition;
+  macTerminalApp?: MacTerminalApp;
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('set_mac_settings', {
+    macCommandKey: params.macCommandKey ?? null,
+    macWindowPosition: params.macWindowPosition ?? null,
+    macTerminalApp: params.macTerminalApp ?? null,
+  });
+}
+
+export function quitApp(): Promise<void> {
+  return ipc<void>('quit_app');
 }
