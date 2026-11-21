@@ -3583,10 +3583,15 @@ fn update_pin(
     custom_icon: PatchArg<String>,
     custom_color: PatchArg<String>,
     icon_data: PatchArg<String>,
+    tile_size: PatchArg<String>,
+    section: PatchArg<String>,
+    run_as_admin: Option<bool>,
 ) -> Result<TestBarConfig, String> {
     let custom_icon_opt = custom_icon.into_double_option();
     let custom_color_opt = custom_color.into_double_option();
     let icon_data_opt = icon_data.into_double_option();
+    let tile_size_opt = tile_size.into_double_option();
+    let section_opt = section.into_double_option();
     let mut inner_err: Option<String> = None;
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         match config::update_pin_v2(
@@ -3601,6 +3606,9 @@ fn update_pin(
             custom_icon_opt.clone(),
             custom_color_opt.clone(),
             icon_data_opt.clone(),
+            tile_size_opt.clone(),
+            section_opt.clone(),
+            run_as_admin,
         ) {
             Ok(changed) => changed,
             Err(err) => {
@@ -3638,6 +3646,30 @@ fn reorder_pins(
 ) -> Result<TestBarConfig, String> {
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         config::reorder_pins_in_space(cfg, &space, from_idx, to_idx)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn move_pin_in_space(
+    app: AppHandle,
+    state: State<AppState>,
+    space: String,
+    from_id: String,
+    to_id: Option<String>,
+    target_section: Option<String>,
+) -> Result<TestBarConfig, String> {
+    if let Some(ref sec) = target_section {
+        config::validate_tile_section(sec)?;
+    }
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::reorder_pins_by_id(
+            cfg,
+            &space,
+            &from_id,
+            to_id.as_deref(),
+            target_section.as_deref(),
+        )
     })?;
     Ok(updated)
 }
@@ -3788,7 +3820,9 @@ fn update_space(
     layout_kind: Option<String>,
     show_hero_row: Option<bool>,
     widgets: Option<Vec<String>>,
+    bottom_section_title: PatchArg<String>,
 ) -> Result<TestBarConfig, String> {
+    let bottom_title_opt = bottom_section_title.into_double_option();
     let mut inner_err: Option<String> = None;
     let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
         match config::update_space_config(
@@ -3800,6 +3834,7 @@ fn update_space(
             layout_kind.clone(),
             show_hero_row,
             widgets.clone(),
+            bottom_title_opt.clone(),
         ) {
             Ok(changed) => changed,
             Err(err) => {
@@ -4094,6 +4129,40 @@ fn restore_all_tray_apps(
             let _ = refresh_cached_tray_apps(&h, true);
         });
     }
+    Ok(updated)
+}
+
+#[tauri::command]
+fn hide_battery_device(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::hide_battery_device(cfg, &id)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn restore_battery_device(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) = mutate_config_and_emit(&app, &state, |cfg| {
+        config::restore_battery_device(cfg, &id)
+    })?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn restore_all_battery_devices(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<TestBarConfig, String> {
+    let (updated, _) =
+        mutate_config_and_emit(&app, &state, config::restore_all_battery_devices)?;
     Ok(updated)
 }
 
@@ -5018,6 +5087,7 @@ pub fn run(hide_native: bool) {
             update_pin,
             remove_pin,
             reorder_pins,
+            move_pin_in_space,
             add_custom_space,
             update_custom_space,
             delete_custom_space,
@@ -5033,6 +5103,9 @@ pub fn run(hide_native: bool) {
             hide_tray_app,
             restore_tray_app,
             restore_all_tray_apps,
+            hide_battery_device,
+            restore_battery_device,
+            restore_all_battery_devices,
             record_frecency,
             pick_folder,
             pick_file,
@@ -6193,6 +6266,9 @@ mod integration_tests {
                     combo_targets: None,
                     custom_icon: None,
                     custom_color: None,
+                    tile_size: None,
+                    section: None,
+                    run_as_admin: false,
                 },
             )
         })

@@ -41,6 +41,7 @@ import {
   getFileThumbnails,
   getPeripheralBatteries,
   getWeather,
+  hideBatteryDevice,
   hideTrayApp,
   ICON_CACHE_MAX_ENTRIES,
   iconCache,
@@ -53,6 +54,7 @@ import {
   LruIconCache,
   mergeTaskbarItems,
   minimizeOtherWindows,
+  movePinInSpace,
   normalizeStartStatePayload,
   onEvent,
   openScreenSnip,
@@ -62,7 +64,9 @@ import {
   refreshIndexes,
   refreshPeripheralBatteries,
   reorderSpaces,
+  restoreAllBatteryDevices,
   restoreAllTrayApps,
+  restoreBatteryDevice,
   restoreTrayApp,
   searchWeatherCities,
   seekMedia,
@@ -86,6 +90,8 @@ import {
   type AppWindowGroup,
   type PinItem,
   type TestBarConfig,
+  type TileSection,
+  type TileSize,
 } from './ipc';
 
 function makeConfig(revision: number, barMode: 'dock' | 'edge' = 'dock'): TestBarConfig {
@@ -855,6 +861,113 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
 
     await refreshPeripheralBatteries();
     expect(invokeMock).toHaveBeenLastCalledWith('refresh_peripheral_batteries', undefined);
+  });
+
+  it('serializes Wave 5A v3 pin layout/admin, space bottomSectionTitle, movePinInSpace, and battery hide/restore commands', async () => {
+    const size: TileSize = 'hero';
+    const section: TileSection = 'main';
+    await updatePin({
+      space: 'personal',
+      pinId: 'pin-v3',
+      tileSize: size,
+      section,
+      runAsAdmin: true,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_pin', {
+      space: 'personal',
+      pinId: 'pin-v3',
+      title: null,
+      target: null,
+      args: null,
+      altAction: null,
+      altLabel: null,
+      tileSize: 'hero',
+      section: 'main',
+      runAsAdmin: true,
+    });
+
+    await updatePin({
+      space: 'personal',
+      pinId: 'pin-v3',
+      tileSize: null,
+      section: null,
+      runAsAdmin: false,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_pin', {
+      space: 'personal',
+      pinId: 'pin-v3',
+      title: null,
+      target: null,
+      args: null,
+      altAction: null,
+      altLabel: null,
+      tileSize: null,
+      section: null,
+      runAsAdmin: false,
+    });
+
+    await updateSpace({
+      id: 'personal',
+      bottomSectionTitle: 'Быстрые папки',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_space', {
+      id: 'personal',
+      name: null,
+      accentHex: null,
+      accentRgb: null,
+      layoutKind: null,
+      showHeroRow: null,
+      widgets: null,
+      bottomSectionTitle: 'Быстрые папки',
+    });
+
+    await updateSpace({
+      id: 'personal',
+      bottomSectionTitle: null,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('update_space', {
+      id: 'personal',
+      name: null,
+      accentHex: null,
+      accentRgb: null,
+      layoutKind: null,
+      showHeroRow: null,
+      widgets: null,
+      bottomSectionTitle: null,
+    });
+
+    await movePinInSpace({
+      space: 'personal',
+      fromId: 'p-1',
+      toId: 'p-2',
+      targetSection: 'bottom',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('move_pin_in_space', {
+      space: 'personal',
+      fromId: 'p-1',
+      toId: 'p-2',
+      targetSection: 'bottom',
+    });
+
+    await movePinInSpace({
+      space: 'personal',
+      fromId: 'p-2',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('move_pin_in_space', {
+      space: 'personal',
+      fromId: 'p-2',
+      toId: null,
+      targetSection: null,
+    });
+
+    await hideBatteryDevice('sony:0ce6');
+    expect(invokeMock).toHaveBeenLastCalledWith('hide_battery_device', { id: 'sony:0ce6' });
+
+    await restoreBatteryDevice('sony:0ce6');
+    expect(invokeMock).toHaveBeenLastCalledWith('restore_battery_device', { id: 'sony:0ce6' });
+
+    await restoreAllBatteryDevices();
+    expect(invokeMock).toHaveBeenLastCalledWith('restore_all_battery_devices', undefined);
   });
 
   it('binds onEvent strictly to getCurrentWebviewWindow().listen() to prevent cross-window event clobbering', async () => {

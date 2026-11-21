@@ -24,14 +24,18 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
     AttachThreadInput, CreateEventW, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId,
     OpenEventW, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, SetEvent,
-    WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
+    TerminateProcess, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    SYNCHRONIZATION_ACCESS_RIGHTS,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -60,7 +64,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, HC_ACTION, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, MA_NOACTIVATE,
     MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, SHOW_WINDOW_CMD, SM_CXSCREEN, SM_CYSCREEN,
     SPIF_SENDCHANGE, SPI_GETWORKAREA, SPI_SETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    SW_SHOWNOACTIVATE,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
     WM_NCACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCPAINT, WM_QUIT, WM_RBUTTONDOWN,
@@ -2020,6 +2025,22 @@ pub fn flush_orphaned_appbars() {
 
 fn show_native_taskbars_and_restore_workarea(explicit_workarea: Option<PixelRect>) {
     set_native_taskbars_visibility(SW_SHOW, SW_SHOW);
+    unsafe {
+        let cls = wide("Shell_TrayWnd");
+        if let Ok(hwnd) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
+            if !hwnd.0.is_null() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
     if let Some(wa_rect) = get_recovery_workarea(explicit_workarea) {
         let mut wa = RECT {
             left: wa_rect.left,
@@ -2046,6 +2067,7 @@ pub fn restore_native_taskbar_nonblocking() {
     unregister_appbar();
     show_native_taskbars_and_restore_workarea(None);
     ensure_native_start_menu_healthy();
+    reset_native_start_menu_host();
     if let Ok(slot) = APPBAR_MSG_WINDOW.try_lock() {
         if let Some(wnd) = slot.as_ref() {
             wnd.request_close_nonblocking();
@@ -2063,6 +2085,7 @@ fn restore_native_taskbar_internal(explicit_workarea: Option<PixelRect>, flush_o
     }
     show_native_taskbars_and_restore_workarea(explicit_workarea);
     ensure_native_start_menu_healthy();
+    reset_native_start_menu_host();
     NATIVE_HIDDEN.store(false, Ordering::SeqCst);
 }
 
@@ -2851,12 +2874,19 @@ impl Drop for HookThreadGuard {
     }
 }
 
-/// Posts `WM_QUIT` to the active global shell hook thread so it unhooks cleanly and drops its sender.
+/// Posts `WM_QUIT` to the active global shell hook thread and waits briefly (up to 150ms)
+/// so `UnhookWindowsHookEx` completes cleanly before `app.exit(0)`.
 pub(crate) fn stop_shell_hook_thread() {
     let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
     if tid != 0 {
         unsafe {
             let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        for _ in 0..15 {
+            if !HOOK_THREAD_ACTIVE.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -3112,6 +3142,57 @@ pub fn should_restore_start_menu_visibility(
 /// excluding hidden Win32 helper classes (`IME`, `MSCTFIME UI`, etc.) inside the same process.
 pub fn is_start_menu_core_window_class(class_name: &str) -> bool {
     class_name == "Windows.UI.Core.CoreWindow"
+}
+
+/// Returns `true` STRICTLY for `"startmenuexperiencehost.exe"` (case-insensitive) and `false`
+/// for `"explorer.exe"`, `"shellexperiencehost.exe"`, `"searchhost.exe"`, and all other executables.
+pub fn is_restartable_start_host_exe(exe_name: &str) -> bool {
+    let trimmed = exe_name.trim().trim_end_matches('\0');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let base = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+    base.eq_ignore_ascii_case("startmenuexperiencehost.exe")
+}
+
+/// Terminates any wedged `StartMenuExperienceHost.exe` process (NEVER `explorer.exe`) so
+/// Windows 11 automatically restarts a clean Start Menu host in `<150ms` on demand.
+/// Non-blocking and lock-free; safe during clean exit, panic hooks, and watchdog recovery.
+pub fn reset_native_start_menu_host() {
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return;
+        };
+        if snap.is_invalid() || snap.0.is_null() {
+            return;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if entry.th32ProcessID != 0 && is_restartable_start_host_exe(&exe_name) {
+                    if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
+                        if !handle.is_invalid() && !handle.0.is_null() {
+                            let _ = TerminateProcess(handle, 0);
+                            let _ = CloseHandle(handle);
+                        }
+                    }
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
 }
 
 /// Ensures Windows 11's persistent `StartMenuExperienceHost.exe` `CoreWindow` retains `WS_VISIBLE`
@@ -5770,7 +5851,7 @@ mod tests {
         assert!(body.contains("WM_CANCELMODE"));
         assert!(body.contains("NativeStartSuppressed"));
 
-        // Verify both internal & nonblocking restore paths call ensure_native_start_menu_healthy
+        // Verify both internal & nonblocking restore paths call ensure_native_start_menu_healthy and reset_native_start_menu_host
         for fn_sig in [
             "\npub fn restore_native_taskbar_nonblocking()",
             "\nfn restore_native_taskbar_internal(",
@@ -5782,9 +5863,44 @@ mod tests {
                 fn_tail[..fn_end].contains("ensure_native_start_menu_healthy()"),
                 "{fn_sig} must call ensure_native_start_menu_healthy()"
             );
+            assert!(
+                fn_tail[..fn_end].contains("reset_native_start_menu_host()"),
+                "{fn_sig} must call reset_native_start_menu_host()"
+            );
         }
 
         // Smoke-check live execution (non-blocking no-op when Start CoreWindow is healthy/absent)
         ensure_native_start_menu_healthy();
+    }
+
+    #[test]
+    fn restartable_start_host_exe_strictly_matches_start_menu_experience_host_only() {
+        assert!(is_restartable_start_host_exe("StartMenuExperienceHost.exe"));
+        assert!(is_restartable_start_host_exe("startmenuexperiencehost.exe"));
+        assert!(is_restartable_start_host_exe("STARTMENUEXPERIENCEHOST.EXE"));
+        assert!(is_restartable_start_host_exe(
+            r"C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe"
+        ));
+        assert!(is_restartable_start_host_exe("StartMenuExperienceHost.exe\0"));
+
+        for forbidden in [
+            "",
+            "   ",
+            "explorer.exe",
+            "EXPLORER.EXE",
+            r"C:\Windows\explorer.exe",
+            "ShellExperienceHost.exe",
+            "shellexperiencehost.exe",
+            "SearchHost.exe",
+            "searchhost.exe",
+            "ScreenClippingHost.exe",
+            "ApplicationFrameHost.exe",
+            "testbar.exe",
+        ] {
+            assert!(
+                !is_restartable_start_host_exe(forbidden),
+                "{forbidden:?} must NEVER be matched by is_restartable_start_host_exe"
+            );
+        }
     }
 }

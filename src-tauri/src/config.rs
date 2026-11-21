@@ -14,7 +14,7 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const SECONDARY_TASKBAR_MODE_TESTBAR: &str = "testbar";
 pub const SECONDARY_TASKBAR_MODE_NATIVE: &str = "native";
 pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
@@ -30,6 +30,10 @@ pub const WIDGET_PRESET_FULL_GRID: &str = "full_grid";
 
 pub const SPACE_LAYOUT_GRID: &str = "grid";
 pub const SPACE_LAYOUT_GAMES: &str = "games";
+pub const TILE_SIZE_HERO: &str = "hero";
+pub const TILE_SIZE_COMPACT: &str = "compact";
+pub const TILE_SECTION_MAIN: &str = "main";
+pub const TILE_SECTION_BOTTOM: &str = "bottom";
 pub const MAX_SPACES: usize = 12;
 
 pub const SPACE_WIDGET_IDS: &[&str] = &[
@@ -104,6 +108,42 @@ pub fn validate_space_layout_kind(kind: &str) -> Result<&'static str, String> {
         "games" => Ok(SPACE_LAYOUT_GAMES),
         other => Err(format!(
             "Недопустимый тип сетки пространства: '{other}' (допустимы: grid, games)"
+        )),
+    }
+}
+
+pub fn normalize_tile_size(size: &str) -> Option<&'static str> {
+    match size.trim().to_ascii_lowercase().as_str() {
+        "hero" => Some(TILE_SIZE_HERO),
+        "compact" => Some(TILE_SIZE_COMPACT),
+        _ => None,
+    }
+}
+
+pub fn validate_tile_size(size: &str) -> Result<&'static str, String> {
+    match size.trim().to_ascii_lowercase().as_str() {
+        "hero" => Ok(TILE_SIZE_HERO),
+        "compact" => Ok(TILE_SIZE_COMPACT),
+        other => Err(format!(
+            "Недопустимый размер плитки: '{other}' (допустимы: hero, compact)"
+        )),
+    }
+}
+
+pub fn normalize_tile_section(section: &str) -> Option<&'static str> {
+    match section.trim().to_ascii_lowercase().as_str() {
+        "main" => Some(TILE_SECTION_MAIN),
+        "bottom" => Some(TILE_SECTION_BOTTOM),
+        _ => None,
+    }
+}
+
+pub fn validate_tile_section(section: &str) -> Result<&'static str, String> {
+    match section.trim().to_ascii_lowercase().as_str() {
+        "main" => Ok(TILE_SECTION_MAIN),
+        "bottom" => Ok(TILE_SECTION_BOTTOM),
+        other => Err(format!(
+            "Недопустимая секция плитки: '{other}' (допустимы: main, bottom)"
         )),
     }
 }
@@ -296,6 +336,12 @@ pub struct PinItem {
     pub custom_icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub run_as_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -311,20 +357,18 @@ pub struct SpaceConfig {
     pub layout_kind: String,
     #[serde(default)]
     pub show_hero_row: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_section_title: Option<String>,
     #[serde(default)]
     pub widgets: Vec<String>,
     #[serde(default)]
     pub items: Vec<PinItem>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskbarWidgetSettings {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub show_weather: bool,
     #[serde(default)]
     pub show_batteries: bool,
@@ -343,7 +387,7 @@ pub struct TaskbarWidgetSettings {
 impl Default for TaskbarWidgetSettings {
     fn default() -> Self {
         Self {
-            show_weather: true,
+            show_weather: false,
             show_batteries: false,
             show_telemetry: false,
             weather_city: String::new(),
@@ -401,6 +445,8 @@ pub struct TestBarConfig {
     pub start_remember_space: bool,
     #[serde(default)]
     pub hidden_tray_keys: Vec<String>,
+    #[serde(default)]
+    pub hidden_battery_ids: Vec<String>,
     #[serde(default)]
     pub frecency: HashMap<String, FrecencyEntry>,
     #[serde(default)]
@@ -896,6 +942,9 @@ fn pin(
         combo_targets: None,
         custom_icon: None,
         custom_color: None,
+        tile_size: None,
+        section: None,
+        run_as_admin: false,
     }
 }
 
@@ -923,6 +972,9 @@ fn combo_pin(
         combo_targets: Some(targets),
         custom_icon: None,
         custom_color: None,
+        tile_size: None,
+        section: None,
+        run_as_admin: false,
     }
 }
 
@@ -1167,6 +1219,26 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         changed = true;
     }
 
+    let clean_tile_size = item
+        .tile_size
+        .as_deref()
+        .and_then(normalize_tile_size)
+        .map(str::to_string);
+    if item.tile_size != clean_tile_size {
+        item.tile_size = clean_tile_size;
+        changed = true;
+    }
+
+    let clean_section = item
+        .section
+        .as_deref()
+        .and_then(normalize_tile_section)
+        .map(str::to_string);
+    if item.section != clean_section {
+        item.section = clean_section;
+        changed = true;
+    }
+
     changed
 }
 
@@ -1273,6 +1345,12 @@ fn normalize_space_config(
         changed = true;
     }
 
+    let clean_bottom_title = sanitize_optional_nonempty(&space.bottom_section_title);
+    if space.bottom_section_title != clean_bottom_title {
+        space.bottom_section_title = clean_bottom_title;
+        changed = true;
+    }
+
     for item in space.items.iter_mut() {
         if normalize_pin(item, false) {
             changed = true;
@@ -1282,12 +1360,36 @@ fn normalize_space_config(
     changed
 }
 
+fn default_bottom_section_title(space_id: &str, layout_kind: &str) -> &'static str {
+    match space_id {
+        "personal" => "Быстрый доступ",
+        "work" => "Приложения",
+        "studio" => "Инструменты",
+        "games" => "Лаунчеры и закреплённое",
+        _ if layout_kind == SPACE_LAYOUT_GAMES => "Лаунчеры и закреплённое",
+        _ => "Закреплённое",
+    }
+}
+
 fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
     let mut spaces = Vec::with_capacity(4 + cfg.custom_spaces.len());
 
     let mut personal_items = Vec::with_capacity(cfg.personal_pins.len() + cfg.personal_links.len());
-    personal_items.extend(cfg.personal_pins.iter().cloned());
-    personal_items.extend(cfg.personal_links.iter().cloned());
+    for (idx, mut item) in cfg.personal_pins.iter().cloned().enumerate() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+        }
+        if idx < 2 && item.tile_size.is_none() {
+            item.tile_size = Some(TILE_SIZE_HERO.to_string());
+        }
+        personal_items.push(item);
+    }
+    for mut item in cfg.personal_links.iter().cloned() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        }
+        personal_items.push(item);
+    }
     spaces.push(SpaceConfig {
         id: "personal".to_string(),
         name: "Личное".to_string(),
@@ -1295,6 +1397,7 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         accent_rgb: "129,140,248".to_string(),
         layout_kind: SPACE_LAYOUT_GRID.to_string(),
         show_hero_row: true,
+        bottom_section_title: Some("Быстрый доступ".to_string()),
         widgets: vec![
             "media".to_string(),
             "audio_mixer".to_string(),
@@ -1304,8 +1407,18 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
     });
 
     let mut work_items = Vec::with_capacity(cfg.work_folders.len() + cfg.work_apps.len());
-    work_items.extend(cfg.work_folders.iter().cloned());
-    work_items.extend(cfg.work_apps.iter().cloned());
+    for mut item in cfg.work_folders.iter().cloned() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+        }
+        work_items.push(item);
+    }
+    for mut item in cfg.work_apps.iter().cloned() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        }
+        work_items.push(item);
+    }
     spaces.push(SpaceConfig {
         id: "work".to_string(),
         name: "Работа".to_string(),
@@ -1313,13 +1426,27 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         accent_rgb: "56,189,248".to_string(),
         layout_kind: SPACE_LAYOUT_GRID.to_string(),
         show_hero_row: false,
+        bottom_section_title: Some("Приложения".to_string()),
         widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
         items: work_items,
     });
 
     let mut studio_items = Vec::with_capacity(cfg.studio_pins.len() + cfg.studio_tools.len());
-    studio_items.extend(cfg.studio_pins.iter().cloned());
-    studio_items.extend(cfg.studio_tools.iter().cloned());
+    for (idx, mut item) in cfg.studio_pins.iter().cloned().enumerate() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+        }
+        if idx < 2 && item.tile_size.is_none() {
+            item.tile_size = Some(TILE_SIZE_HERO.to_string());
+        }
+        studio_items.push(item);
+    }
+    for mut item in cfg.studio_tools.iter().cloned() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        }
+        studio_items.push(item);
+    }
     spaces.push(SpaceConfig {
         id: "studio".to_string(),
         name: "Студия".to_string(),
@@ -1327,6 +1454,7 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         accent_rgb: "52,211,153".to_string(),
         layout_kind: SPACE_LAYOUT_GRID.to_string(),
         show_hero_row: true,
+        bottom_section_title: Some("Инструменты".to_string()),
         widgets: vec![
             "pc_health".to_string(),
             "audio_mixer".to_string(),
@@ -1335,6 +1463,13 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         items: studio_items,
     });
 
+    let mut game_items = Vec::with_capacity(cfg.game_launchers.len());
+    for mut item in cfg.game_launchers.iter().cloned() {
+        if item.section.is_none() {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        }
+        game_items.push(item);
+    }
     spaces.push(SpaceConfig {
         id: "games".to_string(),
         name: "Игры".to_string(),
@@ -1342,16 +1477,24 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
         accent_rgb: "251,113,133".to_string(),
         layout_kind: SPACE_LAYOUT_GAMES.to_string(),
         show_hero_row: false,
+        bottom_section_title: Some("Лаунчеры и закреплённое".to_string()),
         widgets: vec![
             "audio_mixer".to_string(),
             "game_combos".to_string(),
             "pc_health".to_string(),
         ],
-        items: cfg.game_launchers.clone(),
+        items: game_items,
     });
 
     for cs in &cfg.custom_spaces {
         let (hex, rgb) = sanitize_accent_hex_rgb(Some(&cs.accent_hex), Some(&cs.accent_rgb));
+        let mut custom_items = Vec::with_capacity(cs.items.len());
+        for mut item in cs.items.iter().cloned() {
+            if item.section.is_none() {
+                item.section = Some(TILE_SECTION_MAIN.to_string());
+            }
+            custom_items.push(item);
+        }
         spaces.push(SpaceConfig {
             id: cs.id.clone(),
             name: cs.name.clone(),
@@ -1359,18 +1502,142 @@ fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
             accent_rgb: rgb,
             layout_kind: SPACE_LAYOUT_GRID.to_string(),
             show_hero_row: false,
+            bottom_section_title: Some("Закреплённое".to_string()),
             widgets: widget_preset_to_widgets(&cs.widget_preset),
-            items: cs.items.clone(),
+            items: custom_items,
         });
     }
 
     spaces
 }
 
-/// Losslessly upgrades legacy v0/v1 config payloads to schema v2 and normalizes all pin lists & spaces.
+fn upgrade_v2_spaces_to_v3(cfg: &mut TestBarConfig) -> bool {
+    let mut changed = false;
+    let personal_bottom_ids: HashSet<String> =
+        cfg.personal_links.iter().map(|i| i.id.clone()).collect();
+    let work_bottom_ids: HashSet<String> = cfg.work_apps.iter().map(|i| i.id.clone()).collect();
+    let studio_bottom_ids: HashSet<String> =
+        cfg.studio_tools.iter().map(|i| i.id.clone()).collect();
+
+    for sp in &mut cfg.spaces {
+        if sp.bottom_section_title.is_none() {
+            sp.bottom_section_title =
+                Some(default_bottom_section_title(&sp.id, &sp.layout_kind).to_string());
+            changed = true;
+        }
+
+        if sp.items.iter().any(|i| i.section.is_some()) {
+            continue;
+        }
+
+        match sp.id.as_str() {
+            "personal" => {
+                let trailing_folder_start = if personal_bottom_ids.is_empty() {
+                    let has_non_folder = sp.items.iter().any(|i| i.kind != "folder");
+                    let has_folder = sp.items.iter().any(|i| i.kind == "folder");
+                    if has_non_folder && has_folder {
+                        sp.items
+                            .iter()
+                            .rposition(|i| i.kind != "folder")
+                            .map(|pos| pos + 1)
+                            .filter(|&start| start < sp.items.len())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut main_count = 0usize;
+                for (idx, item) in sp.items.iter_mut().enumerate() {
+                    let is_bottom = if !personal_bottom_ids.is_empty() {
+                        personal_bottom_ids.contains(&item.id)
+                    } else {
+                        trailing_folder_start.is_some_and(|start| idx >= start)
+                    };
+                    if is_bottom {
+                        item.section = Some(TILE_SECTION_BOTTOM.to_string());
+                    } else {
+                        item.section = Some(TILE_SECTION_MAIN.to_string());
+                        if main_count < 2 && item.tile_size.is_none() {
+                            item.tile_size = Some(TILE_SIZE_HERO.to_string());
+                        }
+                        main_count += 1;
+                    }
+                }
+                if !sp.items.is_empty() {
+                    changed = true;
+                }
+            }
+            "work" => {
+                for item in &mut sp.items {
+                    let is_bottom = if !work_bottom_ids.is_empty() {
+                        work_bottom_ids.contains(&item.id)
+                    } else {
+                        item.kind == "app"
+                    };
+                    item.section = Some(
+                        if is_bottom {
+                            TILE_SECTION_BOTTOM
+                        } else {
+                            TILE_SECTION_MAIN
+                        }
+                        .to_string(),
+                    );
+                }
+                if !sp.items.is_empty() {
+                    changed = true;
+                }
+            }
+            "studio" => {
+                let mut main_count = 0usize;
+                for item in &mut sp.items {
+                    if !studio_bottom_ids.is_empty() && studio_bottom_ids.contains(&item.id) {
+                        item.section = Some(TILE_SECTION_BOTTOM.to_string());
+                    } else {
+                        item.section = Some(TILE_SECTION_MAIN.to_string());
+                        if main_count < 2 && item.tile_size.is_none() {
+                            item.tile_size = Some(TILE_SIZE_HERO.to_string());
+                        }
+                        main_count += 1;
+                    }
+                }
+                if !sp.items.is_empty() {
+                    changed = true;
+                }
+            }
+            id if id == "games" || sp.layout_kind == SPACE_LAYOUT_GAMES => {
+                for item in &mut sp.items {
+                    item.section = Some(TILE_SECTION_BOTTOM.to_string());
+                }
+                if !sp.items.is_empty() {
+                    changed = true;
+                }
+            }
+            _ => {
+                let mut main_count = 0usize;
+                for item in &mut sp.items {
+                    item.section = Some(TILE_SECTION_MAIN.to_string());
+                    if sp.show_hero_row && main_count < 2 && item.tile_size.is_none() {
+                        item.tile_size = Some(TILE_SIZE_HERO.to_string());
+                    }
+                    main_count += 1;
+                }
+                if !sp.items.is_empty() {
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Losslessly upgrades legacy v0/v1/v2 config payloads to schema v3 and normalizes all pin lists & spaces.
 /// Returns `true` if any field was upgraded or normalized.
 pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
     let mut changed = false;
+    let prev_schema = cfg.schema_version;
 
     if cfg.schema_version < CURRENT_SCHEMA_VERSION {
         cfg.schema_version = CURRENT_SCHEMA_VERSION;
@@ -1445,6 +1712,8 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
             default_modular_spaces()
         };
         changed = true;
+    } else if prev_schema < CURRENT_SCHEMA_VERSION && upgrade_v2_spaces_to_v3(cfg) {
+        changed = true;
     }
 
     if cfg.spaces.is_empty() {
@@ -1457,6 +1726,11 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         if normalize_space_config(space, &mut seen_space_ids, idx) {
             changed = true;
         }
+    }
+
+    if prev_schema < CURRENT_SCHEMA_VERSION && cfg.taskbar_widgets.show_weather {
+        cfg.taskbar_widgets.show_weather = false;
+        changed = true;
     }
 
     if normalize_taskbar_widgets(&mut cfg.taskbar_widgets) {
@@ -1488,6 +1762,20 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
     }
     if cleaned_tray != cfg.hidden_tray_keys {
         cfg.hidden_tray_keys = cleaned_tray;
+        changed = true;
+    }
+
+    // Deduplicate and normalize hidden_battery_ids (case-insensitive)
+    let mut seen_bats = HashSet::new();
+    let mut cleaned_bats = Vec::with_capacity(cfg.hidden_battery_ids.len());
+    for entry in &cfg.hidden_battery_ids {
+        let norm = entry.trim().to_ascii_lowercase();
+        if !norm.is_empty() && seen_bats.insert(norm.clone()) {
+            cleaned_bats.push(norm);
+        }
+    }
+    if cleaned_bats != cfg.hidden_battery_ids {
+        cfg.hidden_battery_ids = cleaned_bats;
         changed = true;
     }
 
@@ -1569,8 +1857,21 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
         pin("p-pics", "folder", "Изображения", "Скриншоты", pictures.clone(), "Скопировать путь", "139,92,246", "image"),
         pin("p-desktop", "folder", "Рабочий стол", "Файлы", desktop.clone(), "Скопировать путь", "52,211,153", "folder"),
     ]);
+    let mut personal_items = retain_resolved_pins(personal_items);
+    let mut personal_main_idx = 0usize;
+    for item in &mut personal_items {
+        if item.kind == "folder" {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        } else {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+            if personal_main_idx < 2 {
+                item.tile_size = Some(TILE_SIZE_HERO.to_string());
+            }
+            personal_main_idx += 1;
+        }
+    }
 
-    let work_items = retain_resolved_pins(vec![
+    let mut work_items = retain_resolved_pins(vec![
         pin("w-dl", "folder", "Загрузки", "Свежие файлы", downloads, "Открыть в терминале", "245,158,11", "folder"),
         pin("w-docs", "folder", "Документы", "Основная папка", documents, "Открыть в терминале", "245,158,11", "folder"),
         pin("w-desktop", "folder", "Рабочий стол", "Файлы и ярлыки", desktop, "Открыть в терминале", "56,189,248", "folder"),
@@ -1580,8 +1881,18 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
         pin("w-notepad", "app", "Блокнот", "Заметки", detect_app_target("notepad"), "", "148,163,184", "notepad"),
         pin("w-taskmgr", "app", "Диспетчер задач", "Процессы", detect_app_target("taskmgr"), "От админа", "129,140,248", "cpu"),
     ]);
+    for item in &mut work_items {
+        item.section = Some(
+            if item.kind == "app" {
+                TILE_SECTION_BOTTOM
+            } else {
+                TILE_SECTION_MAIN
+            }
+            .to_string(),
+        );
+    }
 
-    let studio_items = retain_resolved_pins(vec![
+    let mut studio_items = retain_resolved_pins(vec![
         pin("s-photoshop", "app", "Photoshop", "Графика и ретушь", detect_app_target("photoshop"), "От админа", "49,168,255", "photoshop"),
         pin("s-figma", "app", "Figma", "Интерфейсы", detect_app_target("figma"), "", "168,85,247", "figma"),
         pin("s-obs", "app", "OBS Studio", "Захват видео", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
@@ -1590,12 +1901,27 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
         pin("s-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
         pin("s-taskmgr", "app", "Диспетчер задач", "Процессы", detect_app_target("taskmgr"), "От админа", "129,140,248", "cpu"),
     ]);
+    let mut studio_main_idx = 0usize;
+    for item in &mut studio_items {
+        if matches!(item.id.as_str(), "s-snip" | "s-wt" | "s-taskmgr") {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        } else {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+            if studio_main_idx < 2 {
+                item.tile_size = Some(TILE_SIZE_HERO.to_string());
+            }
+            studio_main_idx += 1;
+        }
+    }
 
-    let game_items = retain_resolved_pins(vec![
+    let mut game_items = retain_resolved_pins(vec![
         pin("g-steam", "app", "Steam", "Библиотека", detect_app_target("steam"), "", "56,189,248", "steam"),
         pin("g-discord", "app", "Discord", "Голос", detect_app_target("discord"), "", "99,102,241", "discord"),
         pin("g-obs", "app", "OBS Studio", "Запись", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
     ]);
+    for item in &mut game_items {
+        item.section = Some(TILE_SECTION_BOTTOM.to_string());
+    }
 
     vec![
         SpaceConfig {
@@ -1605,12 +1931,13 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             accent_rgb: "129,140,248".to_string(),
             layout_kind: SPACE_LAYOUT_GRID.to_string(),
             show_hero_row: true,
+            bottom_section_title: Some("Быстрый доступ".to_string()),
             widgets: vec![
                 "media".to_string(),
                 "audio_mixer".to_string(),
                 "clipboard".to_string(),
             ],
-            items: retain_resolved_pins(personal_items),
+            items: personal_items,
         },
         SpaceConfig {
             id: "work".to_string(),
@@ -1619,6 +1946,7 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             accent_rgb: "56,189,248".to_string(),
             layout_kind: SPACE_LAYOUT_GRID.to_string(),
             show_hero_row: false,
+            bottom_section_title: Some("Приложения".to_string()),
             widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
             items: work_items,
         },
@@ -1629,6 +1957,7 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             accent_rgb: "52,211,153".to_string(),
             layout_kind: SPACE_LAYOUT_GRID.to_string(),
             show_hero_row: true,
+            bottom_section_title: Some("Инструменты".to_string()),
             widgets: vec![
                 "pc_health".to_string(),
                 "audio_mixer".to_string(),
@@ -1643,6 +1972,7 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
             accent_rgb: "251,113,133".to_string(),
             layout_kind: SPACE_LAYOUT_GAMES.to_string(),
             show_hero_row: false,
+            bottom_section_title: Some("Лаунчеры и закреплённое".to_string()),
             widgets: vec![
                 "audio_mixer".to_string(),
                 "game_combos".to_string(),
@@ -1696,6 +2026,7 @@ impl Default for TestBarConfig {
             clock_show_weekday: false,
             start_remember_space: false,
             hidden_tray_keys: vec![],
+            hidden_battery_ids: vec![],
             frecency: HashMap::new(),
             taskbar_pins: retain_resolved_pins(taskbar),
             spaces: default_modular_spaces(),
@@ -2048,32 +2379,104 @@ fn reorder_vec(vec: &mut Vec<PinItem>, from_idx: usize, to_idx: usize) -> bool {
     }
 }
 
+fn resolve_space_pins_mut<'a>(
+    cfg: &'a mut TestBarConfig,
+    space: &str,
+) -> Option<&'a mut Vec<PinItem>> {
+    match space {
+        "taskbar" | "taskbar_pins" => Some(&mut cfg.taskbar_pins),
+        "game_combos" => Some(&mut cfg.game_combos),
+        "personal_pins" => Some(&mut cfg.personal_pins),
+        "personal_links" => Some(&mut cfg.personal_links),
+        "work_folders" => Some(&mut cfg.work_folders),
+        "work_apps" => Some(&mut cfg.work_apps),
+        "studio_pins" => Some(&mut cfg.studio_pins),
+        "studio_tools" => Some(&mut cfg.studio_tools),
+        "game_launchers" => Some(&mut cfg.game_launchers),
+        space_id => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+                Some(&mut sp.items)
+            } else {
+                cfg.custom_spaces
+                    .iter_mut()
+                    .find(|s| s.id == space_id)
+                    .map(|cs| &mut cs.items)
+            }
+        }
+    }
+}
+
 pub fn reorder_pins_in_space(
     cfg: &mut TestBarConfig,
     space: &str,
     from_idx: usize,
     to_idx: usize,
 ) -> bool {
-    match space {
-        "taskbar" | "taskbar_pins" => reorder_vec(&mut cfg.taskbar_pins, from_idx, to_idx),
-        "game_combos" => reorder_vec(&mut cfg.game_combos, from_idx, to_idx),
-        "personal_pins" => reorder_vec(&mut cfg.personal_pins, from_idx, to_idx),
-        "personal_links" => reorder_vec(&mut cfg.personal_links, from_idx, to_idx),
-        "work_folders" => reorder_vec(&mut cfg.work_folders, from_idx, to_idx),
-        "work_apps" => reorder_vec(&mut cfg.work_apps, from_idx, to_idx),
-        "studio_pins" => reorder_vec(&mut cfg.studio_pins, from_idx, to_idx),
-        "studio_tools" => reorder_vec(&mut cfg.studio_tools, from_idx, to_idx),
-        "game_launchers" => reorder_vec(&mut cfg.game_launchers, from_idx, to_idx),
-        space_id => {
-            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
-                reorder_vec(&mut sp.items, from_idx, to_idx)
-            } else if let Some(cs) = cfg.custom_spaces.iter_mut().find(|s| s.id == space_id) {
-                reorder_vec(&mut cs.items, from_idx, to_idx)
-            } else {
-                false
+    let Some(list) = resolve_space_pins_mut(cfg, space) else {
+        return false;
+    };
+    reorder_vec(list, from_idx, to_idx)
+}
+
+pub fn reorder_pins_by_id(
+    cfg: &mut TestBarConfig,
+    space: &str,
+    from_id: &str,
+    to_id: Option<&str>,
+    target_section: Option<&str>,
+) -> bool {
+    let normalized_section = match target_section {
+        Some(raw) => match normalize_tile_section(raw) {
+            Some(valid) => Some(valid),
+            None => return false,
+        },
+        None => None,
+    };
+
+    let Some(list) = resolve_space_pins_mut(cfg, space) else {
+        return false;
+    };
+
+    let Some(from_idx) = list.iter().position(|p| p.id == from_id) else {
+        return false;
+    };
+
+    if let Some(tid) = to_id {
+        let Some(to_idx) = list.iter().position(|p| p.id == tid) else {
+            return false;
+        };
+        let mut item = list.remove(from_idx);
+        let mut changed = from_idx != to_idx;
+        if let Some(sec) = normalized_section {
+            if item.section.as_deref() != Some(sec) {
+                item.section = Some(sec.to_string());
+                changed = true;
             }
         }
+        list.insert(to_idx, item);
+        return changed;
     }
+
+    let before = list.clone();
+    let mut item = list.remove(from_idx);
+    if let Some(sec) = normalized_section {
+        item.section = Some(sec.to_string());
+    }
+    let insert_idx = match normalized_section {
+        Some(TILE_SECTION_MAIN) => list
+            .iter()
+            .rposition(|p| p.section.as_deref() != Some(TILE_SECTION_BOTTOM))
+            .map(|pos| pos + 1)
+            .unwrap_or(0),
+        Some(TILE_SECTION_BOTTOM) => list
+            .iter()
+            .rposition(|p| p.section.as_deref() == Some(TILE_SECTION_BOTTOM))
+            .map(|pos| pos + 1)
+            .unwrap_or(list.len()),
+        _ => list.len(),
+    };
+    list.insert(insert_idx, item);
+    *list != before
 }
 
 fn transliterate_cyrillic_char(ch: char) -> &'static str {
@@ -2237,6 +2640,7 @@ pub fn create_space_from_template(
         None => spec.widgets.iter().map(|s| (*s).to_string()).collect(),
     };
     let id = slugify_space_id(&clean_name, cfg);
+    let bottom_title = default_bottom_section_title(template.trim(), spec.layout_kind).to_string();
     let space = SpaceConfig {
         id,
         name: clean_name,
@@ -2244,6 +2648,7 @@ pub fn create_space_from_template(
         accent_rgb: rgb,
         layout_kind: spec.layout_kind.to_string(),
         show_hero_row: spec.show_hero_row,
+        bottom_section_title: Some(bottom_title),
         widgets: final_widgets,
         items: vec![],
     };
@@ -2251,6 +2656,7 @@ pub fn create_space_from_template(
     Ok(space)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_space_config(
     cfg: &mut TestBarConfig,
     id: &str,
@@ -2260,6 +2666,7 @@ pub fn update_space_config(
     layout_kind: Option<String>,
     show_hero_row: Option<bool>,
     widgets: Option<Vec<String>>,
+    bottom_section_title: Option<Option<String>>,
 ) -> Result<bool, String> {
     let next_name = match name {
         Some(raw) => {
@@ -2279,6 +2686,7 @@ pub fn update_space_config(
         Some(w) => Some(validate_and_normalize_space_widgets(&w)?),
         None => None,
     };
+    let next_bottom_title = bottom_section_title.map(|opt| sanitize_optional_nonempty(&opt));
 
     let Some(space) = cfg.spaces.iter_mut().find(|s| s.id == id) else {
         return Err(format!("Пространство '{id}' не найдено"));
@@ -2320,6 +2728,12 @@ pub fn update_space_config(
     if let Some(w) = next_widgets {
         if space.widgets != w {
             space.widgets = w;
+            changed = true;
+        }
+    }
+    if let Some(title_opt) = next_bottom_title {
+        if space.bottom_section_title != title_opt {
+            space.bottom_section_title = title_opt;
             changed = true;
         }
     }
@@ -2624,6 +3038,9 @@ pub fn update_pin_v2(
     custom_icon: Option<Option<String>>,
     custom_color: Option<Option<String>>,
     icon_data: Option<Option<String>>,
+    tile_size: Option<Option<String>>,
+    section: Option<Option<String>>,
+    run_as_admin: Option<bool>,
 ) -> Result<bool, String> {
     let next_title = match title {
         Some(raw) => {
@@ -2634,6 +3051,18 @@ pub fn update_pin_v2(
             Some(clean)
         }
         None => None,
+    };
+
+    let next_tile_size = match tile_size {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(Some(validate_tile_size(&raw)?.to_string())),
+    };
+
+    let next_section = match section {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(Some(validate_tile_section(&raw)?.to_string())),
     };
 
     let Some((pin_item, force_combo)) = find_pin_mut(cfg, space, pin_id) else {
@@ -2689,6 +3118,18 @@ pub fn update_pin_v2(
             .map(str::to_string);
     }
 
+    if let Some(next_size_opt) = next_tile_size {
+        pin_item.tile_size = next_size_opt;
+    }
+
+    if let Some(next_sec_opt) = next_section {
+        pin_item.section = next_sec_opt;
+    }
+
+    if let Some(admin) = run_as_admin {
+        pin_item.run_as_admin = admin;
+    }
+
     normalize_pin(pin_item, force_combo);
     let mut changed = *pin_item != before;
 
@@ -2719,7 +3160,8 @@ pub fn update_pin(
     alt_label: Option<String>,
 ) -> Result<bool, String> {
     update_pin_v2(
-        cfg, space, pin_id, title, target, args, alt_action, alt_label, None, None, None,
+        cfg, space, pin_id, title, target, args, alt_action, alt_label, None, None, None, None,
+        None, None,
     )
 }
 
@@ -2889,6 +3331,41 @@ pub fn restore_all_tray_keys(cfg: &mut TestBarConfig) -> bool {
         return false;
     }
     cfg.hidden_tray_keys.clear();
+    true
+}
+
+pub fn hide_battery_device(cfg: &mut TestBarConfig, id: &str) -> bool {
+    let norm = id.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    if cfg
+        .hidden_battery_ids
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(&norm))
+    {
+        return false;
+    }
+    cfg.hidden_battery_ids.push(norm);
+    true
+}
+
+pub fn restore_battery_device(cfg: &mut TestBarConfig, id: &str) -> bool {
+    let norm = id.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    let before = cfg.hidden_battery_ids.len();
+    cfg.hidden_battery_ids
+        .retain(|k| !k.eq_ignore_ascii_case(&norm));
+    cfg.hidden_battery_ids.len() != before
+}
+
+pub fn restore_all_battery_devices(cfg: &mut TestBarConfig) -> bool {
+    if cfg.hidden_battery_ids.is_empty() {
+        return false;
+    }
+    cfg.hidden_battery_ids.clear();
     true
 }
 
@@ -3644,18 +4121,18 @@ mod tests {
         assert_eq!(loaded_bom.taskbar_pins[0].title, "BomApp");
         assert!(!loaded_bom.spaces.is_empty());
 
-        // 3. Newer schemaVersion (3) is preserved untouched and not downgraded
-        let v3_path = dir.join("v3.json");
-        let v3_json = r##"{"schemaVersion":3,"revision":10,"barMode":"dock","taskbarPins":[{"id":"v3p","kind":"app","title":"FutureApp","target":"C:\\Apps\\Future.exe","matchExe":"future.exe"}],"spaces":[{"id":"personal","name":"Личное","accentHex":"#818CF8","accentRgb":"129,140,248","layoutKind":"grid","showHeroRow":true,"widgets":["media"],"items":[]}]}"##;
-        fs::write(&v3_path, v3_json).expect("write v3");
-        let mut loaded_v3 = load_config_from(&v3_path);
-        assert_eq!(loaded_v3.schema_version, 3);
-        assert_eq!(loaded_v3.revision, 10);
-        assert!(!normalize_and_migrate(&mut loaded_v3));
-        assert_eq!(loaded_v3.schema_version, 3);
-        let on_disk_v3: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&v3_path).expect("read v3")).expect("parse");
-        assert_eq!(on_disk_v3["schemaVersion"], 3);
+        // 3. Newer schemaVersion (99) is preserved untouched and not downgraded
+        let v99_path = dir.join("v99.json");
+        let v99_json = r##"{"schemaVersion":99,"revision":10,"barMode":"dock","taskbarPins":[{"id":"v3p","kind":"app","title":"FutureApp","target":"C:\\Apps\\Future.exe","matchExe":"future.exe"}],"spaces":[{"id":"personal","name":"Личное","accentHex":"#818CF8","accentRgb":"129,140,248","layoutKind":"grid","showHeroRow":true,"widgets":["media"],"items":[]}]}"##;
+        fs::write(&v99_path, v99_json).expect("write v99");
+        let mut loaded_v99 = load_config_from(&v99_path);
+        assert_eq!(loaded_v99.schema_version, 99);
+        assert_eq!(loaded_v99.revision, 10);
+        assert!(!normalize_and_migrate(&mut loaded_v99));
+        assert_eq!(loaded_v99.schema_version, 99);
+        let on_disk_v99: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&v99_path).expect("read v99")).expect("parse");
+        assert_eq!(on_disk_v99["schemaVersion"], 99);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3691,6 +4168,9 @@ mod tests {
                 combo_targets: None,
                 custom_icon: Some("  chat  ".to_string()),
                 custom_color: Some(" #38bdf8 ".to_string()),
+                tile_size: None,
+                section: None,
+                run_as_admin: false,
             },
             // Non-forced combo item with target and no combo_targets
             PinItem {
@@ -3710,6 +4190,9 @@ mod tests {
                 combo_targets: None,
                 custom_icon: Some("   ".to_string()),
                 custom_color: Some("   ".to_string()),
+                tile_size: None,
+                section: None,
+                run_as_admin: false,
             },
             // Non-app item with padded/uppercase match_exe
             PinItem {
@@ -3729,6 +4212,9 @@ mod tests {
                 combo_targets: None,
                 custom_icon: None,
                 custom_color: None,
+                tile_size: None,
+                section: None,
+                run_as_admin: false,
             },
         ];
 
@@ -3754,6 +4240,9 @@ mod tests {
             ]),
             custom_icon: None,
             custom_color: None,
+            tile_size: None,
+            section: None,
+            run_as_admin: false,
         }];
 
         assert!(normalize_and_migrate(&mut cfg));
@@ -3948,8 +4437,8 @@ mod tests {
         assert_eq!(count_tmp_files(&dir), 0);
         let persisted_raw = fs::read_to_string(&path).expect("read migrated file");
         let persisted_val: serde_json::Value =
-            serde_json::from_str(&persisted_raw).expect("valid v2 json");
-        assert_eq!(persisted_val["schemaVersion"], 2);
+            serde_json::from_str(&persisted_raw).expect("valid v3 json");
+        assert_eq!(persisted_val["schemaVersion"], CURRENT_SCHEMA_VERSION);
         assert_eq!(persisted_val["taskbarPins"][0]["title"], "Firefox");
         assert_eq!(persisted_val["taskbarPins"][0]["matchExe"], "firefox.exe");
         assert_eq!(persisted_val["gameCombos"][0]["kind"], "combo");
@@ -4373,6 +4862,9 @@ mod tests {
             combo_targets: None,
             custom_icon: None,
             custom_color: None,
+            tile_size: None,
+            section: None,
+            run_as_admin: false,
         };
         assert!(normalize_pin(&mut legacy, false));
         assert_eq!(legacy.args.as_deref(), Some("--processStart Discord.exe"));
@@ -4575,6 +5067,9 @@ mod tests {
             combo_targets: None,
             custom_icon: None,
             custom_color: None,
+            tile_size: None,
+            section: None,
+            run_as_admin: false,
         };
 
         let mut cfg = TestBarConfig::default();
@@ -4759,9 +5254,23 @@ mod tests {
 
         let mut cfg: TestBarConfig = serde_json::from_str(v1_json).expect("parse v1");
         assert!(normalize_and_migrate(&mut cfg));
-        assert_eq!(cfg.schema_version, 2);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.revision, 42);
         assert_eq!(cfg.spaces.len(), 8);
+        assert!(!cfg.taskbar_widgets.show_weather);
+        assert_eq!(cfg.spaces[0].bottom_section_title.as_deref(), Some("Быстрый доступ"));
+        assert_eq!(cfg.spaces[0].items[0].section.as_deref(), Some("main"));
+        assert_eq!(cfg.spaces[0].items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(cfg.spaces[0].items[1].section.as_deref(), Some("bottom"));
+        assert_eq!(cfg.spaces[1].bottom_section_title.as_deref(), Some("Приложения"));
+        assert_eq!(cfg.spaces[1].items[0].section.as_deref(), Some("main"));
+        assert_eq!(cfg.spaces[1].items[1].section.as_deref(), Some("bottom"));
+        assert_eq!(cfg.spaces[2].bottom_section_title.as_deref(), Some("Инструменты"));
+        assert_eq!(cfg.spaces[2].items[0].section.as_deref(), Some("main"));
+        assert_eq!(cfg.spaces[2].items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(cfg.spaces[2].items[1].section.as_deref(), Some("bottom"));
+        assert_eq!(cfg.spaces[3].bottom_section_title.as_deref(), Some("Лаунчеры и закреплённое"));
+        assert_eq!(cfg.spaces[3].items[0].section.as_deref(), Some("bottom"));
 
         assert_eq!(cfg.spaces[0].id, "personal");
         assert_eq!(cfg.spaces[0].name, "Личное");
@@ -4883,6 +5392,7 @@ mod tests {
             Some("games".to_string()),
             Some(true),
             Some(vec!["weather".to_string(), "media".to_string()]),
+            None,
         )
         .unwrap());
         let sp = cfg.spaces.iter().find(|s| s.id == "dev-proekty").unwrap();
@@ -4995,6 +5505,9 @@ mod tests {
             Some(Some("  custom_image  ".to_string())),
             Some(Some(" #34d399 ".to_string())),
             Some(Some("data:image/png;base64,AAA".to_string())),
+            None,
+            None,
+            None,
         )
         .unwrap());
         let edited = cfg
@@ -5043,6 +5556,9 @@ mod tests {
             None,
             None,
             Some(Some("data:image/svg+xml;base64,PHN2Zz4=".to_string())),
+            None,
+            None,
+            None,
         )
         .unwrap());
         assert_eq!(
@@ -5071,6 +5587,9 @@ mod tests {
             None,
             None,
             Some(Some(huge)),
+            None,
+            None,
+            None,
         )
         .unwrap());
 
@@ -5087,6 +5606,9 @@ mod tests {
             None,
             None,
             Some(Some("data:image/png;base64,BBB".to_string())),
+            None,
+            None,
+            None,
         )
         .unwrap());
         assert!(update_pin_v2(
@@ -5099,6 +5621,9 @@ mod tests {
             None,
             None,
             Some(Some("  terminal  ".to_string())),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -5116,6 +5641,9 @@ mod tests {
             None,
             None,
             Some(None),
+            None,
+            None,
+            None,
             None,
         )
         .unwrap());
@@ -5139,7 +5667,7 @@ mod tests {
     #[test]
     fn taskbar_widgets_validation_normalization_and_persistence() {
         let mut cfg = TestBarConfig::default();
-        assert!(cfg.taskbar_widgets.show_weather);
+        assert!(!cfg.taskbar_widgets.show_weather);
         assert!(!cfg.taskbar_widgets.show_batteries);
         assert!(!cfg.taskbar_widgets.show_telemetry);
         assert_eq!(cfg.taskbar_widgets.weather_units, "c");
@@ -5341,5 +5869,467 @@ mod tests {
             r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
         );
         assert!(!normalize_pin(&mut winapps_pin, false));
+    }
+
+    #[test]
+    fn v2_to_v3_migration_preserves_user_pins_and_restores_sections_and_hero_tiles() {
+        let v2_json = r##"{
+          "schemaVersion": 2,
+          "revision": 19,
+          "barMode": "dock",
+          "taskbarWidgets": {
+            "showWeather": true,
+            "showBatteries": true,
+            "showTelemetry": false,
+            "weatherCity": "Москва",
+            "weatherUnits": "c"
+          },
+          "personalLinks": [
+            { "id": "pl-legacy", "kind": "url", "title": "Docs", "target": "https://example.com" }
+          ],
+          "spaces": [
+            {
+              "id": "personal",
+              "name": "Личное",
+              "accentHex": "#818CF8",
+              "accentRgb": "129,140,248",
+              "layoutKind": "grid",
+              "showHeroRow": true,
+              "widgets": ["media"],
+              "items": [
+                { "id": "p-a1", "kind": "app", "title": "Browser", "target": "C:\\Apps\\Browser.exe" },
+                { "id": "p-a2", "kind": "app", "title": "Explorer", "target": "C:\\Windows\\explorer.exe" },
+                { "id": "p-a3", "kind": "app", "title": "Telegram", "target": "C:\\Apps\\Telegram.exe" },
+                { "id": "pl-legacy", "kind": "url", "title": "Docs", "target": "https://example.com" }
+              ]
+            },
+            {
+              "id": "work",
+              "name": "Работа",
+              "accentHex": "#38BDF8",
+              "accentRgb": "56,189,248",
+              "layoutKind": "grid",
+              "showHeroRow": false,
+              "widgets": ["pc_health"],
+              "items": [
+                { "id": "w-f1", "kind": "folder", "title": "Projects", "target": "C:\\Projects" },
+                { "id": "w-a1", "kind": "app", "title": "Code", "target": "C:\\Apps\\Code.exe" },
+                { "id": "w-a2", "kind": "app", "title": "Terminal", "target": "C:\\Windows\\System32\\cmd.exe" }
+              ]
+            },
+            {
+              "id": "studio",
+              "name": "Студия",
+              "accentHex": "#34D399",
+              "accentRgb": "52,211,153",
+              "layoutKind": "grid",
+              "showHeroRow": true,
+              "widgets": ["pc_health"],
+              "items": [
+                { "id": "s-1", "kind": "app", "title": "Figma", "target": "C:\\Apps\\Figma.exe" },
+                { "id": "s-2", "kind": "app", "title": "OBS", "target": "C:\\Apps\\obs64.exe" },
+                { "id": "s-3", "kind": "app", "title": "VLC", "target": "C:\\Apps\\vlc.exe" }
+              ]
+            },
+            {
+              "id": "games",
+              "name": "Игры",
+              "accentHex": "#FB7185",
+              "accentRgb": "251,113,133",
+              "layoutKind": "games",
+              "showHeroRow": false,
+              "widgets": ["game_combos"],
+              "items": [
+                { "id": "g-1", "kind": "app", "title": "Steam", "target": "C:\\Steam\\steam.exe" }
+              ]
+            },
+            {
+              "id": "custom-hero",
+              "name": "Медиа",
+              "accentHex": "#A78BFA",
+              "accentRgb": "167,139,250",
+              "layoutKind": "grid",
+              "showHeroRow": true,
+              "widgets": ["media"],
+              "items": [
+                { "id": "c-1", "kind": "app", "title": "App1", "target": "C:\\Apps\\One.exe" },
+                { "id": "c-2", "kind": "app", "title": "App2", "target": "C:\\Apps\\Two.exe" },
+                { "id": "c-3", "kind": "app", "title": "App3", "target": "C:\\Apps\\Three.exe" }
+              ]
+            }
+          ]
+        }"##;
+
+        let mut cfg: TestBarConfig = serde_json::from_str(v2_json).expect("parse v2");
+        assert!(normalize_and_migrate(&mut cfg));
+        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.revision, 19);
+        assert!(!cfg.taskbar_widgets.show_weather);
+        assert!(cfg.taskbar_widgets.show_batteries);
+
+        // Personal: all 4 pins kept, legacy personalLinks item -> bottom, first 2 main -> hero
+        let personal = &cfg.spaces[0];
+        assert_eq!(personal.items.len(), 4);
+        assert_eq!(personal.bottom_section_title.as_deref(), Some("Быстрый доступ"));
+        assert_eq!(personal.items[0].section.as_deref(), Some("main"));
+        assert_eq!(personal.items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(personal.items[1].section.as_deref(), Some("main"));
+        assert_eq!(personal.items[1].tile_size.as_deref(), Some("hero"));
+        assert_eq!(personal.items[2].section.as_deref(), Some("main"));
+        assert_eq!(personal.items[2].tile_size, None);
+        assert_eq!(personal.items[3].section.as_deref(), Some("bottom"));
+
+        // Work with empty workApps: folder -> main, apps -> bottom
+        let work = &cfg.spaces[1];
+        assert_eq!(work.items.len(), 3);
+        assert_eq!(work.bottom_section_title.as_deref(), Some("Приложения"));
+        assert_eq!(work.items[0].section.as_deref(), Some("main"));
+        assert_eq!(work.items[1].section.as_deref(), Some("bottom"));
+        assert_eq!(work.items[2].section.as_deref(), Some("bottom"));
+
+        // Studio: first 2 main -> hero
+        let studio = &cfg.spaces[2];
+        assert_eq!(studio.bottom_section_title.as_deref(), Some("Инструменты"));
+        assert_eq!(studio.items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(studio.items[1].tile_size.as_deref(), Some("hero"));
+        assert_eq!(studio.items[2].tile_size, None);
+        assert_eq!(studio.items[2].section.as_deref(), Some("main"));
+
+        // Games: all -> bottom
+        let games = &cfg.spaces[3];
+        assert_eq!(games.bottom_section_title.as_deref(), Some("Лаунчеры и закреплённое"));
+        assert_eq!(games.items[0].section.as_deref(), Some("bottom"));
+
+        // Custom with showHeroRow: true -> main + first 2 hero
+        let custom = &cfg.spaces[4];
+        assert_eq!(custom.bottom_section_title.as_deref(), Some("Закреплённое"));
+        assert_eq!(custom.items[0].section.as_deref(), Some("main"));
+        assert_eq!(custom.items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(custom.items[1].tile_size.as_deref(), Some("hero"));
+        assert_eq!(custom.items[2].tile_size, None);
+
+        // Second pass is idempotent AND user re-enabling showWeather in v3 is preserved
+        assert!(!normalize_and_migrate(&mut cfg));
+        cfg.taskbar_widgets.show_weather = true;
+        assert!(!normalize_and_migrate(&mut cfg));
+        assert!(cfg.taskbar_widgets.show_weather);
+
+        // v2 personal with empty personalLinks splits trailing folders into bottom
+        let v2_mixed_personal = r##"{
+          "schemaVersion": 2,
+          "spaces": [
+            {
+              "id": "personal",
+              "name": "Личное",
+              "accentHex": "#818CF8",
+              "accentRgb": "129,140,248",
+              "layoutKind": "grid",
+              "showHeroRow": true,
+              "items": [
+                { "id": "a1", "kind": "app", "title": "App", "target": "C:\\Apps\\One.exe" },
+                { "id": "f1", "kind": "folder", "title": "Downloads", "target": "C:\\Downloads" },
+                { "id": "f2", "kind": "folder", "title": "Docs", "target": "C:\\Docs" }
+              ]
+            }
+          ]
+        }"##;
+        let mut mixed_cfg: TestBarConfig = serde_json::from_str(v2_mixed_personal).expect("parse mixed v2");
+        assert!(normalize_and_migrate(&mut mixed_cfg));
+        assert_eq!(mixed_cfg.spaces[0].items[0].section.as_deref(), Some("main"));
+        assert_eq!(mixed_cfg.spaces[0].items[0].tile_size.as_deref(), Some("hero"));
+        assert_eq!(mixed_cfg.spaces[0].items[1].section.as_deref(), Some("bottom"));
+        assert_eq!(mixed_cfg.spaces[0].items[2].section.as_deref(), Some("bottom"));
+    }
+
+    #[test]
+    fn v3_pin_tile_size_section_admin_and_space_bottom_title_roundtrip() {
+        let mut cfg = TestBarConfig::default();
+        assert_eq!(
+            cfg.spaces[0].bottom_section_title.as_deref(),
+            Some("Быстрый доступ")
+        );
+        let first_id = cfg.spaces[0].items[0].id.clone();
+
+        assert!(update_pin_v2(
+            &mut cfg,
+            "personal",
+            &first_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("compact".to_string())),
+            Some(Some("bottom".to_string())),
+            Some(true),
+        )
+        .unwrap());
+
+        assert!(update_pin_v2(
+            &mut cfg,
+            "personal",
+            &first_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("giant".to_string())),
+            None,
+            None,
+        )
+        .is_err());
+
+        assert!(update_pin_v2(
+            &mut cfg,
+            "personal",
+            &first_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("sidebar".to_string())),
+            None,
+        )
+        .is_err());
+
+        assert!(update_space_config(
+            &mut cfg,
+            "personal",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("  Свои ссылки  ".to_string())),
+        )
+        .unwrap());
+
+        let exported = export_config_json(&cfg).expect("export v3");
+        let back = import_config_json(&exported).expect("import v3");
+        let item_back = back.spaces[0]
+            .items
+            .iter()
+            .find(|i| i.id == first_id)
+            .unwrap();
+        assert_eq!(item_back.tile_size.as_deref(), Some("compact"));
+        assert_eq!(item_back.section.as_deref(), Some("bottom"));
+        assert!(item_back.run_as_admin);
+        assert_eq!(
+            back.spaces[0].bottom_section_title.as_deref(),
+            Some("Свои ссылки")
+        );
+
+        // Clear tile_size, section, bottom_section_title, and run_as_admin
+        assert!(update_pin_v2(
+            &mut cfg,
+            "personal",
+            &first_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            Some(None),
+            Some(false),
+        )
+        .unwrap());
+        assert!(update_space_config(
+            &mut cfg,
+            "personal",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+        )
+        .unwrap());
+        let cleared = cfg.spaces[0]
+            .items
+            .iter()
+            .find(|i| i.id == first_id)
+            .unwrap();
+        assert_eq!(cleared.tile_size, None);
+        assert_eq!(cleared.section, None);
+        assert!(!cleared.run_as_admin);
+        assert_eq!(cfg.spaces[0].bottom_section_title, None);
+    }
+
+    #[test]
+    fn reorder_pins_by_id_handles_intra_section_and_cross_section_moves() {
+        let mut cfg = TestBarConfig::default();
+        let space = create_space_from_template(
+            &mut cfg,
+            "Sections".to_string(),
+            "blank",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        for (id, sec) in [
+            ("m1", "main"),
+            ("m2", "main"),
+            ("b1", "bottom"),
+            ("b2", "bottom"),
+        ] {
+            let mut item = pin(
+                id,
+                "app",
+                id,
+                "",
+                format!(r"C:\Apps\{id}.exe"),
+                "",
+                "56,189,248",
+                "app",
+            );
+            item.section = Some(sec.to_string());
+            assert!(add_pin_to_space(&mut cfg, &space.id, item));
+        }
+
+        // Intra-section move: m2 -> m1
+        assert!(reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "m2",
+            Some("m1"),
+            Some("main"),
+        ));
+        let ids = |cfg: &TestBarConfig| -> Vec<(String, Option<String>)> {
+            cfg.spaces
+                .iter()
+                .find(|s| s.id == space.id)
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| (i.id.clone(), i.section.clone()))
+                .collect()
+        };
+        assert_eq!(
+            ids(&cfg),
+            vec![
+                ("m2".into(), Some("main".into())),
+                ("m1".into(), Some("main".into())),
+                ("b1".into(), Some("bottom".into())),
+                ("b2".into(), Some("bottom".into())),
+            ]
+        );
+
+        // Cross-section Main -> Bottom onto specific target b1
+        assert!(reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "m2",
+            Some("b1"),
+            Some("bottom"),
+        ));
+        assert_eq!(
+            ids(&cfg),
+            vec![
+                ("m1".into(), Some("main".into())),
+                ("b1".into(), Some("bottom".into())),
+                ("m2".into(), Some("bottom".into())),
+                ("b2".into(), Some("bottom".into())),
+            ]
+        );
+
+        // Cross-section Bottom -> Main dropzone (to_id = None)
+        assert!(reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "b2",
+            None,
+            Some("main"),
+        ));
+        assert_eq!(
+            ids(&cfg),
+            vec![
+                ("m1".into(), Some("main".into())),
+                ("b2".into(), Some("main".into())),
+                ("b1".into(), Some("bottom".into())),
+                ("m2".into(), Some("bottom".into())),
+            ]
+        );
+
+        // No-op when already at end of main
+        assert!(!reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "b2",
+            None,
+            Some("main"),
+        ));
+        // Invalid section / missing pin / missing space return false
+        assert!(!reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "m1",
+            None,
+            Some("invalid"),
+        ));
+        assert!(!reorder_pins_by_id(
+            &mut cfg,
+            &space.id,
+            "missing",
+            None,
+            Some("bottom"),
+        ));
+        assert!(!reorder_pins_by_id(
+            &mut cfg,
+            "no-such-space",
+            "m1",
+            None,
+            Some("bottom"),
+        ));
+    }
+
+    #[test]
+    fn hidden_battery_devices_hide_restore_restore_all_and_normalize() {
+        let mut cfg = TestBarConfig::default();
+        assert!(cfg.hidden_battery_ids.is_empty());
+
+        assert!(hide_battery_device(&mut cfg, "  Sony:0CE6 "));
+        assert!(!hide_battery_device(&mut cfg, "sony:0ce6"));
+        assert!(!hide_battery_device(&mut cfg, "   "));
+        assert!(hide_battery_device(&mut cfg, "Razer:00CC"));
+        assert_eq!(cfg.hidden_battery_ids, vec!["sony:0ce6", "razer:00cc"]);
+
+        assert!(restore_battery_device(&mut cfg, "SONY:0ce6"));
+        assert!(!restore_battery_device(&mut cfg, "sony:0ce6"));
+        assert_eq!(cfg.hidden_battery_ids, vec!["razer:00cc"]);
+
+        assert!(restore_all_battery_devices(&mut cfg));
+        assert!(!restore_all_battery_devices(&mut cfg));
+        assert!(cfg.hidden_battery_ids.is_empty());
+
+        // normalize_and_migrate deduplicates and lowercases hidden_battery_ids
+        cfg.hidden_battery_ids = vec![
+            "  BT:AABB  ".to_string(),
+            "".to_string(),
+            "bt:aabb".to_string(),
+            "Sony:0DF2".to_string(),
+        ];
+        assert!(normalize_and_migrate(&mut cfg));
+        assert_eq!(cfg.hidden_battery_ids, vec!["bt:aabb", "sony:0df2"]);
+        assert!(!normalize_and_migrate(&mut cfg));
     }
 }

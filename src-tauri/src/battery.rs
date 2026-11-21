@@ -48,6 +48,8 @@ const DEVPKEY_DEVICE_IS_CONNECTED: DEVPROPKEY = DEVPROPKEY {
 
 const RAZER_VID: u16 = 0x1532;
 const LOGITECH_VID: u16 = 0x046D;
+const SONY_VID: u16 = 0x054C;
+const SONY_HID_IO_TIMEOUT_MS: u32 = 80;
 const HIDP_STATUS_SUCCESS: i32 = 0x0011_0000;
 
 const RAZER_REPORT_LEN: usize = 91;
@@ -529,6 +531,7 @@ type FnHidDFreePreparsedData = unsafe extern "system" fn(*mut c_void) -> u8;
 type FnHidPGetCaps = unsafe extern "system" fn(*mut c_void, *mut HidpCaps) -> i32;
 type FnHidDSetFeature = unsafe extern "system" fn(HANDLE, *const u8, u32) -> u8;
 type FnHidDGetFeature = unsafe extern "system" fn(HANDLE, *mut u8, u32) -> u8;
+type FnHidDGetInputReport = unsafe extern "system" fn(HANDLE, *mut u8, u32) -> u8;
 
 struct HidApi {
     _hmod: HMODULE,
@@ -539,6 +542,7 @@ struct HidApi {
     get_caps: FnHidPGetCaps,
     set_feature: FnHidDSetFeature,
     get_feature: FnHidDGetFeature,
+    get_input_report: Option<FnHidDGetInputReport>,
 }
 
 unsafe impl Send for HidApi {}
@@ -560,6 +564,9 @@ fn load_hid_api() -> Result<&'static HidApi, String> {
                 .map(|p| p as *const ())
                 .ok_or_else(|| format!("Missing {name} in hid.dll"))
         };
+        let get_input_report = get_fn("HidD_GetInputReport")
+            .ok()
+            .map(|p| std::mem::transmute(p));
         Ok(HidApi {
             _hmod: hmod,
             get_attributes: std::mem::transmute(get_fn("HidD_GetAttributes")?),
@@ -569,6 +576,7 @@ fn load_hid_api() -> Result<&'static HidApi, String> {
             get_caps: std::mem::transmute(get_fn("HidP_GetCaps")?),
             set_feature: std::mem::transmute(get_fn("HidD_SetFeature")?),
             get_feature: std::mem::transmute(get_fn("HidD_GetFeature")?),
+            get_input_report,
         })
     });
     res.as_ref().map_err(Clone::clone)
@@ -1477,6 +1485,301 @@ fn scan_logitech_hidpp_batteries() -> Vec<PeripheralBattery> {
     results
 }
 
+// ======================= BACKEND 3B: SONY PLAYSTATION HID =======================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonyPadProtocol {
+    DualSense,
+    DualShock4,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SonyGamepadSpec {
+    pid: u16,
+    name: &'static str,
+    protocol: SonyPadProtocol,
+}
+
+const SONY_GAMEPAD_PIDS: &[SonyGamepadSpec] = &[
+    SonyGamepadSpec {
+        pid: 0x0CE6,
+        name: "DualSense",
+        protocol: SonyPadProtocol::DualSense,
+    },
+    SonyGamepadSpec {
+        pid: 0x0DF2,
+        name: "DualSense Edge",
+        protocol: SonyPadProtocol::DualSense,
+    },
+    SonyGamepadSpec {
+        pid: 0x05C4,
+        name: "DualShock 4",
+        protocol: SonyPadProtocol::DualShock4,
+    },
+    SonyGamepadSpec {
+        pid: 0x09CC,
+        name: "DualShock 4",
+        protocol: SonyPadProtocol::DualShock4,
+    },
+];
+
+fn lookup_sony_gamepad_spec(pid: u16) -> Option<&'static SonyGamepadSpec> {
+    SONY_GAMEPAD_PIDS.iter().find(|spec| spec.pid == pid)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SonyBatteryReading {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+/// Clean-room DualSense (`0x0CE6`) & DualSense Edge (`0x0DF2`) input report parser:
+/// - USB (`report[0] == 0x01`): status at byte `53`
+/// - Bluetooth (`report[0] == 0x31`): status at byte `54`
+/// Low nibble encodes `0..=10` (`0..=100%`), high nibble `0x1` = charging, `0x2` = full (`100%`).
+pub fn parse_dualsense_battery_report(report: &[u8]) -> Option<SonyBatteryReading> {
+    let raw = match report.first().copied()? {
+        0x01 => *report.get(53)?,
+        0x31 => *report.get(54)?,
+        _ => return None,
+    };
+    let level = raw & 0x0F;
+    let state = (raw >> 4) & 0x0F;
+    match state {
+        0x0 if level <= 10 => Some(SonyBatteryReading {
+            percent: (level * 10).min(100),
+            charging: false,
+        }),
+        0x1 if level <= 10 => Some(SonyBatteryReading {
+            percent: (level * 10).min(100),
+            charging: true,
+        }),
+        0x2 => Some(SonyBatteryReading {
+            percent: 100,
+            charging: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Clean-room DualShock 4 (`0x05C4`, `0x09CC`) input report parser:
+/// - USB (`report[0] == 0x01`): status at byte `30`
+/// - Bluetooth (`report[0] == 0x11`): status at byte `32`
+/// Low nibble encodes `0..=10` (`0..=100%`), bit `0x10` indicates USB cable / charging (`0x1B` = full).
+pub fn parse_dualshock4_battery_report(report: &[u8]) -> Option<SonyBatteryReading> {
+    let raw = match report.first().copied()? {
+        0x01 => *report.get(30)?,
+        0x11 => *report.get(32)?,
+        _ => return None,
+    };
+    let cable_charging = (raw & 0x10) != 0;
+    let level = raw & 0x0F;
+    if cable_charging {
+        if level == 11 {
+            return Some(SonyBatteryReading {
+                percent: 100,
+                charging: false,
+            });
+        }
+        if level <= 10 {
+            return Some(SonyBatteryReading {
+                percent: (level * 10).min(100),
+                charging: true,
+            });
+        }
+        None
+    } else if level <= 10 {
+        Some(SonyBatteryReading {
+            percent: (level * 10).min(100),
+            charging: false,
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_sony_report_by_protocol(
+    protocol: SonyPadProtocol,
+    report: &[u8],
+) -> Option<SonyBatteryReading> {
+    match protocol {
+        SonyPadProtocol::DualSense => parse_dualsense_battery_report(report),
+        SonyPadProtocol::DualShock4 => parse_dualshock4_battery_report(report),
+    }
+}
+
+fn read_sony_overlapped_input(
+    io: &KernelIoApi,
+    handle: HANDLE,
+    in_len: usize,
+    protocol: SonyPadProtocol,
+) -> Option<SonyBatteryReading> {
+    let read_size = in_len.max(78);
+    unsafe {
+        let Ok(read_evt) = CreateEventW(None, false, false, PCWSTR::null()) else {
+            return None;
+        };
+        let _revt_guard = HandleGuard::new(read_evt)?;
+        let deadline = Instant::now() + Duration::from_millis(SONY_HID_IO_TIMEOUT_MS as u64);
+
+        for _ in 0..4 {
+            let rem_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u32;
+            if rem_ms == 0 {
+                break;
+            }
+            let mut rbuf = vec![0u8; read_size];
+            let mut ov_read = RawOverlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                h_event: read_evt,
+            };
+            let mut read_bytes = 0u32;
+            let rr = (io.read_file)(
+                handle,
+                rbuf.as_mut_ptr() as *mut c_void,
+                rbuf.len() as u32,
+                &mut read_bytes,
+                &mut ov_read,
+            );
+            if rr == 0 {
+                let err = GetLastError().0;
+                if err != ERROR_IO_PENDING.0 {
+                    return None;
+                }
+                let wait_rc = WaitForSingleObject(read_evt, rem_ms);
+                if wait_rc == WAIT_TIMEOUT || wait_rc != WAIT_OBJECT_0 {
+                    let _ = (io.cancel_io_ex)(handle, &ov_read);
+                    let mut dummy = 0u32;
+                    let _ = (io.get_overlapped_result)(handle, &ov_read, &mut dummy, 1);
+                    return None;
+                }
+                if (io.get_overlapped_result)(handle, &ov_read, &mut read_bytes, 0) == 0 {
+                    return None;
+                }
+            }
+            let n = (read_bytes as usize).min(rbuf.len());
+            if let Some(reading) = parse_sony_report_by_protocol(protocol, &rbuf[..n]) {
+                return Some(reading);
+            }
+        }
+    }
+    None
+}
+
+fn read_sony_hid_battery_reading(
+    hid_api: &HidApi,
+    io: Option<&KernelIoApi>,
+    handle: HANDLE,
+    in_len: usize,
+    protocol: SonyPadProtocol,
+) -> Option<SonyBatteryReading> {
+    if let Some(kernel_io) = io {
+        if let Some(reading) = read_sony_overlapped_input(kernel_io, handle, in_len, protocol) {
+            return Some(reading);
+        }
+    }
+
+    let get_input_report = hid_api.get_input_report?;
+    let buf_len = in_len.max(1);
+    let candidate_ids: &[u8] = match protocol {
+        SonyPadProtocol::DualSense if buf_len >= 55 => &[0x31, 0x01],
+        SonyPadProtocol::DualSense => &[0x01],
+        SonyPadProtocol::DualShock4 if buf_len >= 33 => &[0x11, 0x01],
+        SonyPadProtocol::DualShock4 => &[0x01],
+    };
+
+    for &report_id in candidate_ids {
+        let mut buf = vec![0u8; buf_len];
+        buf[0] = report_id;
+        let ok = unsafe { get_input_report(handle, buf.as_mut_ptr(), buf.len() as u32) };
+        if ok != 0 && buf.get(1..30).is_some_and(|s| s.iter().any(|&b| b != 0)) {
+            if let Some(reading) = parse_sony_report_by_protocol(protocol, &buf) {
+                return Some(reading);
+            }
+        }
+    }
+    None
+}
+
+fn scan_sony_hid_batteries() -> Vec<PeripheralBattery> {
+    let Ok(hid_api) = load_hid_api() else {
+        return Vec::new();
+    };
+    let kernel_io = load_kernel_io().ok();
+    let paths = enumerate_hid_interface_paths();
+    let mut results = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for path in paths {
+        let Some((vid, pid)) = parse_vid_pid_from_hid_path(&path) else {
+            continue;
+        };
+        if vid != SONY_VID {
+            continue;
+        }
+        let Some(spec) = lookup_sony_gamepad_spec(pid) else {
+            continue;
+        };
+
+        let device_id = format!("sony:{pid:04x}");
+        if seen_ids.contains(&device_id) {
+            continue;
+        }
+
+        let Some(zero_guard) = open_hid_handle(&path, 0, FILE_FLAGS_AND_ATTRIBUTES(0)) else {
+            continue;
+        };
+        if let Some(attrs) = read_hid_attributes(hid_api, zero_guard.0) {
+            if attrs.vendor_id != SONY_VID || attrs.product_id != pid {
+                continue;
+            }
+        }
+        let Some(caps) = read_hid_caps(hid_api, zero_guard.0) else {
+            continue;
+        };
+        if caps.usage_page != 0x01 || (caps.usage != 0x05 && caps.usage != 0x04) {
+            continue;
+        }
+        let in_len = caps.input_report_byte_length as usize;
+        if in_len < 31 {
+            continue;
+        }
+
+        let prod_name = read_hid_product_string(hid_api, zero_guard.0);
+        let display_name = prod_name
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("wireless controller"))
+            .unwrap_or_else(|| spec.name.to_string());
+        drop(zero_guard);
+
+        let Some(read_guard) = open_hid_handle(&path, GENERIC_READ_FLAG, FILE_FLAG_OVERLAPPED)
+        else {
+            continue;
+        };
+
+        if let Some(reading) =
+            read_sony_hid_battery_reading(hid_api, kernel_io, read_guard.0, in_len, spec.protocol)
+        {
+            seen_ids.insert(device_id.clone());
+            results.push(PeripheralBattery {
+                id: device_id,
+                name: display_name,
+                kind: "gamepad".to_string(),
+                percent: reading.percent,
+                charging: reading.charging,
+                source: "sony_hid".to_string(),
+                connected: true,
+                sub_levels: None,
+            });
+        }
+    }
+
+    results
+}
+
 // ======================= BACKEND 4: XINPUT WIRELESS GAMEPADS =======================
 
 #[repr(C)]
@@ -1570,14 +1873,21 @@ fn scan_xinput_batteries() -> Vec<PeripheralBattery> {
 fn merge_peripheral_batteries(
     razer: Vec<PeripheralBattery>,
     logitech: Vec<PeripheralBattery>,
+    sony: Vec<PeripheralBattery>,
     bluetooth: Vec<PeripheralBattery>,
     xinput: Vec<PeripheralBattery>,
 ) -> Vec<PeripheralBattery> {
     let mut out = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
 
-    // Highest-fidelity protocols first (USB HID / HID++ report charging & higher resolution than BT)
-    for item in razer.into_iter().chain(logitech).chain(bluetooth).chain(xinput) {
+    // Highest-fidelity protocols first (USB/Sony HID / HID++ report charging & higher resolution than BT)
+    for item in razer
+        .into_iter()
+        .chain(logitech)
+        .chain(sony)
+        .chain(bluetooth)
+        .chain(xinput)
+    {
         let norm_name = item.name.trim().to_ascii_lowercase();
         if seen_names.insert(norm_name) {
             out.push(item);
@@ -1596,8 +1906,9 @@ fn scan_all_peripheral_batteries_live() -> Vec<PeripheralBattery> {
     let bt = scan_pnp_bluetooth_batteries();
     let razer = scan_razer_hid_batteries();
     let logi = scan_logitech_hidpp_batteries();
+    let sony = scan_sony_hid_batteries();
     let xinput = scan_xinput_batteries();
-    merge_peripheral_batteries(razer, logi, bt, xinput)
+    merge_peripheral_batteries(razer, logi, sony, bt, xinput)
 }
 
 pub fn get_peripheral_batteries() -> Vec<PeripheralBattery> {
@@ -1816,6 +2127,172 @@ mod tests {
         assert_eq!(pad.kind, "gamepad");
         assert_eq!(pad.percent, 65);
         assert_eq!(pad.source, "xinput");
+    }
+
+    #[test]
+    fn sony_dualsense_usb_and_bluetooth_battery_packets_parse_cleanly() {
+        assert!(lookup_sony_gamepad_spec(0x0CE6).is_some());
+        assert!(lookup_sony_gamepad_spec(0x0DF2).is_some());
+
+        // DualSense USB (0x01), byte 53: discharging 70% (0x07)
+        let mut usb_pkt = [0u8; 64];
+        usb_pkt[0] = 0x01;
+        usb_pkt[53] = 0x07;
+        assert_eq!(
+            parse_dualsense_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 70,
+                charging: false
+            })
+        );
+
+        // DualSense USB (0x01), byte 53: charging 40% (0x14)
+        usb_pkt[53] = 0x14;
+        assert_eq!(
+            parse_dualsense_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 40,
+                charging: true
+            })
+        );
+
+        // DualSense USB (0x01), byte 53: full (0x2A / 0x20)
+        usb_pkt[53] = 0x2A;
+        assert_eq!(
+            parse_dualsense_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 100,
+                charging: false
+            })
+        );
+
+        // DualSense Bluetooth (0x31), byte 54
+        let mut bt_pkt = [0u8; 78];
+        bt_pkt[0] = 0x31;
+        bt_pkt[54] = 0x09; // 90% discharging
+        assert_eq!(
+            parse_dualsense_battery_report(&bt_pkt),
+            Some(SonyBatteryReading {
+                percent: 90,
+                charging: false
+            })
+        );
+        bt_pkt[54] = 0x12; // 20% charging
+        assert_eq!(
+            parse_dualsense_battery_report(&bt_pkt),
+            Some(SonyBatteryReading {
+                percent: 20,
+                charging: true
+            })
+        );
+        bt_pkt[54] = 0x20; // full -> 100%
+        assert_eq!(
+            parse_dualsense_battery_report(&bt_pkt),
+            Some(SonyBatteryReading {
+                percent: 100,
+                charging: false
+            })
+        );
+
+        // Short BT 0x01 report (10 bytes) or fault state (0xA* / level > 10) rejected cleanly
+        assert_eq!(parse_dualsense_battery_report(&[0x01; 10]), None);
+        bt_pkt[54] = 0xA5;
+        assert_eq!(parse_dualsense_battery_report(&bt_pkt), None);
+        bt_pkt[54] = 0x0F;
+        assert_eq!(parse_dualsense_battery_report(&bt_pkt), None);
+    }
+
+    #[test]
+    fn sony_dualshock4_usb_and_bluetooth_battery_packets_parse_cleanly() {
+        assert!(lookup_sony_gamepad_spec(0x05C4).is_some());
+        assert!(lookup_sony_gamepad_spec(0x09CC).is_some());
+
+        // DualShock 4 USB (0x01), byte 30: discharging 60% (0x06), plus headset bit 0x20 ignored
+        let mut usb_pkt = [0u8; 64];
+        usb_pkt[0] = 0x01;
+        usb_pkt[30] = 0x26;
+        assert_eq!(
+            parse_dualshock4_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 60,
+                charging: false
+            })
+        );
+
+        // DualShock 4 USB (0x01), byte 30: charging 50% (0x15) with mic/ext bits (0x40)
+        usb_pkt[30] = 0x55;
+        assert_eq!(
+            parse_dualshock4_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 50,
+                charging: true
+            })
+        );
+
+        // DualShock 4 USB (0x01), byte 30: full on cable (0x1B)
+        usb_pkt[30] = 0x1B;
+        assert_eq!(
+            parse_dualshock4_battery_report(&usb_pkt),
+            Some(SonyBatteryReading {
+                percent: 100,
+                charging: false
+            })
+        );
+
+        // DualShock 4 Bluetooth (0x11), byte 32
+        let mut bt_pkt = [0u8; 78];
+        bt_pkt[0] = 0x11;
+        bt_pkt[32] = 0x08;
+        assert_eq!(
+            parse_dualshock4_battery_report(&bt_pkt),
+            Some(SonyBatteryReading {
+                percent: 80,
+                charging: false
+            })
+        );
+        bt_pkt[32] = 0x13;
+        assert_eq!(
+            parse_dualshock4_battery_report(&bt_pkt),
+            Some(SonyBatteryReading {
+                percent: 30,
+                charging: true
+            })
+        );
+
+        // Short / invalid packets rejected cleanly
+        assert_eq!(parse_dualshock4_battery_report(&[0x11; 20]), None);
+        bt_pkt[32] = 0x0D;
+        assert_eq!(parse_dualshock4_battery_report(&bt_pkt), None);
+
+        // sony_hid takes precedence over bluetooth when same device name exists
+        let merged = merge_peripheral_batteries(
+            vec![],
+            vec![],
+            vec![PeripheralBattery {
+                id: "sony:0ce6".into(),
+                name: "DualSense".into(),
+                kind: "gamepad".into(),
+                percent: 60,
+                charging: true,
+                source: "sony_hid".into(),
+                connected: true,
+                sub_levels: None,
+            }],
+            vec![PeripheralBattery {
+                id: "bt:112233445566".into(),
+                name: "DualSense".into(),
+                kind: "gamepad".into(),
+                percent: 60,
+                charging: false,
+                source: "bluetooth".into(),
+                connected: true,
+                sub_levels: None,
+            }],
+            vec![],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "sony_hid");
+        assert!(merged[0].charging);
     }
 
     #[test]

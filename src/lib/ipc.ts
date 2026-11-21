@@ -2,6 +2,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
+export type TileSize = 'hero' | 'compact';
+export type TileSection = 'main' | 'bottom';
+
 export interface PinItem {
   id: string;
   kind: 'app' | 'folder' | 'file' | 'url' | 'combo';
@@ -19,6 +22,9 @@ export interface PinItem {
   comboTargets?: string[] | null;
   customIcon?: string | null;
   customColor?: string | null;
+  tileSize?: TileSize | null;
+  section?: TileSection | null;
+  runAsAdmin?: boolean;
 }
 
 export type WidgetPreset =
@@ -46,6 +52,7 @@ export interface SpaceConfig {
   accentRgb: string;
   layoutKind: SpaceLayoutKind;
   showHeroRow: boolean;
+  bottomSectionTitle?: string | null;
   widgets: SpaceWidgetId[];
   items: PinItem[];
 }
@@ -90,6 +97,7 @@ export interface TestBarConfig {
   clockShowWeekday?: boolean;
   startRememberSpace?: boolean;
   hiddenTrayKeys?: string[];
+  hiddenBatteryIds?: string[];
   frecency?: Record<string, FrecencyEntry>;
   taskbarPins: PinItem[];
   spaces: SpaceConfig[];
@@ -1134,6 +1142,9 @@ export function updatePin(params: {
   customIcon?: string | null;
   customColor?: string | null;
   iconData?: string | null;
+  tileSize?: TileSize | null;
+  section?: TileSection | null;
+  runAsAdmin?: boolean;
 }): Promise<TestBarConfig> {
   const payload: Record<string, unknown> = {
     space: params.space,
@@ -1147,7 +1158,24 @@ export function updatePin(params: {
   if (params.customIcon !== undefined) payload.customIcon = params.customIcon;
   if (params.customColor !== undefined) payload.customColor = params.customColor;
   if (params.iconData !== undefined) payload.iconData = params.iconData;
+  if (params.tileSize !== undefined) payload.tileSize = params.tileSize;
+  if (params.section !== undefined) payload.section = params.section;
+  if (params.runAsAdmin !== undefined) payload.runAsAdmin = params.runAsAdmin;
   return ipc<TestBarConfig>('update_pin', payload);
+}
+
+export function movePinInSpace(params: {
+  space: string;
+  fromId: string;
+  toId?: string | null;
+  targetSection?: TileSection | null;
+}): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('move_pin_in_space', {
+    space: params.space,
+    fromId: params.fromId,
+    toId: params.toId ?? null,
+    targetSection: params.targetSection ?? null,
+  });
 }
 
 export function createSpace(params: {
@@ -1174,8 +1202,9 @@ export function updateSpace(params: {
   layoutKind?: SpaceLayoutKind;
   showHeroRow?: boolean;
   widgets?: SpaceWidgetId[];
+  bottomSectionTitle?: string | null;
 }): Promise<TestBarConfig> {
-  return ipc<TestBarConfig>('update_space', {
+  const payload: Record<string, unknown> = {
     id: params.id,
     name: params.name ?? null,
     accentHex: params.accentHex ?? null,
@@ -1183,7 +1212,11 @@ export function updateSpace(params: {
     layoutKind: params.layoutKind ?? null,
     showHeroRow: params.showHeroRow ?? null,
     widgets: params.widgets ?? null,
-  });
+  };
+  if (params.bottomSectionTitle !== undefined) {
+    payload.bottomSectionTitle = params.bottomSectionTitle;
+  }
+  return ipc<TestBarConfig>('update_space', payload);
 }
 
 export function deleteSpace(id: string): Promise<TestBarConfig> {
@@ -1357,6 +1390,18 @@ export function restoreTrayApp(key: string): Promise<TestBarConfig> {
 
 export function restoreAllTrayApps(): Promise<TestBarConfig> {
   return ipc<TestBarConfig>('restore_all_tray_apps');
+}
+
+export function hideBatteryDevice(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('hide_battery_device', { id });
+}
+
+export function restoreBatteryDevice(id: string): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('restore_battery_device', { id });
+}
+
+export function restoreAllBatteryDevices(): Promise<TestBarConfig> {
+  return ipc<TestBarConfig>('restore_all_battery_devices');
 }
 
 export function recordFrecency(itemId: string): Promise<TestBarConfig> {
