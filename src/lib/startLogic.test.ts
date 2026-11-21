@@ -42,17 +42,21 @@ import {
   getPinnedItemInSpace,
   getSpaceDisplayName,
   getSpacePinList,
+  getSpaceWidgetPlacement,
   getStartChassisAnimClass,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
   hasExceededDragThreshold,
   hasHonestShiftAction,
+  HEADER_OVERFLOW_BADGE_PX,
+  HEADER_WIDGET_GAP_PX,
   hexColorToRgbString,
   INITIAL_START_ANIM_STATE,
   isAppPinnedInSpace,
   isLowBatteryPercent,
   mergeAudioStateRespectingLocks,
   MODULAR_SPACE_ACCENTS,
+  moveHeaderWidget,
   moveSpaceIdInOrder,
   moveSpaceWidget,
   normalizeRgbTriplet,
@@ -60,6 +64,7 @@ import {
   normalizeUrlPinInput,
   partitionHeroAndCompact,
   partitionSpaceItemsBySection,
+  planHeaderWidgetSlots,
   pushTelemetryHistory,
   pushTelemetrySample,
   RECENT_GAMES_LIMIT,
@@ -71,7 +76,10 @@ import {
   resolveCustomColorRgb,
   resolvePinAction,
   resolveProcessKillPids,
+  resolveSpaceHeaderWidgets,
   selectDisplayedGames,
+  setHeaderWidgetSide,
+  setSpaceWidgetPlacement,
   settleStartOpen,
   shouldResetExplorerOnReopen,
   SPACE_TEMPLATES,
@@ -934,7 +942,21 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     expect(fallbackSpaces[4].widgets).toEqual(['audio_mixer', 'media']);
 
     expect(SPACE_TEMPLATES).toHaveLength(5);
-    expect(SPACE_WIDGET_CATALOG).toHaveLength(8);
+    expect(SPACE_WIDGET_CATALOG).toHaveLength(12);
+    expect(SPACE_WIDGET_CATALOG.map((w) => w.id)).toEqual([
+      'media',
+      'audio_mixer',
+      'clipboard',
+      'pc_health',
+      'top_processes',
+      'game_combos',
+      'weather',
+      'batteries',
+      'notes',
+      'timer',
+      'network',
+      'quick_toggles',
+    ]);
     expect(MODULAR_SPACE_ACCENTS.length).toBeGreaterThanOrEqual(6);
 
     expect(validateSpaceName('  Код  ', ['Дом', 'Работа'])).toEqual({ ok: true, name: 'Код' });
@@ -1166,5 +1188,166 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
     expect(startViewSrc).toContain('tile-edit-backdrop');
     expect(startViewSrc).toContain('tile-edit-modal');
     expect(startViewSrc).toContain('shouldResetExplorerOnReopen');
+  });
+
+  it('plans header widget slots without overflowing left/right pockets and reserves 38px on overflow', () => {
+    const widths = {
+      batteries: 90,
+      weather: 64,
+      timer: 76,
+      network: 96,
+      notes: 84,
+    };
+
+    // Exact fit with zero overflow (no 38px badge reservation)
+    const exact = planHeaderWidgetSlots(
+      [
+        { id: 'batteries', side: 'left' },
+        { id: 'weather', side: 'left' },
+        { id: 'timer', side: 'right' },
+      ],
+      90 + HEADER_WIDGET_GAP_PX + 64,
+      76,
+      widths,
+    );
+    expect(exact.left.map((e) => e.id)).toEqual(['batteries', 'weather']);
+    expect(exact.right.map((e) => e.id)).toEqual(['timer']);
+    expect(exact.overflow).toEqual([]);
+    expect(exact.overflowSide).toBeNull();
+    expect(exact.leftUsedPx).toBe(160);
+    expect(exact.rightUsedPx).toBe(76);
+
+    // 'auto' spills left-first then right without overflowing either pocket
+    const autoSplit = planHeaderWidgetSlots(
+      [
+        { id: 'batteries', side: 'auto' },
+        { id: 'weather', side: 'auto' },
+        { id: 'timer', side: 'auto' },
+        { id: 'network', side: 'auto' },
+      ],
+      170,
+      190,
+      widths,
+    );
+    expect(autoSplit.left.map((e) => e.id)).toEqual(['batteries', 'weather']);
+    expect(autoSplit.right.map((e) => e.id)).toEqual(['timer', 'network']);
+    expect(autoSplit.overflow).toEqual([]);
+
+    // Explicit 'left' never jumps to right pocket; overflow reserves 38px badge inside pocket
+    const leftOverflow = planHeaderWidgetSlots(
+      [
+        { id: 'batteries', side: 'left' },
+        { id: 'weather', side: 'left' },
+        { id: 'timer', side: 'left' },
+      ],
+      165,
+      200,
+      widths,
+    );
+    // 90 + 64 + 6 = 160 fits without badge, but 3rd widget overflows so 38px+6px must be reserved:
+    // 90 + 6 + 64 + 6 + 38 = 204 > 165 -> weather also moves to overflow, leaving batteries (90) + gap (6) + badge (38) = 134 <= 165
+    expect(leftOverflow.left.map((e) => e.id)).toEqual(['batteries']);
+    expect(leftOverflow.right).toEqual([]);
+    expect(leftOverflow.overflow.map((e) => e.id)).toEqual(['weather', 'timer']);
+    expect(leftOverflow.overflowSide).toBe('left');
+    expect(leftOverflow.leftUsedPx).toBe(90 + HEADER_WIDGET_GAP_PX + HEADER_OVERFLOW_BADGE_PX);
+    expect(leftOverflow.leftUsedPx).toBeLessThanOrEqual(165);
+
+    // Auto overflow reserves 38px on right when right holds items
+    const autoOverflow = planHeaderWidgetSlots(
+      [
+        { id: 'batteries', side: 'auto' },
+        { id: 'weather', side: 'auto' },
+        { id: 'timer', side: 'auto' },
+        { id: 'network', side: 'auto' },
+        { id: 'notes', side: 'auto' },
+      ],
+      180,
+      190,
+      widths,
+    );
+    expect(autoOverflow.leftUsedPx).toBeLessThanOrEqual(180);
+    expect(autoOverflow.rightUsedPx).toBeLessThanOrEqual(190);
+    expect(autoOverflow.overflowSide).toBe('right');
+    expect(autoOverflow.overflow.length).toBeGreaterThanOrEqual(2);
+    expect(autoOverflow.left.length + autoOverflow.right.length + autoOverflow.overflow.length).toBe(5);
+
+    // Zero / negative available px never overflows
+    const zeroSpace = planHeaderWidgetSlots(
+      [{ id: 'weather', side: 'auto' }],
+      -10,
+      0,
+      widths,
+    );
+    expect(zeroSpace.left).toEqual([]);
+    expect(zeroSpace.right).toEqual([]);
+    expect(zeroSpace.overflow.map((e) => e.id)).toEqual(['weather']);
+    expect(zeroSpace.overflowSide).toBeNull();
+    expect(zeroSpace.leftUsedPx).toBe(0);
+    expect(zeroSpace.rightUsedPx).toBe(0);
+  });
+
+  it('maintains mutual exclusivity between side widgets and headerWidgets and reorders header widgets', () => {
+    const startSide: TestBarConfig['spaces'][number]['widgets'] = ['media', 'audio_mixer'];
+    const startHeader = [{ id: 'batteries' as const, side: 'left' as const }];
+
+    // Placing 'media' in top header removes it from side widgets
+    const movedToTop = setSpaceWidgetPlacement(startSide, startHeader, 'media', 'top', 'right');
+    expect(movedToTop.widgets).toEqual(['audio_mixer']);
+    expect(movedToTop.headerWidgets).toEqual([
+      { id: 'batteries', side: 'left' },
+      { id: 'media', side: 'right' },
+    ]);
+    expect(getSpaceWidgetPlacement(movedToTop.widgets, movedToTop.headerWidgets, 'media')).toEqual({
+      placement: 'top',
+      side: 'right',
+    });
+
+    // Updating side on already-top widget preserves its position in headerWidgets
+    const changedSide = setSpaceWidgetPlacement(
+      movedToTop.widgets,
+      movedToTop.headerWidgets,
+      'batteries',
+      'top',
+      'auto',
+    );
+    expect(changedSide.headerWidgets).toEqual([
+      { id: 'batteries', side: 'auto' },
+      { id: 'media', side: 'right' },
+    ]);
+
+    // Reordering inside headerWidgets
+    const reorderedHeader = moveHeaderWidget(changedSide.headerWidgets, 'media', 'up');
+    expect(reorderedHeader.map((h) => h.id)).toEqual(['media', 'batteries']);
+    expect(setHeaderWidgetSide(reorderedHeader, 'media', 'left')).toEqual([
+      { id: 'media', side: 'left' },
+      { id: 'batteries', side: 'auto' },
+    ]);
+
+    // Placing 'batteries' into side rail removes it from headerWidgets
+    const movedToSide = setSpaceWidgetPlacement(
+      changedSide.widgets,
+      reorderedHeader,
+      'batteries',
+      'side',
+    );
+    expect(movedToSide.widgets).toEqual(['audio_mixer', 'batteries']);
+    expect(movedToSide.headerWidgets).toEqual([{ id: 'media', side: 'right' }]);
+
+    // Turning off removes from both
+    const turnedOff = setSpaceWidgetPlacement(
+      movedToSide.widgets,
+      movedToSide.headerWidgets,
+      'media',
+      'off',
+    );
+    expect(turnedOff.widgets).toEqual(['audio_mixer', 'batteries']);
+    expect(turnedOff.headerWidgets).toEqual([]);
+
+    // resolveSpaceHeaderWidgets respects explicit empty v4 array vs pre-v4 undefined fallback
+    expect(resolveSpaceHeaderWidgets({ widgets: ['weather'], headerWidgets: undefined })).toEqual([
+      { id: 'batteries', side: 'left' },
+    ]);
+    expect(resolveSpaceHeaderWidgets({ widgets: ['audio_mixer'], headerWidgets: [] })).toEqual([]);
   });
 });
