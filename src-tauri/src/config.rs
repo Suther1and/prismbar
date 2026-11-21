@@ -9,11 +9,12 @@ use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const SECONDARY_TASKBAR_MODE_TESTBAR: &str = "testbar";
 pub const SECONDARY_TASKBAR_MODE_NATIVE: &str = "native";
 pub const SECONDARY_TASKBAR_MODE_HIDDEN: &str = "hidden";
@@ -27,10 +28,120 @@ pub const WIDGET_PRESET_TELEMETRY_PROCESSES: &str = "telemetry_processes";
 pub const WIDGET_PRESET_AUDIO_MIC: &str = "audio_mic";
 pub const WIDGET_PRESET_FULL_GRID: &str = "full_grid";
 
+pub const SPACE_LAYOUT_GRID: &str = "grid";
+pub const SPACE_LAYOUT_GAMES: &str = "games";
+pub const MAX_SPACES: usize = 12;
+
+pub const SPACE_WIDGET_IDS: &[&str] = &[
+    "media",
+    "audio_mixer",
+    "clipboard",
+    "pc_health",
+    "top_processes",
+    "game_combos",
+    "weather",
+    "batteries",
+];
+
 pub const MAX_FRECENCY_ENTRIES: usize = 200;
 const SAVE_RENAME_RETRIES: usize = 3;
 const SAVE_RENAME_RETRY_DELAY_MS: u64 = 15;
 const MAX_IMPORT_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn validate_space_widget_id(id: &str) -> Result<&'static str, String> {
+    let norm = id.trim().to_ascii_lowercase();
+    for &valid in SPACE_WIDGET_IDS {
+        if norm == valid {
+            return Ok(valid);
+        }
+    }
+    Err(format!(
+        "Недопустимый виджет пространства: '{id}' (допустимы: {})",
+        SPACE_WIDGET_IDS.join(", ")
+    ))
+}
+
+pub fn normalize_space_widgets(widgets: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(widgets.len().min(SPACE_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for w in widgets {
+        if let Ok(valid) = validate_space_widget_id(w) {
+            if seen.insert(valid) {
+                out.push(valid.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn validate_and_normalize_space_widgets(widgets: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(widgets.len().min(SPACE_WIDGET_IDS.len()));
+    let mut seen = HashSet::new();
+    for w in widgets {
+        let valid = validate_space_widget_id(w)?;
+        if seen.insert(valid) {
+            out.push(valid.to_string());
+        }
+    }
+    Ok(out)
+}
+
+pub fn default_space_layout_kind() -> String {
+    SPACE_LAYOUT_GRID.to_string()
+}
+
+pub fn normalize_space_layout_kind(kind: &str) -> &'static str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "games" => SPACE_LAYOUT_GAMES,
+        _ => SPACE_LAYOUT_GRID,
+    }
+}
+
+pub fn validate_space_layout_kind(kind: &str) -> Result<&'static str, String> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "grid" => Ok(SPACE_LAYOUT_GRID),
+        "games" => Ok(SPACE_LAYOUT_GAMES),
+        other => Err(format!(
+            "Недопустимый тип сетки пространства: '{other}' (допустимы: grid, games)"
+        )),
+    }
+}
+
+pub fn default_weather_units() -> String {
+    "c".to_string()
+}
+
+pub fn normalize_weather_units(units: &str) -> &'static str {
+    match units.trim().to_ascii_lowercase().as_str() {
+        "f" => "f",
+        _ => "c",
+    }
+}
+
+pub fn validate_weather_units(units: &str) -> Result<&'static str, String> {
+    match units.trim().to_ascii_lowercase().as_str() {
+        "c" => Ok("c"),
+        "f" => Ok("f"),
+        other => Err(format!(
+            "Недопустимые единицы температуры: '{other}' (допустимы: c, f)"
+        )),
+    }
+}
+
+pub fn widget_preset_to_widgets(preset: &str) -> Vec<String> {
+    match normalize_widget_preset(preset) {
+        WIDGET_PRESET_TELEMETRY_PROCESSES => {
+            vec!["pc_health".to_string(), "top_processes".to_string()]
+        }
+        WIDGET_PRESET_AUDIO_MIC => vec!["audio_mixer".to_string(), "media".to_string()],
+        WIDGET_PRESET_FULL_GRID => vec![],
+        _ => vec![
+            "media".to_string(),
+            "audio_mixer".to_string(),
+            "clipboard".to_string(),
+        ],
+    }
+}
 
 pub fn default_secondary_taskbar_mode() -> String {
     SECONDARY_TASKBAR_MODE_TESTBAR.to_string()
@@ -103,46 +214,53 @@ pub fn validate_widget_preset(preset: &str) -> Result<&'static str, String> {
     }
 }
 
+fn parse_hex_color(raw: &str) -> Option<(u8, u8, u8, String)> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed[1..].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        let r = u8::from_str_radix(&trimmed[1..3], 16).ok()?;
+        let g = u8::from_str_radix(&trimmed[3..5], 16).ok()?;
+        let b = u8::from_str_radix(&trimmed[5..7], 16).ok()?;
+        return Some((r, g, b, trimmed.to_uppercase()));
+    }
+    None
+}
+
+fn parse_rgb_color(raw: &str) -> Option<(u8, u8, u8, String)> {
+    let parts: Vec<&str> = raw.trim().split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let r = parts[0].trim().parse::<u8>().ok()?;
+    let g = parts[1].trim().parse::<u8>().ok()?;
+    let b = parts[2].trim().parse::<u8>().ok()?;
+    Some((r, g, b, format!("{r},{g},{b}")))
+}
+
 pub fn sanitize_accent_hex_rgb(
     accent_hex: Option<&str>,
     accent_rgb: Option<&str>,
 ) -> (String, String) {
-    let hex = accent_hex
-        .map(str::trim)
-        .filter(|h| {
-            h.len() == 7 && h.starts_with('#') && h[1..].chars().all(|c| c.is_ascii_hexdigit())
-        })
-        .unwrap_or("#A78BFA");
-    let rgb = accent_rgb
-        .map(str::trim)
-        .filter(|r| {
-            let parts: Vec<&str> = r.split(',').collect();
-            parts.len() == 3 && parts.iter().all(|p| p.trim().parse::<u8>().is_ok())
-        })
-        .map(|r| {
-            r.split(',')
-                .map(|p| p.trim())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_else(|| {
-            if let (Ok(r), Ok(g), Ok(b)) = (
-                u8::from_str_radix(&hex[1..3], 16),
-                u8::from_str_radix(&hex[3..5], 16),
-                u8::from_str_radix(&hex[5..7], 16),
-            ) {
-                format!("{r},{g},{b}")
-            } else {
-                "167,139,250".to_string()
-            }
-        });
-    (hex.to_uppercase(), rgb)
+    let parsed_hex = accent_hex.and_then(parse_hex_color);
+    let parsed_rgb = accent_rgb.and_then(parse_rgb_color);
+
+    match (parsed_hex, parsed_rgb) {
+        (Some((hr, hg, hb, hex)), Some((_, _, _, rgb))) => {
+            let _ = (hr, hg, hb);
+            (hex, rgb)
+        }
+        (Some((r, g, b, hex)), None) => (hex, format!("{r},{g},{b}")),
+        (None, Some((r, g, b, rgb))) => (format!("#{r:02X}{g:02X}{b:02X}"), rgb),
+        (None, None) => ("#A78BFA".to_string(), "167,139,250".to_string()),
+    }
 }
 
 const AUTOSTART_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE_NAME: &str = "TestBar";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PinItem {
     pub id: String,
@@ -173,6 +291,66 @@ pub struct PinItem {
     pub match_aumid: Option<String>,
     #[serde(default, alias = "targets")]
     pub combo_targets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub accent_hex: String,
+    #[serde(default)]
+    pub accent_rgb: String,
+    #[serde(default = "default_space_layout_kind")]
+    pub layout_kind: String,
+    #[serde(default)]
+    pub show_hero_row: bool,
+    #[serde(default)]
+    pub widgets: Vec<String>,
+    #[serde(default)]
+    pub items: Vec<PinItem>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskbarWidgetSettings {
+    #[serde(default = "default_true")]
+    pub show_weather: bool,
+    #[serde(default)]
+    pub show_batteries: bool,
+    #[serde(default)]
+    pub show_telemetry: bool,
+    #[serde(default)]
+    pub weather_city: String,
+    #[serde(default)]
+    pub weather_lat: Option<f64>,
+    #[serde(default)]
+    pub weather_lon: Option<f64>,
+    #[serde(default = "default_weather_units")]
+    pub weather_units: String,
+}
+
+impl Default for TaskbarWidgetSettings {
+    fn default() -> Self {
+        Self {
+            show_weather: true,
+            show_batteries: false,
+            show_telemetry: false,
+            weather_city: String::new(),
+            weather_lat: None,
+            weather_lon: None,
+            weather_units: default_weather_units(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -227,6 +405,10 @@ pub struct TestBarConfig {
     #[serde(default)]
     pub taskbar_pins: Vec<PinItem>,
     #[serde(default)]
+    pub spaces: Vec<SpaceConfig>,
+    #[serde(default)]
+    pub taskbar_widgets: TaskbarWidgetSettings,
+    #[serde(default)]
     pub personal_pins: Vec<PinItem>,
     #[serde(default)]
     pub personal_links: Vec<PinItem>,
@@ -250,8 +432,9 @@ pub struct TestBarConfig {
 
 fn find_first_existing(candidates: &[PathBuf]) -> Option<String> {
     for p in candidates {
-        if p.exists() {
-            return Some(p.to_string_lossy().to_string());
+        let s = p.to_string_lossy();
+        if path_exists_including_reparse(&s) {
+            return Some(s.into_owned());
         }
     }
     None
@@ -269,72 +452,278 @@ fn roaming_appdata() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| user_home().join(r"AppData\Roaming"))
 }
 
+fn read_registry_sz(root: HKEY, subkey: &str, value_name: &str) -> Option<String> {
+    let subkey_w = to_wide_nul(subkey);
+    let value_w = if value_name.is_empty() {
+        Vec::new()
+    } else {
+        to_wide_nul(value_name)
+    };
+    let value_ptr = if value_name.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(value_w.as_ptr())
+    };
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    let mut byte_len: u32 = 0;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            value_ptr,
+            flags,
+            None,
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if status != ERROR_SUCCESS || byte_len < 2 || byte_len > 16_384 {
+        return None;
+    }
+    let mut buf = vec![0u16; (byte_len as usize / 2) + 2];
+    let mut actual_bytes = (buf.len() * 2) as u32;
+    let status2 = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey_w.as_ptr()),
+            value_ptr,
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            Some(&mut actual_bytes),
+        )
+    };
+    if status2 != ERROR_SUCCESS {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let text = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+pub fn parse_browser_command_exe(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw_exe = if let Some(after_open) = trimmed.strip_prefix('"') {
+        let close_idx = after_open.find('"')?;
+        after_open[..close_idx].trim()
+    } else {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(pos) = lower.find(".exe") {
+            let end = pos + 4;
+            trimmed[..end].trim()
+        } else {
+            trimmed.split_whitespace().next().unwrap_or("").trim()
+        }
+    };
+    let stripped = strip_verbatim_prefix(raw_exe);
+    let cleaned = stripped.trim();
+    let lower = cleaned.to_ascii_lowercase();
+    if !lower.ends_with(".exe")
+        || lower.ends_with("\\launchwinapp.exe")
+        || lower.ends_with("\\rundll32.exe")
+        || lower.ends_with("\\cmd.exe")
+        || lower.ends_with("\\wscript.exe")
+    {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+pub fn browser_display_info(
+    exe_path: &str,
+    prog_id: Option<&str>,
+) -> (String, &'static str, &'static str) {
+    let exe_low = derive_match_exe(exe_path).unwrap_or_default();
+    let prog_low = prog_id.unwrap_or("").trim().to_ascii_lowercase();
+    match exe_low.as_str() {
+        "msedge.exe" => ("Microsoft Edge".to_string(), "edge", "56,189,248"),
+        "chrome.exe" => ("Google Chrome".to_string(), "chrome", "56,189,248"),
+        "firefox.exe" => ("Firefox".to_string(), "firefox", "249,115,22"),
+        "brave.exe" => ("Brave".to_string(), "brave", "249,115,22"),
+        "opera.exe" | "launcher.exe" if prog_low.contains("opera") || exe_low == "opera.exe" => {
+            ("Opera".to_string(), "opera", "239,68,68")
+        }
+        "browser.exe" if prog_low.contains("yandex") || exe_path.to_ascii_lowercase().contains("yandex") => {
+            ("Яндекс Браузер".to_string(), "yandex", "239,68,68")
+        }
+        "vivaldi.exe" => ("Vivaldi".to_string(), "browser", "239,68,68"),
+        "arc.exe" => ("Arc".to_string(), "browser", "129,140,248"),
+        _ => {
+            let stem = exe_low.trim_end_matches(".exe");
+            let title = if stem.is_empty() {
+                "Браузер".to_string()
+            } else {
+                let mut chars = stem.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => "Браузер".to_string(),
+                }
+            };
+            (title, "browser", "56,189,248")
+        }
+    }
+}
+
+struct DetectedBrowser {
+    title: String,
+    target: String,
+    icon_key: String,
+    accent_rgb: String,
+}
+
+fn detect_default_browser() -> Option<DetectedBrowser> {
+    let prog_id = read_registry_sz(
+        HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        "ProgId",
+    );
+
+    if let Some(ref pid) = prog_id {
+        let subkey = format!(r"Software\Classes\{pid}\shell\open\command");
+        let cmd = read_registry_sz(HKEY_CURRENT_USER, &subkey, "")
+            .or_else(|| read_registry_sz(HKEY_LOCAL_MACHINE, &subkey, ""));
+        if let Some(cmd_str) = cmd {
+            if let Some(exe) = parse_browser_command_exe(&cmd_str) {
+                if path_exists_including_reparse(&exe) {
+                    let (title, icon_key, accent_rgb) = browser_display_info(&exe, Some(pid));
+                    return Some(DetectedBrowser {
+                        title,
+                        target: exe,
+                        icon_key: icon_key.to_string(),
+                        accent_rgb: accent_rgb.to_string(),
+                    });
+                }
+            }
+        }
+
+        let pid_low = pid.to_ascii_lowercase();
+        let hinted_key = if pid_low.contains("edge") {
+            Some("edge")
+        } else if pid_low.contains("chrome") {
+            Some("chrome")
+        } else if pid_low.contains("firefox") {
+            Some("firefox")
+        } else if pid_low.contains("brave") {
+            Some("brave")
+        } else if pid_low.contains("opera") {
+            Some("opera")
+        } else if pid_low.contains("yandex") {
+            Some("yandex")
+        } else {
+            None
+        };
+        if let Some(key) = hinted_key {
+            let target = detect_app_target(key);
+            if !target.is_empty() {
+                let (title, icon_key, accent_rgb) = browser_display_info(&target, Some(pid));
+                return Some(DetectedBrowser {
+                    title,
+                    target,
+                    icon_key: icon_key.to_string(),
+                    accent_rgb: accent_rgb.to_string(),
+                });
+            }
+        }
+    }
+
+    for key in ["edge", "chrome", "firefox", "brave", "opera", "yandex"] {
+        let target = detect_app_target(key);
+        if !target.is_empty() {
+            let (title, icon_key, accent_rgb) = browser_display_info(&target, None);
+            return Some(DetectedBrowser {
+                title,
+                target,
+                icon_key: icon_key.to_string(),
+                accent_rgb: accent_rgb.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+fn detect_adobe_photoshop(pf: &Path) -> Vec<PathBuf> {
+    let mut dirs_found = Vec::new();
+    let adobe_dir = pf.join("Adobe");
+    if let Ok(entries) = fs::read_dir(&adobe_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.to_ascii_lowercase().starts_with("adobe photoshop") {
+                let exe = entry.path().join("Photoshop.exe");
+                if exe.is_file() {
+                    dirs_found.push(exe);
+                }
+            }
+        }
+    }
+    dirs_found.sort_by(|a, b| b.cmp(a));
+    dirs_found
+}
+
 fn detect_app_target(name_key: &str) -> String {
     let local = local_appdata();
     let roaming = roaming_appdata();
     let pf = PathBuf::from(r"C:\Program Files");
     let pf86 = PathBuf::from(r"C:\Program Files (x86)");
 
+    if name_key == "snipping" {
+        return "ms-screenclip:".to_string();
+    }
+
     let candidates: Vec<PathBuf> = match name_key {
         "explorer" => vec![PathBuf::from(r"C:\Windows\explorer.exe")],
-        "zen" => vec![
-            pf.join(r"Zen Browser\zen.exe"),
-            local.join(r"Zen Browser\zen.exe"),
+        "wt" => vec![
+            local.join(r"Microsoft\WindowsApps\wt.exe"),
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+        ],
+        "notepad" => vec![
+            PathBuf::from(r"C:\Windows\System32\notepad.exe"),
+            PathBuf::from(r"C:\Windows\notepad.exe"),
+        ],
+        "taskmgr" => vec![PathBuf::from(r"C:\Windows\System32\Taskmgr.exe")],
+        "edge" => vec![
+            pf86.join(r"Microsoft\Edge\Application\msedge.exe"),
+            pf.join(r"Microsoft\Edge\Application\msedge.exe"),
+        ],
+        "chrome" => vec![
+            pf.join(r"Google\Chrome\Application\chrome.exe"),
+            pf86.join(r"Google\Chrome\Application\chrome.exe"),
+            local.join(r"Google\Chrome\Application\chrome.exe"),
+        ],
+        "firefox" => vec![
             pf.join(r"Mozilla Firefox\firefox.exe"),
+            pf86.join(r"Mozilla Firefox\firefox.exe"),
         ],
-        "telegram" => vec![
-            roaming.join(r"Telegram Desktop\Telegram.exe"),
-            local.join(r"Programs\Telegram Desktop\Telegram.exe"),
+        "brave" => vec![
+            pf.join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            local.join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            pf86.join(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
         ],
-        "spark" => vec![
-            local.join(r"Programs\SparkDesktop\Spark Desktop.exe"),
-            local.join(r"SparkDesktop\Spark Desktop.exe"),
-            pf.join(r"SparkDesktop\Spark Desktop.exe"),
-            local.join(r"SparkDesktop\SparkDesktop.exe"),
-            local.join(r"Programs\SparkDesktop\SparkDesktop.exe"),
-            local.join(r"Programs\Spark\Spark.exe"),
-            pf.join(r"SparkDesktop\SparkDesktop.exe"),
-        ],
-        "obsidian" => vec![
-            local.join(r"Programs\obsidian\Obsidian.exe"),
-            local.join(r"Obsidian\Obsidian.exe"),
-        ],
-        "claude" => vec![
-            local.join(r"AnthropicClaude\claude.exe"),
-            local.join(r"Programs\Claude\Claude.exe"),
+        "opera" => vec![
+            local.join(r"Programs\Opera\opera.exe"),
+            local.join(r"Programs\Opera GX\opera.exe"),
+            pf.join(r"Opera\opera.exe"),
         ],
         "yandex" => vec![
             local.join(r"Yandex\YandexBrowser\Application\browser.exe"),
             pf.join(r"Yandex\YandexBrowser\Application\browser.exe"),
             pf86.join(r"Yandex\YandexBrowser\Application\browser.exe"),
-            local.join(r"Yandex\YaPin\Yandex.exe"),
-        ],
-        "ymusic" => vec![
-            local.join(r"Programs\YandexMusic\Яндекс Музыка.exe"),
-            local.join(r"Programs\YandexMusic\YandexMusic.exe"),
-        ],
-        "discord" => vec![local.join(r"Discord\Update.exe")],
-        "obs" => vec![pf.join(r"obs-studio\bin\64bit\obs64.exe")],
-        "antigravity" => vec![local.join(r"Programs\Antigravity\Antigravity.exe")],
-        "cursor" => vec![
-            pf.join(r"cursor\Cursor.exe"),
-            pf.join(r"Cursor\Cursor.exe"),
-            local.join(r"Programs\cursor\Cursor.exe"),
         ],
         "vscode" => vec![
             local.join(r"Programs\Microsoft VS Code\Code.exe"),
             pf.join(r"Microsoft VS Code\Code.exe"),
+            pf86.join(r"Microsoft VS Code\Code.exe"),
         ],
-        "photoshop" => vec![
-            pf.join(r"Adobe\Adobe Photoshop 2025\Photoshop.exe"),
-            pf.join(r"Adobe\Adobe Photoshop 2024\Photoshop.exe"),
+        "telegram" => vec![
+            roaming.join(r"Telegram Desktop\Telegram.exe"),
+            local.join(r"Programs\Telegram Desktop\Telegram.exe"),
+            local.join(r"Telegram Desktop\Telegram.exe"),
         ],
-        "lightroom" => vec![pf.join(r"Adobe\Adobe Lightroom Classic\Lightroom.exe")],
-        "figma" => vec![local.join(r"Figma\Figma.exe")],
-        "unity" => vec![
-            pf.join(r"Unity Hub\Unity Hub.exe"),
-            local.join(r"Programs\Unity Hub\Unity Hub.exe"),
-        ],
+        "discord" => vec![local.join(r"Discord\Update.exe")],
         "steam" => {
             if let Some(detected) = crate::apps_indexer::detect_steam_exe() {
                 return detected;
@@ -342,25 +731,29 @@ fn detect_app_target(name_key: &str) -> String {
             vec![
                 pf86.join(r"Steam\steam.exe"),
                 pf.join(r"Steam\steam.exe"),
-                PathBuf::from(r"D:\steam\steam.exe"),
             ]
         }
-        "battlenet" => vec![pf86.join(r"Battle.net\Battle.net Launcher.exe")],
-        "warp" => vec![local.join(r"Programs\Warp\warp.exe")],
-        "wt" => vec![
-            local.join(r"Microsoft\WindowsApps\wt.exe"),
-            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+        "obs" => vec![
+            pf.join(r"obs-studio\bin\64bit\obs64.exe"),
+            pf86.join(r"obs-studio\bin\64bit\obs64.exe"),
         ],
-        "wiztree" => vec![pf.join(r"WizTree\WizTree64.exe")],
+        "figma" => vec![local.join(r"Figma\Figma.exe")],
+        "photoshop" => detect_adobe_photoshop(&pf),
+        "vlc" => vec![
+            pf.join(r"VideoLAN\VLC\vlc.exe"),
+            pf86.join(r"VideoLAN\VLC\vlc.exe"),
+        ],
+        "spotify" => vec![
+            roaming.join(r"Spotify\Spotify.exe"),
+            local.join(r"Microsoft\WindowsApps\Spotify.exe"),
+        ],
         _ => vec![],
     };
 
     find_first_existing(&candidates).unwrap_or_else(|| match name_key {
         "explorer" => r"C:\Windows\explorer.exe".to_string(),
-        "steam" => "steam://open/main".to_string(),
-        "ymusic" => "https://music.yandex.ru".to_string(),
-        "claude" => "https://claude.ai".to_string(),
-        "figma" => "https://figma.com".to_string(),
+        "notepad" => r"C:\Windows\System32\notepad.exe".to_string(),
+        "taskmgr" => r"C:\Windows\System32\Taskmgr.exe".to_string(),
         _ => String::new(),
     })
 }
@@ -500,6 +893,8 @@ fn pin(
         match_exe,
         match_aumid: None,
         combo_targets: None,
+        custom_icon: None,
+        custom_color: None,
     }
 }
 
@@ -525,6 +920,8 @@ fn combo_pin(
         match_exe: None,
         match_aumid: None,
         combo_targets: Some(targets),
+        custom_icon: None,
+        custom_color: None,
     }
 }
 
@@ -541,6 +938,27 @@ fn retain_resolved_pins(items: Vec<PinItem>) -> Vec<PinItem> {
             }
         })
         .collect()
+}
+
+fn sanitize_custom_color(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((_, _, _, hex)) = parse_hex_color(trimmed) {
+        return Some(hex);
+    }
+    if let Some((_, _, _, rgb)) = parse_rgb_color(trimmed) {
+        return Some(rgb);
+    }
+    Some(trimmed.to_string())
+}
+
+fn sanitize_optional_nonempty(opt: &Option<String>) -> Option<String> {
+    opt.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
@@ -635,10 +1053,225 @@ pub fn normalize_pin(item: &mut PinItem, force_combo: bool) -> bool {
         changed = true;
     }
 
+    let clean_icon_data = sanitize_optional_nonempty(&item.icon_data);
+    if item.icon_data != clean_icon_data {
+        item.icon_data = clean_icon_data;
+        changed = true;
+    }
+
+    let clean_custom_icon = sanitize_optional_nonempty(&item.custom_icon);
+    if item.custom_icon != clean_custom_icon {
+        item.custom_icon = clean_custom_icon;
+        changed = true;
+    }
+
+    let clean_custom_color = item.custom_color.as_deref().and_then(sanitize_custom_color);
+    if item.custom_color != clean_custom_color {
+        item.custom_color = clean_custom_color;
+        changed = true;
+    }
+
     changed
 }
 
-/// Losslessly upgrades legacy v0 config payloads to schema v1 and normalizes all pin lists.
+pub fn normalize_taskbar_widgets(settings: &mut TaskbarWidgetSettings) -> bool {
+    let mut changed = false;
+
+    let clean_city = settings.weather_city.trim().to_string();
+    if settings.weather_city != clean_city {
+        settings.weather_city = clean_city;
+        changed = true;
+    }
+
+    let clean_units = normalize_weather_units(&settings.weather_units);
+    if settings.weather_units != clean_units {
+        settings.weather_units = clean_units.to_string();
+        changed = true;
+    }
+
+    let coords_valid = match (settings.weather_lat, settings.weather_lon) {
+        (Some(lat), Some(lon)) => {
+            lat.is_finite()
+                && lon.is_finite()
+                && (-90.0..=90.0).contains(&lat)
+                && (-180.0..=180.0).contains(&lon)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !coords_valid {
+        settings.weather_lat = None;
+        settings.weather_lon = None;
+        changed = true;
+    }
+
+    changed
+}
+
+fn ensure_unique_space_id(base: &str, seen: &mut HashSet<String>) -> String {
+    let trimmed = base.trim();
+    let root = if trimmed.is_empty() { "space" } else { trimmed };
+    if seen.insert(root.to_string()) {
+        return root.to_string();
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{root}-{suffix}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn normalize_space_config(
+    space: &mut SpaceConfig,
+    seen_ids: &mut HashSet<String>,
+    idx: usize,
+) -> bool {
+    let mut changed = false;
+
+    let fallback_id = format!("space-{}", idx + 1);
+    let desired_base = if space.id.trim().is_empty() {
+        fallback_id.as_str()
+    } else {
+        space.id.trim()
+    };
+    let unique_id = ensure_unique_space_id(desired_base, seen_ids);
+    if space.id != unique_id {
+        space.id = unique_id;
+        changed = true;
+    }
+
+    let trimmed_name = space.name.trim();
+    let desired_name = if trimmed_name.is_empty() {
+        "Пространство".to_string()
+    } else {
+        trimmed_name.to_string()
+    };
+    if space.name != desired_name {
+        space.name = desired_name;
+        changed = true;
+    }
+
+    let (hex, rgb) =
+        sanitize_accent_hex_rgb(Some(&space.accent_hex), Some(&space.accent_rgb));
+    if space.accent_hex != hex {
+        space.accent_hex = hex;
+        changed = true;
+    }
+    if space.accent_rgb != rgb {
+        space.accent_rgb = rgb;
+        changed = true;
+    }
+
+    let desired_layout = normalize_space_layout_kind(&space.layout_kind);
+    if space.layout_kind != desired_layout {
+        space.layout_kind = desired_layout.to_string();
+        changed = true;
+    }
+
+    let desired_widgets = normalize_space_widgets(&space.widgets);
+    if space.widgets != desired_widgets {
+        space.widgets = desired_widgets;
+        changed = true;
+    }
+
+    for item in space.items.iter_mut() {
+        if normalize_pin(item, false) {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn build_migrated_spaces_from_legacy(cfg: &TestBarConfig) -> Vec<SpaceConfig> {
+    let mut spaces = Vec::with_capacity(4 + cfg.custom_spaces.len());
+
+    let mut personal_items = Vec::with_capacity(cfg.personal_pins.len() + cfg.personal_links.len());
+    personal_items.extend(cfg.personal_pins.iter().cloned());
+    personal_items.extend(cfg.personal_links.iter().cloned());
+    spaces.push(SpaceConfig {
+        id: "personal".to_string(),
+        name: "Личное".to_string(),
+        accent_hex: "#818CF8".to_string(),
+        accent_rgb: "129,140,248".to_string(),
+        layout_kind: SPACE_LAYOUT_GRID.to_string(),
+        show_hero_row: true,
+        widgets: vec![
+            "media".to_string(),
+            "audio_mixer".to_string(),
+            "clipboard".to_string(),
+        ],
+        items: personal_items,
+    });
+
+    let mut work_items = Vec::with_capacity(cfg.work_folders.len() + cfg.work_apps.len());
+    work_items.extend(cfg.work_folders.iter().cloned());
+    work_items.extend(cfg.work_apps.iter().cloned());
+    spaces.push(SpaceConfig {
+        id: "work".to_string(),
+        name: "Работа".to_string(),
+        accent_hex: "#38BDF8".to_string(),
+        accent_rgb: "56,189,248".to_string(),
+        layout_kind: SPACE_LAYOUT_GRID.to_string(),
+        show_hero_row: false,
+        widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
+        items: work_items,
+    });
+
+    let mut studio_items = Vec::with_capacity(cfg.studio_pins.len() + cfg.studio_tools.len());
+    studio_items.extend(cfg.studio_pins.iter().cloned());
+    studio_items.extend(cfg.studio_tools.iter().cloned());
+    spaces.push(SpaceConfig {
+        id: "studio".to_string(),
+        name: "Студия".to_string(),
+        accent_hex: "#34D399".to_string(),
+        accent_rgb: "52,211,153".to_string(),
+        layout_kind: SPACE_LAYOUT_GRID.to_string(),
+        show_hero_row: true,
+        widgets: vec![
+            "pc_health".to_string(),
+            "audio_mixer".to_string(),
+            "top_processes".to_string(),
+        ],
+        items: studio_items,
+    });
+
+    spaces.push(SpaceConfig {
+        id: "games".to_string(),
+        name: "Игры".to_string(),
+        accent_hex: "#FB7185".to_string(),
+        accent_rgb: "251,113,133".to_string(),
+        layout_kind: SPACE_LAYOUT_GAMES.to_string(),
+        show_hero_row: false,
+        widgets: vec![
+            "audio_mixer".to_string(),
+            "game_combos".to_string(),
+            "pc_health".to_string(),
+        ],
+        items: cfg.game_launchers.clone(),
+    });
+
+    for cs in &cfg.custom_spaces {
+        let (hex, rgb) = sanitize_accent_hex_rgb(Some(&cs.accent_hex), Some(&cs.accent_rgb));
+        spaces.push(SpaceConfig {
+            id: cs.id.clone(),
+            name: cs.name.clone(),
+            accent_hex: hex,
+            accent_rgb: rgb,
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: false,
+            widgets: widget_preset_to_widgets(&cs.widget_preset),
+            items: cs.items.clone(),
+        });
+    }
+
+    spaces
+}
+
+/// Losslessly upgrades legacy v0/v1 config payloads to schema v2 and normalizes all pin lists & spaces.
 /// Returns `true` if any field was upgraded or normalized.
 pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
     let mut changed = false;
@@ -701,6 +1334,39 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         }
     }
 
+    if cfg.spaces.is_empty() {
+        let has_legacy_spaces = !cfg.personal_pins.is_empty()
+            || !cfg.personal_links.is_empty()
+            || !cfg.work_folders.is_empty()
+            || !cfg.work_apps.is_empty()
+            || !cfg.studio_pins.is_empty()
+            || !cfg.studio_tools.is_empty()
+            || !cfg.game_launchers.is_empty()
+            || !cfg.custom_spaces.is_empty();
+        cfg.spaces = if has_legacy_spaces {
+            build_migrated_spaces_from_legacy(cfg)
+        } else {
+            default_modular_spaces()
+        };
+        changed = true;
+    }
+
+    if cfg.spaces.is_empty() {
+        cfg.spaces = default_modular_spaces();
+        changed = true;
+    }
+
+    let mut seen_space_ids = HashSet::new();
+    for (idx, space) in cfg.spaces.iter_mut().enumerate() {
+        if normalize_space_config(space, &mut seen_space_ids, idx) {
+            changed = true;
+        }
+    }
+
+    if normalize_taskbar_widgets(&mut cfg.taskbar_widgets) {
+        changed = true;
+    }
+
     // Deduplicate and drop blank entries in pinned_clipboard while preserving order
     let mut seen = HashSet::new();
     let mut cleaned = Vec::with_capacity(cfg.pinned_clipboard.len());
@@ -760,31 +1426,168 @@ fn trim_frecency_map(map: &mut HashMap<String, FrecencyEntry>) -> bool {
     changed
 }
 
+fn default_modular_spaces() -> Vec<SpaceConfig> {
+    let home = user_home();
+    let downloads = dirs::download_dir()
+        .unwrap_or_else(|| home.join("Downloads"))
+        .to_string_lossy()
+        .to_string();
+    let documents = dirs::document_dir()
+        .unwrap_or_else(|| home.join("Documents"))
+        .to_string_lossy()
+        .to_string();
+    let desktop = dirs::desktop_dir()
+        .unwrap_or_else(|| home.join("Desktop"))
+        .to_string_lossy()
+        .to_string();
+    let pictures = dirs::picture_dir()
+        .unwrap_or_else(|| home.join("Pictures"))
+        .to_string_lossy()
+        .to_string();
+
+    let browser_pin_personal = detect_default_browser().map(|b| {
+        pin(
+            "p-browser",
+            "app",
+            &b.title,
+            "Браузер по умолчанию",
+            b.target,
+            "Новое окно",
+            &b.accent_rgb,
+            &b.icon_key,
+        )
+    });
+
+    let mut personal_items = Vec::new();
+    if let Some(browser) = browser_pin_personal {
+        personal_items.push(browser);
+    }
+    personal_items.extend([
+        pin("p-explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
+        pin("p-telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
+        pin("p-discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
+        pin("p-spotify", "app", "Spotify", "Музыка", detect_app_target("spotify"), "", "52,211,153", "spotify"),
+        pin("p-vlc", "app", "VLC", "Медиаплеер", detect_app_target("vlc"), "", "249,115,22", "vlc"),
+        pin("p-downloads", "folder", "Загрузки", "Папка", downloads.clone(), "Скопировать путь", "56,189,248", "folder"),
+        pin("p-docs", "folder", "Документы", "Папка", documents.clone(), "Скопировать путь", "245,158,11", "folder"),
+        pin("p-pics", "folder", "Изображения", "Скриншоты", pictures.clone(), "Скопировать путь", "139,92,246", "image"),
+        pin("p-desktop", "folder", "Рабочий стол", "Файлы", desktop.clone(), "Скопировать путь", "52,211,153", "folder"),
+    ]);
+
+    let work_items = retain_resolved_pins(vec![
+        pin("w-dl", "folder", "Загрузки", "Свежие файлы", downloads, "Открыть в терминале", "245,158,11", "folder"),
+        pin("w-docs", "folder", "Документы", "Основная папка", documents, "Открыть в терминале", "245,158,11", "folder"),
+        pin("w-desktop", "folder", "Рабочий стол", "Файлы и ярлыки", desktop, "Открыть в терминале", "56,189,248", "folder"),
+        pin("w-pics", "folder", "Изображения", "Скриншоты", pictures, "Открыть в терминале", "139,92,246", "folder"),
+        pin("w-vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
+        pin("w-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
+        pin("w-notepad", "app", "Блокнот", "Заметки", detect_app_target("notepad"), "", "148,163,184", "notepad"),
+        pin("w-taskmgr", "app", "Диспетчер задач", "Процессы", detect_app_target("taskmgr"), "От админа", "129,140,248", "cpu"),
+    ]);
+
+    let studio_items = retain_resolved_pins(vec![
+        pin("s-photoshop", "app", "Photoshop", "Графика и ретушь", detect_app_target("photoshop"), "От админа", "49,168,255", "photoshop"),
+        pin("s-figma", "app", "Figma", "Интерфейсы", detect_app_target("figma"), "", "168,85,247", "figma"),
+        pin("s-obs", "app", "OBS Studio", "Захват видео", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
+        pin("s-vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
+        pin("s-snip", "app", "Ножницы", "Скриншот", detect_app_target("snipping"), "", "52,211,153", "scissors"),
+        pin("s-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
+        pin("s-taskmgr", "app", "Диспетчер задач", "Процессы", detect_app_target("taskmgr"), "От админа", "129,140,248", "cpu"),
+    ]);
+
+    let game_items = retain_resolved_pins(vec![
+        pin("g-steam", "app", "Steam", "Библиотека", detect_app_target("steam"), "", "56,189,248", "steam"),
+        pin("g-discord", "app", "Discord", "Голос", detect_app_target("discord"), "", "99,102,241", "discord"),
+        pin("g-obs", "app", "OBS Studio", "Запись", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
+    ]);
+
+    vec![
+        SpaceConfig {
+            id: "personal".to_string(),
+            name: "Личное".to_string(),
+            accent_hex: "#818CF8".to_string(),
+            accent_rgb: "129,140,248".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: true,
+            widgets: vec![
+                "media".to_string(),
+                "audio_mixer".to_string(),
+                "clipboard".to_string(),
+            ],
+            items: retain_resolved_pins(personal_items),
+        },
+        SpaceConfig {
+            id: "work".to_string(),
+            name: "Работа".to_string(),
+            accent_hex: "#38BDF8".to_string(),
+            accent_rgb: "56,189,248".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: false,
+            widgets: vec!["pc_health".to_string(), "top_processes".to_string()],
+            items: work_items,
+        },
+        SpaceConfig {
+            id: "studio".to_string(),
+            name: "Студия".to_string(),
+            accent_hex: "#34D399".to_string(),
+            accent_rgb: "52,211,153".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: true,
+            widgets: vec![
+                "pc_health".to_string(),
+                "audio_mixer".to_string(),
+                "top_processes".to_string(),
+            ],
+            items: studio_items,
+        },
+        SpaceConfig {
+            id: "games".to_string(),
+            name: "Игры".to_string(),
+            accent_hex: "#FB7185".to_string(),
+            accent_rgb: "251,113,133".to_string(),
+            layout_kind: SPACE_LAYOUT_GAMES.to_string(),
+            show_hero_row: false,
+            widgets: vec![
+                "audio_mixer".to_string(),
+                "game_combos".to_string(),
+                "pc_health".to_string(),
+            ],
+            items: game_items,
+        },
+    ]
+}
+
 impl Default for TestBarConfig {
     fn default() -> Self {
-        let home = user_home();
-        let downloads = dirs::download_dir()
-            .unwrap_or_else(|| home.join("Downloads"))
-            .to_string_lossy()
-            .to_string();
-        let documents = dirs::document_dir()
-            .unwrap_or_else(|| home.join("Documents"))
-            .to_string_lossy()
-            .to_string();
-        let desktop = dirs::desktop_dir()
-            .unwrap_or_else(|| home.join("Desktop"))
-            .to_string_lossy()
-            .to_string();
-        let pictures = dirs::picture_dir()
-            .unwrap_or_else(|| home.join("Pictures"))
-            .to_string_lossy()
-            .to_string();
-        let testbar_dir_path = PathBuf::from(&documents).join("testbar");
-        let testbar_dir = if testbar_dir_path.exists() {
-            testbar_dir_path.to_string_lossy().to_string()
-        } else {
-            String::new()
-        };
+        let mut taskbar = vec![pin(
+            "tb-explorer",
+            "app",
+            "Проводник",
+            "Файлы и диски",
+            detect_app_target("explorer"),
+            "Новое окно",
+            "245,158,11",
+            "explorer",
+        )];
+        if let Some(browser) = detect_default_browser() {
+            taskbar.push(pin(
+                "tb-browser",
+                "app",
+                &browser.title,
+                "Браузер",
+                browser.target,
+                "Новое окно",
+                &browser.accent_rgb,
+                &browser.icon_key,
+            ));
+        }
+        taskbar.extend([
+            pin("tb-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
+            pin("tb-vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
+            pin("tb-telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
+            pin("tb-discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
+            pin("tb-spotify", "app", "Spotify", "Музыка", detect_app_target("spotify"), "", "52,211,153", "spotify"),
+        ]);
 
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -798,102 +1601,17 @@ impl Default for TestBarConfig {
             start_remember_space: false,
             hidden_tray_keys: vec![],
             frecency: HashMap::new(),
-            taskbar_pins: retain_resolved_pins(vec![
-                pin("explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
-                pin("zen", "app", "Zen Browser", "Браузер", detect_app_target("zen"), "Новое окно", "249,115,22", "zen"),
-                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
-                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "", "59,130,246", "spark"),
-                pin("antigravity", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
-                pin("vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-                pin("ymusic", "app", "Яндекс Музыка", "Плеер", detect_app_target("ymusic"), "", "250,204,21", "ymusic"),
-            ]),
-            personal_pins: retain_resolved_pins(vec![
-                pin("zen", "app", "Zen Browser", "Основной браузер", detect_app_target("zen"), "Приватное окно", "249,115,22", "zen"),
-                pin("telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
-                pin("spark", "app", "Spark Mail", "Почта", detect_app_target("spark"), "", "59,130,246", "spark"),
-                pin("explorer", "app", "Проводник", "Файлы и диски", detect_app_target("explorer"), "Новое окно", "245,158,11", "explorer"),
-                pin("obsidian", "app", "Второй мозг", "Obsidian", detect_app_target("obsidian"), "", "139,92,246", "obsidian"),
-                pin("claude", "app", "Claude", "Ассистент", detect_app_target("claude"), "", "217,119,87", "claude"),
-                pin("yandex", "app", "Яндекс", "Браузер", detect_app_target("yandex"), "Инкогнито", "239,68,68", "yandex"),
-                pin("discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
-                pin("ymusic", "app", "Я.Музыка", "Плеер", detect_app_target("ymusic"), "", "250,204,21", "ymusic"),
-                pin("obs", "app", "OBS Studio", "Запись экрана", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
-                pin("wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
-            ]),
-            personal_links: retain_resolved_pins(vec![
-                pin("lnk-downloads", "folder", "Загрузки", "Папка", downloads.clone(), "Скопировать путь", "56,189,248", "folder"),
-                pin("lnk-docs", "folder", "Документы", "Папка", documents.clone(), "Скопировать путь", "245,158,11", "folder"),
-                pin("lnk-pics", "folder", "Изображения", "Скриншоты", pictures.clone(), "Скопировать путь", "139,92,246", "image"),
-                pin("lnk-desktop", "folder", "Рабочий стол", "Файлы", desktop.clone(), "Скопировать путь", "52,211,153", "folder"),
-            ]),
-            work_folders: retain_resolved_pins(vec![
-                pin("wf-dl", "folder", "Загрузки", "Свежие файлы", downloads, "Открыть в терминале", "245,158,11", "folder"),
-                pin("wf-docs", "folder", "Документы", "Основная папка", documents.clone(), "Открыть в терминале", "245,158,11", "folder"),
-                pin("wf-testbar", "folder", "testbar", "Проект · сейчас", testbar_dir, "Открыть в терминале", "56,189,248", "folder"),
-                pin("wf-desktop", "folder", "Рабочий стол", "Файлы и ярлыки", desktop, "Открыть в терминале", "56,189,248", "folder"),
-                pin("wf-pics", "folder", "Скриншоты", "Изображения", pictures, "Открыть в терминале", "139,92,246", "folder"),
-                pin("wf-home", "folder", "Профиль", "Домашняя папка", home.to_string_lossy().to_string(), "Открыть в терминале", "52,211,153", "folder"),
-            ]),
-            work_apps: retain_resolved_pins(vec![
-                pin("wa-ag", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
-                pin("wa-cur", "app", "Cursor", "Код", detect_app_target("cursor"), "Новое окно", "226,232,240", "cursor"),
-                pin("wa-vsc", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-                pin("wa-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
-            ]),
-            studio_pins: retain_resolved_pins(vec![
-                pin("photoshop", "app", "Photoshop 2025", "Графика и ретушь", detect_app_target("photoshop"), "От админа", "49,168,255", "photoshop"),
-                pin("obsidian-s", "app", "Obsidian", "База знаний", detect_app_target("obsidian"), "", "139,92,246", "obsidian"),
-                pin("figma", "app", "Figma", "Интерфейсы", detect_app_target("figma"), "", "168,85,247", "figma"),
-                pin("lightroom", "app", "Lightroom", "Classic", detect_app_target("lightroom"), "", "56,189,248", "lightroom"),
-                pin("unity", "app", "Unity Hub", "Проекты 3D", detect_app_target("unity"), "", "226,232,240", "unity"),
-                pin("obs-s", "app", "OBS Studio", "Захват видео", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
-                pin("antigravity-s", "app", "Antigravity", "IDE", detect_app_target("antigravity"), "Новое окно", "56,189,248", "antigravity"),
-                pin("cursor-s", "app", "Cursor", "Редактор кода", detect_app_target("cursor"), "Новое окно", "226,232,240", "cursor"),
-                pin("vscode-s", "app", "VS Code", "Workspace", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-                pin("claude-s", "app", "Claude", "AI-ассистент", detect_app_target("claude"), "", "217,119,87", "claude"),
-                pin("warp-s", "app", "Warp", "Терминал", detect_app_target("warp"), "От админа", "52,211,153", "warp"),
-            ]),
-            studio_tools: retain_resolved_pins(vec![
-                pin("st-snip", "app", "Ножницы", "Скриншот", "ms-screenclip:".to_string(), "", "52,211,153", "scissors"),
-                pin("st-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "warp"),
-                pin("st-wiz", "app", "WizTree", "Диски", detect_app_target("wiztree"), "От админа", "56,189,248", "disk"),
-                pin("st-tm", "app", "Диспетчер", "Процессы", r"C:\Windows\System32\Taskmgr.exe".to_string(), "От админа", "129,140,248", "cpu"),
-            ]),
-            game_launchers: retain_resolved_pins(vec![
-                pin("gl-steam", "app", "Steam", "Библиотека", detect_app_target("steam"), "", "56,189,248", "steam"),
-                pin("gl-bnet", "app", "Battle.net", "Лаунчер", detect_app_target("battlenet"), "", "14,165,233", "battlenet"),
-                pin("gl-discord", "app", "Discord", "Голос", detect_app_target("discord"), "", "99,102,241", "discord"),
-                pin("gl-obs", "app", "OBS Studio", "Запись", detect_app_target("obs"), "От админа", "148,163,184", "obs"),
-            ]),
-            game_combos: vec![
-                combo_pin(
-                    "combo-poe2",
-                    "Path of Exile 2 + Steam",
-                    "Steam · запуск игры",
-                    vec!["steam://rungameid/2694490".to_string()],
-                    "251,113,133",
-                ),
-                combo_pin(
-                    "combo-dota2",
-                    "Dota 2 + Discord",
-                    "Steam + голосовой чат",
-                    {
-                        let mut targets = vec!["steam://rungameid/570".to_string()];
-                        let discord_target = detect_app_target("discord");
-                        if !discord_target.is_empty() {
-                            if is_discord_update_target(&discord_target) {
-                                targets.push(format!(
-                                    "\"{discord_target}\" --processStart Discord.exe"
-                                ));
-                            } else {
-                                targets.push(discord_target);
-                            }
-                        }
-                        targets
-                    },
-                    "56,189,248",
-                ),
-            ],
+            taskbar_pins: retain_resolved_pins(taskbar),
+            spaces: default_modular_spaces(),
+            taskbar_widgets: TaskbarWidgetSettings::default(),
+            personal_pins: vec![],
+            personal_links: vec![],
+            work_folders: vec![],
+            work_apps: vec![],
+            studio_pins: vec![],
+            studio_tools: vec![],
+            game_launchers: vec![],
+            game_combos: vec![],
             custom_spaces: vec![],
             pinned_clipboard: vec![],
         }
@@ -1022,59 +1740,21 @@ pub fn should_force_combo(space: &str, kind: &str) -> bool {
     space == "game_combos" || (space == "games" && kind.trim().eq_ignore_ascii_case("combo"))
 }
 
+fn legacy_parent_space_id(space: &str) -> Option<&'static str> {
+    match space {
+        "personal_pins" | "personal_links" => Some("personal"),
+        "work_folders" | "work_apps" => Some("work"),
+        "studio_pins" | "studio_tools" => Some("studio"),
+        "game_launchers" => Some("games"),
+        _ => None,
+    }
+}
+
 pub fn add_pin_to_space(cfg: &mut TestBarConfig, space: &str, mut item: PinItem) -> bool {
     let force_combo = should_force_combo(space, &item.kind);
     normalize_pin(&mut item, force_combo);
 
     match space {
-        "personal" | "personal_pins" => {
-            cfg.personal_pins.push(item);
-            true
-        }
-        "personal_links" => {
-            cfg.personal_links.push(item);
-            true
-        }
-        "work" => {
-            if item.kind == "app" {
-                cfg.work_apps.push(item);
-            } else {
-                cfg.work_folders.push(item);
-            }
-            true
-        }
-        "work_folders" => {
-            cfg.work_folders.push(item);
-            true
-        }
-        "work_apps" => {
-            cfg.work_apps.push(item);
-            true
-        }
-        "studio" | "studio_pins" => {
-            cfg.studio_pins.push(item);
-            true
-        }
-        "studio_tools" => {
-            cfg.studio_tools.push(item);
-            true
-        }
-        "games" => {
-            if item.kind == "combo" {
-                cfg.game_combos.push(item);
-            } else {
-                cfg.game_launchers.push(item);
-            }
-            true
-        }
-        "game_combos" => {
-            cfg.game_combos.push(item);
-            true
-        }
-        "game_launchers" => {
-            cfg.game_launchers.push(item);
-            true
-        }
         "taskbar" | "taskbar_pins" => {
             let duplicate = (!item.target.is_empty()
                 && cfg
@@ -1095,13 +1775,74 @@ pub fn add_pin_to_space(cfg: &mut TestBarConfig, space: &str, mut item: PinItem)
                 true
             }
         }
-        custom_id => {
-            if let Some(sp) = cfg.custom_spaces.iter_mut().find(|s| s.id == custom_id) {
-                sp.items.push(item);
-                true
-            } else {
-                false
+        "game_combos" => {
+            cfg.game_combos.push(item);
+            true
+        }
+        "games" if item.kind == "combo" => {
+            cfg.game_combos.push(item);
+            true
+        }
+        "personal_pins" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "personal") {
+                sp.items.push(item.clone());
             }
+            cfg.personal_pins.push(item);
+            true
+        }
+        "personal_links" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "personal") {
+                sp.items.push(item.clone());
+            }
+            cfg.personal_links.push(item);
+            true
+        }
+        "work_folders" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "work") {
+                sp.items.push(item.clone());
+            }
+            cfg.work_folders.push(item);
+            true
+        }
+        "work_apps" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "work") {
+                sp.items.push(item.clone());
+            }
+            cfg.work_apps.push(item);
+            true
+        }
+        "studio_pins" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "studio") {
+                sp.items.push(item.clone());
+            }
+            cfg.studio_pins.push(item);
+            true
+        }
+        "studio_tools" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "studio") {
+                sp.items.push(item.clone());
+            }
+            cfg.studio_tools.push(item);
+            true
+        }
+        "game_launchers" => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "games") {
+                sp.items.push(item.clone());
+            }
+            cfg.game_launchers.push(item);
+            true
+        }
+        space_id => {
+            let mut added = false;
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+                sp.items.push(item.clone());
+                added = true;
+            }
+            if let Some(cs) = cfg.custom_spaces.iter_mut().find(|s| s.id == space_id) {
+                cs.items.push(item);
+                added = true;
+            }
+            added
         }
     }
 }
@@ -1114,31 +1855,100 @@ fn remove_by_id(list: &mut Vec<PinItem>, item_id: &str) -> bool {
 
 pub fn remove_pin_from_space(cfg: &mut TestBarConfig, space: &str, item_id: &str) -> bool {
     match space {
-        "personal" | "personal_pins" => remove_by_id(&mut cfg.personal_pins, item_id),
-        "personal_links" => remove_by_id(&mut cfg.personal_links, item_id),
-        "work" => {
-            let removed_folder = remove_by_id(&mut cfg.work_folders, item_id);
-            let removed_app = remove_by_id(&mut cfg.work_apps, item_id);
-            removed_folder || removed_app
-        }
-        "work_folders" => remove_by_id(&mut cfg.work_folders, item_id),
-        "work_apps" => remove_by_id(&mut cfg.work_apps, item_id),
-        "studio" | "studio_pins" => remove_by_id(&mut cfg.studio_pins, item_id),
-        "studio_tools" => remove_by_id(&mut cfg.studio_tools, item_id),
-        "games" => {
-            let removed_combo = remove_by_id(&mut cfg.game_combos, item_id);
-            let removed_launcher = remove_by_id(&mut cfg.game_launchers, item_id);
-            removed_combo || removed_launcher
-        }
-        "game_combos" => remove_by_id(&mut cfg.game_combos, item_id),
-        "game_launchers" => remove_by_id(&mut cfg.game_launchers, item_id),
         "taskbar" | "taskbar_pins" => remove_by_id(&mut cfg.taskbar_pins, item_id),
-        custom_id => cfg
-            .custom_spaces
-            .iter_mut()
-            .find(|s| s.id == custom_id)
-            .map(|sp| remove_by_id(&mut sp.items, item_id))
-            .unwrap_or(false),
+        "game_combos" => remove_by_id(&mut cfg.game_combos, item_id),
+        "personal_pins" => {
+            let mut removed = remove_by_id(&mut cfg.personal_pins, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "personal") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "personal_links" => {
+            let mut removed = remove_by_id(&mut cfg.personal_links, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "personal") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "work_folders" => {
+            let mut removed = remove_by_id(&mut cfg.work_folders, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "work") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "work_apps" => {
+            let mut removed = remove_by_id(&mut cfg.work_apps, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "work") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "studio_pins" => {
+            let mut removed = remove_by_id(&mut cfg.studio_pins, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "studio") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "studio_tools" => {
+            let mut removed = remove_by_id(&mut cfg.studio_tools, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "studio") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "game_launchers" => {
+            let mut removed = remove_by_id(&mut cfg.game_launchers, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "games") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        "games" => {
+            let mut removed = remove_by_id(&mut cfg.game_combos, item_id);
+            removed |= remove_by_id(&mut cfg.game_launchers, item_id);
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == "games") {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            removed
+        }
+        space_id => {
+            let mut removed = false;
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+                removed |= remove_by_id(&mut sp.items, item_id);
+            }
+            if let Some(cs) = cfg.custom_spaces.iter_mut().find(|s| s.id == space_id) {
+                removed |= remove_by_id(&mut cs.items, item_id);
+            }
+            match space_id {
+                "personal" => {
+                    removed |= remove_by_id(&mut cfg.personal_pins, item_id);
+                    removed |= remove_by_id(&mut cfg.personal_links, item_id);
+                }
+                "work" => {
+                    removed |= remove_by_id(&mut cfg.work_folders, item_id);
+                    removed |= remove_by_id(&mut cfg.work_apps, item_id);
+                }
+                "studio" => {
+                    removed |= remove_by_id(&mut cfg.studio_pins, item_id);
+                    removed |= remove_by_id(&mut cfg.studio_tools, item_id);
+                }
+                _ => {}
+            }
+            removed
+        }
+    }
+}
+
+fn reorder_vec(vec: &mut Vec<PinItem>, from_idx: usize, to_idx: usize) -> bool {
+    if from_idx < vec.len() && to_idx < vec.len() && from_idx != to_idx {
+        let item = vec.remove(from_idx);
+        vec.insert(to_idx, item);
+        true
+    } else {
+        false
     }
 }
 
@@ -1148,56 +1958,243 @@ pub fn reorder_pins_in_space(
     from_idx: usize,
     to_idx: usize,
 ) -> bool {
-    let list = match space {
-        "personal" | "personal_pins" => Some(&mut cfg.personal_pins),
-        "personal_links" => Some(&mut cfg.personal_links),
-        "work" | "work_folders" => Some(&mut cfg.work_folders),
-        "work_apps" => Some(&mut cfg.work_apps),
-        "studio" | "studio_pins" => Some(&mut cfg.studio_pins),
-        "studio_tools" => Some(&mut cfg.studio_tools),
-        "games" | "game_combos" => Some(&mut cfg.game_combos),
-        "game_launchers" => Some(&mut cfg.game_launchers),
-        "taskbar" | "taskbar_pins" => Some(&mut cfg.taskbar_pins),
-        custom_id => cfg
-            .custom_spaces
-            .iter_mut()
-            .find(|s| s.id == custom_id)
-            .map(|s| &mut s.items),
-    };
-    if let Some(vec) = list {
-        if from_idx < vec.len() && to_idx < vec.len() && from_idx != to_idx {
-            let item = vec.remove(from_idx);
-            vec.insert(to_idx, item);
-            return true;
+    match space {
+        "taskbar" | "taskbar_pins" => reorder_vec(&mut cfg.taskbar_pins, from_idx, to_idx),
+        "game_combos" => reorder_vec(&mut cfg.game_combos, from_idx, to_idx),
+        "personal_pins" => reorder_vec(&mut cfg.personal_pins, from_idx, to_idx),
+        "personal_links" => reorder_vec(&mut cfg.personal_links, from_idx, to_idx),
+        "work_folders" => reorder_vec(&mut cfg.work_folders, from_idx, to_idx),
+        "work_apps" => reorder_vec(&mut cfg.work_apps, from_idx, to_idx),
+        "studio_pins" => reorder_vec(&mut cfg.studio_pins, from_idx, to_idx),
+        "studio_tools" => reorder_vec(&mut cfg.studio_tools, from_idx, to_idx),
+        "game_launchers" => reorder_vec(&mut cfg.game_launchers, from_idx, to_idx),
+        space_id => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+                reorder_vec(&mut sp.items, from_idx, to_idx)
+            } else if let Some(cs) = cfg.custom_spaces.iter_mut().find(|s| s.id == space_id) {
+                reorder_vec(&mut cs.items, from_idx, to_idx)
+            } else {
+                false
+            }
         }
     }
-    false
 }
 
-pub fn update_custom_space(
+fn transliterate_cyrillic_char(ch: char) -> &'static str {
+    match ch {
+        'а' => "a",
+        'б' => "b",
+        'в' => "v",
+        'г' => "g",
+        'д' => "d",
+        'е' | 'ё' => "e",
+        'ж' => "zh",
+        'з' => "z",
+        'и' | 'й' => "i",
+        'к' => "k",
+        'л' => "l",
+        'м' => "m",
+        'н' => "n",
+        'о' => "o",
+        'п' => "p",
+        'р' => "r",
+        'с' => "s",
+        'т' => "t",
+        'у' => "u",
+        'ф' => "f",
+        'х' => "h",
+        'ц' => "ts",
+        'ч' => "ch",
+        'ш' => "sh",
+        'щ' => "sch",
+        'ъ' | 'ь' => "",
+        'ы' => "y",
+        'э' => "e",
+        'ю' => "yu",
+        'я' => "ya",
+        _ => "",
+    }
+}
+
+fn slugify_space_id(name: &str, cfg: &TestBarConfig) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = true;
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            prev_dash = false;
+        } else {
+            let tr = transliterate_cyrillic_char(ch);
+            if !tr.is_empty() {
+                slug.push_str(tr);
+                prev_dash = false;
+            } else if !prev_dash && (ch == '-' || ch == '_' || ch.is_whitespace()) {
+                slug.push('-');
+                prev_dash = true;
+            }
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    let base = if slug.is_empty() {
+        "space".to_string()
+    } else {
+        slug.chars().take(32).collect()
+    };
+    let is_taken = |cand: &str| {
+        cfg.spaces.iter().any(|s| s.id == cand)
+            || cfg.custom_spaces.iter().any(|s| s.id == cand)
+    };
+    if !is_taken(&base) {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let cand = format!("{base}-{suffix}");
+        if !is_taken(&cand) {
+            return cand;
+        }
+        suffix += 1;
+    }
+}
+
+struct SpaceTemplateSpec {
+    accent_hex: &'static str,
+    accent_rgb: &'static str,
+    layout_kind: &'static str,
+    show_hero_row: bool,
+    widgets: &'static [&'static str],
+}
+
+fn space_template_spec(template: &str) -> Result<SpaceTemplateSpec, String> {
+    match template.trim().to_ascii_lowercase().as_str() {
+        "blank" | "" => Ok(SpaceTemplateSpec {
+            accent_hex: "#A78BFA",
+            accent_rgb: "167,139,250",
+            layout_kind: SPACE_LAYOUT_GRID,
+            show_hero_row: false,
+            widgets: &[],
+        }),
+        "personal" => Ok(SpaceTemplateSpec {
+            accent_hex: "#818CF8",
+            accent_rgb: "129,140,248",
+            layout_kind: SPACE_LAYOUT_GRID,
+            show_hero_row: true,
+            widgets: &["media", "audio_mixer", "clipboard"],
+        }),
+        "work" => Ok(SpaceTemplateSpec {
+            accent_hex: "#38BDF8",
+            accent_rgb: "56,189,248",
+            layout_kind: SPACE_LAYOUT_GRID,
+            show_hero_row: false,
+            widgets: &["pc_health", "top_processes"],
+        }),
+        "studio" => Ok(SpaceTemplateSpec {
+            accent_hex: "#34D399",
+            accent_rgb: "52,211,153",
+            layout_kind: SPACE_LAYOUT_GRID,
+            show_hero_row: true,
+            widgets: &["pc_health", "audio_mixer", "top_processes"],
+        }),
+        "games" => Ok(SpaceTemplateSpec {
+            accent_hex: "#FB7185",
+            accent_rgb: "251,113,133",
+            layout_kind: SPACE_LAYOUT_GAMES,
+            show_hero_row: false,
+            widgets: &["audio_mixer", "game_combos", "pc_health"],
+        }),
+        other => Err(format!(
+            "Неизвестный шаблон пространства: '{other}' (допустимы: blank, personal, work, studio, games)"
+        )),
+    }
+}
+
+pub fn create_space_from_template(
+    cfg: &mut TestBarConfig,
+    name: String,
+    template: &str,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    widgets: Option<Vec<String>>,
+) -> Result<SpaceConfig, String> {
+    if cfg.spaces.len() >= MAX_SPACES {
+        return Err(format!(
+            "Достигнуто максимальное количество пространств ({MAX_SPACES})"
+        ));
+    }
+    let clean_name = name.trim().to_string();
+    if clean_name.is_empty() {
+        return Err("Пустое название пространства".to_string());
+    }
+    let spec = space_template_spec(template)?;
+    let (hex, rgb) = if accent_hex.is_some() || accent_rgb.is_some() {
+        sanitize_accent_hex_rgb(
+            accent_hex.as_deref().or(Some(spec.accent_hex)),
+            accent_rgb.as_deref(),
+        )
+    } else {
+        (spec.accent_hex.to_string(), spec.accent_rgb.to_string())
+    };
+    let final_widgets = match widgets {
+        Some(w) => validate_and_normalize_space_widgets(&w)?,
+        None => spec.widgets.iter().map(|s| (*s).to_string()).collect(),
+    };
+    let id = slugify_space_id(&clean_name, cfg);
+    let space = SpaceConfig {
+        id,
+        name: clean_name,
+        accent_hex: hex,
+        accent_rgb: rgb,
+        layout_kind: spec.layout_kind.to_string(),
+        show_hero_row: spec.show_hero_row,
+        widgets: final_widgets,
+        items: vec![],
+    };
+    cfg.spaces.push(space.clone());
+    Ok(space)
+}
+
+pub fn update_space_config(
     cfg: &mut TestBarConfig,
     id: &str,
     name: Option<String>,
     accent_hex: Option<String>,
     accent_rgb: Option<String>,
-    widget_preset: Option<String>,
+    layout_kind: Option<String>,
+    show_hero_row: Option<bool>,
+    widgets: Option<Vec<String>>,
 ) -> Result<bool, String> {
-    let Some(space) = cfg.custom_spaces.iter_mut().find(|s| s.id == id) else {
+    let next_name = match name {
+        Some(raw) => {
+            let clean = raw.trim().to_string();
+            if clean.is_empty() {
+                return Err("Пустое название пространства".to_string());
+            }
+            Some(clean)
+        }
+        None => None,
+    };
+    let next_layout = match layout_kind {
+        Some(kind) => Some(validate_space_layout_kind(&kind)?.to_string()),
+        None => None,
+    };
+    let next_widgets = match widgets {
+        Some(w) => Some(validate_and_normalize_space_widgets(&w)?),
+        None => None,
+    };
+
+    let Some(space) = cfg.spaces.iter_mut().find(|s| s.id == id) else {
         return Err(format!("Пространство '{id}' не найдено"));
     };
-    let mut changed = false;
 
-    if let Some(raw_name) = name {
-        let clean = raw_name.trim().to_string();
-        if clean.is_empty() {
-            return Err("Пустое название пространства".to_string());
-        }
+    let mut changed = false;
+    if let Some(clean) = next_name {
         if space.name != clean {
             space.name = clean;
             changed = true;
         }
     }
-
     if accent_hex.is_some() || accent_rgb.is_some() {
         let (hex, rgb) = sanitize_accent_hex_rgb(
             accent_hex.as_deref().or(Some(&space.accent_hex)),
@@ -1212,13 +2209,219 @@ pub fn update_custom_space(
             changed = true;
         }
     }
-
-    if let Some(preset) = widget_preset {
-        let valid = validate_widget_preset(&preset)?;
-        if space.widget_preset != valid {
-            space.widget_preset = valid.to_string();
+    if let Some(layout) = next_layout {
+        if space.layout_kind != layout {
+            space.layout_kind = layout;
             changed = true;
         }
+    }
+    if let Some(hero) = show_hero_row {
+        if space.show_hero_row != hero {
+            space.show_hero_row = hero;
+            changed = true;
+        }
+    }
+    if let Some(w) = next_widgets {
+        if space.widgets != w {
+            space.widgets = w;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+pub fn delete_space_by_id(cfg: &mut TestBarConfig, id: &str) -> Result<bool, String> {
+    let Some(pos) = cfg.spaces.iter().position(|s| s.id == id) else {
+        return Ok(false);
+    };
+    if cfg.spaces.len() <= 1 {
+        return Err("Нельзя удалить последнее пространство".to_string());
+    }
+    let removed = cfg.spaces.remove(pos);
+    cfg.custom_spaces.retain(|s| s.id != id);
+    cfg.frecency.remove(id);
+    for item in &removed.items {
+        cfg.frecency.remove(&item.id);
+        cfg.frecency.remove(&format!("pin:{}", item.id));
+    }
+    Ok(true)
+}
+
+pub fn reorder_spaces_by_ids(
+    cfg: &mut TestBarConfig,
+    ordered_ids: Vec<String>,
+) -> Result<bool, String> {
+    if ordered_ids.len() != cfg.spaces.len() {
+        return Err(format!(
+            "Некорректный список пространств для сортировки: получено {}, ожидалось {}",
+            ordered_ids.len(),
+            cfg.spaces.len()
+        ));
+    }
+    let mut seen = HashSet::with_capacity(ordered_ids.len());
+    for id in &ordered_ids {
+        if !seen.insert(id.as_str()) {
+            return Err(format!("Дубликат идентификатора пространства: '{id}'"));
+        }
+        if !cfg.spaces.iter().any(|s| s.id == *id) {
+            return Err(format!("Неизвестное пространство при сортировке: '{id}'"));
+        }
+    }
+    if cfg
+        .spaces
+        .iter()
+        .map(|s| s.id.as_str())
+        .eq(ordered_ids.iter().map(String::as_str))
+    {
+        return Ok(false);
+    }
+
+    let mut by_id: HashMap<String, SpaceConfig> = cfg
+        .spaces
+        .drain(..)
+        .map(|sp| (sp.id.clone(), sp))
+        .collect();
+    for id in ordered_ids {
+        if let Some(sp) = by_id.remove(&id) {
+            cfg.spaces.push(sp);
+        }
+    }
+    Ok(true)
+}
+
+pub fn set_space_widgets_by_id(
+    cfg: &mut TestBarConfig,
+    id: &str,
+    widgets: Vec<String>,
+) -> Result<bool, String> {
+    let normalized = validate_and_normalize_space_widgets(&widgets)?;
+    let Some(space) = cfg.spaces.iter_mut().find(|s| s.id == id) else {
+        return Err(format!("Пространство '{id}' не найдено"));
+    };
+    if space.widgets == normalized {
+        return Ok(false);
+    }
+    space.widgets = normalized;
+    Ok(true)
+}
+
+pub fn set_taskbar_widgets(
+    cfg: &mut TestBarConfig,
+    mut settings: TaskbarWidgetSettings,
+) -> Result<bool, String> {
+    settings.weather_city = settings.weather_city.trim().to_string();
+    settings.weather_units = validate_weather_units(&settings.weather_units)?.to_string();
+
+    match (settings.weather_lat, settings.weather_lon) {
+        (Some(lat), Some(lon)) => {
+            if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+                return Err("Некорректная широта погоды".to_string());
+            }
+            if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+                return Err("Некорректная долгота погоды".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("Укажите обе координаты (широту и долготу)".to_string()),
+    }
+
+    if cfg.taskbar_widgets == settings {
+        return Ok(false);
+    }
+    cfg.taskbar_widgets = settings;
+    Ok(true)
+}
+
+pub fn update_custom_space(
+    cfg: &mut TestBarConfig,
+    id: &str,
+    name: Option<String>,
+    accent_hex: Option<String>,
+    accent_rgb: Option<String>,
+    widget_preset: Option<String>,
+) -> Result<bool, String> {
+    let next_name = match name {
+        Some(raw) => {
+            let clean = raw.trim().to_string();
+            if clean.is_empty() {
+                return Err("Пустое название пространства".to_string());
+            }
+            Some(clean)
+        }
+        None => None,
+    };
+    let next_preset = match widget_preset {
+        Some(preset) => Some(validate_widget_preset(&preset)?.to_string()),
+        None => None,
+    };
+
+    let mut found = false;
+    let mut changed = false;
+
+    if let Some(space) = cfg.custom_spaces.iter_mut().find(|s| s.id == id) {
+        found = true;
+        if let Some(ref clean) = next_name {
+            if space.name != *clean {
+                space.name = clean.clone();
+                changed = true;
+            }
+        }
+        if accent_hex.is_some() || accent_rgb.is_some() {
+            let (hex, rgb) = sanitize_accent_hex_rgb(
+                accent_hex.as_deref().or(Some(&space.accent_hex)),
+                accent_rgb.as_deref(),
+            );
+            if space.accent_hex != hex {
+                space.accent_hex = hex;
+                changed = true;
+            }
+            if space.accent_rgb != rgb {
+                space.accent_rgb = rgb;
+                changed = true;
+            }
+        }
+        if let Some(ref valid) = next_preset {
+            if space.widget_preset != *valid {
+                space.widget_preset = valid.clone();
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == id) {
+        found = true;
+        if let Some(ref clean) = next_name {
+            if sp.name != *clean {
+                sp.name = clean.clone();
+                changed = true;
+            }
+        }
+        if accent_hex.is_some() || accent_rgb.is_some() {
+            let (hex, rgb) = sanitize_accent_hex_rgb(
+                accent_hex.as_deref().or(Some(&sp.accent_hex)),
+                accent_rgb.as_deref(),
+            );
+            if sp.accent_hex != hex {
+                sp.accent_hex = hex;
+                changed = true;
+            }
+            if sp.accent_rgb != rgb {
+                sp.accent_rgb = rgb;
+                changed = true;
+            }
+        }
+        if let Some(ref valid) = next_preset {
+            let widgets = widget_preset_to_widgets(valid);
+            if sp.widgets != widgets {
+                sp.widgets = widgets;
+                changed = true;
+            }
+        }
+    }
+
+    if !found {
+        return Err(format!("Пространство '{id}' не найдено"));
     }
 
     Ok(changed)
@@ -1229,6 +2432,9 @@ pub fn delete_custom_space(cfg: &mut TestBarConfig, id: &str) -> bool {
         return false;
     };
     let removed = cfg.custom_spaces.remove(pos);
+    if cfg.spaces.len() > 1 {
+        cfg.spaces.retain(|s| s.id != id);
+    }
     cfg.frecency.remove(id);
     for item in &removed.items {
         cfg.frecency.remove(&item.id);
@@ -1243,7 +2449,17 @@ fn find_pin_mut<'a>(
     pin_id: &str,
 ) -> Option<(&'a mut PinItem, bool)> {
     match space {
-        "personal" | "personal_pins" => cfg
+        "taskbar" | "taskbar_pins" => cfg
+            .taskbar_pins
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, false)),
+        "game_combos" => cfg
+            .game_combos
+            .iter_mut()
+            .find(|p| p.id == pin_id)
+            .map(|p| (p, true)),
+        "personal_pins" => cfg
             .personal_pins
             .iter_mut()
             .find(|p| p.id == pin_id)
@@ -1253,16 +2469,6 @@ fn find_pin_mut<'a>(
             .iter_mut()
             .find(|p| p.id == pin_id)
             .map(|p| (p, false)),
-        "work" => {
-            if let Some(p) = cfg.work_folders.iter_mut().find(|p| p.id == pin_id) {
-                Some((p, false))
-            } else {
-                cfg.work_apps
-                    .iter_mut()
-                    .find(|p| p.id == pin_id)
-                    .map(|p| (p, false))
-            }
-        }
         "work_folders" => cfg
             .work_folders
             .iter_mut()
@@ -1273,7 +2479,7 @@ fn find_pin_mut<'a>(
             .iter_mut()
             .find(|p| p.id == pin_id)
             .map(|p| (p, false)),
-        "studio" | "studio_pins" => cfg
+        "studio_pins" => cfg
             .studio_pins
             .iter_mut()
             .find(|p| p.id == pin_id)
@@ -1283,41 +2489,34 @@ fn find_pin_mut<'a>(
             .iter_mut()
             .find(|p| p.id == pin_id)
             .map(|p| (p, false)),
-        "games" => {
-            if let Some(p) = cfg.game_combos.iter_mut().find(|p| p.id == pin_id) {
-                Some((p, true))
-            } else {
-                cfg.game_launchers
-                    .iter_mut()
-                    .find(|p| p.id == pin_id)
-                    .map(|p| (p, false))
-            }
-        }
-        "game_combos" => cfg
-            .game_combos
-            .iter_mut()
-            .find(|p| p.id == pin_id)
-            .map(|p| (p, true)),
         "game_launchers" => cfg
             .game_launchers
             .iter_mut()
             .find(|p| p.id == pin_id)
             .map(|p| (p, false)),
-        "taskbar" | "taskbar_pins" => cfg
-            .taskbar_pins
-            .iter_mut()
-            .find(|p| p.id == pin_id)
-            .map(|p| (p, false)),
-        custom_id => cfg
-            .custom_spaces
-            .iter_mut()
-            .find(|s| s.id == custom_id)
-            .and_then(|s| s.items.iter_mut().find(|p| p.id == pin_id))
-            .map(|p| (p, false)),
+        space_id => {
+            if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == space_id) {
+                if let Some(p) = sp.items.iter_mut().find(|p| p.id == pin_id) {
+                    return Some((p, false));
+                }
+            }
+            if space_id == "games" {
+                if let Some(p) = cfg.game_combos.iter_mut().find(|p| p.id == pin_id) {
+                    return Some((p, true));
+                }
+            }
+            if let Some(cs) = cfg.custom_spaces.iter_mut().find(|s| s.id == space_id) {
+                if let Some(p) = cs.items.iter_mut().find(|p| p.id == pin_id) {
+                    return Some((p, false));
+                }
+            }
+            None
+        }
     }
 }
 
-pub fn update_pin(
+#[allow(clippy::too_many_arguments)]
+pub fn update_pin_v2(
     cfg: &mut TestBarConfig,
     space: &str,
     pin_id: &str,
@@ -1326,17 +2525,27 @@ pub fn update_pin(
     args: Option<String>,
     alt_action: Option<String>,
     alt_label: Option<String>,
+    custom_icon: Option<Option<String>>,
+    custom_color: Option<Option<String>>,
+    icon_data: Option<Option<String>>,
 ) -> Result<bool, String> {
+    let next_title = match title {
+        Some(raw) => {
+            let clean = raw.trim().to_string();
+            if clean.is_empty() {
+                return Err("Название элемента не может быть пустым".to_string());
+            }
+            Some(clean)
+        }
+        None => None,
+    };
+
     let Some((pin_item, force_combo)) = find_pin_mut(cfg, space, pin_id) else {
         return Err(format!("Элемент '{pin_id}' не найден в '{space}'"));
     };
     let mut changed = false;
 
-    if let Some(raw_title) = title {
-        let clean = raw_title.trim().to_string();
-        if clean.is_empty() {
-            return Err("Название элемента не может быть пустым".to_string());
-        }
+    if let Some(clean) = next_title {
         if pin_item.title != clean {
             pin_item.title = clean;
             changed = true;
@@ -1347,7 +2556,6 @@ pub fn update_pin(
         let clean = raw_target.trim().to_string();
         if pin_item.target != clean {
             pin_item.target = clean;
-            // Re-derive match_exe on target update for app pins
             if pin_item.kind == "app" {
                 pin_item.match_exe = None;
             }
@@ -1381,11 +2589,70 @@ pub fn update_pin(
         }
     }
 
+    if let Some(next_icon_opt) = custom_icon {
+        let cleaned = next_icon_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if pin_item.custom_icon != cleaned {
+            pin_item.custom_icon = cleaned;
+            changed = true;
+        }
+    }
+
+    if let Some(next_color_opt) = custom_color {
+        let cleaned = next_color_opt.as_deref().and_then(sanitize_custom_color);
+        if pin_item.custom_color != cleaned {
+            pin_item.custom_color = cleaned;
+            changed = true;
+        }
+    }
+
+    if let Some(next_data_opt) = icon_data {
+        let cleaned = next_data_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if pin_item.icon_data != cleaned {
+            pin_item.icon_data = cleaned;
+            changed = true;
+        }
+    }
+
     if normalize_pin(pin_item, force_combo) {
         changed = true;
     }
 
+    // Mirror edits made through legacy sub-list keys into the corresponding v2 space if present.
+    if let Some(parent_id) = legacy_parent_space_id(space) {
+        let updated_clone = pin_item.clone();
+        if let Some(sp) = cfg.spaces.iter_mut().find(|s| s.id == parent_id) {
+            if let Some(mirror) = sp.items.iter_mut().find(|p| p.id == pin_id) {
+                if *mirror != updated_clone {
+                    *mirror = updated_clone;
+                }
+            }
+        }
+    }
+
     Ok(changed)
+}
+
+pub fn update_pin(
+    cfg: &mut TestBarConfig,
+    space: &str,
+    pin_id: &str,
+    title: Option<String>,
+    target: Option<String>,
+    args: Option<String>,
+    alt_action: Option<String>,
+    alt_label: Option<String>,
+) -> Result<bool, String> {
+    update_pin_v2(
+        cfg, space, pin_id, title, target, args, alt_action, alt_label, None, None, None,
+    )
 }
 
 pub fn add_game_combo(
@@ -2110,8 +3377,8 @@ fn try_heal_single_pin(
 }
 
 /// Auto-heals empty or broken app pin targets across ALL TestBar pin lists (`taskbarPins`,
-/// `personalPins`, `workApps`, `studioPins`, `gameLaunchers`, and `customSpaces`) by matching
-/// against live running windows, indexed installed apps, and canonical disk locations.
+/// v2 `spaces`, legacy lists, and `customSpaces`) by matching against live running windows,
+/// indexed installed apps, and canonical disk locations.
 /// Returns `true` iff at least one pin was repaired or enriched.
 pub fn heal_broken_pins(
     cfg: &mut TestBarConfig,
@@ -2127,6 +3394,13 @@ pub fn heal_broken_pins(
         &mut cfg.game_launchers,
     ] {
         for pin in list.iter_mut() {
+            if try_heal_single_pin(pin, installed_apps, open_groups) {
+                changed = true;
+            }
+        }
+    }
+    for sp in &mut cfg.spaces {
+        for pin in &mut sp.items {
             if try_heal_single_pin(pin, installed_apps, open_groups) {
                 changed = true;
             }
@@ -2179,7 +3453,9 @@ mod tests {
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.revision, 0);
         assert_eq!(cfg.bar_mode, "dock");
-        assert!(!cfg.personal_pins.is_empty());
+        assert_eq!(cfg.spaces.len(), 4);
+        assert!(!cfg.spaces[0].items.is_empty());
+        assert!(!normalize_and_migrate(&mut cfg));
 
         let folder_pin = pin(
             "custom-folder-1",
@@ -2192,26 +3468,27 @@ mod tests {
             "folder",
         );
         assert!(add_pin_to_space(&mut cfg, "personal", folder_pin));
-        assert!(cfg.personal_pins.iter().any(|p| p.id == "custom-folder-1"));
+        assert!(cfg.spaces[0].items.iter().any(|p| p.id == "custom-folder-1"));
 
-        let prev_first = cfg.personal_pins[0].id.clone();
+        let prev_first = cfg.spaces[0].items[0].id.clone();
         assert!(reorder_pins_in_space(&mut cfg, "personal", 0, 1));
-        assert_eq!(cfg.personal_pins[1].id, prev_first);
+        assert_eq!(cfg.spaces[0].items[1].id, prev_first);
 
         assert!(remove_pin_from_space(&mut cfg, "personal", "custom-folder-1"));
-        assert!(!cfg.personal_pins.iter().any(|p| p.id == "custom-folder-1"));
+        assert!(!cfg.spaces[0].items.iter().any(|p| p.id == "custom-folder-1"));
 
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed: TestBarConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.bar_mode, "dock");
         assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(parsed.spaces.len(), 4);
     }
 
     #[test]
     fn derive_match_exe_handles_executables_and_rejects_urls_folders_and_schemes() {
         assert_eq!(
-            derive_match_exe(r"C:\Program Files\Zen Browser\Zen.EXE"),
-            Some("zen.exe".to_string())
+            derive_match_exe(r"C:\Program Files\Firefox\Firefox.EXE"),
+            Some("firefox.exe".to_string())
         );
         assert_eq!(
             derive_match_exe(r"C:\Program Files\Unity Hub\Unity Hub.exe"),
@@ -2226,8 +3503,8 @@ mod tests {
             Some("code.exe".to_string())
         );
         assert_eq!(
-            derive_match_exe(r"\\?\C:\Program Files\Zen Browser\Zen.exe"),
-            Some("zen.exe".to_string())
+            derive_match_exe(r"\\?\C:\Program Files\Mozilla Firefox\firefox.exe"),
+            Some("firefox.exe".to_string())
         );
         assert_eq!(
             derive_match_exe(r"\\?\UNC\server\share\Tools\Code.exe"),
@@ -2254,15 +3531,15 @@ mod tests {
         assert_eq!(derive_match_exe("https://example.com/setup.exe"), None);
         assert_eq!(derive_match_exe("steam://rungameid/570"), None);
         assert_eq!(derive_match_exe("ms-screenclip:"), None);
-        assert_eq!(derive_match_exe(r"C:\Users\loki2\Downloads"), None);
-        assert_eq!(derive_match_exe(r"C:\Users\loki2\app.exe\"), None);
+        assert_eq!(derive_match_exe(r"C:\Users\alice\Downloads"), None);
+        assert_eq!(derive_match_exe(r"C:\Users\alice\app.exe\"), None);
         assert_eq!(derive_match_exe(".exe"), None);
         assert_eq!(derive_match_exe("   "), None);
     }
 
     #[test]
     fn load_config_handles_utf8_bom_missing_bar_mode_and_preserves_newer_schema_version() {
-        let dir = make_temp_dir("bom-partial-v2");
+        let dir = make_temp_dir("bom-partial-v3");
 
         // 1. Partial config missing barMode & CustomSpace accent fields
         let partial_path = dir.join("partial.json");
@@ -2283,29 +3560,32 @@ mod tests {
         assert_eq!(loaded_partial.taskbar_pins[0].match_exe.as_deref(), Some("myapp.exe"));
         assert_eq!(loaded_partial.custom_spaces.len(), 1);
         assert_eq!(loaded_partial.custom_spaces[0].id, "cs1");
+        assert!(loaded_partial.spaces.iter().any(|s| s.id == "cs1"));
 
         // 2. UTF-8 BOM prefixed file loads cleanly without resetting pins
         let bom_path = dir.join("bom.json");
         let bom_json = format!("\u{feff}{}", r##"{"schemaVersion":1,"revision":3,"barMode":"edge","taskbarPins":[{"id":"b1","kind":"app","title":"BomApp","target":"C:\\Apps\\Bom.exe","matchExe":"bom.exe"}]}"##);
         fs::write(&bom_path, bom_json).expect("write bom");
         let loaded_bom = load_config_from(&bom_path);
+        assert_eq!(loaded_bom.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(loaded_bom.bar_mode, "edge");
         assert_eq!(loaded_bom.revision, 3);
         assert_eq!(loaded_bom.taskbar_pins.len(), 1);
         assert_eq!(loaded_bom.taskbar_pins[0].title, "BomApp");
+        assert!(!loaded_bom.spaces.is_empty());
 
-        // 3. Newer schemaVersion (2) is preserved untouched and not downgraded
-        let v2_path = dir.join("v2.json");
-        let v2_json = r##"{"schemaVersion":2,"revision":10,"barMode":"dock","taskbarPins":[{"id":"v2p","kind":"app","title":"FutureApp","target":"C:\\Apps\\Future.exe","matchExe":"future.exe"}]}"##;
-        fs::write(&v2_path, v2_json).expect("write v2");
-        let mut loaded_v2 = load_config_from(&v2_path);
-        assert_eq!(loaded_v2.schema_version, 2);
-        assert_eq!(loaded_v2.revision, 10);
-        assert!(!normalize_and_migrate(&mut loaded_v2));
-        assert_eq!(loaded_v2.schema_version, 2);
-        let on_disk_v2: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&v2_path).expect("read v2")).expect("parse");
-        assert_eq!(on_disk_v2["schemaVersion"], 2);
+        // 3. Newer schemaVersion (3) is preserved untouched and not downgraded
+        let v3_path = dir.join("v3.json");
+        let v3_json = r##"{"schemaVersion":3,"revision":10,"barMode":"dock","taskbarPins":[{"id":"v3p","kind":"app","title":"FutureApp","target":"C:\\Apps\\Future.exe","matchExe":"future.exe"}],"spaces":[{"id":"personal","name":"Личное","accentHex":"#818CF8","accentRgb":"129,140,248","layoutKind":"grid","showHeroRow":true,"widgets":["media"],"items":[]}]}"##;
+        fs::write(&v3_path, v3_json).expect("write v3");
+        let mut loaded_v3 = load_config_from(&v3_path);
+        assert_eq!(loaded_v3.schema_version, 3);
+        assert_eq!(loaded_v3.revision, 10);
+        assert!(!normalize_and_migrate(&mut loaded_v3));
+        assert_eq!(loaded_v3.schema_version, 3);
+        let on_disk_v3: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&v3_path).expect("read v3")).expect("parse");
+        assert_eq!(on_disk_v3["schemaVersion"], 3);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2339,6 +3619,8 @@ mod tests {
                 match_exe: Some("  Slack.EXE ".to_string()),
                 match_aumid: Some("   ".to_string()),
                 combo_targets: None,
+                custom_icon: Some("  chat  ".to_string()),
+                custom_color: Some(" #38bdf8 ".to_string()),
             },
             // Non-forced combo item with target and no combo_targets
             PinItem {
@@ -2356,6 +3638,8 @@ mod tests {
                 match_exe: None,
                 match_aumid: Some("  My.App!Id  ".to_string()),
                 combo_targets: None,
+                custom_icon: Some("   ".to_string()),
+                custom_color: Some("   ".to_string()),
             },
             // Non-app item with padded/uppercase match_exe
             PinItem {
@@ -2373,6 +3657,8 @@ mod tests {
                 match_exe: Some(" Explorer.EXE ".to_string()),
                 match_aumid: None,
                 combo_targets: None,
+                custom_icon: None,
+                custom_color: None,
             },
         ];
 
@@ -2396,6 +3682,8 @@ mod tests {
                 "   ".to_string(),
                 "C:\\Apps\\Tool.exe".to_string(),
             ]),
+            custom_icon: None,
+            custom_color: None,
         }];
 
         assert!(normalize_and_migrate(&mut cfg));
@@ -2411,6 +3699,8 @@ mod tests {
         );
         assert_eq!(cfg.personal_pins[0].args, None);
         assert_eq!(cfg.personal_pins[0].match_aumid, None);
+        assert_eq!(cfg.personal_pins[0].custom_icon.as_deref(), Some("chat"));
+        assert_eq!(cfg.personal_pins[0].custom_color.as_deref(), Some("#38BDF8"));
 
         assert_eq!(cfg.personal_pins[1].kind, "combo");
         assert_eq!(
@@ -2421,6 +3711,8 @@ mod tests {
             cfg.personal_pins[1].match_aumid.as_deref(),
             Some("My.App!Id")
         );
+        assert_eq!(cfg.personal_pins[1].custom_icon, None);
+        assert_eq!(cfg.personal_pins[1].custom_color, None);
 
         assert_eq!(cfg.personal_pins[2].kind, "folder");
         assert_eq!(
@@ -2441,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v0_migration_preserves_pins_and_persists_v1_atomically() {
+    fn legacy_v0_migration_preserves_pins_and_persists_v2_atomically() {
         let dir = make_temp_dir("v0-migrate");
         let path = dir.join("config.json");
 
@@ -2450,24 +3742,24 @@ mod tests {
           "autostart": true,
           "taskbarPins": [
             {
-              "id": "tb-zen",
+              "id": "tb-ff",
               "kind": "app",
-              "name": "Zen Browser",
+              "name": "Firefox",
               "subtitle": "Browser",
-              "target": "C:\\Program Files\\Zen Browser\\Zen.EXE",
+              "target": "C:\\Program Files\\Mozilla Firefox\\firefox.EXE",
               "altAction": "New Window",
               "accentRgb": "249,115,22",
-              "iconKey": "zen"
+              "iconKey": "firefox"
             },
             {
               "id": "tb-url",
               "kind": "url",
-              "name": "Claude Web",
+              "name": "Docs Web",
               "subtitle": "Site",
-              "target": "https://claude.ai",
+              "target": "https://example.org",
               "altAction": "Open",
               "accentRgb": "217,119,87",
-              "iconKey": "claude"
+              "iconKey": "url"
             }
           ],
           "personalPins": [
@@ -2502,7 +3794,7 @@ mod tests {
           "gameCombos": [
             {
               "id": "combo-1",
-              "name": "Dota + Discord",
+              "name": "Game + Discord",
               "subtitle": "Stack",
               "targets": ["steam://rungameid/570", "C:\\Discord\\Update.exe"],
               "accentRgb": "56,189,248"
@@ -2514,6 +3806,7 @@ mod tests {
               "name": "Dev",
               "accentHex": "#A78BFA",
               "accentRgb": "167,139,250",
+              "widgetPreset": "telemetry_processes",
               "items": [
                 {
                   "id": "c-code",
@@ -2541,11 +3834,11 @@ mod tests {
 
         // App pin migrated name -> title and derived lowercase match_exe
         assert_eq!(loaded.taskbar_pins.len(), 2);
-        assert_eq!(loaded.taskbar_pins[0].title, "Zen Browser");
-        assert_eq!(loaded.taskbar_pins[0].match_exe.as_deref(), Some("zen.exe"));
+        assert_eq!(loaded.taskbar_pins[0].title, "Firefox");
+        assert_eq!(loaded.taskbar_pins[0].match_exe.as_deref(), Some("firefox.exe"));
 
         // URL, URI scheme, and folder stay match_exe = None
-        assert_eq!(loaded.taskbar_pins[1].title, "Claude Web");
+        assert_eq!(loaded.taskbar_pins[1].title, "Docs Web");
         assert_eq!(loaded.taskbar_pins[1].match_exe, None);
         assert_eq!(loaded.personal_pins[0].match_exe, None);
         assert_eq!(loaded.personal_links[0].match_exe, None);
@@ -2553,7 +3846,7 @@ mod tests {
         // Legacy GameCombo migrated into polymorphic PinItem kind = "combo"
         assert_eq!(loaded.game_combos.len(), 1);
         assert_eq!(loaded.game_combos[0].kind, "combo");
-        assert_eq!(loaded.game_combos[0].title, "Dota + Discord");
+        assert_eq!(loaded.game_combos[0].title, "Game + Discord");
         assert_eq!(
             loaded.game_combos[0].combo_targets,
             Some(vec![
@@ -2562,26 +3855,41 @@ mod tests {
             ])
         );
 
+        // v2 Spaces migrated cleanly (4 core + 1 custom = 5)
+        assert_eq!(loaded.spaces.len(), 5);
+        assert_eq!(loaded.spaces[0].id, "personal");
+        assert_eq!(loaded.spaces[0].items.len(), 2);
+        assert_eq!(loaded.spaces[0].items[0].id, "p-snip");
+        assert_eq!(loaded.spaces[0].items[1].id, "lnk-1");
+        assert_eq!(loaded.spaces[4].id, "custom-1");
+        assert_eq!(loaded.spaces[4].widgets, vec!["pc_health", "top_processes"]);
+        assert_eq!(
+            loaded.spaces[4].items[0].match_exe.as_deref(),
+            Some("code.exe")
+        );
+
         // Custom space pin migrated too
         assert_eq!(
             loaded.custom_spaces[0].items[0].match_exe.as_deref(),
             Some("code.exe")
         );
 
-        // Upgraded v1 file was persisted atomically with zero lingering .tmp files
+        // Upgraded v2 file was persisted atomically with zero lingering .tmp files
         assert_eq!(count_tmp_files(&dir), 0);
         let persisted_raw = fs::read_to_string(&path).expect("read migrated file");
         let persisted_val: serde_json::Value =
-            serde_json::from_str(&persisted_raw).expect("valid v1 json");
-        assert_eq!(persisted_val["schemaVersion"], 1);
-        assert_eq!(persisted_val["taskbarPins"][0]["title"], "Zen Browser");
-        assert_eq!(persisted_val["taskbarPins"][0]["matchExe"], "zen.exe");
+            serde_json::from_str(&persisted_raw).expect("valid v2 json");
+        assert_eq!(persisted_val["schemaVersion"], 2);
+        assert_eq!(persisted_val["taskbarPins"][0]["title"], "Firefox");
+        assert_eq!(persisted_val["taskbarPins"][0]["matchExe"], "firefox.exe");
         assert_eq!(persisted_val["gameCombos"][0]["kind"], "combo");
-        assert_eq!(persisted_val["gameCombos"][0]["title"], "Dota + Discord");
+        assert_eq!(persisted_val["gameCombos"][0]["title"], "Game + Discord");
         assert_eq!(
             persisted_val["gameCombos"][0]["comboTargets"][0],
             "steam://rungameid/570"
         );
+        assert_eq!(persisted_val["spaces"][0]["id"], "personal");
+        assert_eq!(persisted_val["spaces"][4]["id"], "custom-1");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2597,6 +3905,7 @@ mod tests {
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.bar_mode, "dock");
         assert!(!cfg.taskbar_pins.is_empty());
+        assert_eq!(cfg.spaces.len(), 4);
 
         let bak_path = corrupt_backup_path(&corrupt_path);
         assert!(bak_path.exists(), "corrupt config must be backed up to .corrupt.bak");
@@ -2646,26 +3955,30 @@ mod tests {
 
     fn target_slice<'a>(cfg: &'a TestBarConfig, key: &str) -> &'a [PinItem] {
         match key {
-            "personal" | "personal_pins" => &cfg.personal_pins,
+            "personal_pins" => &cfg.personal_pins,
             "personal_links" => &cfg.personal_links,
-            "work" | "work_folders" => &cfg.work_folders,
+            "work_folders" => &cfg.work_folders,
             "work_apps" => &cfg.work_apps,
-            "studio" | "studio_pins" => &cfg.studio_pins,
+            "studio_pins" => &cfg.studio_pins,
             "studio_tools" => &cfg.studio_tools,
-            "games" | "game_combos" => &cfg.game_combos,
+            "game_combos" => &cfg.game_combos,
             "game_launchers" => &cfg.game_launchers,
             "taskbar" | "taskbar_pins" => &cfg.taskbar_pins,
-            custom_id => cfg
-                .custom_spaces
-                .iter()
-                .find(|s| s.id == custom_id)
-                .map(|s| s.items.as_slice())
-                .expect("custom space must exist"),
+            space_id => {
+                if let Some(sp) = cfg.spaces.iter().find(|s| s.id == space_id) {
+                    return sp.items.as_slice();
+                }
+                cfg.custom_spaces
+                    .iter()
+                    .find(|s| s.id == space_id)
+                    .map(|s| s.items.as_slice())
+                    .expect("space must exist")
+            }
         }
     }
 
     #[test]
-    fn uniform_10_list_crud_reorder_and_edge_cases() {
+    fn uniform_list_crud_reorder_and_edge_cases() {
         let mut cfg = TestBarConfig::default();
         cfg.custom_spaces.push(CustomSpace {
             id: "custom-lab".to_string(),
@@ -2680,7 +3993,7 @@ mod tests {
             pin(id, kind, id, "sub", target.to_string(), "", "1,2,3", "app")
         };
 
-        // Test all 10 explicit lists with exact target-slice presence, order, and removal assertions
+        // Test legacy slices + v2 spaces + taskbar + custom space
         let lists: &[(&str, &str, &str)] = &[
             ("personal_pins", "app", r"C:\Apps\a.exe"),
             ("personal_links", "url", "https://example.com"),
@@ -2691,6 +4004,10 @@ mod tests {
             ("game_launchers", "app", r"C:\Apps\launcher.exe"),
             ("game_combos", "combo", "steam://rungameid/1"),
             ("taskbar_pins", "app", r"C:\Apps\unique-tb-1.exe"),
+            ("personal", "file", r"C:\Docs\notes.md"),
+            ("work", "app", r"C:\Apps\work-app.exe"),
+            ("studio", "url", "https://figma.com"),
+            ("games", "app", r"C:\Apps\epic.exe"),
             ("custom-lab", "file", r"C:\Docs\spec.md"),
         ];
 
@@ -2738,36 +4055,7 @@ mod tests {
             assert!(!remove_pin_from_space(&mut cfg, space_key, &id1));
         }
 
-        // Alias routing: "work" routes apps to work_apps, folders to work_folders, reorders work_folders, removes from both
-        assert!(add_pin_to_space(
-            &mut cfg,
-            "work",
-            make_item("wa-alias", "app", r"C:\Apps\wa.exe")
-        ));
-        assert!(cfg.work_apps.iter().any(|p| p.id == "wa-alias"));
-        assert!(!cfg.work_folders.iter().any(|p| p.id == "wa-alias"));
-        assert!(add_pin_to_space(
-            &mut cfg,
-            "work",
-            make_item("wf-alias", "folder", r"C:\Work\Dir")
-        ));
-        assert!(cfg.work_folders.iter().any(|p| p.id == "wf-alias"));
-        assert!(!cfg.work_apps.iter().any(|p| p.id == "wf-alias"));
-
-        let wf_0 = cfg.work_folders[0].id.clone();
-        let wf_1 = cfg.work_folders[1].id.clone();
-        let wa_0 = cfg.work_apps[0].id.clone();
-        assert!(reorder_pins_in_space(&mut cfg, "work", 0, 1));
-        assert_eq!(cfg.work_folders[0].id, wf_1);
-        assert_eq!(cfg.work_folders[1].id, wf_0);
-        assert_eq!(cfg.work_apps[0].id, wa_0, "work alias reorder must not mutate work_apps");
-
-        assert!(remove_pin_from_space(&mut cfg, "work", "wa-alias"));
-        assert!(remove_pin_from_space(&mut cfg, "work", "wf-alias"));
-        assert!(!cfg.work_apps.iter().any(|p| p.id == "wa-alias"));
-        assert!(!cfg.work_folders.iter().any(|p| p.id == "wf-alias"));
-
-        // Alias routing: "games" routes combo to game_combos, app to game_launchers, reorders game_combos, removes from both
+        // Games combo routing via "games" still routes combo to game_combos
         assert!(add_pin_to_space(
             &mut cfg,
             "games",
@@ -2777,27 +4065,8 @@ mod tests {
             .game_combos
             .iter()
             .any(|p| p.id == "gc-alias" && p.kind == "combo" && p.combo_targets.is_some()));
-        assert!(!cfg.game_launchers.iter().any(|p| p.id == "gc-alias"));
-        assert!(add_pin_to_space(
-            &mut cfg,
-            "games",
-            make_item("gl-alias", "app", r"C:\Apps\epic.exe")
-        ));
-        assert!(cfg.game_launchers.iter().any(|p| p.id == "gl-alias"));
-        assert!(!cfg.game_combos.iter().any(|p| p.id == "gl-alias"));
-
-        let gc_0 = cfg.game_combos[0].id.clone();
-        let gc_1 = cfg.game_combos[1].id.clone();
-        let gl_0 = cfg.game_launchers[0].id.clone();
-        assert!(reorder_pins_in_space(&mut cfg, "games", 0, 1));
-        assert_eq!(cfg.game_combos[0].id, gc_1);
-        assert_eq!(cfg.game_combos[1].id, gc_0);
-        assert_eq!(cfg.game_launchers[0].id, gl_0, "games alias reorder must not mutate game_launchers");
-
         assert!(remove_pin_from_space(&mut cfg, "games", "gc-alias"));
-        assert!(remove_pin_from_space(&mut cfg, "games", "gl-alias"));
         assert!(!cfg.game_combos.iter().any(|p| p.id == "gc-alias"));
-        assert!(!cfg.game_launchers.iter().any(|p| p.id == "gl-alias"));
 
         // Duplicate taskbar pin returns false without mutating
         let tb_len_before = cfg.taskbar_pins.len();
@@ -3032,6 +4301,8 @@ mod tests {
             match_exe: Some("update.exe".to_string()),
             match_aumid: None,
             combo_targets: None,
+            custom_icon: None,
+            custom_color: None,
         };
         assert!(normalize_pin(&mut legacy, false));
         assert_eq!(legacy.args.as_deref(), Some("--processStart Discord.exe"));
@@ -3054,16 +4325,6 @@ mod tests {
     #[test]
     fn honest_defaults_omit_empty_targets_and_fake_alt_labels() {
         let cfg = TestBarConfig::default();
-        let all_non_combo = [
-            &cfg.taskbar_pins,
-            &cfg.personal_pins,
-            &cfg.personal_links,
-            &cfg.work_folders,
-            &cfg.work_apps,
-            &cfg.studio_pins,
-            &cfg.studio_tools,
-            &cfg.game_launchers,
-        ];
         let banned_fake_alts = [
             "Избранное",
             "Новое письмо",
@@ -3074,20 +4335,22 @@ mod tests {
             "Каталог",
             "Открыть",
         ];
-        for list in all_non_combo {
-            for p in list {
-                assert!(
-                    !p.target.trim().is_empty(),
-                    "default pin '{}' must never have empty target",
-                    p.id
-                );
-                assert!(
-                    !banned_fake_alts.contains(&p.alt_action.as_str()),
-                    "default pin '{}' must not carry unimplemented fake alt_action '{}'",
-                    p.id,
-                    p.alt_action
-                );
-            }
+        for p in cfg
+            .taskbar_pins
+            .iter()
+            .chain(cfg.spaces.iter().flat_map(|s| s.items.iter()))
+        {
+            assert!(
+                !p.target.trim().is_empty(),
+                "default pin '{}' must never have empty target",
+                p.id
+            );
+            assert!(
+                !banned_fake_alts.contains(&p.alt_action.as_str()),
+                "default pin '{}' must not carry unimplemented fake alt_action '{}'",
+                p.id,
+                p.alt_action
+            );
         }
         assert_eq!(cfg.glass_depth, GLASS_DEPTH_OBSIDIAN);
         assert!(!cfg.clock_show_seconds);
@@ -3095,6 +4358,7 @@ mod tests {
         assert!(!cfg.start_remember_space);
         assert!(cfg.hidden_tray_keys.is_empty());
         assert!(cfg.frecency.is_empty());
+        assert!(cfg.game_combos.is_empty());
     }
 
     #[test]
@@ -3220,7 +4484,7 @@ mod tests {
     }
 
     #[test]
-    fn heal_broken_pins_repairs_spark_cursor_yandex_unity_and_custom_spaces() {
+    fn heal_broken_pins_repairs_spark_cursor_yandex_unity_and_spaces() {
         use crate::apps_indexer::IndexedApp;
         use crate::windows_tracker::AppWindowGroup;
 
@@ -3239,6 +4503,8 @@ mod tests {
             match_exe: None,
             match_aumid: None,
             combo_targets: None,
+            custom_icon: None,
+            custom_color: None,
         };
 
         let mut cfg = TestBarConfig::default();
@@ -3260,6 +4526,7 @@ mod tests {
             make_pin("unity", "app", "Unity Hub", ""),
             make_pin("cursor-s", "app", "Cursor", r"C:\NonExistent\OldCursor\Cursor.exe"),
         ];
+        cfg.spaces[0].items = vec![make_pin("sp2-cur", "app", "Cursor", "")];
         cfg.custom_spaces = vec![CustomSpace {
             id: "sp-1".into(),
             name: "Dev".into(),
@@ -3272,7 +4539,7 @@ mod tests {
         let open_groups = vec![AppWindowGroup {
             key: "spark desktop.exe".into(),
             name: "Spark Desktop".into(),
-            exe_path: r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+            exe_path: r"C:\Users\alice\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
                 .into(),
             aumid: None,
             icon_key: None,
@@ -3286,7 +4553,7 @@ mod tests {
                 id: "uninstall-spark".into(),
                 name: "Uninstall Spark Desktop".into(),
                 category: "App".into(),
-                target: r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Uninstall Spark Desktop.exe".into(),
+                target: r"C:\Users\alice\AppData\Local\Programs\SparkDesktop\Uninstall Spark Desktop.exe".into(),
                 aumid: None,
                 icon_key: None,
                 icon_data: None,
@@ -3295,7 +4562,7 @@ mod tests {
                 id: "yandex-disk".into(),
                 name: "Yandex Disk".into(),
                 category: "App".into(),
-                target: r"C:\Users\loki2\AppData\Local\Programs\Yandex\YandexDisk4\YandexDisk4.exe".into(),
+                target: r"C:\Users\alice\AppData\Local\Programs\Yandex\YandexDisk4\YandexDisk4.exe".into(),
                 aumid: None,
                 icon_key: None,
                 icon_data: None,
@@ -3334,7 +4601,7 @@ mod tests {
         // 1. Spark Mail healed from running Spark Desktop.exe (not Uninstall!)
         assert_eq!(
             cfg.taskbar_pins[0].target,
-            r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+            r"C:\Users\alice\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
         );
         assert_eq!(
             cfg.taskbar_pins[0].match_exe.as_deref(),
@@ -3361,7 +4628,7 @@ mod tests {
             Some("OpenAI.Codex_2p2nqsd0c76g0!App")
         );
 
-        // 5. Cursor (empty & stale path) + Unity Hub + CustomSpace healed
+        // 5. Cursor (empty & stale path) + Unity Hub + v2 Space + CustomSpace healed
         assert_eq!(cfg.work_apps[0].target, r"C:\Program Files\cursor\Cursor.exe");
         assert_eq!(cfg.work_apps[0].match_exe.as_deref(), Some("cursor.exe"));
         assert_eq!(
@@ -3373,11 +4640,502 @@ mod tests {
             r"C:\Program Files\cursor\Cursor.exe"
         );
         assert_eq!(
+            cfg.spaces[0].items[0].target,
+            r"C:\Program Files\cursor\Cursor.exe"
+        );
+        assert_eq!(
             cfg.custom_spaces[0].items[0].target,
-            r"C:\Users\loki2\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
+            r"C:\Users\alice\AppData\Local\Programs\SparkDesktop\Spark Desktop.exe"
         );
 
         // 6. Second pass is idempotent (returns false)
         assert!(!heal_broken_pins(&mut cfg, &installed_apps, &open_groups));
+    }
+
+    #[test]
+    fn v1_to_v2_migration_preserves_all_spaces_custom_presets_and_is_idempotent() {
+        let v1_json = r##"{
+          "schemaVersion": 1,
+          "revision": 42,
+          "barMode": "dock",
+          "personalPins": [
+            { "id": "p1", "kind": "app", "title": "App1", "target": "C:\\Apps\\One.exe" }
+          ],
+          "personalLinks": [
+            { "id": "pl1", "kind": "url", "title": "Site", "target": "https://example.com" }
+          ],
+          "workFolders": [
+            { "id": "wf1", "kind": "folder", "title": "Work", "target": "C:\\Work" }
+          ],
+          "workApps": [
+            { "id": "wa1", "kind": "app", "title": "IDE", "target": "C:\\Apps\\Code.exe" }
+          ],
+          "studioPins": [
+            { "id": "sp1", "kind": "app", "title": "Figma", "target": "C:\\Apps\\Figma.exe" }
+          ],
+          "studioTools": [
+            { "id": "st1", "kind": "app", "title": "Taskmgr", "target": "C:\\Windows\\System32\\Taskmgr.exe" }
+          ],
+          "gameLaunchers": [
+            { "id": "gl1", "kind": "app", "title": "Steam", "target": "C:\\Steam\\steam.exe" }
+          ],
+          "customSpaces": [
+            { "id": "cs-media", "name": "Музыка", "accentHex": "#34d399", "widgetPreset": "media_clipboard", "items": [] },
+            { "id": "cs-tel", "name": "Монитор", "accentRgb": "56, 189, 248", "widgetPreset": "telemetry_processes", "items": [] },
+            { "id": "cs-aud", "name": "Звук", "widgetPreset": "audio_mic", "items": [] },
+            { "id": "cs-full", "name": "Сетка", "widgetPreset": "full_grid", "items": [] }
+          ]
+        }"##;
+
+        let mut cfg: TestBarConfig = serde_json::from_str(v1_json).expect("parse v1");
+        assert!(normalize_and_migrate(&mut cfg));
+        assert_eq!(cfg.schema_version, 2);
+        assert_eq!(cfg.revision, 42);
+        assert_eq!(cfg.spaces.len(), 8);
+
+        assert_eq!(cfg.spaces[0].id, "personal");
+        assert_eq!(cfg.spaces[0].name, "Личное");
+        assert_eq!(cfg.spaces[0].accent_hex, "#818CF8");
+        assert_eq!(cfg.spaces[0].accent_rgb, "129,140,248");
+        assert_eq!(cfg.spaces[0].layout_kind, "grid");
+        assert!(cfg.spaces[0].show_hero_row);
+        assert_eq!(cfg.spaces[0].widgets, vec!["media", "audio_mixer", "clipboard"]);
+        assert_eq!(
+            cfg.spaces[0].items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["p1", "pl1"]
+        );
+
+        assert_eq!(cfg.spaces[1].id, "work");
+        assert_eq!(cfg.spaces[1].name, "Работа");
+        assert_eq!(cfg.spaces[1].accent_hex, "#38BDF8");
+        assert_eq!(cfg.spaces[1].accent_rgb, "56,189,248");
+        assert!(!cfg.spaces[1].show_hero_row);
+        assert_eq!(cfg.spaces[1].widgets, vec!["pc_health", "top_processes"]);
+        assert_eq!(
+            cfg.spaces[1].items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["wf1", "wa1"]
+        );
+
+        assert_eq!(cfg.spaces[2].id, "studio");
+        assert_eq!(cfg.spaces[2].name, "Студия");
+        assert_eq!(cfg.spaces[2].accent_hex, "#34D399");
+        assert_eq!(cfg.spaces[2].accent_rgb, "52,211,153");
+        assert!(cfg.spaces[2].show_hero_row);
+        assert_eq!(cfg.spaces[2].widgets, vec!["pc_health", "audio_mixer", "top_processes"]);
+        assert_eq!(
+            cfg.spaces[2].items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["sp1", "st1"]
+        );
+
+        assert_eq!(cfg.spaces[3].id, "games");
+        assert_eq!(cfg.spaces[3].name, "Игры");
+        assert_eq!(cfg.spaces[3].accent_hex, "#FB7185");
+        assert_eq!(cfg.spaces[3].accent_rgb, "251,113,133");
+        assert_eq!(cfg.spaces[3].layout_kind, "games");
+        assert!(!cfg.spaces[3].show_hero_row);
+        assert_eq!(cfg.spaces[3].widgets, vec!["audio_mixer", "game_combos", "pc_health"]);
+        assert_eq!(
+            cfg.spaces[3].items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["gl1"]
+        );
+
+        assert_eq!(cfg.spaces[4].widgets, vec!["media", "audio_mixer", "clipboard"]);
+        assert_eq!(cfg.spaces[5].accent_hex, "#38BDF8");
+        assert_eq!(cfg.spaces[5].widgets, vec!["pc_health", "top_processes"]);
+        assert_eq!(cfg.spaces[6].widgets, vec!["audio_mixer", "media"]);
+        assert!(cfg.spaces[7].widgets.is_empty());
+
+        assert!(!normalize_and_migrate(&mut cfg));
+
+        // Blank/empty spaces never remain empty after normalize_and_migrate
+        let mut blank: TestBarConfig = serde_json::from_str("{}").expect("empty object");
+        assert!(normalize_and_migrate(&mut blank));
+        assert_eq!(blank.spaces.len(), 4);
+    }
+
+    #[test]
+    fn space_crud_templates_last_space_guard_cap_and_reorder() {
+        let mut cfg = TestBarConfig::default();
+        assert_eq!(cfg.spaces.len(), 4);
+
+        // Create from templates with deduped widgets & unique slug id
+        let created_work = create_space_from_template(
+            &mut cfg,
+            "  Dev Проекты  ".to_string(),
+            "work",
+            None,
+            None,
+            None,
+        )
+        .expect("create work space");
+        assert_eq!(created_work.id, "dev-proekty");
+        assert_eq!(created_work.accent_hex, "#38BDF8");
+        assert_eq!(created_work.widgets, vec!["pc_health", "top_processes"]);
+
+        let created_dup = create_space_from_template(
+            &mut cfg,
+            "Dev Проекты".to_string(),
+            "games",
+            Some("#f97316".to_string()),
+            None,
+            Some(vec![
+                "weather".to_string(),
+                "WEATHER".to_string(),
+                "batteries".to_string(),
+            ]),
+        )
+        .expect("create second space with unique slug");
+        assert_eq!(created_dup.id, "dev-proekty-2");
+        assert_eq!(created_dup.layout_kind, "games");
+        assert_eq!(created_dup.accent_hex, "#F97316");
+        assert_eq!(created_dup.accent_rgb, "249,115,22");
+        assert_eq!(created_dup.widgets, vec!["weather", "batteries"]);
+
+        assert!(create_space_from_template(&mut cfg, "Bad".into(), "unknown", None, None, None).is_err());
+        assert!(create_space_from_template(&mut cfg, "   ".into(), "blank", None, None, None).is_err());
+        assert!(create_space_from_template(
+            &mut cfg,
+            "BadW".into(),
+            "blank",
+            None,
+            None,
+            Some(vec!["invalid_widget".to_string()])
+        )
+        .is_err());
+
+        // Update space config + set_space_widgets_by_id
+        assert!(update_space_config(
+            &mut cfg,
+            "dev-proekty",
+            Some("Разработка".to_string()),
+            Some("#a78bfa".to_string()),
+            None,
+            Some("games".to_string()),
+            Some(true),
+            Some(vec!["weather".to_string(), "media".to_string()]),
+        )
+        .unwrap());
+        let sp = cfg.spaces.iter().find(|s| s.id == "dev-proekty").unwrap();
+        assert_eq!(sp.name, "Разработка");
+        assert_eq!(sp.accent_hex, "#A78BFA");
+        assert_eq!(sp.layout_kind, "games");
+        assert!(sp.show_hero_row);
+        assert_eq!(sp.widgets, vec!["weather", "media"]);
+
+        assert!(set_space_widgets_by_id(
+            &mut cfg,
+            "dev-proekty",
+            vec!["batteries".into(), "batteries".into(), "clipboard".into()],
+        )
+        .unwrap());
+        assert!(!set_space_widgets_by_id(
+            &mut cfg,
+            "dev-proekty",
+            vec!["batteries".into(), "clipboard".into()],
+        )
+        .unwrap());
+        assert!(set_space_widgets_by_id(&mut cfg, "dev-proekty", vec!["bogus".into()]).is_err());
+
+        // Reorder spaces
+        let mut ids: Vec<String> = cfg.spaces.iter().map(|s| s.id.clone()).collect();
+        assert!(!reorder_spaces_by_ids(&mut cfg, ids.clone()).unwrap());
+        ids.reverse();
+        assert!(reorder_spaces_by_ids(&mut cfg, ids.clone()).unwrap());
+        assert_eq!(
+            cfg.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(reorder_spaces_by_ids(&mut cfg, vec!["personal".into()]).is_err());
+        let mut dup_ids = ids.clone();
+        dup_ids[1] = dup_ids[0].clone();
+        assert!(reorder_spaces_by_ids(&mut cfg, dup_ids).is_err());
+
+        // Max spaces cap
+        while cfg.spaces.len() < MAX_SPACES {
+            let extra_name = format!("Extra {}", cfg.spaces.len());
+            create_space_from_template(
+                &mut cfg,
+                extra_name,
+                "blank",
+                None,
+                None,
+                None,
+            )
+            .expect("within cap");
+        }
+        assert!(create_space_from_template(&mut cfg, "Overflow".into(), "blank", None, None, None).is_err());
+
+        // Delete down to 1 space, then last-space delete guard rejects deletion
+        while cfg.spaces.len() > 1 {
+            let last_id = cfg.spaces.last().unwrap().id.clone();
+            assert!(delete_space_by_id(&mut cfg, &last_id).unwrap());
+        }
+        let only_id = cfg.spaces[0].id.clone();
+        assert!(delete_space_by_id(&mut cfg, &only_id).is_err());
+        assert_eq!(cfg.spaces.len(), 1);
+    }
+
+    #[test]
+    fn mixed_items_reorder_and_pin_v2_custom_icon_color_roundtrip() {
+        let mut cfg = TestBarConfig::default();
+        let space = create_space_from_template(
+            &mut cfg,
+            "Mixed".to_string(),
+            "blank",
+            None,
+            None,
+            None,
+        )
+        .expect("create blank");
+
+        assert!(add_pin_to_space(
+            &mut cfg,
+            &space.id,
+            pin("m-app", "app", "Notepad", "", r"C:\Windows\System32\notepad.exe".into(), "", "56,189,248", "notepad")
+        ));
+        assert!(add_pin_to_space(
+            &mut cfg,
+            &space.id,
+            pin("m-dir", "folder", "Temp", "", r"C:\Temp".into(), "", "245,158,11", "folder")
+        ));
+        assert!(add_pin_to_space(
+            &mut cfg,
+            &space.id,
+            pin("m-url", "url", "Docs", "", "https://example.com".into(), "", "129,140,248", "url")
+        ));
+
+        // Mixed grid reorder: move url (idx 2) before app (idx 0)
+        assert!(reorder_pins_in_space(&mut cfg, &space.id, 2, 0));
+        let sp = cfg.spaces.iter().find(|s| s.id == space.id).unwrap();
+        assert_eq!(
+            sp.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-url", "m-app", "m-dir"]
+        );
+
+        // update_pin_v2 sets custom_icon, custom_color, icon_data; None keeps unchanged; Some(None) clears
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            Some("Editor".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some(Some("  terminal  ".to_string())),
+            Some(Some(" #34d399 ".to_string())),
+            Some(Some("data:image/png;base64,AAA".to_string())),
+        )
+        .unwrap());
+        let edited = cfg
+            .spaces
+            .iter()
+            .find(|s| s.id == space.id)
+            .unwrap()
+            .items
+            .iter()
+            .find(|i| i.id == "m-app")
+            .unwrap();
+        assert_eq!(edited.title, "Editor");
+        assert_eq!(edited.custom_icon.as_deref(), Some("terminal"));
+        assert_eq!(edited.custom_color.as_deref(), Some("#34D399"));
+        assert_eq!(edited.icon_data.as_deref(), Some("data:image/png;base64,AAA"));
+
+        // Roundtrip JSON preserves customIcon / customColor, omits when None
+        let json = export_config_json(&cfg).expect("export");
+        let back = import_config_json(&json).expect("import");
+        let edited_back = back
+            .spaces
+            .iter()
+            .find(|s| s.id == space.id)
+            .unwrap()
+            .items
+            .iter()
+            .find(|i| i.id == "m-app")
+            .unwrap();
+        assert_eq!(edited_back.custom_icon.as_deref(), Some("terminal"));
+        assert_eq!(edited_back.custom_color.as_deref(), Some("#34D399"));
+
+        // Leave custom_icon untouched (None), clear custom_color & icon_data (Some(None))
+        assert!(update_pin_v2(
+            &mut cfg,
+            &space.id,
+            "m-app",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            Some(None),
+        )
+        .unwrap());
+        let cleared = cfg
+            .spaces
+            .iter()
+            .find(|s| s.id == space.id)
+            .unwrap()
+            .items
+            .iter()
+            .find(|i| i.id == "m-app")
+            .unwrap();
+        assert_eq!(cleared.custom_icon.as_deref(), Some("terminal"));
+        assert_eq!(cleared.custom_color, None);
+        assert_eq!(cleared.icon_data, None);
+        let serialized_item = serde_json::to_value(cleared).unwrap();
+        assert!(serialized_item.get("customColor").is_none());
+        assert_eq!(serialized_item["customIcon"], "terminal");
+    }
+
+    #[test]
+    fn taskbar_widgets_validation_normalization_and_persistence() {
+        let mut cfg = TestBarConfig::default();
+        assert!(cfg.taskbar_widgets.show_weather);
+        assert!(!cfg.taskbar_widgets.show_batteries);
+        assert!(!cfg.taskbar_widgets.show_telemetry);
+        assert_eq!(cfg.taskbar_widgets.weather_units, "c");
+
+        assert!(set_taskbar_widgets(
+            &mut cfg,
+            TaskbarWidgetSettings {
+                show_weather: true,
+                show_batteries: true,
+                show_telemetry: true,
+                weather_city: "  Москва  ".to_string(),
+                weather_lat: Some(55.7558),
+                weather_lon: Some(37.6173),
+                weather_units: "F".to_string(),
+            }
+        )
+        .unwrap());
+        assert_eq!(cfg.taskbar_widgets.weather_city, "Москва");
+        assert_eq!(cfg.taskbar_widgets.weather_units, "f");
+        let same_widgets = cfg.taskbar_widgets.clone();
+        assert!(!set_taskbar_widgets(&mut cfg, same_widgets).unwrap());
+
+        assert!(set_taskbar_widgets(
+            &mut cfg,
+            TaskbarWidgetSettings {
+                weather_units: "k".to_string(),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(set_taskbar_widgets(
+            &mut cfg,
+            TaskbarWidgetSettings {
+                weather_lat: Some(55.0),
+                weather_lon: None,
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        // Dirty JSON normalizes units & resets unpaired/out-of-range coords
+        let dirty_json = r#"{"taskbarWidgets":{"showWeather":false,"weatherCity":"  Berlin ","weatherLat":120.0,"weatherLon":13.4,"weatherUnits":"kelvin"}}"#;
+        let parsed = import_config_json(dirty_json).expect("import dirty taskbarWidgets");
+        assert!(!parsed.taskbar_widgets.show_weather);
+        assert_eq!(parsed.taskbar_widgets.weather_city, "Berlin");
+        assert_eq!(parsed.taskbar_widgets.weather_units, "c");
+        assert_eq!(parsed.taskbar_widgets.weather_lat, None);
+        assert_eq!(parsed.taskbar_widgets.weather_lon, None);
+    }
+
+    #[test]
+    fn browser_command_parser_and_clean_defaults_have_zero_personal_hardcodes() {
+        assert_eq!(
+            parse_browser_command_exe(
+                r#""C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --single-argument %1"#
+            ),
+            Some(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string())
+        );
+        assert_eq!(
+            parse_browser_command_exe(r"C:\Program Files\Mozilla Firefox\firefox.exe -osint -url %1"),
+            Some(r"C:\Program Files\Mozilla Firefox\firefox.exe".to_string())
+        );
+        assert_eq!(
+            parse_browser_command_exe(r"C:\Windows\System32\LaunchWinApp.exe %1"),
+            None
+        );
+
+        let src = include_str!("config.rs");
+        let detect_start = src
+            .find("fn detect_app_target(")
+            .expect("detect_app_target must exist");
+        let detect_end = src[detect_start..]
+            .find("\nfn strip_verbatim_prefix(")
+            .map(|rel| detect_start + rel)
+            .expect("end of detect_app_target");
+        let defaults_start = src
+            .find("fn default_modular_spaces()")
+            .expect("default_modular_spaces must exist");
+        let defaults_end = src[defaults_start..]
+            .find("\npub fn config_path()")
+            .map(|rel| defaults_start + rel)
+            .expect("end of TestBarConfig::default");
+        let source_corpus = format!(
+            "{}\n{}",
+            &src[detect_start..detect_end],
+            &src[defaults_start..defaults_end]
+        )
+        .to_lowercase();
+
+        let banned_source = [
+            "loki2",
+            r"d:\steam",
+            "antigravity",
+            "spark",
+            "zen",
+            "wiztree",
+            "poe",
+            "dota",
+            "\"testbar\"",
+            "второй мозг",
+            "wf-testbar",
+        ];
+        for needle in banned_source {
+            assert!(
+                !source_corpus.contains(needle),
+                "detect_app_target / default spaces must not hardcode '{needle}'"
+            );
+        }
+
+        let cfg = TestBarConfig::default();
+        assert!(cfg.game_combos.is_empty());
+        let banned_runtime_labels = [
+            "loki2",
+            r"d:\steam",
+            "antigravity",
+            "spark",
+            "zen browser",
+            "wiztree",
+            "poe",
+            "dota",
+            "testbar",
+            "второй мозг",
+            "wf-testbar",
+        ];
+        let mut label_corpus = String::new();
+        for p in cfg
+            .taskbar_pins
+            .iter()
+            .chain(cfg.spaces.iter().flat_map(|s| s.items.iter()))
+            .chain(cfg.game_combos.iter())
+        {
+            label_corpus.push_str(&p.id);
+            label_corpus.push('|');
+            label_corpus.push_str(&p.title);
+            label_corpus.push('|');
+            label_corpus.push_str(&p.subtitle);
+            label_corpus.push('|');
+        }
+        let lower_labels = label_corpus.to_lowercase();
+        for needle in banned_runtime_labels {
+            assert!(
+                !lower_labels.contains(needle),
+                "TestBarConfig::default() pin metadata must not contain personal hardcode '{needle}', got: {lower_labels}"
+            );
+        }
     }
 }
