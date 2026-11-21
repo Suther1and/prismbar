@@ -60,6 +60,7 @@ import {
   getAudioPeaks,
   getPeripheralBatteries,
   getWeather,
+  hideBatteryDevice,
   hideTrayApp,
   iconCache,
   ipc,
@@ -185,6 +186,27 @@ function formatCompactNetworkLabel(net: NetworkInfo | null): string {
   }
   const speed = (net.speedLabel ?? '').trim();
   return speed ? `${kindLabel} · ${speed}` : kindLabel;
+}
+
+function formatBatterySourceLabel(source: string | null | undefined): string {
+  const norm = (source ?? '').trim().toLowerCase();
+  if (!norm) return 'Беспроводное';
+  switch (norm) {
+    case 'sony_hid':
+      return 'PlayStation HID';
+    case 'razer_hid':
+      return 'USB HID';
+    case 'logitech_hidpp':
+      return 'Logitech HID++';
+    case 'bluetooth_pnp':
+    case 'bluetooth':
+    case 'bt':
+      return 'Bluetooth';
+    case 'xinput':
+      return 'Xbox / XInput';
+    default:
+      return formatPeripheralSourceLabel(source);
+  }
 }
 
 function measureCardHeight(el: HTMLElement, kind: FlyoutKind): number | null {
@@ -555,6 +577,9 @@ export const FlyoutView: React.FC = () => {
               }
             });
         } else if (r.kind === 'battery') {
+          ipc<TestBarConfig>('get_config')
+            .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+            .catch(() => {});
           getPeripheralBatteries()
             .then((items) => {
               if (Array.isArray(items)) {
@@ -1118,6 +1143,16 @@ export const FlyoutView: React.FC = () => {
     return () => window.clearTimeout(timer);
   }, [anim.phase, anim.req?.kind, weatherCityOpen, weatherCityQuery]);
 
+  const hiddenBatterySet = useMemo(() => {
+    const ids = config?.hiddenBatteryIds ?? [];
+    return new Set(ids.map((id) => id.trim().toLowerCase()));
+  }, [config?.hiddenBatteryIds]);
+
+  const visibleBatteries = useMemo(
+    () => periphBatteries.filter((dev) => !hiddenBatterySet.has(dev.id.trim().toLowerCase())),
+    [periphBatteries, hiddenBatterySet],
+  );
+
   // Auto-fit flyout height for dynamic post-open content (Jump List, audio sessions, media strip, alerts, weather, battery)
   useEffect(() => {
     if (!req || isClosing || anim.phase === 'closed' || !jumpListReady) return;
@@ -1173,7 +1208,7 @@ export const FlyoutView: React.FC = () => {
     weatherCityResults.length,
     weatherCitySearching,
     weatherCityError,
-    periphBatteries.length,
+    visibleBatteries.length,
     periphHydrated,
   ]);
 
@@ -1228,6 +1263,12 @@ export const FlyoutView: React.FC = () => {
 
   const close = () => ipc('close_flyout').catch(() => {});
 
+  const handleRootContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!(e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable="true"]')) {
+      e.preventDefault();
+    }
+  };
+
   const runActionAndClose = (promise: Promise<unknown>) => {
     setActionError(null);
     promise
@@ -1245,7 +1286,7 @@ export const FlyoutView: React.FC = () => {
       : cardOriginStyle;
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1432,7 +1473,7 @@ export const FlyoutView: React.FC = () => {
   if (req.kind === 'osd') {
     const pct = osdState.muted ? 0 : osdState.volume;
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1618,7 +1659,7 @@ export const FlyoutView: React.FC = () => {
     };
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -1985,7 +2026,7 @@ export const FlyoutView: React.FC = () => {
     };
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -2183,7 +2224,7 @@ export const FlyoutView: React.FC = () => {
     };
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -2382,6 +2423,7 @@ export const FlyoutView: React.FC = () => {
   if (req.kind === 'battery') {
     const handleRefreshBatteries = () => {
       if (periphRefreshing) return;
+      setActionError(null);
       setPeriphRefreshing(true);
       refreshPeripheralBatteries()
         .then((items) => {
@@ -2392,8 +2434,15 @@ export const FlyoutView: React.FC = () => {
         .finally(() => setPeriphRefreshing(false));
     };
 
+    const handleHideBattery = (id: string) => {
+      setActionError(null);
+      hideBatteryDevice(id)
+        .then((updated) => setConfig((prev) => applyConfigUpdate(prev, updated)))
+        .catch((err) => setActionError(formatIpcError(err)));
+    };
+
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -2405,8 +2454,8 @@ export const FlyoutView: React.FC = () => {
           <div className="wf-head">
             <div className="wf-head-meta">
               <span className="wf-title">Беспроводные устройства</span>
-              {periphBatteries.length > 0 && (
-                <span className="wf-badge count">{periphBatteries.length}</span>
+              {visibleBatteries.length > 0 && (
+                <span className="wf-badge count">{visibleBatteries.length}</span>
               )}
             </div>
             <button
@@ -2420,20 +2469,22 @@ export const FlyoutView: React.FC = () => {
             </button>
           </div>
 
-          {periphBatteries.length === 0 ? (
+          {visibleBatteries.length === 0 ? (
             <div className="bat-empty">
               <div className="bat-empty-ic">
                 <BluetoothIcon className="ic18" />
               </div>
               <span>
-                {periphHydrated
-                  ? 'Беспроводные устройства не найдены'
-                  : 'Поиск подключённых устройств…'}
+                {!periphHydrated
+                  ? 'Поиск подключённых устройств…'
+                  : periphBatteries.length > 0
+                    ? 'Все устройства скрыты'
+                    : 'Беспроводные устройства не найдены'}
               </span>
             </div>
           ) : (
             <div className="bat-list">
-              {periphBatteries.map((dev, idx) => {
+              {visibleBatteries.map((dev, idx) => {
                 const pct = Math.max(0, Math.min(100, Math.round(dev.percent)));
                 const isLow = pct < 20;
                 const itemCls = [
@@ -2462,7 +2513,7 @@ export const FlyoutView: React.FC = () => {
                         </div>
                         <div className="bat-badges-row">
                           <span className="bat-source-badge">
-                            {formatPeripheralSourceLabel(dev.source)}
+                            {formatBatterySourceLabel(dev.source)}
                           </span>
                         </div>
                       </div>
@@ -2470,6 +2521,15 @@ export const FlyoutView: React.FC = () => {
                         {dev.charging && <ChargingBoltIcon className="ic12 bat-bolt" />}
                         <span className="bat-pct">{pct}%</span>
                       </div>
+                      <button
+                        type="button"
+                        className="bat-hide-btn"
+                        title="Скрыть устройство"
+                        aria-label={`Скрыть устройство ${dev.name}`}
+                        onClick={() => handleHideBattery(dev.id)}
+                      >
+                        <EyeOffIcon className="ic12" />
+                      </button>
                     </div>
 
                     <div className="bat-bar-track" aria-hidden="true">
@@ -2499,6 +2559,12 @@ export const FlyoutView: React.FC = () => {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {actionError && (
+            <div className="ctx-err" role="alert">
+              {actionError}
             </div>
           )}
         </div>
@@ -2556,6 +2622,7 @@ export const FlyoutView: React.FC = () => {
         className="flyout-root"
         data-space="personal"
         data-visible="true"
+        onContextMenu={handleRootContextMenu}
         onMouseLeave={() => {
           ipc(PREVIEW_LEAVE_COMMAND).catch(() => {});
         }}
@@ -2899,7 +2966,7 @@ export const FlyoutView: React.FC = () => {
     ctxActionsRef.current = actions;
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}
@@ -3000,7 +3067,7 @@ export const FlyoutView: React.FC = () => {
     ctxActionsRef.current = barActions;
 
     return (
-      <div className="flyout-root" data-space="personal" data-visible="true">
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
         <div
           key={anim.renderSeq}
           ref={cardRef}

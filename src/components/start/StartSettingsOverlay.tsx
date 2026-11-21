@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import '../../styles/widgets.css';
 import { formatCityOptionSubtitle, formatIpcError } from '../../lib/flyoutLogic';
 import {
+  restoreAllBatteryDevices,
+  restoreBatteryDevice,
   searchWeatherCities,
   setTaskbarWidgets,
   type GlassDepth,
@@ -109,6 +111,38 @@ function formatHiddenTrayLabel(rawKey: string): string {
   return base.replace(/\.exe$/i, '') || rawKey;
 }
 
+function formatHiddenBatteryLabel(rawId: string): string {
+  const trimmed = rawId.trim();
+  if (!trimmed) return rawId;
+  const colonIdx = trimmed.indexOf(':');
+  if (colonIdx <= 0) return trimmed;
+
+  const prefix = trimmed.slice(0, colonIdx).toLowerCase();
+  const rest = trimmed.slice(colonIdx + 1).trim();
+  if (!rest) return trimmed;
+
+  if (prefix === 'xinput' && /^\d+$/.test(rest)) {
+    return `Xbox #${Number(rest) + 1}`;
+  }
+
+  const brandMap: Record<string, string> = {
+    razer: 'Razer',
+    sony: 'PlayStation',
+    logitech: 'Logitech',
+    bt: 'Bluetooth',
+    bluetooth: 'Bluetooth',
+    xinput: 'Xbox',
+  };
+  const brand = brandMap[prefix] ?? (prefix.charAt(0).toUpperCase() + prefix.slice(1));
+  const looksHexOrMac = /^[0-9a-f:.-]+$/i.test(rest) && /[0-9a-f]/i.test(rest);
+  const formattedRest = looksHexOrMac
+    ? rest.toUpperCase()
+    : rest
+        .replace(/[-_]+/g, ' ')
+        .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  return `${brand} (${formattedRest})`;
+}
+
 export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   open,
   config,
@@ -193,8 +227,9 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   const clockShowWeekday = config?.clockShowWeekday ?? false;
   const startRememberSpace = config?.startRememberSpace ?? false;
   const hiddenTrayKeys = config?.hiddenTrayKeys ?? [];
+  const hiddenBatteryIds = config?.hiddenBatteryIds ?? [];
   const tw = config?.taskbarWidgets;
-  const showWeather = tw?.showWeather !== false;
+  const showWeather = Boolean(tw?.showWeather);
   const showBatteries = tw?.showBatteries === true;
   const showTelemetry = tw?.showTelemetry === true;
   const weatherCity = tw?.weatherCity?.trim() ?? '';
@@ -460,7 +495,9 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                     <div className="set-toggle-row">
                       <div>
                         <div className="set-row-title">Погода на панели</div>
-                        <div className="set-row-desc">Температура и прогноз на основной панели</div>
+                        <div className="set-row-desc">
+                          Дублировать погоду на нижней панели (в шапке «Пуска» показывается всегда)
+                        </div>
                       </div>
                       <button
                         type="button"
@@ -788,6 +825,56 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                           <XIcon10 />
                         </button>
                       ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="set-group">
+                  <div className="sec-row" style={{ marginBottom: 4 }}>
+                    <span className="set-group-title" style={{ marginBottom: 0 }}>
+                      Скрытые устройства батарей
+                      {hiddenBatteryIds.length > 0 ? ` (${hiddenBatteryIds.length})` : ''}
+                    </span>
+                    {hiddenBatteryIds.length > 0 && (
+                      <button
+                        type="button"
+                        className="sec-act"
+                        disabled={busyKey === 'restoreAllBatteries'}
+                        onClick={() =>
+                          void runAction('restoreAllBatteries', async () => {
+                            await restoreAllBatteryDevices();
+                          })
+                        }
+                      >
+                        Показать все
+                      </button>
+                    )}
+                  </div>
+                  {hiddenBatteryIds.length === 0 ? (
+                    <div className="set-row-desc">Нет скрытых устройств</div>
+                  ) : (
+                    <div className="tray-hidden-chips">
+                      {hiddenBatteryIds.map((id) => {
+                        const label = formatHiddenBatteryLabel(id);
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            className="tray-hidden-chip"
+                            title={`Показать ${label}`}
+                            aria-label={`Показать ${label}`}
+                            disabled={busyKey === `battery:${id}`}
+                            onClick={() =>
+                              void runAction(`battery:${id}`, async () => {
+                                await restoreBatteryDevice(id);
+                              })
+                            }
+                          >
+                            <span>{label}</span>
+                            <XIcon10 />
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>

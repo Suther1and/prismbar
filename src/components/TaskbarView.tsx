@@ -152,7 +152,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const isEdge = config?.barMode === 'edge';
   const useEdgeCentered = shouldUseEdgeCenteredLayout(config?.barMode, monitor, viewportWidth);
 
-  const showWeather = !isSecondary && config?.taskbarWidgets?.showWeather !== false;
+  const showWeather = !isSecondary && config?.taskbarWidgets?.showWeather === true;
   const showBatteries = !isSecondary && config?.taskbarWidgets?.showBatteries === true;
   const showTelemetry = !isSecondary && config?.taskbarWidgets?.showTelemetry === true;
   const weatherUnits: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
@@ -163,9 +163,15 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const weatherTempStr = showWeather
     ? formatWeatherTempLabel(weather?.available ? weather.tempC : null, weatherUnits)
     : '';
+  const visiblePeriphList = useMemo(() => {
+    const hiddenIds = config?.hiddenBatteryIds;
+    if (!hiddenIds || hiddenIds.length === 0) return periphs;
+    const hiddenSet = new Set(hiddenIds.map((id) => id.trim().toLowerCase()));
+    return periphs.filter((p) => !hiddenSet.has(p.id.trim().toLowerCase()));
+  }, [periphs, config?.hiddenBatteryIds]);
   const periphSummary = useMemo(
-    () => (showBatteries ? formatBatteryPillSummary(periphs) : null),
-    [showBatteries, periphs],
+    () => (showBatteries ? formatBatteryPillSummary(visiblePeriphList) : null),
+    [showBatteries, visiblePeriphList],
   );
   const periphBadgeKey = periphSummary
     ? `${periphSummary.device.kind}:${periphSummary.percent}:${periphSummary.charging ? 1 : 0}:${periphSummary.count}`
@@ -750,10 +756,13 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       ipc('open_start_settings').catch(() => {});
     } else {
       triggerLaunchHop(item.id);
+      const matchedPin = item.pinId
+        ? config?.taskbarPins?.find((pin) => pin.id === item.pinId)
+        : undefined;
       ipc('launch_item', {
         target: action.target,
         args: action.args,
-        asAdmin: false,
+        asAdmin: Boolean(matchedPin?.runAsAdmin),
         closeStart: false,
       }).catch(() => {
         clearLaunchHop(item.id);
@@ -1002,11 +1011,18 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       (telemetry.cpuPct >= 60 || (telemetry.gpuAvailable && telemetry.gpuTempC >= 68)),
   );
 
+  const handleRootContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!(e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable="true"]')) {
+      e.preventDefault();
+    }
+  };
+
   return (
     <div
       className={getTaskbarRootClassName(config?.barMode)}
       data-space="personal"
       data-monitor={monitor}
+      onContextMenu={handleRootContextMenu}
     >
       <nav
         ref={barRef}
