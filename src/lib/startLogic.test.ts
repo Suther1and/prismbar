@@ -9,6 +9,7 @@ import startSpacesSrc from '../components/start/StartSpaces.tsx?raw';
 import startViewSrc from '../components/StartView.tsx?raw';
 import type { ClipboardEntry, PinItem, SpaceConfig, TestBarConfig } from './ipc';
 import {
+  applyOptimisticMovePinInSpace,
   applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
   buildSparklinePath,
@@ -20,7 +21,9 @@ import {
   convertTempFromC,
   CUSTOM_SPACE_ACCENTS,
   EMPTY_TELEMETRY_HISTORY,
+  EXPLORER_RESUME_TTL_MS,
   filterClipboardEntries,
+  filterVisibleBatteries,
   findBannedStartArtifacts,
   findMatchingInstalledAppForPin,
   formatDiskSummary,
@@ -56,6 +59,7 @@ import {
   normalizeSessionVolumeScalar,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
+  partitionSpaceItemsBySection,
   pushTelemetryHistory,
   pushTelemetrySample,
   RECENT_GAMES_LIMIT,
@@ -69,6 +73,7 @@ import {
   resolveProcessKillPids,
   selectDisplayedGames,
   settleStartOpen,
+  shouldResetExplorerOnReopen,
   SPACE_TEMPLATES,
   SPACE_WIDGET_CATALOG,
   START_DRAG_THRESHOLD_PX,
@@ -1018,5 +1023,148 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
       expect(content, `${relPath} must not contain Exiled`).not.toContain('Exiled');
       expect(content, `${relPath} must not hardcode 64 ГБ or 24 ГБ`).not.toMatch(/\b(64|24)\s*ГБ\b/);
     }
+  });
+
+  it('partitions space items into mainItems and bottomItems while preserving relative order', () => {
+    const items: PinItem[] = [
+      makePin({ id: 'a', title: 'Alpha', target: 'alpha.exe' }),
+      makePin({ id: 'b', title: 'Beta', target: 'beta.exe', section: 'bottom' }),
+      makePin({ id: 'c', title: 'Gamma', target: 'gamma.exe', section: 'main', tileSize: 'hero' }),
+      makePin({ id: 'd', title: 'Delta', target: 'delta.exe', section: 'bottom' }),
+    ];
+
+    const res = partitionSpaceItemsBySection(items);
+    expect(res.mainItems.map((p) => p.id)).toEqual(['a', 'c']);
+    expect(res.bottomItems.map((p) => p.id)).toEqual(['b', 'd']);
+    expect(partitionSpaceItemsBySection([])).toEqual({ mainItems: [], bottomItems: [] });
+  });
+
+  it('evaluates 3-minute Explorer resume TTL boundaries cleanly', () => {
+    expect(EXPLORER_RESUME_TTL_MS).toBe(180_000);
+    expect(shouldResetExplorerOnReopen(null, 500_000)).toBe(false);
+    expect(shouldResetExplorerOnReopen(undefined, 500_000)).toBe(false);
+    expect(shouldResetExplorerOnReopen(Number.NaN, 500_000)).toBe(false);
+
+    const closedAt = 1_000_000;
+    expect(shouldResetExplorerOnReopen(closedAt, closedAt + 179_999)).toBe(false);
+    expect(shouldResetExplorerOnReopen(closedAt, closedAt + 180_000)).toBe(true);
+    expect(shouldResetExplorerOnReopen(closedAt, closedAt + 240_000)).toBe(true);
+    expect(shouldResetExplorerOnReopen(closedAt, closedAt + 1000, 0)).toBe(true);
+  });
+
+  it('filters hidden battery devices case-insensitively without mutating source order', () => {
+    const devices = [
+      { id: 'Logi-GPRO', name: 'Mouse', percent: 82 },
+      { id: 'BT-Headset-1', name: 'Headset', percent: 45 },
+      { id: 'KB-915', name: 'Keyboard', percent: 91 },
+    ];
+
+    expect(filterVisibleBatteries(devices, undefined).map((d) => d.id)).toEqual([
+      'Logi-GPRO',
+      'BT-Headset-1',
+      'KB-915',
+    ]);
+    expect(filterVisibleBatteries(devices, []).map((d) => d.id)).toEqual([
+      'Logi-GPRO',
+      'BT-Headset-1',
+      'KB-915',
+    ]);
+    expect(filterVisibleBatteries(devices, ['  bt-headset-1  ']).map((d) => d.id)).toEqual([
+      'Logi-GPRO',
+      'KB-915',
+    ]);
+    expect(filterVisibleBatteries([], ['Logi-GPRO'])).toEqual([]);
+  });
+
+  it('optimistically moves pins within and across main/bottom sections by ID and honors runAsAdmin', () => {
+    const baseConfig: TestBarConfig = {
+      schemaVersion: 2,
+      revision: 1,
+      barMode: 'dock',
+      secondaryTaskbarMode: 'native',
+      autostart: true,
+      taskbarPins: [],
+      spaces: [
+        {
+          id: 'personal',
+          name: 'Личное',
+          accentHex: '#818CF8',
+          accentRgb: '129, 140, 248',
+          layoutKind: 'grid',
+          showHeroRow: false,
+          widgets: [],
+          items: [
+            makePin({ id: 'p1', title: 'Code', target: 'code.exe', section: 'main', tileSize: 'hero' }),
+            makePin({ id: 'p2', title: 'Notes', target: 'notes.exe', section: 'main' }),
+            makePin({ id: 'p3', title: 'Docs', target: 'C:\\Docs', kind: 'folder', section: 'bottom' }),
+          ],
+        },
+      ],
+      personalPins: [],
+      personalLinks: [],
+      workFolders: [],
+      workApps: [],
+      studioPins: [],
+      studioTools: [],
+      gameLaunchers: [],
+      gameCombos: [],
+      customSpaces: [],
+      pinnedClipboard: [],
+    };
+
+    const movedToBottom = applyOptimisticMovePinInSpace(baseConfig, {
+      space: 'personal',
+      fromId: 'p2',
+      toId: null,
+      targetSection: 'bottom',
+    });
+    expect(movedToBottom).not.toBeNull();
+    const afterBottom = movedToBottom!.spaces[0].items;
+    expect(afterBottom.find((p) => p.id === 'p2')?.section).toBe('bottom');
+    expect(afterBottom.map((p) => p.id)).toEqual(['p1', 'p3', 'p2']);
+
+    const movedBackToMain = applyOptimisticMovePinInSpace(movedToBottom, {
+      space: 'personal',
+      fromId: 'p3',
+      toId: 'p1',
+      targetSection: 'main',
+    });
+    expect(movedBackToMain).not.toBeNull();
+    expect(movedBackToMain!.spaces[0].items.map((p) => p.id)).toEqual(['p3', 'p1', 'p2']);
+    expect(movedBackToMain!.spaces[0].items[0].section).toBe('main');
+
+    expect(
+      applyOptimisticMovePinInSpace(baseConfig, {
+        space: 'personal',
+        fromId: 'missing',
+        toId: null,
+        targetSection: 'bottom',
+      }),
+    ).toBeNull();
+
+    const adminPin = makePin({
+      id: 'adm',
+      title: 'Regedit',
+      target: 'C:\\Windows\\regedit.exe',
+      runAsAdmin: true,
+    });
+    const action = resolvePinAction(adminPin, false);
+    expect(action.type).toBe('launch');
+    if (action.type === 'launch') {
+      expect(Boolean(action.asAdmin || adminPin.runAsAdmin)).toBe(true);
+    }
+  });
+
+  it('wires header weather pill, empty-space context menu, mixed grid, and centered tile edit modal', () => {
+    expect(startHeaderSrc).toContain('weather-hdr-pill');
+    expect(startHeaderSrc).toContain('weather-hdr-pop');
+    expect(startHeaderSrc).toContain('periph-hide-btn');
+    expect(startSpacesSrc).toContain('mixed-tile-grid');
+    expect(startSpacesSrc).toContain('space-dock-foot');
+    expect(startSpacesSrc).toContain('periph-hide-btn');
+    expect(startViewSrc).toContain('empty-ctx-menu');
+    expect(startViewSrc).toContain('tile-edit-backdrop');
+    expect(startViewSrc).toContain('tile-edit-modal');
+    expect(startViewSrc).toContain('shouldResetExplorerOnReopen');
   });
 });

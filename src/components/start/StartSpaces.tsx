@@ -8,10 +8,12 @@ import {
   deleteGameCombo,
   getAudioPeaks,
   getClipboardPaused,
+  hideBatteryDevice,
   iconCache,
   ipc,
   isCacheIconKey,
   loadGameCover,
+  movePinInSpace,
   pasteClipboardEntry,
   seekMedia,
   selectMediaSession,
@@ -30,6 +32,7 @@ import {
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
+  type TileSection,
   type TopProcessInfo,
   type WeatherSnapshot,
 } from '../../lib/ipc';
@@ -40,6 +43,7 @@ import {
   computePointerReorderRequest,
   EMPTY_TELEMETRY_HISTORY,
   filterClipboardEntries,
+  filterVisibleBatteries,
   formatDiskSummary,
   formatGbValue,
   formatHardwareSummaryLine,
@@ -60,7 +64,7 @@ import {
   isLowBatteryPercent,
   moveSpaceWidget,
   normalizeSessionVolumeScalar,
-  partitionHeroAndCompact,
+  partitionSpaceItemsBySection,
   PROCESS_KILL_ARM_MS,
   pushTelemetryHistory,
   reduceProcessKillClick,
@@ -72,6 +76,7 @@ import {
   toggleSpaceWidget,
   validateGameComboInput,
   type GameLibraryFilter,
+  type MovePinInSpaceParams,
   type TelemetryHistory,
 } from '../../lib/startLogic';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
@@ -86,6 +91,7 @@ import {
   DiskIcon,
   DropletIcon,
   ExternalArrowIcon,
+  EyeOffIcon,
   FallbackAppIcon,
   FolderSvg,
   KillIcon,
@@ -118,7 +124,11 @@ const BentoSpotCard = SpotCard as React.ComponentType<BentoSpotCardProps>;
 interface ActivePointerDrag {
   spaceKey: string;
   fromIdx: number;
+  fromId: string;
+  fromSection: TileSection | null;
   overIdx: number | null;
+  overId: string | null;
+  overSection: TileSection | null;
   label: string;
 }
 
@@ -269,6 +279,8 @@ export interface StartSpacesProps {
   onResolveIconKeys?: (keys: string[]) => void;
   onSetConfig?: (config: TestBarConfig) => void;
   onOptimisticReorder?: (spaceKey: string, fromIdx: number, toIdx: number) => void;
+  onOptimisticMovePin?: (params: MovePinInSpaceParams) => void;
+  onHideBatteryDevice?: (id: string) => void;
   onEditPin?: (item: PinItem, spaceKey: string) => void;
 }
 
@@ -314,6 +326,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   onResolveIconKeys,
   onSetConfig,
   onOptimisticReorder,
+  onOptimisticMovePin,
+  onHideBatteryDevice,
 }) => {
   const reducedMotion = useReducedMotion();
 
@@ -846,11 +860,13 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     [editMode, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
   );
 
-  // Always-on pointer-based pin reordering (6px threshold, Hero <-> Compact, immune to Tauri v2 dragDropEnabled)
+  // Always-on pointer-based pin reordering (6px threshold, Main <-> Bottom & Hero <-> Compact, immune to Tauri v2 dragDropEnabled)
   const handlePinPointerDown = (
     e: React.PointerEvent<HTMLElement>,
     spaceKey: string,
     idx: number,
+    itemId: string,
+    fromSection: TileSection | null,
     label: string,
   ) => {
     if (e.button !== 0 || typeof window === 'undefined') return;
@@ -867,6 +883,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const startY = e.clientY;
     let active = false;
     let currentOverIdx: number | null = null;
+    let currentOverId: string | null = null;
+    let currentOverSection: TileSection | null = null;
     let lastX = startX;
     let lastY = startY;
 
@@ -888,7 +906,16 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         if (typeof document !== 'undefined') {
           document.body.classList.add('is-reordering-pins');
         }
-        setActiveDrag({ spaceKey, fromIdx: idx, overIdx: null, label });
+        setActiveDrag({
+          spaceKey,
+          fromIdx: idx,
+          fromId: itemId,
+          fromSection,
+          overIdx: null,
+          overId: null,
+          overSection: null,
+          label,
+        });
         requestAnimationFrame(() => positionGhost(lastX, lastY));
       } else {
         positionGhost(ev.clientX, ev.clientY);
@@ -897,16 +924,57 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       const hit =
         typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
       const dropTile = hit?.closest?.<HTMLElement>('[data-drag-space][data-drag-idx]');
-      let nextOver: number | null = null;
+      let nextOverIdx: number | null = null;
+      let nextOverId: string | null = null;
+      let nextOverSection: TileSection | null = null;
+
       if (dropTile && dropTile.dataset.dragSpace === spaceKey) {
         const parsed = Number.parseInt(dropTile.dataset.dragIdx ?? '', 10);
-        if (Number.isInteger(parsed) && parsed !== idx) {
-          nextOver = parsed;
+        const targetId = dropTile.dataset.dragId || null;
+        const rawSec = dropTile.dataset.dragSection;
+        const targetSec: TileSection | null =
+          rawSec === 'main' || rawSec === 'bottom' ? rawSec : null;
+        if (spaceKey !== 'game_combos' && targetId && targetId !== itemId) {
+          nextOverIdx = Number.isInteger(parsed) ? parsed : null;
+          nextOverId = targetId;
+          nextOverSection = targetSec;
+        } else if (spaceKey === 'game_combos' && Number.isInteger(parsed) && parsed !== idx) {
+          nextOverIdx = parsed;
+          nextOverId = targetId;
+        }
+      } else if (spaceKey !== 'game_combos') {
+        const dropZone = hit?.closest?.<HTMLElement>('[data-drop-space][data-drop-section]');
+        if (dropZone && dropZone.dataset.dropSpace === spaceKey) {
+          const zoneSec: TileSection | null =
+            dropZone.dataset.dropSection === 'bottom'
+              ? 'bottom'
+              : dropZone.dataset.dropSection === 'main'
+                ? 'main'
+                : null;
+          if (zoneSec && zoneSec !== fromSection) {
+            nextOverSection = zoneSec;
+          }
         }
       }
-      if (nextOver !== currentOverIdx) {
-        currentOverIdx = nextOver;
-        setActiveDrag({ spaceKey, fromIdx: idx, overIdx: nextOver, label });
+
+      if (
+        nextOverIdx !== currentOverIdx ||
+        nextOverId !== currentOverId ||
+        nextOverSection !== currentOverSection
+      ) {
+        currentOverIdx = nextOverIdx;
+        currentOverId = nextOverId;
+        currentOverSection = nextOverSection;
+        setActiveDrag({
+          spaceKey,
+          fromIdx: idx,
+          fromId: itemId,
+          fromSection,
+          overIdx: nextOverIdx,
+          overId: nextOverId,
+          overSection: nextOverSection,
+          label,
+        });
       }
     };
 
@@ -932,14 +1000,40 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       if (!active) return;
       suppressClickUntilRef.current =
         typeof performance !== 'undefined' ? performance.now() + 260 : 0;
-      const req = computePointerReorderRequest(
-        { spaceKey, idx },
-        currentOverIdx !== null ? { spaceKey, idx: currentOverIdx } : null,
-      );
       setActiveDrag(null);
-      if (req) {
-        onOptimisticReorder?.(req.space, req.fromIdx, req.toIdx);
-        ipc<TestBarConfig>('reorder_pins', req)
+
+      if (spaceKey === 'game_combos') {
+        const req = computePointerReorderRequest(
+          { spaceKey, idx },
+          currentOverIdx !== null ? { spaceKey, idx: currentOverIdx } : null,
+        );
+        if (req) {
+          onOptimisticReorder?.(req.space, req.fromIdx, req.toIdx);
+          ipc<TestBarConfig>('reorder_pins', req)
+            .then((updated) => {
+              if (updated) onSetConfig?.(updated);
+            })
+            .catch(() => {
+              ipc<TestBarConfig>('get_config')
+                .then((fresh) => {
+                  if (fresh) onSetConfig?.(fresh);
+                })
+                .catch(() => {});
+              onShowToast('Не удалось изменить порядок');
+            });
+        }
+        return;
+      }
+
+      if (itemId && (currentOverId || (currentOverSection && currentOverSection !== fromSection))) {
+        const moveReq: MovePinInSpaceParams = {
+          space: spaceKey,
+          fromId: itemId,
+          toId: currentOverId ?? null,
+          targetSection: currentOverSection ?? fromSection ?? 'main',
+        };
+        onOptimisticMovePin?.(moveReq);
+        movePinInSpace(moveReq)
           .then((updated) => {
             if (updated) onSetConfig?.(updated);
           })
@@ -960,18 +1054,31 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     pointerDragCleanupRef.current = cleanup;
   };
 
-  const getDragClasses = (spaceKey: string, idx: number): string => {
+  const getDragClasses = (spaceKey: string, idx: number, itemId?: string): string => {
     if (!activeDrag || activeDrag.spaceKey !== spaceKey) return '';
-    if (activeDrag.fromIdx === idx) return ' is-dragging';
-    if (activeDrag.overIdx === idx) return ' drag-over';
+    if (spaceKey === 'game_combos') {
+      if (activeDrag.fromIdx === idx) return ' is-dragging';
+      if (activeDrag.overIdx === idx) return ' drag-over';
+      return '';
+    }
+    if (itemId && activeDrag.fromId === itemId) return ' is-dragging';
+    if (itemId && activeDrag.overId === itemId) return ' drag-over';
     return '';
   };
 
-  const makeDragProps = (spaceKey: string, idx: number, label: string) => ({
+  const makeDragProps = (
+    spaceKey: string,
+    idx: number,
+    itemId: string,
+    section: TileSection | null,
+    label: string,
+  ) => ({
     'data-drag-space': spaceKey,
     'data-drag-idx': idx,
+    'data-drag-id': itemId,
+    'data-drag-section': section ?? '',
     onPointerDown: (e: React.PointerEvent<HTMLElement>) =>
-      handlePinPointerDown(e, spaceKey, idx, label),
+      handlePinPointerDown(e, spaceKey, idx, itemId, section, label),
   });
 
   const renderEmptyStrip = (message: string) => (
@@ -979,7 +1086,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       <span>{message}</span>
       <button type="button" className="pin-any-btn" onClick={onOpenDrawer}>
         <PlusIcon className="ic12" />
-        <span>Закрепить</span>
+        <span>Добавить</span>
       </button>
     </div>
   );
@@ -1013,6 +1120,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         kind={item.kind}
         target={item.target}
         size={fallbackPx}
+        color={item.customColor ?? undefined}
       />
     );
   };
@@ -1021,6 +1129,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const running = isRunning(item);
     const customRgb = resolveCustomColorRgb(item.customColor);
     const isFolder = item.kind === 'folder';
+    const isFile = item.kind === 'file';
+    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
     const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
 
     const tileStyle: React.CSSProperties = {
@@ -1032,6 +1142,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     const icBoxCls = [
       'tile-ic',
       isFolder && !isCustomImg ? 'is-folder-ic' : '',
+      isFile && !isCustomImg ? 'is-file-ic' : '',
     ]
       .filter(Boolean)
       .join(' ');
@@ -1041,10 +1152,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className={`app-tile ${isHero ? 'hero' : 'compact'}${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx)}`}
+        className={`app-tile ${isHero ? 'hero' : 'compact'}${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
         style={tileStyle}
         onMouseMove={trackTilePointer}
-        {...makeDragProps(spaceKey, idx, item.title)}
+        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
         onClick={(e) => handlePinTileClick(item, e.shiftKey)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
@@ -1087,23 +1198,29 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   const renderQuickLink = (item: PinItem, idx: number, spaceKey: string) => {
     const customRgb = resolveCustomColorRgb(item.customColor);
     const isFolder = item.kind === 'folder';
+    const isFile = item.kind === 'file';
+    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
+    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
     const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+    const qIcCls = [
+      'qlink-ic',
+      isFolder && !isCustomImg ? 'is-folder-ic' : '',
+      isFile && !isCustomImg ? 'is-file-ic' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     return (
       <div
         key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
         role="button"
         tabIndex={0}
-        className={`qlink${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx)}`}
+        className={`qlink${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
         style={
           customRgb
-            ? ({
-                ['--tile-custom-rgb' as string]: customRgb,
-                borderColor: `rgba(${customRgb}, 0.34)`,
-                background: `linear-gradient(135deg, rgba(${customRgb}, 0.14), rgba(255, 255, 255, 0.03) 74%)`,
-              } as React.CSSProperties)
+            ? ({ ['--tile-custom-rgb' as string]: customRgb } as React.CSSProperties)
             : undefined
         }
-        {...makeDragProps(spaceKey, idx, item.title)}
+        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
         onClick={(e) => handlePinTileClick(item, e.shiftKey)}
         onKeyDown={(e) => {
           if (e.target === e.currentTarget && isActivateKey(e)) {
@@ -1129,9 +1246,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             <XIcon10 />
           </button>
         )}
-        <span style={customRgb ? { color: `rgb(${customRgb})` } : undefined}>
-          {renderTileGlyph(item, 'quick')}
-        </span>
+        <span className={qIcCls}>{renderTileGlyph(item, 'quick')}</span>
         <div className="qlink-meta">
           <div className="qlink-name">{item.title}</div>
           <div className={`qlink-sub ${shiftHeld && honestAlt ? 'alt-on' : ''}`}>
@@ -2312,8 +2427,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
                   key={cb.id || `combo-${idx}`}
                   role="button"
                   tabIndex={0}
-                  className={`consumer-row combo-row${getDragClasses('game_combos', idx)}`}
-                  {...makeDragProps('game_combos', idx, cb.title)}
+                  className={`consumer-row combo-row${getDragClasses('game_combos', idx, cb.id)}`}
+                  {...makeDragProps('game_combos', idx, cb.id, null, cb.title)}
                   onClick={() => {
                     if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
                       return;
@@ -2607,90 +2722,114 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
   };
 
-  const renderBatteriesCard = (bentoIndex: number) => (
-    <BentoSpotCard bentoIndex={bentoIndex} className="batteries-card">
-      <div className="sec-row" style={{ marginBottom: 8 }}>
-        <span className="sec-title">Беспроводные устройства</span>
-        <button
-          type="button"
-          className={`periph-refresh-btn ${periphsRefreshing ? 'spinning' : ''}`}
-          title="Обновить заряд устройств"
-          aria-label="Обновить заряд устройств"
-          disabled={periphsRefreshing}
-          onClick={() => void onRefreshPeriphs()}
-        >
-          <RefreshIcon className="ic12" />
-        </button>
-      </div>
-
-      {periphs.length === 0 ? (
-        <div className="weather-empty">Беспроводные устройства не найдены</div>
-      ) : (
-        <div className="bat-widget-list">
-          {periphs.map((p, idx) => {
-            const isLow = isLowBatteryPercent(p.percent);
-            const subLevels = p.subLevels ?? [];
-            const fillColor = isLow ? '#FB7185' : getBatteryColor(p.percent);
-            return (
-              <div
-                key={p.id || `bat-card-${p.name}-${idx}`}
-                className={`bat-widget-row ${isLow ? 'is-low' : ''}`}
-              >
-                <div className="bat-widget-top">
-                  <span className="bat-widget-ic">
-                    <PeripheralDeviceIcon kind={p.kind} className="ic14" />
-                  </span>
-                  <div className="bat-widget-meta">
-                    <span className="bat-widget-name" title={p.name}>{p.name}</span>
-                    <span className="periph-src-badge">
-                      {formatPeripheralSourceLabel(p.source)}
-                    </span>
-                  </div>
-                  <span
-                    className="bat-widget-pct"
-                    style={{ color: fillColor }}
-                  >
-                    {p.charging && <ChargingBoltIcon className="ic12" />}
-                    <span>{p.percent}%</span>
-                  </span>
-                </div>
-
-                <div className="bat-widget-bar">
-                  <div
-                    className="bat-widget-fill"
-                    style={
-                      {
-                        ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
-                        background: fillColor,
-                      } as React.CSSProperties
-                    }
-                  />
-                </div>
-
-                {subLevels.length > 0 && (
-                  <div className="periph-sub-levels">
-                    {subLevels.map((sub, sIdx) => {
-                      const subLow = isLowBatteryPercent(sub.percent);
-                      return (
-                        <span
-                          key={`${sub.label}-${sIdx}`}
-                          className={`periph-sub-chip ${subLow ? 'is-low' : ''}`}
-                        >
-                          {sub.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
-                          <span>{sub.label}:</span>
-                          <strong>{sub.percent}%</strong>
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+  const renderBatteriesCard = (bentoIndex: number) => {
+    const visiblePeriphList = filterVisibleBatteries(periphs, config?.hiddenBatteryIds);
+    return (
+      <BentoSpotCard bentoIndex={bentoIndex} className="batteries-card">
+        <div className="sec-row" style={{ marginBottom: 8 }}>
+          <span className="sec-title">Беспроводные устройства</span>
+          <button
+            type="button"
+            className={`periph-refresh-btn ${periphsRefreshing ? 'spinning' : ''}`}
+            title="Обновить заряд устройств"
+            aria-label="Обновить заряд устройств"
+            disabled={periphsRefreshing}
+            onClick={() => void onRefreshPeriphs()}
+          >
+            <RefreshIcon className="ic12" />
+          </button>
         </div>
-      )}
-    </BentoSpotCard>
-  );
+
+        {visiblePeriphList.length === 0 ? (
+          <div className="weather-empty">Беспроводные устройства не найдены</div>
+        ) : (
+          <div className="bat-widget-list">
+            {visiblePeriphList.map((p, idx) => {
+              const isLow = isLowBatteryPercent(p.percent);
+              const subLevels = p.subLevels ?? [];
+              const fillColor = isLow ? '#FB7185' : getBatteryColor(p.percent);
+              return (
+                <div
+                  key={p.id || `bat-card-${p.name}-${idx}`}
+                  className={`bat-widget-row ${isLow ? 'is-low' : ''}`}
+                >
+                  <div className="bat-widget-top">
+                    <span className="bat-widget-ic">
+                      <PeripheralDeviceIcon kind={p.kind} className="ic14" />
+                    </span>
+                    <div className="bat-widget-meta">
+                      <span className="bat-widget-name" title={p.name}>{p.name}</span>
+                      <span className="periph-src-badge">
+                        {formatPeripheralSourceLabel(p.source)}
+                      </span>
+                    </div>
+                    <span
+                      className="bat-widget-pct"
+                      style={{ color: fillColor }}
+                    >
+                      {p.charging && <ChargingBoltIcon className="ic12" />}
+                      <span>{p.percent}%</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="periph-hide-btn"
+                      title="Скрыть устройство"
+                      aria-label={`Скрыть ${p.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onHideBatteryDevice) {
+                          onHideBatteryDevice(p.id);
+                        } else {
+                          void hideBatteryDevice(p.id)
+                            .then((updated) => {
+                              onSetConfig?.(updated);
+                              onShowToast('Устройство скрыто; вернуть можно в Настройках');
+                            })
+                            .catch(() => onShowToast('Не удалось скрыть устройство'));
+                        }
+                      }}
+                    >
+                      <EyeOffIcon className="ic12" />
+                    </button>
+                  </div>
+
+                  <div className="bat-widget-bar">
+                    <div
+                      className="bat-widget-fill"
+                      style={
+                        {
+                          ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
+                          background: fillColor,
+                        } as React.CSSProperties
+                      }
+                    />
+                  </div>
+
+                  {subLevels.length > 0 && (
+                    <div className="periph-sub-levels">
+                      {subLevels.map((sub, sIdx) => {
+                        const subLow = isLowBatteryPercent(sub.percent);
+                        return (
+                          <span
+                            key={`${sub.label}-${sIdx}`}
+                            className={`periph-sub-chip ${subLow ? 'is-low' : ''}`}
+                          >
+                            {sub.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                            <span>{sub.label}:</span>
+                            <strong>{sub.percent}%</strong>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </BentoSpotCard>
+    );
+  };
 
   const renderWidgetById = (widgetId: SpaceWidgetId, bentoIndex: number): React.ReactNode => {
     switch (widgetId) {
@@ -2798,13 +2937,27 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       </button>
       <button type="button" className="sec-act sec-act-ic" onClick={onOpenDrawer}>
         <PlusIcon className="ic12" />
-        <span>Закрепить</span>
+        <span>Добавить</span>
       </button>
     </div>
   );
 
   const items = activeSpace.items ?? [];
-  const partitioned = activeSpace.showHeroRow ? partitionHeroAndCompact(items) : null;
+  const { mainItems, bottomItems } = partitionSpaceItemsBySection(items);
+  const showBottomDock = bottomItems.length > 0 || editMode;
+  const bottomDockTitle = activeSpace.bottomSectionTitle?.trim() || 'Быстрый доступ';
+  const gamesDockTitle =
+    activeSpace.bottomSectionTitle?.trim() || 'Лаунчеры и закреплённое';
+  const isDroppingToMain =
+    activeDrag?.spaceKey === activeSpace.id &&
+    !activeDrag.overId &&
+    activeDrag.overSection === 'main' &&
+    activeDrag.fromSection === 'bottom';
+  const isDroppingToBottom =
+    activeDrag?.spaceKey === activeSpace.id &&
+    !activeDrag.overId &&
+    activeDrag.overSection === 'bottom' &&
+    activeDrag.fromSection !== 'bottom';
 
   const leftColumnCard = isGamesLayout ? (
     <BentoSpotCard bentoIndex={0} className="space-card-flex">
@@ -2903,9 +3056,24 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         )}
       </div>
 
-      <div className="space-dock-foot">
+      <div
+        className={`space-dock-foot${isDroppingToBottom ? ' is-drop-target' : ''}`}
+        data-drop-space={activeSpace.id}
+        data-drop-section="bottom"
+      >
         <div className="sec-row" style={{ marginBottom: 7 }}>
-          <span className="sec-title">Лаунчеры и закреплённое</span>
+          <span className="sec-title">{gamesDockTitle}</span>
+          {editMode && (
+            <button
+              type="button"
+              className="dock-add-btn"
+              title="Добавить элемент"
+              aria-label="Добавить элемент"
+              onClick={onOpenDrawer}
+            >
+              <PlusIcon className="ic12" />
+            </button>
+          )}
         </div>
         {items.length === 0 ? (
           renderEmptyStrip('Нет закреплённых элементов')
@@ -2923,7 +3091,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         {renderSpaceActionButtons()}
       </div>
 
-      {items.length === 0 ? (
+      {items.length === 0 && !editMode ? (
         <div className="custom-empty">
           <div className="custom-empty-title">Пока пусто</div>
           <div className="custom-empty-sub">
@@ -2931,32 +3099,66 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           </div>
           <button type="button" className="pin-any-btn primary" onClick={onOpenDrawer}>
             <PlusIcon className="ic12" />
-            <span>Закрепить элементы</span>
+            <span>Добавить элементы</span>
           </button>
         </div>
       ) : (
-        <div className="space-scroll-main">
-          {partitioned ? (
-            <>
-              {partitioned.heroes.length > 0 && (
-                <div className="hero-pair">
-                  {partitioned.heroes.map((p, i) => renderTile(p, i, activeSpace.id, true))}
+        <>
+          <div
+            className={`space-scroll-main${isDroppingToMain ? ' is-drop-target' : ''}`}
+            data-drop-space={activeSpace.id}
+            data-drop-section="main"
+          >
+            {mainItems.length === 0 ? (
+              <div className="custom-empty">
+                <div className="custom-empty-title">Пока пусто</div>
+                <div className="custom-empty-sub">
+                  Закрепите сюда программы, папки, файлы или ссылки.
+                </div>
+                <button type="button" className="pin-any-btn primary" onClick={onOpenDrawer}>
+                  <PlusIcon className="ic12" />
+                  <span>Добавить элементы</span>
+                </button>
+              </div>
+            ) : (
+              <div className="mixed-tile-grid">
+                {mainItems.map((p, i) =>
+                  renderTile(p, i, activeSpace.id, p.tileSize === 'hero'),
+                )}
+              </div>
+            )}
+          </div>
+
+          {showBottomDock && (
+            <div
+              className={`space-dock-foot${isDroppingToBottom ? ' is-drop-target' : ''}`}
+              data-drop-space={activeSpace.id}
+              data-drop-section="bottom"
+            >
+              <div className="sec-row" style={{ marginBottom: 7 }}>
+                <span className="sec-title">{bottomDockTitle}</span>
+                {editMode && (
+                  <button
+                    type="button"
+                    className="dock-add-btn"
+                    title="Добавить элемент"
+                    aria-label="Добавить элемент"
+                    onClick={onOpenDrawer}
+                  >
+                    <PlusIcon className="ic12" />
+                  </button>
+                )}
+              </div>
+              {bottomItems.length === 0 ? (
+                <div className="dock-foot-empty">Нет закреплённых элементов</div>
+              ) : (
+                <div className="qlinks-grid qlinks-scroll">
+                  {bottomItems.map((item, idx) => renderQuickLink(item, idx, activeSpace.id))}
                 </div>
               )}
-              {partitioned.compact.length > 0 && (
-                <div className="sub-grid">
-                  {partitioned.compact.map((p, i) =>
-                    renderTile(p, i + 2, activeSpace.id, false),
-                  )}
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="sub-grid">
-              {items.map((p, i) => renderTile(p, i, activeSpace.id, false))}
             </div>
           )}
-        </div>
+        </>
       )}
     </BentoSpotCard>
   );

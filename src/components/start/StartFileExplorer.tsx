@@ -18,6 +18,7 @@ import {
   type ExplorerViewMode,
 } from '../../lib/fileExplorerLogic';
 import { formatIpcError } from '../../lib/flyoutLogic';
+import type { ExplorerSessionSnapshot } from '../../lib/startLogic';
 import {
   fsCopyFilesToClipboard,
   fsCreateFolder,
@@ -69,9 +70,13 @@ import {
   TrashIcon,
 } from '../Icons';
 
+export type { ExplorerSessionSnapshot };
+
 export interface StartFileExplorerProps {
   initialPath: string;
   activeSpaceId: string;
+  initialSession?: ExplorerSessionSnapshot | null;
+  onSessionChange?: (snap: ExplorerSessionSnapshot) => void;
   onClose: () => void;
   onPinFolder: (path: string, name: string) => Promise<void> | void;
   onShowToast: (msg: string) => void;
@@ -212,20 +217,27 @@ async function copyTextToClipboard(text: string): Promise<void> {
 export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
   initialPath,
   activeSpaceId,
+  initialSession = null,
+  onSessionChange,
   onClose,
   onPinFolder,
   onShowToast,
 }) => {
+  const bootPath = initialSession?.path?.trim() || initialPath;
   const [listing, setListing] = useState<DirectoryListing | null>(null);
   const [history, setHistory] = useState<ExplorerHistoryState>(() =>
-    createHistoryState(initialPath),
+    createHistoryState(bootPath),
   );
-  const [viewMode, setViewMode] = useState<ExplorerViewMode>('list');
-  const [sortBy, setSortBy] = useState<ExplorerSortBy>('name');
-  const [sortDir, setSortDir] = useState<ExplorerSortDir>('asc');
+  const [viewMode, setViewMode] = useState<ExplorerViewMode>(
+    () => initialSession?.viewMode ?? 'list',
+  );
+  const [sortBy, setSortBy] = useState<ExplorerSortBy>(() => initialSession?.sortBy ?? 'name');
+  const [sortDir, setSortDir] = useState<ExplorerSortDir>(() => initialSession?.sortDir ?? 'asc');
   const [showHidden, setShowHidden] = useState(false);
   const [filterQuery, setFilterQuery] = useState('');
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(
+    () => initialSession?.selectedPath ?? null,
+  );
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -259,7 +271,11 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
     width: 880,
     height: 450,
   });
-  const [scrollTop, setScrollTop] = useState(0);
+  const [scrollTop, setScrollTop] = useState(() =>
+    initialSession && Number.isFinite(initialSession.scrollTop)
+      ? Math.max(0, initialSession.scrollTop)
+      : 0,
+  );
 
   // Thumbnail LRU cache & reactive lookup map
   const thumbLruRef = useRef<LruIconCache>(new LruIconCache(THUMB_CACHE_MAX));
@@ -270,9 +286,24 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
   // Refs for lifecycle & stale async guards
   const mountedRef = useRef(true);
   const navSeqRef = useRef(0);
-  const activePathRef = useRef(initialPath);
+  const activePathRef = useRef(bootPath);
   const thumbSizeRef = useRef<number>(32);
   const prevInitialPathRef = useRef(initialPath);
+  const pendingRestoreRef = useRef<{
+    scrollTop: number;
+    selectedPath: string | null;
+  } | null>(
+    initialSession
+      ? {
+          scrollTop: Number.isFinite(initialSession.scrollTop)
+            ? Math.max(0, initialSession.scrollTop)
+            : 0,
+          selectedPath: initialSession.selectedPath ?? null,
+        }
+      : null,
+  );
+  const onSessionChangeRef = useRef(onSessionChange);
+  onSessionChangeRef.current = onSessionChange;
   const historyRef = useRef(history);
   historyRef.current = history;
   const listingRef = useRef(listing);
@@ -344,14 +375,36 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
         setRenamingPath(null);
 
         if (opts.mode === 'init') {
+          const restore = pendingRestoreRef.current;
+          pendingRestoreRef.current = null;
           setHistory(createHistoryState(res.currentPath));
           setFilterQuery('');
-          setSelectedPath(opts.selectAfterLoad ?? null);
           setNewFolderOpen(false);
           setPathEditing(false);
-          setScrollTop(0);
-          if (viewportRef.current) viewportRef.current.scrollTop = 0;
+          if (restore) {
+            const matchedSel =
+              restore.selectedPath && res.entries.some((e) => e.path === restore.selectedPath)
+                ? restore.selectedPath
+                : null;
+            const restoredScroll = Math.max(0, restore.scrollTop);
+            setSelectedPath(opts.selectAfterLoad ?? matchedSel);
+            setScrollTop(restoredScroll);
+            if (typeof requestAnimationFrame === 'function') {
+              requestAnimationFrame(() => {
+                if (viewportRef.current) {
+                  viewportRef.current.scrollTop = restoredScroll;
+                }
+              });
+            } else if (viewportRef.current) {
+              viewportRef.current.scrollTop = restoredScroll;
+            }
+          } else {
+            setSelectedPath(opts.selectAfterLoad ?? null);
+            setScrollTop(0);
+            if (viewportRef.current) viewportRef.current.scrollTop = 0;
+          }
         } else if (opts.mode === 'push') {
+          pendingRestoreRef.current = null;
           setHistory((prev) => pushHistoryPath(prev, res.currentPath));
           setFilterQuery('');
           setSelectedPath(opts.selectAfterLoad ?? null);
@@ -360,6 +413,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
           setScrollTop(0);
           if (viewportRef.current) viewportRef.current.scrollTop = 0;
         } else if (opts.mode === 'history' && opts.nextHistory) {
+          pendingRestoreRef.current = null;
           setHistory(opts.nextHistory);
           setFilterQuery('');
           setSelectedPath(opts.selectAfterLoad ?? null);
@@ -400,8 +454,13 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
     const pathChanged = prevInitialPathRef.current !== initialPath;
     if (isInitialMount || pathChanged) {
       prevInitialPathRef.current = initialPath;
-      activePathRef.current = initialPath;
-      void loadDirectory(initialPath, {
+      if (pathChanged) {
+        pendingRestoreRef.current = null;
+      }
+      const targetToLoad =
+        isInitialMount && initialSession?.path?.trim() ? initialSession.path.trim() : initialPath;
+      activePathRef.current = targetToLoad;
+      void loadDirectory(targetToLoad, {
         mode: 'init',
         sortBy,
         sortDir,
@@ -411,6 +470,21 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
     // Intentionally trigger only on initialPath changes; sort/hidden changes use dedicated refresh below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPath, loadDirectory]);
+
+  // Emit live session snapshot for 3-minute Start resume
+  useEffect(() => {
+    if (!listing?.currentPath || pendingRestoreRef.current !== null) {
+      return;
+    }
+    onSessionChangeRef.current?.({
+      path: listing.currentPath,
+      viewMode,
+      sortBy,
+      sortDir,
+      scrollTop,
+      selectedPath,
+    });
+  }, [listing?.currentPath, viewMode, sortBy, sortDir, scrollTop, selectedPath]);
 
   // Reload when sort / hidden toggle changes (StrictMode-safe key diff)
   const sortHiddenKey = `${sortBy}|${sortDir}|${showHidden}`;
@@ -1080,7 +1154,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
       if (
         document.activeElement === document.body &&
         !document.querySelector(
-          '.settings-backdrop, .search-backdrop, .all-apps-drawer, .space-create-pop, .space-manage-pop, .periph-pop',
+          '.settings-backdrop, .search-backdrop, .all-apps-drawer, .space-create-pop, .space-manage-pop, .periph-pop, .weather-hdr-pop, .tile-edit-backdrop, .empty-ctx-menu',
         )
       ) {
         e.preventDefault();
