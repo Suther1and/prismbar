@@ -1,16 +1,17 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './styles/tokens.css';
+import './styles/themes.css';
 import { TaskbarView } from './components/TaskbarView';
 import { StartView } from './components/StartView';
 import { FlyoutView } from './components/FlyoutView';
+import { applyAppearanceToDocument } from './lib/appearance';
 import {
   getBackdropMode,
   ipc,
   isTauri,
   onEvent,
   type BackdropMode,
-  type GlassDepth,
   type TestBarConfig,
 } from './lib/ipc';
 
@@ -22,17 +23,9 @@ function applyBackdropMode(mode: unknown) {
   }
 }
 
-function applyGlassDepth(depth: unknown) {
-  if (depth === 'crystal' || depth === 'obsidian' || depth === 'matte') {
-    document.documentElement.dataset.glass = depth;
-  } else {
-    document.documentElement.dataset.glass = 'obsidian';
-  }
-}
-
 if (typeof document !== 'undefined') {
   document.documentElement.dataset.backdrop = 'dcomp';
-  document.documentElement.dataset.glass = 'obsidian';
+  applyAppearanceToDocument(null);
 
   if (isTauri()) {
     void getBackdropMode()
@@ -45,10 +38,10 @@ if (typeof document !== 'undefined') {
       applyBackdropMode(mode);
     });
     void ipc<TestBarConfig>('get_config')
-      .then((cfg) => applyGlassDepth(cfg?.glassDepth))
+      .then((cfg) => applyAppearanceToDocument(cfg))
       .catch(() => {});
     void onEvent<TestBarConfig>('config-updated', (cfg) => {
-      applyGlassDepth(cfg?.glassDepth as GlassDepth | undefined);
+      applyAppearanceToDocument(cfg);
     });
   }
 }

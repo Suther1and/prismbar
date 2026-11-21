@@ -1,0 +1,483 @@
+/* ==========================================================================
+   TestBar v3.2 — Global Theme Presets, Glass Depths, Custom Accent,
+   No-Gradient & No-Hover-Glow Engine
+   ========================================================================== */
+
+:root {
+  --theme-solid-hex: #0D1017;
+  --theme-elevated-hex: #151A26;
+  --theme-rgb-hi: 16, 19, 28;
+  --theme-rgb-lo: 11, 13, 19;
+  --theme-dock-rgb-hi: 18, 21, 31;
+  --theme-dock-rgb-lo: 12, 14, 21;
+
+  --glass-alpha-hi: 0.74;
+  --glass-alpha-lo: 0.69;
+  --glass-fly-hi: 0.75;
+  --glass-fly-lo: 0.70;
+  --glass-pop-hi: 0.96;
+  --glass-pop-lo: 0.97;
+  --glass-preview-hi: 0.87;
+  --glass-preview-lo: 0.85;
+  --glass-ctx-hi: 0.84;
+  --glass-ctx-lo: 0.82;
+
+  --global-accent: #818CF8;
+  --global-accent-rgb: 129, 140, 248;
+}
+
+/* --- 6 Dark Theme Presets --- */
+:root[data-theme="obsidian"] {
+  --bg-solid: #0D1017;
+  --theme-solid-hex: #0D1017;
+  --theme-elevated-hex: #151A26;
+  --theme-rgb-hi: 16, 19, 28;
+  --theme-rgb-lo: 11, 13, 19;
+  --theme-dock-rgb-hi: 18, 21, 31;
+  --theme-dock-rgb-lo: 12, 14, 21;
+  --surface-1: rgba(255, 255, 255, 0.032);
+  --surface-2: rgba(255, 255, 255, 0.044);
+  --surface-2-hov: rgba(255, 255, 255, 0.082);
+  --surface-well: rgba(0, 0, 0, 0.34);
+  --stroke-subtle: rgba(255, 255, 255, 0.075);
+  --stroke-hair: rgba(255, 255, 255, 0.11);
+  --stroke-hi: rgba(255, 255, 255, 0.18);
+}
+
+:root[data-theme="carbon"] {
+  --bg-solid: #0A0A0C;
+  --theme-solid-hex: #0A0A0C;
+  --theme-elevated-hex: #121214;
+  --theme-rgb-hi: 18, 18, 20;
+  --theme-rgb-lo: 10, 10, 12;
+  --theme-dock-rgb-hi: 18, 18, 20;
+  --theme-dock-rgb-lo: 10, 10, 12;
+  --surface-1: rgba(255, 255, 255, 0.026);
+  --surface-2: rgba(255, 255, 255, 0.04);
+  --surface-2-hov: rgba(255, 255, 255, 0.078);
+  --surface-well: rgba(0, 0, 0, 0.48);
+  --stroke-subtle: rgba(255, 255, 255, 0.072);
+  --stroke-hair: rgba(255, 255, 255, 0.11);
+  --stroke-hi: rgba(255, 255, 255, 0.17);
+}
+
+:root[data-theme="midnight"] {
+  --bg-solid: #080E1E;
+  --theme-solid-hex: #080E1E;
+  --theme-elevated-hex: #101932;
+  --theme-rgb-hi: 16, 25, 50;
+  --theme-rgb-lo: 8, 14, 30;
+  --theme-dock-rgb-hi: 18, 28, 56;
+  --theme-dock-rgb-lo: 10, 16, 34;
+  --surface-1: rgba(165, 198, 255, 0.036);
+  --surface-2: rgba(165, 198, 255, 0.05);
+  --surface-2-hov: rgba(165, 198, 255, 0.095);
+  --surface-well: rgba(4, 8, 20, 0.42);
+  --stroke-subtle: rgba(148, 184, 255, 0.09);
+  --stroke-hair: rgba(148, 184, 255, 0.14);
+  --stroke-hi: rgba(165, 198, 255, 0.22);
+}
+
+:root[data-theme="emerald"] {
+  --bg-solid: #081310;
+  --theme-solid-hex: #081310;
+  --theme-elevated-hex: #10211C;
+  --theme-rgb-hi: 16, 33, 28;
+  --theme-rgb-lo: 8, 19, 16;
+  --theme-dock-rgb-hi: 18, 38, 32;
+  --theme-dock-rgb-lo: 9, 22, 18;
+  --surface-1: rgba(167, 243, 208, 0.034);
+  --surface-2: rgba(167, 243, 208, 0.048);
+  --surface-2-hov: rgba(167, 243, 208, 0.09);
+  --surface-well: rgba(4, 12, 10, 0.40);
+  --stroke-subtle: rgba(140, 230, 195, 0.09);
+  --stroke-hair: rgba(140, 230, 195, 0.135);
+  --stroke-hi: rgba(167, 243, 208, 0.21);
+}
+
+:root[data-theme="amethyst"] {
+  --bg-solid: #100B19;
+  --theme-solid-hex: #100B19;
+  --theme-elevated-hex: #1A1328;
+  --theme-rgb-hi: 26, 19, 40;
+  --theme-rgb-lo: 16, 11, 25;
+  --theme-dock-rgb-hi: 30, 22, 46;
+  --theme-dock-rgb-lo: 18, 12, 28;
+  --surface-1: rgba(216, 194, 255, 0.036);
+  --surface-2: rgba(216, 194, 255, 0.05);
+  --surface-2-hov: rgba(216, 194, 255, 0.092);
+  --surface-well: rgba(10, 6, 18, 0.42);
+  --stroke-subtle: rgba(202, 178, 255, 0.09);
+  --stroke-hair: rgba(202, 178, 255, 0.135);
+  --stroke-hi: rgba(216, 194, 255, 0.21);
+}
+
+:root[data-theme="graphite"] {
+  --bg-solid: #121417;
+  --theme-solid-hex: #121417;
+  --theme-elevated-hex: #1B1E24;
+  --theme-rgb-hi: 27, 30, 36;
+  --theme-rgb-lo: 18, 20, 23;
+  --theme-dock-rgb-hi: 30, 34, 40;
+  --theme-dock-rgb-lo: 20, 22, 26;
+  --surface-1: rgba(226, 232, 240, 0.036);
+  --surface-2: rgba(226, 232, 240, 0.052);
+  --surface-2-hov: rgba(226, 232, 240, 0.092);
+  --surface-well: rgba(10, 11, 14, 0.38);
+  --stroke-subtle: rgba(226, 232, 240, 0.085);
+  --stroke-hair: rgba(226, 232, 240, 0.125);
+  --stroke-hi: rgba(226, 232, 240, 0.20);
+}
+
+/* --- 4 Glass Depth Levels (Crystal / Obsidian / Matte / Solid) --- */
+:root[data-glass="crystal"] {
+  --glass-alpha-hi: 0.58;
+  --glass-alpha-lo: 0.52;
+  --glass-fly-hi: 0.59;
+  --glass-fly-lo: 0.54;
+  --glass-pop-hi: 0.94;
+  --glass-pop-lo: 0.95;
+  --glass-preview-hi: 0.76;
+  --glass-preview-lo: 0.72;
+  --glass-ctx-hi: 0.72;
+  --glass-ctx-lo: 0.68;
+}
+
+:root[data-glass="obsidian"] {
+  --glass-alpha-hi: 0.74;
+  --glass-alpha-lo: 0.69;
+  --glass-fly-hi: 0.75;
+  --glass-fly-lo: 0.70;
+  --glass-pop-hi: 0.96;
+  --glass-pop-lo: 0.97;
+  --glass-preview-hi: 0.87;
+  --glass-preview-lo: 0.85;
+  --glass-ctx-hi: 0.84;
+  --glass-ctx-lo: 0.82;
+}
+
+:root[data-glass="matte"] {
+  --glass-alpha-hi: 0.88;
+  --glass-alpha-lo: 0.84;
+  --glass-fly-hi: 0.88;
+  --glass-fly-lo: 0.85;
+  --glass-pop-hi: 0.97;
+  --glass-pop-lo: 0.98;
+  --glass-preview-hi: 0.94;
+  --glass-preview-lo: 0.92;
+  --glass-ctx-hi: 0.94;
+  --glass-ctx-lo: 0.92;
+}
+
+:root[data-glass="solid"] {
+  --glass-alpha-hi: 1;
+  --glass-alpha-lo: 1;
+  --glass-fly-hi: 1;
+  --glass-fly-lo: 1;
+  --glass-pop-hi: 1;
+  --glass-pop-lo: 1;
+  --glass-preview-hi: 1;
+  --glass-preview-lo: 1;
+  --glass-ctx-hi: 1;
+  --glass-ctx-lo: 1;
+}
+
+:root[data-backdrop="none"]:not([data-glass="solid"]) {
+  --glass-alpha-hi: 0.95;
+  --glass-alpha-lo: 0.94;
+  --glass-fly-hi: 0.95;
+  --glass-fly-lo: 0.94;
+  --glass-pop-hi: 0.98;
+  --glass-pop-lo: 0.99;
+  --glass-preview-hi: 0.95;
+  --glass-preview-lo: 0.94;
+  --glass-ctx-hi: 0.95;
+  --glass-ctx-lo: 0.94;
+}
+
+/* Compose surfaces from active theme RGB × active glass depth alpha */
+:root,
+:root[data-theme],
+:root[data-glass],
+:root[data-backdrop="none"] {
+  --surface-shell: linear-gradient(
+    180deg,
+    rgba(var(--theme-rgb-hi), var(--glass-alpha-hi)) 0%,
+    rgba(var(--theme-rgb-lo), var(--glass-alpha-lo)) 100%
+  );
+  --surface-dock: linear-gradient(
+    180deg,
+    rgba(var(--theme-dock-rgb-hi), var(--glass-alpha-hi)) 0%,
+    rgba(var(--theme-dock-rgb-lo), var(--glass-alpha-lo)) 100%
+  );
+  --surface-flyout: linear-gradient(
+    180deg,
+    rgba(var(--theme-rgb-hi), var(--glass-fly-hi)) 0%,
+    rgba(var(--theme-rgb-lo), var(--glass-fly-lo)) 100%
+  );
+  --surface-pop: linear-gradient(
+    180deg,
+    rgba(var(--theme-rgb-hi), var(--glass-pop-hi)) 0%,
+    rgba(var(--theme-rgb-lo), var(--glass-pop-lo)) 100%
+  );
+}
+
+:root[data-glass="solid"],
+:root[data-theme][data-glass="solid"],
+:root[data-glass="solid"][data-backdrop="none"] {
+  --surface-shell: linear-gradient(
+    180deg,
+    rgb(var(--theme-rgb-hi)) 0%,
+    var(--theme-solid-hex) 100%
+  );
+  --surface-dock: linear-gradient(
+    180deg,
+    rgb(var(--theme-dock-rgb-hi)) 0%,
+    var(--theme-solid-hex) 100%
+  );
+  --surface-flyout: linear-gradient(
+    180deg,
+    rgb(var(--theme-rgb-hi)) 0%,
+    var(--theme-solid-hex) 100%
+  );
+  --surface-pop: linear-gradient(
+    180deg,
+    rgb(var(--theme-rgb-hi)) 0%,
+    var(--theme-solid-hex) 100%
+  );
+}
+
+/* Secondary surfaces follow active theme & glass depth */
+.all-apps-drawer,
+.cmd-palette,
+.power-strip,
+.start-toast,
+.tray-ctx-overlay {
+  background: rgba(var(--theme-rgb-hi), 0.99);
+}
+
+.start-chassis > .fx-root {
+  background: rgba(var(--theme-rgb-lo), 0.985);
+}
+
+.settings-modal,
+.tile-edit-modal {
+  background: var(--theme-solid-hex, #0D1017);
+}
+
+.tile-edit-foot {
+  background: rgba(var(--theme-rgb-lo), 0.88);
+}
+
+.flyout-card.preview-card,
+:root[data-glass] .flyout-card.preview-card {
+  background: linear-gradient(
+    180deg,
+    rgba(var(--theme-rgb-hi), var(--glass-preview-hi)) 0%,
+    rgba(var(--theme-rgb-lo), var(--glass-preview-lo)) 100%
+  );
+}
+
+:root[data-glass="solid"] .flyout-card.preview-card {
+  background: linear-gradient(
+    180deg,
+    rgb(var(--theme-rgb-hi)) 0%,
+    var(--theme-solid-hex) 100%
+  );
+}
+
+.ctx-card:not(.tile-ctx-menu),
+:root[data-glass] .ctx-card:not(.tile-ctx-menu) {
+  background:
+    radial-gradient(240px 110px at 50% 0%, rgba(var(--accent-rgb), 0.085), transparent 72%),
+    linear-gradient(
+      180deg,
+      rgba(var(--theme-rgb-hi), var(--glass-ctx-hi)) 0%,
+      rgba(var(--theme-rgb-lo), var(--glass-ctx-lo)) 100%
+    );
+}
+
+:root[data-glass="solid"] .ctx-card:not(.tile-ctx-menu) {
+  background:
+    radial-gradient(240px 110px at 50% 0%, rgba(var(--accent-rgb), 0.085), transparent 72%),
+    linear-gradient(180deg, rgb(var(--theme-rgb-hi)) 0%, var(--theme-solid-hex) 100%);
+}
+
+.tile-ctx-menu,
+.flyout-card.ctx-card.tile-ctx-menu,
+.tile-edit-pop,
+.fx-ctx-menu {
+  background:
+    radial-gradient(240px 120px at 50% 0%, rgba(var(--accent-rgb), 0.11), transparent 72%),
+    linear-gradient(
+      180deg,
+      rgba(var(--theme-rgb-hi), 0.96) 0%,
+      rgba(var(--theme-rgb-lo), 0.98) 100%
+    );
+}
+
+/* --- Custom Global Accent Mode Override (overrides per-space inline/attr vars) --- */
+:root[data-accent-mode="custom"],
+:root[data-accent-mode="custom"] .start-root,
+:root[data-accent-mode="custom"] .tb-root,
+:root[data-accent-mode="custom"] .flyout-root,
+:root[data-accent-mode="custom"] [data-space] {
+  --accent: var(--global-accent) !important;
+  --accent-rgb: var(--global-accent-rgb) !important;
+}
+
+:root[data-accent-mode="custom"] .chassis-aura,
+:root[data-accent-mode="custom"] .chassis-aura-layer {
+  --aura-rgb: var(--global-accent-rgb) !important;
+}
+
+/* --- No-Gradient Engine (flattens all gradients + hides chassis ambient aura) --- */
+:root[data-gradients="off"],
+:root[data-gradients="off"][data-theme],
+:root[data-gradients="off"][data-glass],
+:root[data-gradients="off"][data-backdrop="none"] {
+  --surface-shell: rgba(var(--theme-rgb-hi), var(--glass-alpha-hi));
+  --surface-dock: rgba(var(--theme-dock-rgb-hi), var(--glass-alpha-hi));
+  --surface-flyout: rgba(var(--theme-rgb-hi), var(--glass-fly-hi));
+  --surface-pop: rgba(var(--theme-rgb-hi), var(--glass-pop-hi));
+}
+
+:root[data-gradients="off"][data-glass="solid"],
+:root[data-gradients="off"][data-theme][data-glass="solid"],
+:root[data-gradients="off"][data-glass="solid"][data-backdrop="none"] {
+  --surface-shell: var(--theme-solid-hex);
+  --surface-dock: var(--theme-solid-hex);
+  --surface-flyout: var(--theme-solid-hex);
+  --surface-pop: var(--theme-solid-hex);
+}
+
+:root[data-gradients="off"] .chassis-aura,
+:root[data-gradients="off"] .chassis-aura-layer {
+  display: none !important;
+  opacity: 0 !important;
+}
+
+:root[data-gradients="off"] .flyout-card.preview-card,
+:root[data-gradients="off"][data-glass] .flyout-card.preview-card {
+  background: rgba(var(--theme-rgb-hi), var(--glass-preview-hi));
+}
+
+:root[data-gradients="off"][data-glass="solid"] .flyout-card.preview-card {
+  background: var(--theme-solid-hex);
+}
+
+:root[data-gradients="off"] .ctx-card:not(.tile-ctx-menu),
+:root[data-gradients="off"][data-glass] .ctx-card:not(.tile-ctx-menu) {
+  background: rgba(var(--theme-rgb-hi), var(--glass-ctx-hi));
+}
+
+:root[data-gradients="off"][data-glass="solid"] .ctx-card:not(.tile-ctx-menu) {
+  background: var(--theme-solid-hex);
+}
+
+:root[data-gradients="off"] .tile-ctx-menu,
+:root[data-gradients="off"] .flyout-card.ctx-card.tile-ctx-menu,
+:root[data-gradients="off"] .tile-edit-pop,
+:root[data-gradients="off"] .fx-ctx-menu,
+:root[data-gradients="off"] .pin-drag-ghost {
+  background: rgba(var(--theme-rgb-hi), 0.97);
+}
+
+:root[data-gradients="off"] .app-tile.hero {
+  background: rgba(var(--tile-rgb, var(--accent-rgb)), 0.11);
+}
+:root[data-gradients="off"] .app-tile.hero:hover {
+  background: rgba(var(--tile-rgb, var(--accent-rgb)), 0.16);
+}
+:root[data-gradients="off"] .app-tile.has-custom-color {
+  background: rgba(var(--tile-custom-rgb), 0.11);
+}
+:root[data-gradients="off"] .app-tile.hero.has-custom-color {
+  background: rgba(var(--tile-custom-rgb), 0.15);
+}
+:root[data-gradients="off"] .app-tile.has-custom-color:hover {
+  background: rgba(var(--tile-custom-rgb), 0.18);
+}
+:root[data-gradients="off"] .qlink.has-custom-color {
+  background: rgba(var(--tile-custom-rgb), 0.11);
+}
+:root[data-gradients="off"] .qlink.has-custom-color:hover {
+  background: rgba(var(--tile-custom-rgb), 0.18);
+}
+:root[data-gradients="off"] .tile-edit-preview.has-custom-color {
+  background: rgba(var(--tile-custom-rgb), 0.13);
+}
+
+:root[data-gradients="off"] .media-card.playing {
+  background: var(--surface-1);
+}
+:root[data-gradients="off"] .qs-now-playing,
+:root[data-gradients="off"] .weather-hero {
+  background: var(--surface-well);
+}
+:root[data-gradients="off"] .media-card.playing .album-box {
+  background: rgba(var(--media-ambient-rgb, var(--accent-rgb)), 0.24);
+}
+:root[data-gradients="off"] .m-btn.play,
+:root[data-gradients="off"] .m-btn.primary,
+:root[data-gradients="off"] .m-btn.qs-play-btn {
+  background: rgba(var(--accent-rgb), 0.28);
+}
+:root[data-gradients="off"] .m-btn.play:hover,
+:root[data-gradients="off"] .m-btn.primary:hover,
+:root[data-gradients="off"] .m-btn.qs-play-btn:hover {
+  background: rgba(var(--accent-rgb), 0.40);
+}
+
+:root[data-gradients="off"] .obs-slider-fill,
+:root[data-gradients="off"] .scrub-fill,
+:root[data-gradients="off"] .whp-range-fill,
+:root[data-gradients="off"] .weather-range-fill {
+  background: var(--accent);
+}
+:root[data-gradients="off"] .obs-slider-peak {
+  background: rgba(255, 255, 255, 0.34);
+}
+
+:root[data-gradients="off"] .folder-acts,
+:root[data-gradients="off"] .wp-actions {
+  background: rgba(var(--theme-rgb-lo), 0.96);
+}
+:root[data-gradients="off"] .wp-thumb {
+  background: rgba(7, 9, 14, 0.92);
+}
+:root[data-gradients="off"] .lp-screen {
+  background: var(--theme-solid-hex, #0D1017);
+}
+
+/* --- No-Hover-Glow Engine (zero pointer spotlights or hover light bloom) --- */
+:root[data-hover-glow="off"] .tb-sheen,
+:root[data-hover-glow="off"] .taskbar::before,
+:root[data-hover-glow="off"] .spot-card::before,
+:root[data-hover-glow="off"] .spot-sheen,
+:root[data-hover-glow="off"] .app-tile::after,
+:root[data-hover-glow="off"] .game-card::before,
+:root[data-hover-glow="off"] .game-card::after,
+:root[data-hover-glow="off"] .game-sheen,
+:root[data-hover-glow="off"] .media-ambient {
+  display: none !important;
+  opacity: 0 !important;
+}
+
+:root[data-hover-glow="off"] .tb-btn:hover .start-logo-svg,
+:root[data-hover-glow="off"] .tb-btn.start-on .start-logo-svg {
+  filter: none;
+}
+
+:root[data-hover-glow="off"] .tb-btn:hover .start-logo-svg .start-logo-accent {
+  opacity: 0;
+}
+
+:root[data-hover-glow="off"] .app-tile:hover,
+:root[data-hover-glow="off"] .game-card:hover {
+  box-shadow: none;
+}
+
+:root[data-hover-glow="off"] .game-card:hover .game-bg {
+  filter: brightness(0.84) saturate(1.04);
+}
