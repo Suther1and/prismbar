@@ -1,50 +1,57 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   type AudioState,
-  type CustomSpace,
   type PeripheralBattery,
-  type WidgetPreset,
+  type SpaceConfig,
+  type SpaceLayoutKind,
+  type SpaceWidgetId,
 } from '../../lib/ipc';
 import {
-  BUILTIN_SPACES,
   computeSlidingPillRect,
-  CUSTOM_SPACE_ACCENTS,
+  formatPeripheralSourceLabel,
   getBatteryColor,
-  validateCustomSpaceName,
+  isLowBatteryPercent,
+  MAX_MODULAR_SPACES,
+  MODULAR_SPACE_ACCENTS,
+  moveSpaceIdInOrder,
+  SPACE_TEMPLATES,
+  SPACE_WIDGET_CATALOG,
+  toggleSpaceWidget,
+  validateSpaceName,
   type ArmedPowerKind,
   type PowerActionKind,
   type SlidingPillRect,
   type SpaceAccentOption,
+  type SpaceTemplateId,
 } from '../../lib/startLogic';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import { useReducedMotion } from '../../lib/useReducedMotion';
 import {
   AppsGridIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ChargingBoltIcon,
   EditIcon,
   EditPencilIcon,
   HeadphonesIcon,
   LockIcon,
-  MouseIcon,
+  PeripheralDeviceIcon,
   PlusIcon,
   PowerIcon,
   RebootIcon,
+  RefreshIcon,
   SearchIcon,
   SettingsGearIcon,
   SleepIcon,
+  SlidersIcon,
   VolIcon,
 } from '../Icons';
 
-const WIDGET_PRESET_OPTIONS: ReadonlyArray<{ id: WidgetPreset; label: string }> = [
-  { id: 'media_clipboard', label: 'Медиа и буфер' },
-  { id: 'telemetry_processes', label: 'Телеметрия и процессы' },
-  { id: 'audio_mic', label: 'Звук и микрофон' },
-  { id: 'full_grid', label: 'Полная сетка' },
-];
-
 export interface StartHeaderProps {
   space: string;
-  customSpaces: CustomSpace[];
+  spaces: SpaceConfig[];
   periphs: PeripheralBattery[];
+  periphsRefreshing?: boolean;
   audio: AudioState | null;
   periphOpen: boolean;
   editMode: boolean;
@@ -58,6 +65,7 @@ export interface StartHeaderProps {
   onSelectSpace: (spaceId: string) => void;
   onTogglePeriph: () => void;
   onClosePeriph: () => void;
+  onRefreshPeriphs: () => Promise<void>;
   onSelectAudioDevice: (deviceId: string) => void;
   onOpenSearch: () => void;
   onToggleEditMode: () => void;
@@ -68,31 +76,38 @@ export interface StartHeaderProps {
   onPowerAction: (kind: PowerActionKind) => void;
   onSetAddingSpace: (open: boolean) => void;
   onSetManagingSpaceId: (spaceId: string | null) => void;
-  onCreateCustomSpace: (
-    name: string,
-    accent: SpaceAccentOption,
-    widgetPreset: WidgetPreset,
-  ) => Promise<void>;
-  onUpdateCustomSpace: (params: {
+  onCreateSpace: (params: {
+    name: string;
+    template: SpaceTemplateId;
+    accentHex: string;
+    accentRgb: string;
+    widgets: SpaceWidgetId[];
+  }) => Promise<void>;
+  onUpdateSpace: (params: {
     id: string;
     name: string;
-    accent: SpaceAccentOption;
-    widgetPreset: WidgetPreset;
+    accentHex: string;
+    accentRgb: string;
+    layoutKind: SpaceLayoutKind;
+    showHeroRow: boolean;
   }) => Promise<void>;
-  onDeleteCustomSpace: (id: string) => Promise<void>;
+  onReorderSpaces: (orderedIds: string[]) => Promise<void>;
+  onDeleteSpace: (id: string) => Promise<void>;
+  onOpenWidgetBuilder: (spaceId: string) => void;
 }
 
 function findMatchingAccent(hex: string | undefined): SpaceAccentOption {
   const norm = (hex ?? '').trim().toUpperCase();
   return (
-    CUSTOM_SPACE_ACCENTS.find((a) => a.hex.toUpperCase() === norm) ?? CUSTOM_SPACE_ACCENTS[4]
+    MODULAR_SPACE_ACCENTS.find((a) => a.hex.toUpperCase() === norm) ?? MODULAR_SPACE_ACCENTS[4]
   );
 }
 
 export const StartHeader: React.FC<StartHeaderProps> = ({
   space,
-  customSpaces,
+  spaces,
   periphs,
+  periphsRefreshing = false,
   audio,
   periphOpen,
   editMode,
@@ -106,6 +121,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onSelectSpace,
   onTogglePeriph,
   onClosePeriph,
+  onRefreshPeriphs,
   onSelectAudioDevice,
   onOpenSearch,
   onToggleEditMode,
@@ -116,9 +132,11 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onPowerAction,
   onSetAddingSpace,
   onSetManagingSpaceId,
-  onCreateCustomSpace,
-  onUpdateCustomSpace,
-  onDeleteCustomSpace,
+  onCreateSpace,
+  onUpdateSpace,
+  onReorderSpaces,
+  onDeleteSpace,
+  onOpenWidgetBuilder,
 }) => {
   const reducedMotion = useReducedMotion();
   const navRef = useRef<HTMLElement>(null);
@@ -134,26 +152,29 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   const [indicatorReady, setIndicatorReady] = useState(false);
   const [ghost, setGhost] = useState<SlidingPillRect>({ left: 0, width: 0, visible: false });
 
-  // Create Space popover state
+  // Create Space modal/popover state
+  const [newSpaceTemplate, setNewSpaceTemplate] = useState<SpaceTemplateId>('blank');
   const [newSpaceName, setNewSpaceName] = useState('');
-  const [selectedAccent, setSelectedAccent] = useState<SpaceAccentOption>(CUSTOM_SPACE_ACCENTS[4]);
-  const [newWidgetPreset, setNewWidgetPreset] = useState<WidgetPreset>('media_clipboard');
+  const [selectedAccent, setSelectedAccent] = useState<SpaceAccentOption>(MODULAR_SPACE_ACCENTS[4]);
+  const [newWidgets, setNewWidgets] = useState<SpaceWidgetId[]>([]);
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  // Manage Custom Space popover state
-  const managingSpace = customSpaces.find((s) => s.id === managingSpaceId) ?? null;
-  const lastManagedSpaceRef = useRef<CustomSpace | null>(null);
+  // Manage Space popover state
+  const managingSpace = spaces.find((s) => s.id === managingSpaceId) ?? null;
+  const lastManagedSpaceRef = useRef<SpaceConfig | null>(null);
   if (managingSpace) {
     lastManagedSpaceRef.current = managingSpace;
   }
   const activeManagedSpace = managingSpace ?? lastManagedSpaceRef.current;
 
   const [editSpaceName, setEditSpaceName] = useState('');
-  const [editSpaceAccent, setEditSpaceAccent] = useState<SpaceAccentOption>(CUSTOM_SPACE_ACCENTS[4]);
-  const [editWidgetPreset, setEditWidgetPreset] = useState<WidgetPreset>('media_clipboard');
+  const [editSpaceAccent, setEditSpaceAccent] = useState<SpaceAccentOption>(MODULAR_SPACE_ACCENTS[4]);
+  const [editLayoutKind, setEditLayoutKind] = useState<SpaceLayoutKind>('grid');
+  const [editShowHeroRow, setEditShowHeroRow] = useState<boolean>(false);
   const [manageError, setManageError] = useState<string | null>(null);
   const [savingSpace, setSavingSpace] = useState(false);
+  const [reorderingSpaces, setReorderingSpaces] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deletingSpace, setDeletingSpace] = useState(false);
 
@@ -161,16 +182,23 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   const createPresence = useAnimatedPresence(addingSpace, 105);
   const managePresence = useAnimatedPresence(Boolean(managingSpace), 105);
 
-  const customSpacesKey = customSpaces.map((s) => `${s.id}:${s.name}`).join('|');
+  const spacesKey = spaces.map((s) => `${s.id}:${s.name}:${s.accentHex}`).join('|');
 
   const measureActiveTab = () => {
     const btn = tabRefs.current[space];
-    if (!btn) return;
+    if (!btn) {
+      setIndicator((prev) => (prev.visible ? { left: 0, width: 0, visible: false } : prev));
+      return;
+    }
     setIndicator(computeSlidingPillRect(btn.offsetLeft, btn.offsetWidth));
   };
 
   useLayoutEffect(() => {
     measureActiveTab();
+    const btn = tabRefs.current[space];
+    if (btn && typeof btn.scrollIntoView === 'function') {
+      btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
     if (!indicatorReady) {
       const id =
         typeof requestAnimationFrame === 'function'
@@ -184,7 +212,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         }
       };
     }
-  }, [space, customSpacesKey, editMode, indicatorReady]);
+  }, [space, spacesKey, editMode, indicatorReady]);
 
   useEffect(() => {
     const nav = navRef.current;
@@ -192,7 +220,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     const ro = new ResizeObserver(() => measureActiveTab());
     ro.observe(nav);
     return () => ro.disconnect();
-  }, [space, customSpacesKey, editMode]);
+  }, [space, spacesKey, editMode]);
 
   useEffect(() => {
     return () => {
@@ -205,8 +233,10 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   // Create Space popover lifecycle & outside click
   useEffect(() => {
     if (!addingSpace) {
+      setNewSpaceTemplate('blank');
       setNewSpaceName('');
-      setNewWidgetPreset('media_clipboard');
+      setSelectedAccent(MODULAR_SPACE_ACCENTS[4]);
+      setNewWidgets([]);
       setCreateError(null);
       setCreating(false);
       return;
@@ -233,6 +263,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     if (!managingSpace) {
       setManageError(null);
       setSavingSpace(false);
+      setReorderingSpaces(false);
       setDeleteArmed(false);
       setDeletingSpace(false);
       if (deleteArmTimerRef.current !== null) {
@@ -243,7 +274,8 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     }
     setEditSpaceName(managingSpace.name);
     setEditSpaceAccent(findMatchingAccent(managingSpace.accentHex));
-    setEditWidgetPreset(managingSpace.widgetPreset ?? 'media_clipboard');
+    setEditLayoutKind(managingSpace.layoutKind === 'games' ? 'games' : 'grid');
+    setEditShowHeroRow(Boolean(managingSpace.showHeroRow));
     setManageError(null);
     setDeleteArmed(false);
     setDeletingSpace(false);
@@ -295,11 +327,24 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     return () => window.removeEventListener('mousedown', onOutsideMouseDown);
   }, [powerOpen, onClosePower]);
 
+  const handleSelectTemplate = (tplId: SpaceTemplateId) => {
+    setNewSpaceTemplate(tplId);
+    const spec = SPACE_TEMPLATES.find((t) => t.id === tplId);
+    if (spec) {
+      setSelectedAccent(findMatchingAccent(spec.accentHex));
+      setNewWidgets([...spec.widgets]);
+    }
+  };
+
   const handleSubmitSpace = async () => {
     if (creating) return;
-    const check = validateCustomSpaceName(
+    if (spaces.length >= MAX_MODULAR_SPACES) {
+      setCreateError(`Максимум ${MAX_MODULAR_SPACES} пространств`);
+      return;
+    }
+    const check = validateSpaceName(
       newSpaceName,
-      customSpaces.map((c) => c.name),
+      spaces.map((s) => s.name),
     );
     if (!check.ok) {
       setCreateError(check.error);
@@ -309,20 +354,26 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     setCreating(true);
     setCreateError(null);
     try {
-      await onCreateCustomSpace(check.name, selectedAccent, newWidgetPreset);
+      await onCreateSpace({
+        name: check.name,
+        template: newSpaceTemplate,
+        accentHex: selectedAccent.hex,
+        accentRgb: selectedAccent.rgb,
+        widgets: newWidgets,
+      });
       onSetAddingSpace(false);
-    } catch {
-      setCreateError('Не удалось создать пространство');
+    } catch (err) {
+      setCreateError(typeof err === 'string' && err.trim() ? err : 'Не удалось создать пространство');
       setCreating(false);
     }
   };
 
   const handleSaveManagedSpace = async () => {
     if (!managingSpace || savingSpace) return;
-    const otherNames = customSpaces
-      .filter((c) => c.id !== managingSpace.id)
-      .map((c) => c.name);
-    const check = validateCustomSpaceName(editSpaceName, otherNames);
+    const otherNames = spaces
+      .filter((s) => s.id !== managingSpace.id)
+      .map((s) => s.name);
+    const check = validateSpaceName(editSpaceName, otherNames, managingSpace.name);
     if (!check.ok) {
       setManageError(check.error);
       manageInputRef.current?.focus();
@@ -331,21 +382,42 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     setSavingSpace(true);
     setManageError(null);
     try {
-      await onUpdateCustomSpace({
+      await onUpdateSpace({
         id: managingSpace.id,
         name: check.name,
-        accent: editSpaceAccent,
-        widgetPreset: editWidgetPreset,
+        accentHex: editSpaceAccent.hex,
+        accentRgb: editSpaceAccent.rgb,
+        layoutKind: editLayoutKind,
+        showHeroRow: editShowHeroRow,
       });
       onSetManagingSpaceId(null);
-    } catch {
-      setManageError('Не удалось сохранить изменения');
+    } catch (err) {
+      setManageError(typeof err === 'string' && err.trim() ? err : 'Не удалось сохранить изменения');
       setSavingSpace(false);
     }
   };
 
+  const handleMoveManagedSpace = async (direction: 'left' | 'right') => {
+    if (!managingSpace || reorderingSpaces) return;
+    const nextOrder = moveSpaceIdInOrder(
+      spaces.map((s) => s.id),
+      managingSpace.id,
+      direction,
+    );
+    if (!nextOrder) return;
+    setReorderingSpaces(true);
+    setManageError(null);
+    try {
+      await onReorderSpaces(nextOrder);
+    } catch (err) {
+      setManageError(typeof err === 'string' && err.trim() ? err : 'Не удалось изменить порядок');
+    } finally {
+      setReorderingSpaces(false);
+    }
+  };
+
   const handleDeleteClick = async () => {
-    if (!managingSpace || deletingSpace) return;
+    if (!managingSpace || deletingSpace || spaces.length <= 1) return;
     if (!deleteArmed) {
       setDeleteArmed(true);
       if (deleteArmTimerRef.current !== null) {
@@ -360,23 +432,22 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     setDeletingSpace(true);
     setManageError(null);
     try {
-      await onDeleteCustomSpace(managingSpace.id);
+      await onDeleteSpace(managingSpace.id);
       onSetManagingSpaceId(null);
-    } catch {
-      setManageError('Не удалось удалить пространство');
+    } catch (err) {
+      setManageError(typeof err === 'string' && err.trim() ? err : 'Не удалось удалить пространство');
       setDeletingSpace(false);
       setDeleteArmed(false);
     }
   };
 
-  const mouseBat = periphs.find((p) => p.kind === 'mouse');
-  const audioBat = periphs.find((p) => p.kind === 'audio');
   const activeDev = audio?.devices.find((d) => d.isDefault);
-
-  const allTabs: Array<{ id: string; label: string; isCustom: boolean }> = [
-    ...BUILTIN_SPACES.map((b) => ({ id: b.id, label: b.label, isCustom: false })),
-    ...customSpaces.map((cs) => ({ id: cs.id, label: cs.name, isCustom: true })),
-  ];
+  const inlinePeriphLimit = 2;
+  const inlinePeriphs = periphs.slice(0, inlinePeriphLimit);
+  const extraPeriphCount = Math.max(0, periphs.length - inlinePeriphLimit);
+  const hasLowBat = periphs.some((p) => isLowBatteryPercent(p.percent));
+  const managedIdx = managingSpace ? spaces.findIndex((s) => s.id === managingSpace.id) : -1;
+  const canDeleteSpace = spaces.length > 1;
 
   return (
     <>
@@ -384,42 +455,43 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         <div className="hdr-left">
           <button
             type="button"
-            className={`periph-pill ${periphOpen ? 'open' : ''}`}
-            title="Устройства и вывод звука"
+            className={`periph-pill ${periphOpen ? 'open' : ''} ${hasLowBat ? 'has-low-bat' : ''}`}
+            title="Беспроводные устройства и вывод звука"
             onClick={onTogglePeriph}
           >
-            {mouseBat && (
+            {inlinePeriphs.length === 0 ? (
               <>
-                <MouseIcon className="ic14" />
-                <span>{mouseBat.percent}%</span>
-                <span className="bat-track">
-                  <i
-                    className="bat-fill"
-                    style={
-                      {
-                        ['--pct' as string]: Math.max(0, Math.min(1, mouseBat.percent / 100)),
-                        background: getBatteryColor(mouseBat.percent),
-                      } as React.CSSProperties
-                    }
-                  />
-                </span>
-                <span className="periph-sep" />
+                <HeadphonesIcon className="ic14" />
+                <span>{activeDev?.shortName || 'Звук'}</span>
               </>
-            )}
-            <HeadphonesIcon className="ic14" />
-            <span>{audioBat ? `${audioBat.percent}%` : activeDev?.shortName || 'Звук'}</span>
-            {audioBat && (
-              <span className="bat-track">
-                <i
-                  className="bat-fill"
-                  style={
-                    {
-                      ['--pct' as string]: Math.max(0, Math.min(1, audioBat.percent / 100)),
-                      background: getBatteryColor(audioBat.percent),
-                    } as React.CSSProperties
-                  }
-                />
-              </span>
+            ) : (
+              <>
+                {inlinePeriphs.map((p, idx) => {
+                  const isLow = isLowBatteryPercent(p.percent);
+                  return (
+                    <React.Fragment key={p.id || `${p.name}-${idx}`}>
+                      {idx > 0 && <span className="periph-sep" />}
+                      <PeripheralDeviceIcon kind={p.kind} className="ic14" />
+                      {p.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                      <span className={isLow ? 'periph-low-txt' : undefined}>{p.percent}%</span>
+                      <span className="bat-track">
+                        <i
+                          className="bat-fill"
+                          style={
+                            {
+                              ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
+                              background: isLow ? '#FB7185' : getBatteryColor(p.percent),
+                            } as React.CSSProperties
+                          }
+                        />
+                      </span>
+                    </React.Fragment>
+                  );
+                })}
+                {extraPeriphCount > 0 && (
+                  <span className="periph-more-badge">+{extraPeriphCount}</span>
+                )}
+              </>
             )}
           </button>
         </div>
@@ -465,50 +537,62 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
               opacity: indicator.visible ? 1 : 0,
             }}
           />
-          {allTabs.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              ref={(el) => {
-                tabRefs.current[t.id] = el;
-              }}
-              className={`space-tab ${space === t.id ? 'active' : ''}`}
-              title={
-                t.isCustom
-                  ? 'Правый клик — настроить пространство'
-                  : undefined
-              }
-              onMouseEnter={(e) => {
-                if (space === t.id) {
-                  setGhost((prev) => ({ ...prev, visible: false }));
-                } else {
-                  setGhost(computeSlidingPillRect(e.currentTarget.offsetLeft, e.currentTarget.offsetWidth));
-                }
-              }}
-              onClick={() => {
-                if (t.isCustom && editMode && space === t.id) {
-                  onSetManagingSpaceId(managingSpaceId === t.id ? null : t.id);
-                  return;
-                }
-                onSelectSpace(t.id);
-              }}
-              onContextMenu={(e) => {
-                if (!t.isCustom) return;
-                e.preventDefault();
-                e.stopPropagation();
-                onSelectSpace(t.id);
-                onSetManagingSpaceId(t.id);
-              }}
-            >
-              <span className="s-dot" />
-              <span>{t.label}</span>
-              {t.isCustom && editMode && <EditIcon className="ic12" />}
-            </button>
-          ))}
+          {spaces.map((sp) => {
+            const isActive = space === sp.id;
+            return (
+              <button
+                key={sp.id}
+                type="button"
+                ref={(el) => {
+                  tabRefs.current[sp.id] = el;
+                }}
+                className={`space-tab ${isActive ? 'active' : ''}`}
+                title="Правый клик — настроить пространство"
+                onMouseEnter={(e) => {
+                  if (isActive) {
+                    setGhost((prev) => ({ ...prev, visible: false }));
+                  } else {
+                    setGhost(
+                      computeSlidingPillRect(e.currentTarget.offsetLeft, e.currentTarget.offsetWidth),
+                    );
+                  }
+                }}
+                onClick={() => {
+                  if (editMode && isActive) {
+                    onSetManagingSpaceId(managingSpaceId === sp.id ? null : sp.id);
+                    return;
+                  }
+                  onSelectSpace(sp.id);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onSelectSpace(sp.id);
+                  onSetManagingSpaceId(sp.id);
+                }}
+              >
+                <span
+                  className="s-dot"
+                  style={
+                    !isActive && sp.accentHex
+                      ? { background: sp.accentHex, opacity: 0.5 }
+                      : undefined
+                  }
+                />
+                <span>{sp.name}</span>
+                {editMode && <EditIcon className="ic12" />}
+              </button>
+            );
+          })}
           <button
             type="button"
             className={`space-add-btn ${addingSpace ? 'open' : ''}`}
-            title="Создать пространство"
+            disabled={spaces.length >= MAX_MODULAR_SPACES}
+            title={
+              spaces.length >= MAX_MODULAR_SPACES
+                ? `Достигнут лимит (${MAX_MODULAR_SPACES})`
+                : 'Создать пространство'
+            }
             aria-label="Создать пространство"
             aria-expanded={addingSpace}
             onClick={() => onSetAddingSpace(!addingSpace)}
@@ -603,18 +687,37 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         </div>
       </header>
 
-      {/* FLOATING CREATE / MANAGE CUSTOM SPACE POPOVER (inside .space-pop-anchor) */}
+      {/* FLOATING CREATE / MANAGE MODULAR SPACE POPOVER */}
       {(createPresence.mounted || managePresence.mounted) && (
         <div className="space-pop-anchor" ref={spacePopRef}>
           {createPresence.mounted && (
             <div
-              className="space-create-pop"
+              className="space-create-pop v3-space-pop"
               data-phase={createPresence.phase}
               role="dialog"
               aria-label="Новое пространство"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="space-create-head">Новое пространство</div>
+
+              <div className="tile-edit-field">
+                <span className="tile-edit-lbl">Шаблон</span>
+                <div className="space-tpl-grid">
+                  {SPACE_TEMPLATES.map((tpl) => (
+                    <button
+                      key={tpl.id}
+                      type="button"
+                      className={`space-tpl-btn ${newSpaceTemplate === tpl.id ? 'active' : ''}`}
+                      aria-pressed={newSpaceTemplate === tpl.id}
+                      onClick={() => handleSelectTemplate(tpl.id)}
+                    >
+                      <span className="space-tpl-dot" style={{ background: tpl.accentHex }} />
+                      <span>{tpl.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <input
                 ref={createInputRef}
                 className="space-create-input"
@@ -636,10 +739,11 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                   }
                 }}
               />
+
               <div className="space-swatch-row">
                 <span className="space-swatch-lbl">Акцент</span>
-                <div className="space-swatches">
-                  {CUSTOM_SPACE_ACCENTS.map((sw) => (
+                <div className="space-swatches wrap">
+                  {MODULAR_SPACE_ACCENTS.map((sw) => (
                     <button
                       key={sw.hex}
                       type="button"
@@ -653,23 +757,29 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                   ))}
                 </div>
               </div>
+
               <div className="tile-edit-field">
-                <span className="tile-edit-lbl">Правая колонка</span>
-                <div className="space-preset-grid">
-                  {WIDGET_PRESET_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      className={`space-preset-btn ${newWidgetPreset === opt.id ? 'active' : ''}`}
-                      aria-pressed={newWidgetPreset === opt.id}
-                      onClick={() => setNewWidgetPreset(opt.id)}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
+                <span className="tile-edit-lbl">Виджеты</span>
+                <div className="space-widget-chips">
+                  {SPACE_WIDGET_CATALOG.map((w) => {
+                    const active = newWidgets.includes(w.id);
+                    return (
+                      <button
+                        key={w.id}
+                        type="button"
+                        className={`space-widget-chip ${active ? 'active' : ''}`}
+                        aria-pressed={active}
+                        onClick={() => setNewWidgets((prev) => toggleSpaceWidget(prev, w.id))}
+                      >
+                        {w.label}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
+
               {createError && <div className="space-create-err">{createError}</div>}
+
               <div className="space-create-actions">
                 <button
                   type="button"
@@ -692,13 +802,14 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
 
           {managePresence.mounted && activeManagedSpace && (
             <div
-              className="space-manage-pop"
+              className="space-manage-pop v3-space-pop"
               data-phase={managePresence.phase}
               role="dialog"
               aria-label="Настройка пространства"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="space-create-head">Настройка пространства</div>
+
               <input
                 ref={manageInputRef}
                 className="space-create-input"
@@ -720,10 +831,11 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                   }
                 }}
               />
+
               <div className="space-swatch-row">
                 <span className="space-swatch-lbl">Акцент</span>
-                <div className="space-swatches">
-                  {CUSTOM_SPACE_ACCENTS.map((sw) => (
+                <div className="space-swatches wrap">
+                  {MODULAR_SPACE_ACCENTS.map((sw) => (
                     <button
                       key={sw.hex}
                       type="button"
@@ -737,28 +849,95 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
                   ))}
                 </div>
               </div>
+
               <div className="tile-edit-field">
-                <span className="tile-edit-lbl">Правая колонка</span>
-                <div className="space-preset-grid">
-                  {WIDGET_PRESET_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      className={`space-preset-btn ${editWidgetPreset === opt.id ? 'active' : ''}`}
-                      aria-pressed={editWidgetPreset === opt.id}
-                      onClick={() => setEditWidgetPreset(opt.id)}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
+                <span className="tile-edit-lbl">Макет пространства</span>
+                <div className="space-seg-2" role="radiogroup" aria-label="Макет пространства">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={editLayoutKind === 'grid'}
+                    className={`space-preset-btn ${editLayoutKind === 'grid' ? 'active' : ''}`}
+                    onClick={() => setEditLayoutKind('grid')}
+                  >
+                    Обычная сетка
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={editLayoutKind === 'games'}
+                    className={`space-preset-btn ${editLayoutKind === 'games' ? 'active' : ''}`}
+                    onClick={() => setEditLayoutKind('games')}
+                  >
+                    Библиотека игр
+                  </button>
                 </div>
               </div>
+
+              {editLayoutKind === 'grid' && (
+                <div className="space-toggle-row">
+                  <span className="space-toggle-lbl">Крупные плитки сверху</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={editShowHeroRow}
+                    aria-label="Крупные плитки сверху"
+                    className={`glass-switch ${editShowHeroRow ? 'on' : ''}`}
+                    onClick={() => setEditShowHeroRow((v) => !v)}
+                  >
+                    <span className="glass-switch-thumb" />
+                  </button>
+                </div>
+              )}
+
+              <div className="space-order-row">
+                <div className="space-order-group">
+                  <button
+                    type="button"
+                    className="space-order-btn"
+                    disabled={reorderingSpaces || managedIdx <= 0}
+                    title="Сдвинуть влево"
+                    aria-label="Сдвинуть пространство влево"
+                    onClick={() => void handleMoveManagedSpace('left')}
+                  >
+                    <ArrowLeftIcon className="ic12" />
+                    <span>Влево</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="space-order-btn"
+                    disabled={reorderingSpaces || managedIdx < 0 || managedIdx >= spaces.length - 1}
+                    title="Сдвинуть вправо"
+                    aria-label="Сдвинуть пространство вправо"
+                    onClick={() => void handleMoveManagedSpace('right')}
+                  >
+                    <span>Вправо</span>
+                    <ArrowRightIcon className="ic12" />
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  className="space-order-btn"
+                  onClick={() => {
+                    const targetId = activeManagedSpace.id;
+                    onSetManagingSpaceId(null);
+                    onOpenWidgetBuilder(targetId);
+                  }}
+                >
+                  <SlidersIcon className="ic12" />
+                  <span>Виджеты</span>
+                </button>
+              </div>
+
               {manageError && <div className="space-create-err">{manageError}</div>}
+
               <div className="space-create-actions split">
                 <button
                   type="button"
                   className={`space-delete-btn ${deleteArmed ? 'armed' : ''}`}
-                  disabled={deletingSpace}
+                  disabled={!canDeleteSpace || deletingSpace}
+                  title={!canDeleteSpace ? 'Нельзя удалить последнее пространство' : undefined}
                   onClick={() => void handleDeleteClick()}
                 >
                   {deleteArmed ? 'Подтвердить' : 'Удалить'}
@@ -794,24 +973,94 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
           data-phase={periphPresence.phase}
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="periph-pop-title">Bluetooth-устройства</div>
+          <div className="periph-pop-head">
+            <div className="periph-pop-title">Беспроводные устройства</div>
+            <button
+              type="button"
+              className={`periph-refresh-btn ${periphsRefreshing ? 'spinning' : ''}`}
+              title="Обновить заряд устройств"
+              aria-label="Обновить заряд устройств"
+              disabled={periphsRefreshing}
+              onClick={() => void onRefreshPeriphs()}
+            >
+              <RefreshIcon className="ic12" />
+            </button>
+          </div>
+
           {periphs.length === 0 ? (
-            <div className="pp-empty">Нет устройств с датчиком заряда</div>
+            <div className="pp-empty">Беспроводные устройства не найдены</div>
           ) : (
-            periphs.map((p) => (
-              <div key={p.name} className="pp-row static">
-                <span className="pp-ic">
-                  {p.kind === 'audio' ? <HeadphonesIcon className="ic14" /> : <MouseIcon className="ic14" />}
-                </span>
-                <div className="pp-meta">
-                  <div className="pp-name">{p.name}</div>
-                  <div className="pp-sub">Bluetooth</div>
-                </div>
-                <strong className="pp-pct" style={{ color: getBatteryColor(p.percent) }}>
-                  {p.percent}%
-                </strong>
-              </div>
-            ))
+            <div className="periph-pop-list">
+              {periphs.map((p, idx) => {
+                const isLow = isLowBatteryPercent(p.percent);
+                const subLevels = p.subLevels ?? [];
+                return (
+                  <div
+                    key={p.id || `${p.name}-${idx}`}
+                    className={`periph-pop-card ${isLow ? 'is-low' : ''}`}
+                  >
+                    <div className="periph-pop-row">
+                      <span className="pp-ic">
+                        <PeripheralDeviceIcon kind={p.kind} className="ic14" />
+                      </span>
+                      <div className="pp-meta">
+                        <div className="pp-name">{p.name}</div>
+                        <div className="periph-pop-badges">
+                          <span className="periph-src-badge">
+                            {formatPeripheralSourceLabel(p.source)}
+                          </span>
+                          {p.charging && (
+                            <span className="periph-charge-badge">
+                              <ChargingBoltIcon className="ic12" />
+                              <span>Зарядка</span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="periph-pct-col">
+                        {p.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                        <strong
+                          className="pp-pct"
+                          style={{ color: isLow ? '#FB7185' : getBatteryColor(p.percent) }}
+                        >
+                          {p.percent}%
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className="bat-widget-bar">
+                      <div
+                        className="bat-widget-fill"
+                        style={
+                          {
+                            ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
+                            background: isLow ? '#FB7185' : getBatteryColor(p.percent),
+                          } as React.CSSProperties
+                        }
+                      />
+                    </div>
+
+                    {subLevels.length > 0 && (
+                      <div className="periph-sub-levels">
+                        {subLevels.map((sub, sIdx) => {
+                          const subLow = isLowBatteryPercent(sub.percent);
+                          return (
+                            <span
+                              key={`${sub.label}-${sIdx}`}
+                              className={`periph-sub-chip ${subLow ? 'is-low' : ''}`}
+                            >
+                              {sub.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                              <span>{sub.label}:</span>
+                              <strong>{sub.percent}%</strong>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
 
           <div className="pp-sec">Вывод звука</div>

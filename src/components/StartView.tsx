@@ -4,11 +4,15 @@ import {
   animateSurfaceIn,
   animateSurfaceOut,
   applyConfigUpdate,
-  deleteCustomSpace,
+  createSpace,
+  deleteSpace,
   emptyRecycleBin,
   exportConfigDialog,
   fetchIconsBatch,
   findMatchingGroupForPin,
+  fsOpenInExplorer,
+  getPeripheralBatteries,
+  getWeather,
   iconCache,
   importConfigDialog,
   ipc,
@@ -18,15 +22,19 @@ import {
   onEvent,
   openScreenSnip,
   pasteClipboardEntry,
+  pickCustomIconImage,
   recordFrecency,
   refreshIndexes,
+  refreshPeripheralBatteries,
+  reorderSpaces,
   restoreAllTrayApps,
   restoreTrayApp,
   setAppearanceSettings,
+  setSpaceWidgets,
   surfaceExitAck,
   toggleStart,
-  updateCustomSpace,
   updatePin,
+  updateSpace,
   type AppWindowGroup,
   type AudioMasterState,
   type AudioState,
@@ -37,12 +45,14 @@ import {
   type PeripheralBattery,
   type PinItem,
   type SecondaryTaskbarMode,
+  type SpaceLayoutKind,
+  type SpaceWidgetId,
   type StartShownEvent,
   type StartStateEvent,
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
-  type WidgetPreset,
+  type WeatherSnapshot,
 } from '../lib/ipc';
 import {
   buildSearchCorpus,
@@ -61,29 +71,37 @@ import {
   getStartChassisAnimClass,
   INITIAL_START_ANIM_STATE,
   mergeAudioStateRespectingLocks,
+  normalizeRgbTriplet,
   reducePowerClick,
   reduceStartState,
+  resolveConfiguredSpaces,
+  resolveCustomColorRgb,
   resolvePinAction,
   settleStartOpen,
   START_ENTER_ANIM_MS,
   START_EXIT_ANIM_MS,
   START_OPACITY_ANIM_MS,
+  TILE_COLOR_PALETTE,
   type ArmedPowerKind,
   type PowerActionKind,
-  type SpaceAccentOption,
+  type SpaceTemplateId,
   type StartAnimState,
 } from '../lib/startLogic';
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
+  ArrowLeftIcon,
   CopyIcon,
   EditIcon,
   ExternalWindowIcon,
+  FallbackAppIcon,
   FolderSvg,
   KillIcon,
   PinIcon,
+  renderCustomTileIcon,
   ShieldIcon,
   TerminalIcon,
+  TILE_ICON_CATALOG,
   UnpinIcon,
 } from './Icons';
 import { StartCommandPalette } from './start/StartCommandPalette';
@@ -173,6 +191,9 @@ export const StartView: React.FC = () => {
   const [telem, setTelem] = useState<TelemetryState | null>(null);
   const [clips, setClips] = useState<ClipboardEntry[]>([]);
   const [periphs, setPeriphs] = useState<PeripheralBattery[]>([]);
+  const [periphsRefreshing, setPeriphsRefreshing] = useState(false);
+  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
+  const [weatherRefreshing, setWeatherRefreshing] = useState(false);
   const [iconMap, setIconMap] = useState<Record<string, string>>({});
 
   // Non-remounting Paint-Sync animation state (hidden at 0 opacity at boot inside Tauri)
@@ -194,6 +215,8 @@ export const StartView: React.FC = () => {
   const [armedPower, setArmedPower] = useState<ArmedPowerKind>(null);
   const [addingSpace, setAddingSpace] = useState(false);
   const [managingSpaceId, setManagingSpaceId] = useState<string | null>(null);
+  const [widgetBuilderOpen, setWidgetBuilderOpen] = useState(false);
+  const [activeExplorerPath, setActiveExplorerPath] = useState<string | null>(null);
 
   // Toast with smooth enter/exit presence
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -217,6 +240,10 @@ export const StartView: React.FC = () => {
   const [editPinArgs, setEditPinArgs] = useState('');
   const [editPinAltAction, setEditPinAltAction] = useState('');
   const [editPinAltLabel, setEditPinAltLabel] = useState('');
+  const [editCustomColor, setEditCustomColor] = useState<string | null>(null);
+  const [editCustomIcon, setEditCustomIcon] = useState<string | null>(null);
+  const [editIconData, setEditIconData] = useState<string | null>(null);
+  const [pickingCustomImg, setPickingCustomImg] = useState(false);
   const [savingPinEdit, setSavingPinEdit] = useState(false);
   const editTitleInputRef = useRef<HTMLInputElement>(null);
 
@@ -244,6 +271,7 @@ export const StartView: React.FC = () => {
   const closeCleanupTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const lastSpaceSwitchTsRef = useRef<number>(0);
+  const lastWeatherFetchMsRef = useRef<number>(0);
   const configRef = useRef<TestBarConfig | null>(null);
   const spaceRef = useRef<string>(space);
   const secondaryHydratedRef = useRef<boolean>(false);
@@ -259,6 +287,7 @@ export const StartView: React.FC = () => {
     telem?: TelemetryState;
     clips?: ClipboardEntry[];
     periphs?: PeripheralBattery[];
+    weather?: WeatherSnapshot;
   }>({});
 
   const flushPendingHiddenState = useCallback(() => {
@@ -292,6 +321,7 @@ export const StartView: React.FC = () => {
     if (pending.telem !== undefined) setTelem(pending.telem);
     if (pending.clips !== undefined) setClips(pending.clips);
     if (pending.periphs !== undefined) setPeriphs(pending.periphs);
+    if (pending.weather !== undefined) setWeather(pending.weather);
   }, []);
 
   const cancelChassisAnims = useCallback(() => {
@@ -353,11 +383,18 @@ export const StartView: React.FC = () => {
   configRef.current = config;
   spaceRef.current = space;
 
+  const resolvedSpaces = useMemo(() => resolveConfiguredSpaces(config), [config]);
+  const activeSpace = useMemo(
+    () => resolvedSpaces.find((s) => s.id === space) ?? resolvedSpaces[0],
+    [resolvedSpaces, space],
+  );
+
   // 2-layer ambient aura crossfade state
-  const activeCustomSpace = config?.customSpaces.find((s) => s.id === space) ?? null;
   const spaceTheme = ['personal', 'work', 'studio', 'games'].includes(space) ? space : 'custom';
   const targetAuraRgb =
-    BUILTIN_SPACE_AURA_RGB[space] ?? activeCustomSpace?.accentRgb ?? '167, 139, 250';
+    normalizeRgbTriplet(activeSpace?.accentRgb) ??
+    BUILTIN_SPACE_AURA_RGB[space] ??
+    '167, 139, 250';
 
   const [auraSlots, setAuraSlots] = useState<[string, string]>([targetAuraRgb, targetAuraRgb]);
   const [activeAuraSlot, setActiveAuraSlot] = useState<0 | 1>(0);
@@ -404,6 +441,8 @@ export const StartView: React.FC = () => {
     setPeriphOpen(false);
     setAddingSpace(false);
     setManagingSpaceId(null);
+    setWidgetBuilderOpen(false);
+    setActiveExplorerPath(null);
     setSettingsOpen(false);
     setDrawerOpen(false);
     setTileCtx(null);
@@ -430,7 +469,9 @@ export const StartView: React.FC = () => {
     ipc<MediaState>('get_media_state').then(setMedia).catch(() => {});
     ipc<AudioState>('get_audio_state').then(setAudio).catch(() => {});
     ipc<TelemetryState>('get_telemetry').then(setTelem).catch(() => {});
-    ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {});
+    getPeripheralBatteries()
+      .then(setPeriphs)
+      .catch(() => ipc<PeripheralBattery[]>('get_peripherals').then(setPeriphs).catch(() => {}));
   }, []);
 
   useEffect(() => {
@@ -526,6 +567,15 @@ export const StartView: React.FC = () => {
         }
         setPeriphs(next);
       }),
+      onEvent<WeatherSnapshot>('weather-updated', (next) => {
+        if (!startActiveRef.current) {
+          pendingHiddenRef.current.weather = next;
+          hasPendingHiddenRef.current = true;
+          return;
+        }
+        lastWeatherFetchMsRef.current = Date.now();
+        setWeather(next);
+      }),
       onEvent<StartShownEvent>('start-shown', (ev) => {
         const pending = pendingShowLaunchRef.current;
         if (pending && (ev?.gen === undefined || ev.gen === pending.gen)) {
@@ -552,10 +602,14 @@ export const StartView: React.FC = () => {
           cancelChassisAnims();
           setShiftHeld((prev) => (prev ? false : prev));
           const remember = configRef.current?.startRememberSpace ?? false;
-          if (!remember && spaceRef.current !== 'personal') {
+          const configured = resolveConfiguredSpaces(configRef.current);
+          const defaultSpaceId = configured[0]?.id ?? 'personal';
+          if (!remember && spaceRef.current !== defaultSpaceId) {
             setSpaceDir(0);
             setRapidSwitch(false);
-            setSpace('personal');
+            setSpace(defaultSpaceId);
+            setWidgetBuilderOpen(false);
+            setActiveExplorerPath(null);
           }
           setAnim((prev) => reduceStartState(prev, ev));
 
@@ -736,6 +790,8 @@ export const StartView: React.FC = () => {
         setPeriphOpen(false);
         setAddingSpace(false);
         setManagingSpaceId(null);
+        setWidgetBuilderOpen(false);
+        setActiveExplorerPath(null);
         setTileCtx(null);
         setTileEdit(null);
         setSettingsOpen(true);
@@ -766,15 +822,71 @@ export const StartView: React.FC = () => {
     cancelChassisAnims,
   ]);
 
-  // If active custom space was deleted remotely, fall back to 'personal'
+  // If active space was removed or deleted remotely, fall back to first available space
   useEffect(() => {
     if (!config) return;
-    if (['personal', 'work', 'studio', 'games'].includes(space)) return;
-    if (!config.customSpaces.some((s) => s.id === space)) {
+    if (resolvedSpaces.some((s) => s.id === space)) return;
+    const fallbackId = resolvedSpaces[0]?.id ?? 'personal';
+    if (fallbackId !== space) {
       setSpaceDir(0);
-      setSpace('personal');
+      setRapidSwitch(false);
+      setSpace(fallbackId);
+      setWidgetBuilderOpen(false);
+      setActiveExplorerPath(null);
     }
-  }, [config, space]);
+  }, [config, resolvedSpaces, space]);
+
+  const weatherKey = useMemo(() => {
+    const tw = config?.taskbarWidgets;
+    return `${tw?.weatherCity ?? ''}::${tw?.weatherLat ?? ''}::${tw?.weatherLon ?? ''}::${tw?.weatherUnits ?? 'c'}`;
+  }, [config?.taskbarWidgets]);
+  const lastWeatherKeyRef = useRef<string>(weatherKey);
+
+  const handleRefreshWeather = useCallback(async () => {
+    setWeatherRefreshing(true);
+    try {
+      const next = await getWeather({ force: true });
+      if (mountedRef.current) {
+        lastWeatherFetchMsRef.current = Date.now();
+        lastWeatherKeyRef.current = weatherKey;
+        setWeather(next);
+      }
+    } catch (err) {
+      showToast(formatIpcError(err));
+    } finally {
+      if (mountedRef.current) setWeatherRefreshing(false);
+    }
+  }, [showToast, weatherKey]);
+
+  const handleRefreshPeriphs = useCallback(async () => {
+    setPeriphsRefreshing(true);
+    try {
+      const next = await refreshPeripheralBatteries();
+      if (mountedRef.current) {
+        setPeriphs(next);
+      }
+    } catch (err) {
+      showToast(formatIpcError(err));
+    } finally {
+      if (mountedRef.current) setPeriphsRefreshing(false);
+    }
+  }, [showToast]);
+
+  // Lazy weather hydration when Start opens on a space containing the weather widget
+  const needsWeather = anim.phase !== 'hidden' && (activeSpace?.widgets ?? []).includes('weather');
+  useEffect(() => {
+    if (!needsWeather) return;
+    const keyChanged = lastWeatherKeyRef.current !== weatherKey;
+    const stale = Date.now() - lastWeatherFetchMsRef.current > 10 * 60_000;
+    if (weather && !keyChanged && !stale) return;
+    lastWeatherKeyRef.current = weatherKey;
+    lastWeatherFetchMsRef.current = Date.now();
+    getWeather({ force: keyChanged })
+      .then((next) => {
+        if (mountedRef.current) setWeather(next);
+      })
+      .catch(() => {});
+  }, [needsWeather, weatherKey, weather]);
 
   // Shared batch icon hydration callback passed down to StartSpaces
   const handleResolveIconKeys = useCallback((keys: string[]) => {
@@ -837,15 +949,8 @@ export const StartView: React.FC = () => {
     });
     if (config) {
       [
-        ...config.personalPins,
-        ...config.personalLinks,
-        ...config.workFolders,
-        ...config.workApps,
-        ...config.studioPins,
-        ...config.studioTools,
-        ...config.gameLaunchers,
+        ...resolvedSpaces.flatMap((s) => s.items),
         ...config.gameCombos,
-        ...config.customSpaces.flatMap((s) => s.items),
       ].forEach((p) => {
         if (p.iconKey) keys.push(p.iconKey);
       });
@@ -853,19 +958,13 @@ export const StartView: React.FC = () => {
     if (keys.length > 0) {
       handleResolveIconKeys(keys);
     }
-  }, [apps, groups, config, handleResolveIconKeys]);
+  }, [apps, groups, config, resolvedSpaces, handleResolveIconKeys]);
 
   // Batched native icon hydration for path, UWP shell:AppsFolder\, WindowsApps aliases, and web/installed pins
   useEffect(() => {
     if (!config) return;
     const allPins = [
-      ...config.personalPins,
-      ...config.personalLinks,
-      ...config.workApps,
-      ...config.studioPins,
-      ...config.studioTools,
-      ...config.gameLaunchers,
-      ...config.customSpaces.flatMap((s) => s.items),
+      ...resolvedSpaces.flatMap((s) => s.items),
     ];
 
     const targetsToResolve: string[] = [];
@@ -937,17 +1036,11 @@ export const StartView: React.FC = () => {
           resolvedTargetsRef.current.delete(t.toLowerCase());
         }
       });
-  }, [config]);
+  }, [config, resolvedSpaces]);
 
   const allSpaceIds = useMemo(
-    () => [
-      'personal',
-      'work',
-      'studio',
-      'games',
-      ...(config?.customSpaces.map((s) => s.id) ?? []),
-    ],
-    [config?.customSpaces],
+    () => resolvedSpaces.map((s) => s.id),
+    [resolvedSpaces],
   );
 
   // Directional Space switching (also closes Command Palette & popovers!)
@@ -969,6 +1062,8 @@ export const StartView: React.FC = () => {
       setSettingsOpen(false);
       setAddingSpace(false);
       setManagingSpaceId(null);
+      setWidgetBuilderOpen(false);
+      setActiveExplorerPath(null);
       setPeriphOpen(false);
       setPowerOpen(false);
       setArmedPower(null);
@@ -1213,15 +1308,19 @@ export const StartView: React.FC = () => {
     (item: PinItem, spaceKey: string, coords?: { x: number; y: number }) => {
       const vw = typeof window !== 'undefined' ? window.innerWidth : 1172;
       const vh = typeof window !== 'undefined' ? window.innerHeight : 712;
-      const rawX = coords ? coords.x : Math.round((vw - 316) / 2);
-      const rawY = coords ? coords.y : Math.round((vh - 360) / 2);
-      const pos = clampPopoverPos(rawX, rawY, 316, 360);
+      const rawX = coords ? coords.x : Math.round((vw - 348) / 2);
+      const rawY = coords ? coords.y : Math.round((vh - 540) / 2);
+      const pos = clampPopoverPos(rawX, rawY, 348, 540);
 
       setTileCtx(null);
       setEditPinTitle(item.title);
       setEditPinArgs(item.args ?? '');
       setEditPinAltAction(item.altAction ?? '');
       setEditPinAltLabel(item.altLabel ?? '');
+      setEditCustomColor(item.customColor ?? null);
+      setEditCustomIcon(item.customIcon ?? null);
+      setEditIconData(item.customIcon === 'custom_image' ? (item.iconData ?? null) : null);
+      setPickingCustomImg(false);
       setSavingPinEdit(false);
       setTileEdit({ x: pos.x, y: pos.y, item, spaceKey });
       requestAnimationFrame(() => editTitleInputRef.current?.focus());
@@ -1239,6 +1338,9 @@ export const StartView: React.FC = () => {
     }
     setSavingPinEdit(true);
     try {
+      const hadCustomImg = tileEdit.item.customIcon === 'custom_image';
+      const nextIconData =
+        editCustomIcon === 'custom_image' ? editIconData : hadCustomImg ? null : undefined;
       const updated = await updatePin({
         space: tileEdit.spaceKey,
         pinId: tileEdit.item.id,
@@ -1246,6 +1348,9 @@ export const StartView: React.FC = () => {
         args: tileEdit.item.kind === 'app' ? editPinArgs.trim() : undefined,
         altAction: editPinAltAction,
         altLabel: editPinAltAction ? editPinAltLabel.trim() : '',
+        customIcon: editCustomIcon,
+        customColor: editCustomColor,
+        iconData: nextIconData,
       });
       handleApplyConfig(updated);
       setTileEdit(null);
@@ -1256,22 +1361,44 @@ export const StartView: React.FC = () => {
     }
   };
 
-  // Build dynamic Tile Context Menu actions (all 7+ items with 14px SVG icons!)
+  // Build dynamic Tile Context Menu actions (all 6+ items with 14px SVG icons!)
   const activeCtxSource = tileCtx ?? lastTileCtxRef.current;
   const tileCtxActions = useMemo<TileCtxAction[]>(() => {
     if (!activeCtxSource) return [];
     const { item, spaceKey } = activeCtxSource;
     const actions: TileCtxAction[] = [];
 
-    actions.push({
-      id: 'open',
-      label: 'Открыть',
-      icon: <ExternalWindowIcon className="ic14" />,
-      run: () => {
-        launchPin(item);
-        setTileCtx(null);
-      },
-    });
+    if (item.kind === 'folder') {
+      actions.push({
+        id: 'open',
+        label: 'Открыть в TestBar',
+        icon: <FolderSvg className="ic14" />,
+        run: () => {
+          setWidgetBuilderOpen(false);
+          setActiveExplorerPath(item.target);
+          setTileCtx(null);
+        },
+      });
+      actions.push({
+        id: 'open-explorer',
+        label: 'Открыть в Проводнике Windows',
+        icon: <ExternalWindowIcon className="ic14" />,
+        run: () => {
+          fsOpenInExplorer(item.target).catch((err) => showToast(formatIpcError(err)));
+          setTileCtx(null);
+        },
+      });
+    } else {
+      actions.push({
+        id: 'open',
+        label: 'Открыть',
+        icon: <ExternalWindowIcon className="ic14" />,
+        run: () => {
+          launchPin(item);
+          setTileCtx(null);
+        },
+      });
+    }
 
     if (item.kind === 'app' && canRunAsAdmin(item.target)) {
       actions.push({
@@ -1304,7 +1431,7 @@ export const StartView: React.FC = () => {
       });
     }
 
-    if (canOpenFileLocation(item.target)) {
+    if (item.kind !== 'folder' && canOpenFileLocation(item.target)) {
       actions.push({
         id: 'location',
         label: 'Расположение файла',
@@ -1335,7 +1462,7 @@ export const StartView: React.FC = () => {
     if (item.kind !== 'combo') {
       actions.push({
         id: 'edit',
-        label: 'Настроить плитку',
+        label: 'Настроить вид / изменить',
         icon: <EditIcon className="ic14" />,
         run: () => {
           openTileEditPopover(item, spaceKey, { x: activeCtxSource.x, y: activeCtxSource.y });
@@ -1465,6 +1592,8 @@ export const StartView: React.FC = () => {
           setManagingSpaceId(null);
         } else if (addingSpace) {
           setAddingSpace(false);
+        } else if (widgetBuilderOpen) {
+          setWidgetBuilderOpen(false);
         } else if (drawerOpen) {
           setDrawerOpen(false);
         } else if (settingsOpen) {
@@ -1474,6 +1603,8 @@ export const StartView: React.FC = () => {
         } else if (powerOpen) {
           setPowerOpen(false);
           setArmedPower(null);
+        } else if (activeExplorerPath !== null) {
+          setActiveExplorerPath(null);
         } else {
           toggleStart(false).catch(() => {});
         }
@@ -1491,6 +1622,8 @@ export const StartView: React.FC = () => {
         !settingsOpen &&
         !addingSpace &&
         !managingSpaceId &&
+        !widgetBuilderOpen &&
+        activeExplorerPath === null &&
         !periphOpen &&
         !powerOpen &&
         !tileCtx &&
@@ -1527,6 +1660,8 @@ export const StartView: React.FC = () => {
         !settingsOpen &&
         !addingSpace &&
         !managingSpaceId &&
+        !widgetBuilderOpen &&
+        activeExplorerPath === null &&
         !tileEdit &&
         !insideDialog &&
         isPrintableSearchTrigger(e)
@@ -1562,6 +1697,8 @@ export const StartView: React.FC = () => {
     searchOpen,
     addingSpace,
     managingSpaceId,
+    widgetBuilderOpen,
+    activeExplorerPath,
     drawerOpen,
     settingsOpen,
     periphOpen,
@@ -1583,7 +1720,14 @@ export const StartView: React.FC = () => {
       const picked = await ipc<string | null>('pick_folder');
       if (!picked) return;
       const baseName = picked.split('\\').filter(Boolean).pop() || picked;
-      const targetSpace = space === 'personal' ? 'personal_links' : space === 'work' ? 'work_folders' : space;
+      const hasSpaces = Boolean(config?.spaces && config.spaces.length > 0);
+      const targetSpace = hasSpaces
+        ? space
+        : space === 'personal'
+          ? 'personal_links'
+          : space === 'work'
+            ? 'work_folders'
+            : space;
       const updated = await ipc<TestBarConfig>('add_pin', {
         space: targetSpace,
         item: {
@@ -1611,7 +1755,14 @@ export const StartView: React.FC = () => {
       if (!picked) return;
       const baseName = picked.split('\\').filter(Boolean).pop() || picked;
       const isExe = picked.toLowerCase().endsWith('.exe');
-      const targetSpace = space === 'personal' ? (isExe ? 'personal' : 'personal_links') : space;
+      const hasSpaces = Boolean(config?.spaces && config.spaces.length > 0);
+      const targetSpace = hasSpaces
+        ? space
+        : space === 'personal'
+          ? isExe
+            ? 'personal'
+            : 'personal_links'
+          : space;
       const title = isExe ? baseName.replace(/\.exe$/i, '') : baseName;
       const updated = await ipc<TestBarConfig>('add_pin', {
         space: targetSpace,
@@ -1635,7 +1786,12 @@ export const StartView: React.FC = () => {
   };
 
   const handlePinUrl = async (url: string, title: string) => {
-    const targetSpace = space === 'personal' ? 'personal_links' : space;
+    const hasSpaces = Boolean(config?.spaces && config.spaces.length > 0);
+    const targetSpace = hasSpaces
+      ? space
+      : space === 'personal'
+        ? 'personal_links'
+        : space;
     const updated = await ipc<TestBarConfig>('add_pin', {
       space: targetSpace,
       item: {
@@ -1683,51 +1839,82 @@ export const StartView: React.FC = () => {
     }
   };
 
-  const handleCreateCustomSpace = async (
-    name: string,
-    accent: SpaceAccentOption,
-    widgetPreset: WidgetPreset,
-  ) => {
-    const updated = await ipc<TestBarConfig>('add_custom_space', {
-      name,
-      accentHex: accent.hex,
-      accentRgb: accent.rgb,
-      widgetPreset,
+  const handleCreateSpace = async (params: {
+    name: string;
+    template: SpaceTemplateId;
+    accentHex: string;
+    accentRgb: string;
+    widgets: SpaceWidgetId[];
+  }) => {
+    const updated = await createSpace({
+      name: params.name,
+      template: params.template,
+      accentHex: params.accentHex,
+      accentRgb: params.accentRgb,
+      widgets: params.widgets,
     });
     handleApplyConfig(updated);
-    const newest = updated.customSpaces[updated.customSpaces.length - 1];
+    const newest = updated.spaces[updated.spaces.length - 1];
     if (newest) {
       selectSpace(newest.id);
     }
-    showToast(`Создано пространство «${name}»`);
+    showToast(`Создано пространство «${params.name}»`);
   };
 
-  const handleUpdateCustomSpace = async (params: {
+  const handleUpdateSpace = async (params: {
     id: string;
-    name: string;
-    accent: SpaceAccentOption;
-    widgetPreset: WidgetPreset;
+    name?: string;
+    accentHex?: string;
+    accentRgb?: string;
+    layoutKind?: SpaceLayoutKind;
+    showHeroRow?: boolean;
   }) => {
-    const updated = await updateCustomSpace({
-      id: params.id,
-      name: params.name,
-      accentHex: params.accent.hex,
-      accentRgb: params.accent.rgb,
-      widgetPreset: params.widgetPreset,
-    });
+    const updated = await updateSpace(params);
     handleApplyConfig(updated);
     showToast('Пространство обновлено');
   };
 
-  const handleDeleteCustomSpace = async (id: string) => {
-    const updated = await deleteCustomSpace(id);
+  const handleReorderSpaces = async (orderedIds: string[]) => {
+    try {
+      const updated = await reorderSpaces(orderedIds);
+      handleApplyConfig(updated);
+    } catch (err) {
+      showToast(formatIpcError(err));
+    }
+  };
+
+  const handleDeleteSpace = async (id: string) => {
+    const updated = await deleteSpace(id);
     handleApplyConfig(updated);
     if (spaceRef.current === id) {
+      const fallback = resolveConfiguredSpaces(updated)[0]?.id ?? 'personal';
       setSpaceDir(-1);
-      setSpace('personal');
+      setSpace(fallback);
     }
     showToast('Пространство удалено');
   };
+
+  const handleSetSpaceWidgets = async (spaceId: string, widgets: SpaceWidgetId[]) => {
+    try {
+      const updated = await setSpaceWidgets(spaceId, widgets);
+      handleApplyConfig(updated);
+    } catch (err) {
+      showToast(formatIpcError(err));
+    }
+  };
+
+  const handleOpenWidgetBuilder = useCallback(
+    (spaceId: string) => {
+      if (spaceRef.current !== spaceId) {
+        selectSpace(spaceId);
+      }
+      setActiveExplorerPath(null);
+      setManagingSpaceId(null);
+      setAddingSpace(false);
+      setWidgetBuilderOpen(true);
+    },
+    [selectSpace],
+  );
 
   const handlePowerClick = (kind: PowerActionKind) => {
     const res = reducePowerClick(armedPower, kind);
@@ -1757,12 +1944,16 @@ export const StartView: React.FC = () => {
     [],
   );
 
-  const customSpaceStyle: React.CSSProperties | undefined = activeCustomSpace
-    ? ({
-        ['--accent' as string]: activeCustomSpace.accentHex || '#A78BFA',
-        ['--accent-rgb' as string]: activeCustomSpace.accentRgb || '167, 139, 250',
-      } as React.CSSProperties)
-    : undefined;
+  const activeAccentHex = activeSpace?.accentHex?.trim() || '#52B8F2';
+  const activeAccentRgb = normalizeRgbTriplet(activeSpace?.accentRgb) ?? '82, 184, 242';
+  const spaceAccentStyle = useMemo(
+    () =>
+      ({
+        ['--accent' as string]: activeAccentHex,
+        ['--accent-rgb' as string]: activeAccentRgb,
+      }) as React.CSSProperties,
+    [activeAccentHex, activeAccentRgb],
+  );
 
   const startVisible = anim.phase !== 'hidden';
   const startChassisAnimCls = getStartChassisAnimClass(anim);
@@ -1772,7 +1963,7 @@ export const StartView: React.FC = () => {
       className={`start-root ${editMode ? 'edit-mode' : ''} ${shiftHeld ? 'shift-active' : ''}`}
       data-space={spaceTheme}
       data-visible={startVisible ? 'true' : 'false'}
-      style={customSpaceStyle}
+      style={spaceAccentStyle}
       onClick={() => {
         if (tileCtx) setTileCtx(null);
         if (tileEdit) setTileEdit(null);
@@ -1802,8 +1993,9 @@ export const StartView: React.FC = () => {
 
         <StartHeader
           space={space}
-          customSpaces={config?.customSpaces ?? []}
+          spaces={resolvedSpaces}
           periphs={periphs}
+          periphsRefreshing={periphsRefreshing}
           audio={audio}
           periphOpen={periphOpen}
           editMode={editMode}
@@ -1817,6 +2009,7 @@ export const StartView: React.FC = () => {
           onSelectSpace={selectSpace}
           onTogglePeriph={() => setPeriphOpen((v) => !v)}
           onClosePeriph={() => setPeriphOpen(false)}
+          onRefreshPeriphs={handleRefreshPeriphs}
           onSelectAudioDevice={(deviceId) => {
             ipc<AudioState>('set_audio_device', { deviceId })
               .then(setAudio)
@@ -1829,6 +2022,7 @@ export const StartView: React.FC = () => {
             setSettingsOpen(false);
             setAddingSpace(false);
             setManagingSpaceId(null);
+            setWidgetBuilderOpen(false);
             setTileCtx(null);
             setTileEdit(null);
             setQuery('');
@@ -1841,6 +2035,7 @@ export const StartView: React.FC = () => {
             setSearchOpen(false);
             setAddingSpace(false);
             setManagingSpaceId(null);
+            setWidgetBuilderOpen(false);
             setTileCtx(null);
             setTileEdit(null);
           }}
@@ -1850,6 +2045,7 @@ export const StartView: React.FC = () => {
             setSearchOpen(false);
             setAddingSpace(false);
             setManagingSpaceId(null);
+            setWidgetBuilderOpen(false);
             setTileCtx(null);
             setTileEdit(null);
           }}
@@ -1880,9 +2076,11 @@ export const StartView: React.FC = () => {
               setTileEdit(null);
             }
           }}
-          onCreateCustomSpace={handleCreateCustomSpace}
-          onUpdateCustomSpace={handleUpdateCustomSpace}
-          onDeleteCustomSpace={handleDeleteCustomSpace}
+          onCreateSpace={handleCreateSpace}
+          onUpdateSpace={handleUpdateSpace}
+          onReorderSpaces={handleReorderSpaces}
+          onDeleteSpace={handleDeleteSpace}
+          onOpenWidgetBuilder={handleOpenWidgetBuilder}
         />
 
         <div
@@ -1897,39 +2095,90 @@ export const StartView: React.FC = () => {
             if (tileEdit) setTileEdit(null);
           }}
         >
-          <StartSpaces
-            space={space}
-            activeCustomSpace={activeCustomSpace}
-            config={config}
-            games={games}
-            audio={audio}
-            media={media}
-            telem={telem}
-            clips={clips}
-            editMode={editMode}
-            shiftHeld={shiftHeld}
-            isRunning={isRunning}
-            resolveIconForPin={resolveIconForPin}
-            onLaunchPin={launchPin}
-            onOpenDrawer={() => setDrawerOpen(true)}
-            onOpenTileContext={openTileContextMenu}
-            onSetAudio={handleSetAudioFromChild}
-            onSetMedia={setMedia}
-            onSetTelem={setTelem}
-            onSetClips={setClips}
-            onShowToast={showToast}
-            startVisible={startVisible}
-            startAnimSettled={anim.phase === 'open'}
-            onAudioDragStateChange={handleAudioDragStateChange}
-            spaceDir={spaceDir}
-            rapidSwitch={rapidSwitch}
-            iconMap={iconMap}
-            apps={apps}
-            onResolveIconKeys={handleResolveIconKeys}
-            onSetConfig={handleApplyConfig}
-            onOptimisticReorder={handleOptimisticReorder}
-            onEditPin={(item, spaceKey) => openTileEditPopover(item, spaceKey)}
-          />
+          {activeExplorerPath !== null ? (
+            <div className="v3-explorer-slot" data-explorer-path={activeExplorerPath}>
+              <div className="v3-explorer-placeholder">
+                <div className="v3-explorer-slot-head">
+                  <div className="v3-explorer-slot-path" title={activeExplorerPath}>
+                    <FolderSvg className="ic16" />
+                    <span>{activeExplorerPath}</span>
+                  </div>
+                  <div className="hdr-actions">
+                    <button
+                      type="button"
+                      className="pin-any-btn"
+                      onClick={() => {
+                        fsOpenInExplorer(activeExplorerPath).catch((err) =>
+                          showToast(formatIpcError(err)),
+                        );
+                      }}
+                    >
+                      <ExternalWindowIcon className="ic14" />
+                      <span>Проводник Windows</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="pin-any-btn"
+                      onClick={() => setActiveExplorerPath(null)}
+                    >
+                      <ArrowLeftIcon className="ic14" />
+                      <span>Закрыть</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : activeSpace ? (
+            <StartSpaces
+              space={space}
+              activeSpace={activeSpace}
+              config={config}
+              games={games}
+              audio={audio}
+              media={media}
+              telem={telem}
+              clips={clips}
+              periphs={periphs}
+              periphsRefreshing={periphsRefreshing}
+              weather={weather}
+              weatherRefreshing={weatherRefreshing}
+              editMode={editMode}
+              shiftHeld={shiftHeld}
+              widgetBuilderOpen={widgetBuilderOpen}
+              isRunning={isRunning}
+              resolveIconForPin={resolveIconForPin}
+              onLaunchPin={launchPin}
+              onOpenFolder={(path) => {
+                setWidgetBuilderOpen(false);
+                setActiveExplorerPath(path);
+              }}
+              onOpenFolderInExplorer={(path) => {
+                fsOpenInExplorer(path).catch((err) => showToast(formatIpcError(err)));
+              }}
+              onOpenDrawer={() => setDrawerOpen(true)}
+              onOpenTileContext={openTileContextMenu}
+              onSetAudio={handleSetAudioFromChild}
+              onSetMedia={setMedia}
+              onSetTelem={setTelem}
+              onSetClips={setClips}
+              onShowToast={showToast}
+              onRefreshWeather={handleRefreshWeather}
+              onRefreshPeriphs={handleRefreshPeriphs}
+              onToggleWidgetBuilder={(open) => setWidgetBuilderOpen(open)}
+              onSetSpaceWidgets={handleSetSpaceWidgets}
+              startVisible={startVisible}
+              startAnimSettled={anim.phase === 'open'}
+              onAudioDragStateChange={handleAudioDragStateChange}
+              spaceDir={spaceDir}
+              rapidSwitch={rapidSwitch}
+              iconMap={iconMap}
+              apps={apps}
+              onResolveIconKeys={handleResolveIconKeys}
+              onSetConfig={handleApplyConfig}
+              onOptimisticReorder={handleOptimisticReorder}
+              onEditPin={(item, spaceKey) => openTileEditPopover(item, spaceKey)}
+            />
+          ) : null}
         </div>
 
         <StartPinDrawer
@@ -2059,7 +2308,7 @@ export const StartView: React.FC = () => {
       {/* TILE EDIT POPOVER — Rendered OUTSIDE .start-chassis overflow: hidden! */}
       {tileEditPresence.mounted && (tileEdit ?? lastTileEditRef.current) && (
         <div
-          className="tile-edit-pop"
+          className="tile-edit-pop v3-tile-edit"
           data-phase={tileEditPresence.phase}
           role="dialog"
           aria-label="Настроить плитку"
@@ -2070,6 +2319,47 @@ export const StartView: React.FC = () => {
           onClick={(e) => e.stopPropagation()}
         >
           <div className="space-create-head">Настроить плитку</div>
+
+          {(() => {
+            const editCtx = (tileEdit ?? lastTileEditRef.current)!;
+            const previewRgb = resolveCustomColorRgb(editCustomColor);
+            const fallbackIconSrc =
+              editCustomIcon === 'custom_image' || editCustomIcon
+                ? null
+                : resolveIconForPin(editCtx.item);
+            return (
+              <div
+                className={`tile-edit-preview ${previewRgb ? 'has-custom-color' : ''}`}
+                style={
+                  previewRgb
+                    ? ({ ['--tile-custom-rgb' as string]: previewRgb } as React.CSSProperties)
+                    : undefined
+                }
+              >
+                <div className="tile-edit-preview-ic">
+                  {editCustomIcon === 'custom_image' && editIconData ? (
+                    <img className="custom-tile-img" src={editIconData} alt="" />
+                  ) : editCustomIcon && TILE_ICON_CATALOG.some((c) => c.id === editCustomIcon) ? (
+                    renderCustomTileIcon(editCustomIcon, 'ic18')
+                  ) : fallbackIconSrc ? (
+                    <img src={fallbackIconSrc} alt="" />
+                  ) : editCtx.item.kind === 'folder' ? (
+                    <FolderSvg className="ic18" />
+                  ) : (
+                    <FallbackAppIcon
+                      iconKey={editCtx.item.iconKey}
+                      kind={editCtx.item.kind}
+                      target={editCtx.item.target}
+                      size={18}
+                    />
+                  )}
+                </div>
+                <span className="tile-edit-preview-name">
+                  {editPinTitle.trim() || editCtx.item.title}
+                </span>
+              </div>
+            );
+          })()}
 
           <div className="tile-edit-field">
             <label className="tile-edit-lbl" htmlFor="tb-edit-pin-title">
@@ -2093,6 +2383,95 @@ export const StartView: React.FC = () => {
                 }
               }}
             />
+          </div>
+
+          <div className="tile-edit-field">
+            <div className="tile-edit-lbl-row">
+              <span className="tile-edit-lbl">Цвет плитки</span>
+              <button
+                type="button"
+                className="tile-reset-mini-btn"
+                onClick={() => setEditCustomColor(null)}
+              >
+                По умолчанию
+              </button>
+            </div>
+            <div className="tile-color-grid">
+              {TILE_COLOR_PALETTE.map((swatch) => {
+                const selected = editCustomColor?.toLowerCase() === swatch.hex.toLowerCase();
+                return (
+                  <button
+                    key={swatch.id}
+                    type="button"
+                    className={`tile-color-swatch ${selected ? 'selected' : ''}`}
+                    style={{ background: swatch.hex }}
+                    title={swatch.label}
+                    aria-label={swatch.label}
+                    onClick={() => setEditCustomColor(selected ? null : swatch.hex)}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="tile-edit-field">
+            <div className="tile-edit-lbl-row">
+              <span className="tile-edit-lbl">Иконка плитки</span>
+              <button
+                type="button"
+                className="tile-reset-mini-btn"
+                onClick={() => {
+                  setEditCustomColor(null);
+                  setEditCustomIcon(null);
+                  setEditIconData(null);
+                }}
+              >
+                Сбросить вид
+              </button>
+            </div>
+            <div className="tile-icon-grid">
+              {TILE_ICON_CATALOG.map((opt) => {
+                const selected = editCustomIcon === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`tile-icon-opt ${selected ? 'selected' : ''}`}
+                    title={opt.label}
+                    aria-label={opt.label}
+                    onClick={() => {
+                      setEditCustomIcon(selected ? null : opt.id);
+                      if (!selected) setEditIconData(null);
+                    }}
+                  >
+                    {renderCustomTileIcon(opt.id, 'ic16')}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="tile-icon-actions">
+              <button
+                type="button"
+                className="pin-any-btn"
+                disabled={pickingCustomImg}
+                onClick={() => {
+                  setPickingCustomImg(true);
+                  pickCustomIconImage()
+                    .then((dataUrl) => {
+                      if (dataUrl && mountedRef.current) {
+                        setEditCustomIcon('custom_image');
+                        setEditIconData(dataUrl);
+                      }
+                    })
+                    .catch((err) => showToast(formatIpcError(err)))
+                    .finally(() => {
+                      if (mountedRef.current) setPickingCustomImg(false);
+                    });
+                }}
+              >
+                {pickingCustomImg ? 'Выбор файла…' : 'Своя картинка…'}
+              </button>
+            </div>
           </div>
 
           {(tileEdit ?? lastTileEditRef.current)!.item.kind === 'app' && (

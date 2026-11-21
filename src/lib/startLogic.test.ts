@@ -7,7 +7,7 @@ import startPinDrawerSrc from '../components/start/StartPinDrawer.tsx?raw';
 import startSettingsSrc from '../components/start/StartSettingsOverlay.tsx?raw';
 import startSpacesSrc from '../components/start/StartSpaces.tsx?raw';
 import startViewSrc from '../components/StartView.tsx?raw';
-import type { ClipboardEntry, PinItem, TestBarConfig } from './ipc';
+import type { ClipboardEntry, PinItem, SpaceConfig, TestBarConfig } from './ipc';
 import {
   applyOptimisticPinReorder,
   buildGameComboLaunchPayload,
@@ -17,21 +17,28 @@ import {
   computeInterpolatedMediaSec,
   computePointerReorderRequest,
   computeSlidingPillRect,
+  convertTempFromC,
   CUSTOM_SPACE_ACCENTS,
   EMPTY_TELEMETRY_HISTORY,
   filterClipboardEntries,
   findBannedStartArtifacts,
   findMatchingInstalledAppForPin,
   formatDiskSummary,
+  formatHardwareSummaryLine,
   formatKillProcessError,
   formatMediaDuration,
   formatMemoryRatio,
+  formatPeripheralSourceLabel,
   formatProcessMetricLine,
+  formatStartTemperature,
   GAME_CARD_MAX_TILT_DEG,
   getBatteryColor,
   getClipboardKindLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
+  getPinnedItemInSpace,
+  getSpaceDisplayName,
+  getSpacePinList,
   getStartChassisAnimClass,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
@@ -40,7 +47,12 @@ import {
   hexColorToRgbString,
   INITIAL_START_ANIM_STATE,
   isAppPinnedInSpace,
+  isLowBatteryPercent,
   mergeAudioStateRespectingLocks,
+  MODULAR_SPACE_ACCENTS,
+  moveSpaceIdInOrder,
+  moveSpaceWidget,
+  normalizeRgbTriplet,
   normalizeSessionVolumeScalar,
   normalizeUrlPinInput,
   partitionHeroAndCompact,
@@ -51,17 +63,24 @@ import {
   reduceProcessKillClick,
   reduceStartState,
   resolveClipboardKind,
+  resolveConfiguredSpaces,
+  resolveCustomColorRgb,
   resolvePinAction,
   resolveProcessKillPids,
   selectDisplayedGames,
   settleStartOpen,
+  SPACE_TEMPLATES,
+  SPACE_WIDGET_CATALOG,
   START_DRAG_THRESHOLD_PX,
   START_ENTER_ANIM_MS,
   START_EXIT_ANIM_MS,
   START_OPACITY_ANIM_MS,
   TELEMETRY_HISTORY_CAP,
+  TILE_COLOR_PALETTE,
+  toggleSpaceWidget,
   validateCustomSpaceName,
   validateGameComboInput,
+  validateSpaceName,
 } from './startLogic';
 
 function makePin(overrides: Partial<PinItem> & Pick<PinItem, 'id' | 'title' | 'target'>): PinItem {
@@ -825,5 +844,178 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
         installed,
       )?.iconKey,
     ).toBe('uwp:wt123');
+  });
+
+  it('resolves modular config.spaces with legacy fallback, pin lookup, unified mixed reorder & validation', () => {
+    const modularSpaces: SpaceConfig[] = [
+      {
+        id: 'personal',
+        name: 'Дом',
+        accentHex: '#818CF8',
+        accentRgb: '129, 140, 248',
+        layoutKind: 'grid',
+        showHeroRow: true,
+        widgets: ['media', 'weather', 'batteries'],
+        items: [
+          makePin({ id: 'app-1', kind: 'app', title: 'Zen', target: 'C:\\Apps\\zen.exe' }),
+          makePin({ id: 'fld-1', kind: 'folder', title: 'Проекты', target: 'D:\\Projects' }),
+          makePin({ id: 'url-1', kind: 'url', title: 'Docs', target: 'https://example.com' }),
+        ],
+      },
+      {
+        id: 'sp-custom',
+        name: 'Лаборатория',
+        accentHex: '#34D399',
+        accentRgb: '52, 211, 153',
+        layoutKind: 'grid',
+        showHeroRow: false,
+        widgets: [],
+        items: [],
+      },
+    ];
+
+    const v2Cfg: TestBarConfig = {
+      schemaVersion: 2,
+      revision: 25,
+      barMode: 'dock',
+      secondaryTaskbarMode: 'native',
+      autostart: true,
+      taskbarPins: [],
+      spaces: modularSpaces,
+      personalPins: [makePin({ id: 'legacy', title: 'Legacy', target: 'C:\\legacy.exe' })],
+      personalLinks: [],
+      workFolders: [],
+      workApps: [],
+      studioPins: [],
+      studioTools: [],
+      gameLaunchers: [],
+      gameCombos: [],
+      customSpaces: [],
+      pinnedClipboard: [],
+    };
+
+    const resolved = resolveConfiguredSpaces(v2Cfg);
+    expect(resolved).toHaveLength(2);
+    expect(resolved[0].name).toBe('Дом');
+    expect(getSpaceDisplayName('personal', v2Cfg)).toBe('Дом');
+    expect(getSpacePinList('personal', v2Cfg).map((p) => p.id)).toEqual(['app-1', 'fld-1', 'url-1']);
+    expect(
+      getPinnedItemInSpace({ name: 'Zen', target: 'c:\\apps\\zen.exe' }, 'personal', v2Cfg)?.id,
+    ).toBe('app-1');
+
+    // Mixed grid reorder across folder + app + url pins directly updates config.spaces
+    const reordered = applyOptimisticPinReorder(v2Cfg, 'personal', 2, 0);
+    expect(reordered?.spaces[0].items.map((p) => p.id)).toEqual(['url-1', 'app-1', 'fld-1']);
+    expect(reordered?.revision).toBe(25);
+
+    // Fallback when config.spaces is empty synthesizes built-ins + customSpaces
+    const legacyCfg: TestBarConfig = {
+      ...v2Cfg,
+      spaces: [],
+      customSpaces: [
+        {
+          id: 'cs-9',
+          name: 'Музыка',
+          accentHex: '#F472B6',
+          accentRgb: '244, 114, 182',
+          widgetPreset: 'audio_mic',
+          items: [makePin({ id: 'daw', title: 'DAW', target: 'C:\\daw.exe' })],
+        },
+      ],
+    };
+    const fallbackSpaces = resolveConfiguredSpaces(legacyCfg);
+    expect(fallbackSpaces.map((s) => s.id)).toEqual(['personal', 'work', 'studio', 'games', 'cs-9']);
+    expect(fallbackSpaces[0].items.map((p) => p.id)).toEqual(['legacy']);
+    expect(fallbackSpaces[4].widgets).toEqual(['audio_mixer', 'media']);
+
+    expect(SPACE_TEMPLATES).toHaveLength(5);
+    expect(SPACE_WIDGET_CATALOG).toHaveLength(8);
+    expect(MODULAR_SPACE_ACCENTS.length).toBeGreaterThanOrEqual(6);
+
+    expect(validateSpaceName('  Код  ', ['Дом', 'Работа'])).toEqual({ ok: true, name: 'Код' });
+    expect(validateSpaceName('   ', ['Дом']).ok).toBe(false);
+    expect(validateSpaceName('дом', ['Дом']).ok).toBe(false);
+    expect(validateSpaceName('Дом', ['Дом', 'Работа'], 'Дом')).toEqual({ ok: true, name: 'Дом' });
+    expect(validateSpaceName('Слишком длинное имя пространства', [])).toEqual({
+      ok: false,
+      error: 'Максимум 18 символов',
+    });
+
+    expect(moveSpaceIdInOrder(['personal', 'work', 'studio'], 'work', 'left')).toEqual([
+      'work',
+      'personal',
+      'studio',
+    ]);
+    expect(moveSpaceIdInOrder(['personal', 'work'], 'personal', 'left')).toBeNull();
+    expect(moveSpaceIdInOrder(['personal', 'work'], 'work', 'right')).toBeNull();
+  });
+
+  it('handles custom tile RGB color parsing, widget builder toggles/order, weather/battery & dynamic PC health', () => {
+    expect(TILE_COLOR_PALETTE).toHaveLength(10);
+    expect(resolveCustomColorRgb('#52B8F2')).toBe('82, 184, 242');
+    expect(resolveCustomColorRgb('#fff')).toBe('255, 255, 255');
+    expect(resolveCustomColorRgb(' 167, 139, 250 ')).toBe('167, 139, 250');
+    expect(resolveCustomColorRgb('999, 0, 0')).toBeNull();
+    expect(resolveCustomColorRgb('not-a-color')).toBeNull();
+    expect(normalizeRgbTriplet('52, 211, 153')).toBe('52, 211, 153');
+
+    const w0: TestBarConfig['spaces'][number]['widgets'] = ['media', 'weather'];
+    expect(toggleSpaceWidget(w0, 'batteries')).toEqual(['media', 'weather', 'batteries']);
+    expect(toggleSpaceWidget(w0, 'media')).toEqual(['weather']);
+    expect(w0).toEqual(['media', 'weather']); // Pure / non-mutating
+
+    expect(moveSpaceWidget(['media', 'weather', 'batteries'], 'batteries', 'up')).toEqual([
+      'media',
+      'batteries',
+      'weather',
+    ]);
+    expect(moveSpaceWidget(['media', 'weather'], 'media', 'up')).toEqual(['media', 'weather']);
+
+    expect(isLowBatteryPercent(19)).toBe(true);
+    expect(isLowBatteryPercent(20)).toBe(false);
+    expect(isLowBatteryPercent(Number.NaN)).toBe(false);
+    expect(formatPeripheralSourceLabel('hidpp')).toBe('Logitech HID');
+    expect(formatPeripheralSourceLabel('bluetooth')).toBe('Bluetooth');
+    expect(formatPeripheralSourceLabel('razer_hid')).toBe('Razer HID');
+
+    expect(convertTempFromC(0, 'f')).toBe(32);
+    expect(convertTempFromC(25, 'c')).toBe(25);
+    expect(formatStartTemperature(21.6, 'c')).toBe('22°C');
+    expect(formatStartTemperature(20, 'f')).toBe('68°F');
+    expect(formatStartTemperature(Number.NaN, 'f')).toBe('—°F');
+
+    expect(
+      formatHardwareSummaryLine({
+        ramTotalGb: 31.8,
+        gpuAvailable: true,
+        gpuName: 'AMD Radeon RX 7800 XT',
+        vramTotalGb: 16,
+      }),
+    ).toBe('32 ГБ ОЗУ · AMD Radeon RX 7800 XT · 16 ГБ');
+    expect(
+      formatHardwareSummaryLine({
+        ramTotalGb: 16,
+        gpuAvailable: false,
+        gpuName: '',
+        vramTotalGb: 0,
+      }),
+    ).toBe('16 ГБ ОЗУ');
+    expect(formatHardwareSummaryLine(null)).toBe('Система');
+  });
+
+  it('keeps V3 Start sources free of personal names, hardcoded GPU/VRAM/RAM literals, and wires explorer slot + styles', () => {
+    expect(startSpacesSrc).toContain("import '../../styles/spaces-v3.css'");
+    expect(startViewSrc).toContain('v3-explorer-slot');
+    expect(startViewSrc).toContain('data-explorer-path');
+    for (const [relPath, content] of [
+      ['StartView.tsx', startViewSrc],
+      ['StartHeader.tsx', startHeaderSrc],
+      ['StartSpaces.tsx', startSpacesSrc],
+    ] as const) {
+      expect(content, `${relPath} must not contain hardcoded RTX 4090`).not.toContain('RTX 4090');
+      expect(content, `${relPath} must not contain hardcoded PoE 2`).not.toContain('PoE 2');
+      expect(content, `${relPath} must not contain Exiled`).not.toContain('Exiled');
+      expect(content, `${relPath} must not hardcode 64 ГБ or 24 ГБ`).not.toMatch(/\b(64|24)\s*ГБ\b/);
+    }
   });
 });
