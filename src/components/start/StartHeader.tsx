@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import '../../styles/spaces-v3.css';
 import {
   computeWeatherTempBarRange,
   formatCityOptionSubtitle,
@@ -6,12 +7,21 @@ import {
   formatWeatherWindLabel,
 } from '../../lib/flyoutLogic';
 import {
+  ipc,
   searchWeatherCities,
   type AudioState,
+  type ClipboardEntry,
+  type MediaState,
+  type NetworkSnapshot,
   type PeripheralBattery,
+  type QuickNotesState,
+  type QuickTogglesState,
   type SpaceConfig,
+  type SpaceHeaderWidget,
   type SpaceLayoutKind,
   type SpaceWidgetId,
+  type TelemetryState,
+  type TestBarConfig,
   type WeatherCityOption,
   type WeatherSnapshot,
 } from '../../lib/ipc';
@@ -25,6 +35,8 @@ import {
   MAX_MODULAR_SPACES,
   MODULAR_SPACE_ACCENTS,
   moveSpaceIdInOrder,
+  planHeaderWidgetSlots,
+  resolveSpaceHeaderWidgets,
   SPACE_TEMPLATES,
   SPACE_WIDGET_CATALOG,
   toggleSpaceWidget,
@@ -35,21 +47,31 @@ import {
   type SpaceAccentOption,
   type SpaceTemplateId,
 } from '../../lib/startLogic';
+import { useFocusTimer } from '../../lib/timerStore';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import { useReducedMotion } from '../../lib/useReducedMotion';
 import {
   AppsGridIcon,
   ArrowLeftIcon,
   ArrowRightIcon,
+  BoltToggleIcon,
   ChargingBoltIcon,
   CloseWindowIcon,
   DropletIcon,
   EditIcon,
   EditPencilIcon,
   EyeOffIcon,
+  GamepadIcon,
   HeadphonesIcon,
+  LayersIcon,
   LockIcon,
+  MusicNoteIcon,
+  NetIcon,
+  NoteChecklistIcon,
+  PasteIcon,
+  PauseIcon,
   PeripheralDeviceIcon,
+  PlaySmallIcon,
   PlusIcon,
   PowerIcon,
   RebootIcon,
@@ -58,10 +80,19 @@ import {
   SettingsGearIcon,
   SleepIcon,
   SlidersIcon,
+  TaskmgrIcon,
+  TimerIcon,
   VolIcon,
   WeatherConditionIcon,
   WindIcon,
 } from '../Icons';
+import {
+  formatRate,
+  NetworkWidgetCard,
+  NotesWidgetCard,
+  QuickTogglesWidgetCard,
+  TimerWidgetCard,
+} from './NewWidgetCards';
 
 export interface StartHeaderProps {
   space: string;
@@ -124,6 +155,64 @@ export interface StartHeaderProps {
   onReorderSpaces: (orderedIds: string[]) => Promise<void>;
   onDeleteSpace: (id: string) => Promise<void>;
   onOpenWidgetBuilder: (spaceId: string) => void;
+  headerWidgets?: SpaceHeaderWidget[];
+  media?: MediaState | null;
+  telem?: TelemetryState | null;
+  clips?: ClipboardEntry[];
+  network?: NetworkSnapshot | null;
+  quickNotes?: QuickNotesState | null;
+  quickToggles?: QuickTogglesState | null;
+  activeHeaderWidgetId?: SpaceWidgetId | null;
+  onToggleHeaderWidget?: (widgetId: SpaceWidgetId | null) => void;
+  renderHeaderWidgetPopover?: (widgetId: SpaceWidgetId) => React.ReactNode;
+  onSetMedia?: (media: MediaState) => void;
+  onSetAudio?: (audio: AudioState, fromServer?: boolean) => void;
+  onSetNetwork?: (network: NetworkSnapshot) => void;
+  onSetQuickToggles?: (state: QuickTogglesState) => void;
+  onConfigUpdated?: (config: TestBarConfig) => void;
+  onShowToast?: (msg: string) => void;
+}
+
+interface HeaderBounds {
+  leftAvailPx: number;
+  rightAvailPx: number;
+  rightSlotAnchorPx: number;
+  headerWidthPx: number;
+}
+
+const DEFAULT_HEADER_BOUNDS: HeaderBounds = {
+  leftAvailPx: 240,
+  rightAvailPx: 140,
+  rightSlotAnchorPx: 224,
+  headerWidthPx: 1124,
+};
+
+function getHeaderPopoverWidth(id: SpaceWidgetId | null): number {
+  switch (id) {
+    case 'timer':
+      return 304;
+    case 'network':
+    case 'quick_toggles':
+    case 'notes':
+    case 'media':
+    case 'audio_mixer':
+    case 'clipboard':
+    case 'pc_health':
+    case 'top_processes':
+    case 'game_combos':
+      return 336;
+    default:
+      return 320;
+  }
+}
+
+function clampHeaderPopoverLeft(anchorX: number | null, popWidth: number, headerWidth: number): number {
+  const safeHeader = Math.max(popWidth + 40, headerWidth || 1124);
+  if (anchorX === null || !Number.isFinite(anchorX)) {
+    return 20;
+  }
+  const desired = Math.round(anchorX - popWidth / 2);
+  return Math.max(20, Math.min(safeHeader - popWidth - 20, desired));
 }
 
 function findMatchingAccent(hex: string | undefined): SpaceAccentOption {
@@ -180,18 +269,48 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   onReorderSpaces,
   onDeleteSpace,
   onOpenWidgetBuilder,
+  headerWidgets,
+  media,
+  telem,
+  clips,
+  network,
+  quickNotes,
+  quickToggles,
+  activeHeaderWidgetId,
+  onToggleHeaderWidget,
+  renderHeaderWidgetPopover,
+  onSetMedia,
+  onSetAudio,
+  onSetNetwork,
+  onSetQuickToggles,
+  onConfigUpdated,
+  onShowToast,
 }) => {
   const reducedMotion = useReducedMotion();
+  const focusTimer = useFocusTimer();
+  const headerRef = useRef<HTMLElement>(null);
   const navRef = useRef<HTMLElement>(null);
+  const hdrRightRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const createInputRef = useRef<HTMLInputElement>(null);
   const manageInputRef = useRef<HTMLInputElement>(null);
   const spacePopRef = useRef<HTMLDivElement>(null);
   const periphPopRef = useRef<HTMLDivElement>(null);
   const weatherPopRef = useRef<HTMLDivElement>(null);
+  const widgetPopRef = useRef<HTMLDivElement>(null);
+  const overflowPopRef = useRef<HTMLDivElement>(null);
   const powerCapsuleRef = useRef<HTMLDivElement>(null);
   const deleteArmTimerRef = useRef<number | null>(null);
   const weatherSearchSeqRef = useRef(0);
+
+  const [headerBounds, setHeaderBounds] = useState<HeaderBounds>(DEFAULT_HEADER_BOUNDS);
+  const [internalActiveWidgetId, setInternalActiveWidgetId] = useState<SpaceWidgetId | null>(null);
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const [popoverAnchorX, setPopoverAnchorX] = useState<number | null>(null);
+  const [overflowAnchorX, setOverflowAnchorX] = useState<number | null>(null);
+  const [overflowAnchorSide, setOverflowAnchorSide] = useState<'left' | 'right'>('left');
+  const [periphAnchorX, setPeriphAnchorX] = useState<number | null>(null);
+  const [weatherAnchorX, setWeatherAnchorX] = useState<number | null>(null);
 
   const [indicator, setIndicator] = useState<SlidingPillRect>({ left: 0, width: 0, visible: false });
   const [indicatorReady, setIndicatorReady] = useState(false);
@@ -232,12 +351,63 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   const [weatherBusy, setWeatherBusy] = useState(false);
   const [hidingDeviceId, setHidingDeviceId] = useState<string | null>(null);
 
+  const isControlledHeaderWidget = activeHeaderWidgetId !== undefined;
+  const currentHeaderWidgetId = isControlledHeaderWidget
+    ? activeHeaderWidgetId
+    : internalActiveWidgetId;
+  const openStandaloneWidgetId: SpaceWidgetId | null =
+    currentHeaderWidgetId &&
+    currentHeaderWidgetId !== 'weather' &&
+    currentHeaderWidgetId !== 'batteries'
+      ? currentHeaderWidgetId
+      : null;
+
+  const lastOpenWidgetIdRef = useRef<SpaceWidgetId | null>(null);
+  if (openStandaloneWidgetId) {
+    lastOpenWidgetIdRef.current = openStandaloneWidgetId;
+  }
+
   const periphPresence = useAnimatedPresence(periphOpen, 105);
   const weatherPresence = useAnimatedPresence(weatherOpen, 105);
+  const widgetPopPresence = useAnimatedPresence(Boolean(openStandaloneWidgetId), 105);
+  const overflowPresence = useAnimatedPresence(overflowOpen, 95);
   const createPresence = useAnimatedPresence(addingSpace, 105);
   const managePresence = useAnimatedPresence(Boolean(managingSpace), 105);
 
   const spacesKey = spaces.map((s) => `${s.id}:${s.name}:${s.accentHex}`).join('|');
+
+  const measureHeaderBounds = () => {
+    const headerEl = headerRef.current;
+    const navEl = navRef.current;
+    const rightEl = hdrRightRef.current;
+    if (!headerEl || !navEl || !rightEl) return;
+
+    const headerW = headerEl.clientWidth;
+    const navW = navEl.offsetWidth;
+    const rightW = rightEl.offsetWidth;
+    if (headerW <= 0) return;
+
+    const navLeft = (headerW - navW) / 2;
+    const navRight = (headerW + navW) / 2;
+    const rightLeft = headerW - 20 - rightW;
+    const leftAvailPx = Math.max(0, Math.floor(navLeft - 20 - 10));
+    const rightAvailPx = Math.max(0, Math.floor(rightLeft - navRight - 10));
+    const rightSlotAnchorPx = Math.max(20, Math.round(20 + rightW + 10));
+
+    setHeaderBounds((prev) =>
+      prev.leftAvailPx === leftAvailPx &&
+      prev.rightAvailPx === rightAvailPx &&
+      prev.rightSlotAnchorPx === rightSlotAnchorPx &&
+      prev.headerWidthPx === headerW
+        ? prev
+        : {
+            leftAvailPx,
+            rightAvailPx,
+            rightSlotAnchorPx,
+            headerWidthPx: headerW,
+          },
+    );
+  };
 
   const measureActiveTab = () => {
     const btn = tabRefs.current[space];
@@ -250,6 +420,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
 
   useLayoutEffect(() => {
     measureActiveTab();
+    measureHeaderBounds();
     const btn = tabRefs.current[space];
     if (btn && typeof btn.scrollIntoView === 'function') {
       btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -270,12 +441,35 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
   }, [space, spacesKey, editMode, indicatorReady]);
 
   useEffect(() => {
-    const nav = navRef.current;
-    if (!nav || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => measureActiveTab());
-    ro.observe(nav);
+    const headerEl = headerRef.current;
+    const navEl = navRef.current;
+    const rightEl = hdrRightRef.current;
+    if (!navEl || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      measureActiveTab();
+      measureHeaderBounds();
+    });
+    ro.observe(navEl);
+    if (headerEl) ro.observe(headerEl);
+    if (rightEl) ro.observe(rightEl);
     return () => ro.disconnect();
   }, [space, spacesKey, editMode]);
+
+  useEffect(() => {
+    setOverflowOpen(false);
+    if (!isControlledHeaderWidget) {
+      setInternalActiveWidgetId(null);
+    }
+  }, [space, isControlledHeaderWidget]);
+
+  useEffect(() => {
+    if (weatherOpen || periphOpen || powerOpen) {
+      setOverflowOpen(false);
+      if (!isControlledHeaderWidget) {
+        setInternalActiveWidgetId(null);
+      }
+    }
+  }, [weatherOpen, periphOpen, powerOpen, isControlledHeaderWidget]);
 
   useEffect(() => {
     return () => {
@@ -361,7 +555,8 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         periphPopRef.current &&
         target &&
         !periphPopRef.current.contains(target) &&
-        !(target as HTMLElement).closest?.('.periph-pill')
+        !(target as HTMLElement).closest?.('.periph-pill') &&
+        !(target as HTMLElement).closest?.('.hdr-overflow-pop')
       ) {
         onClosePeriph();
       }
@@ -386,7 +581,8 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
         weatherPopRef.current &&
         target &&
         !weatherPopRef.current.contains(target) &&
-        !(target as HTMLElement).closest?.('.weather-hdr-pill')
+        !(target as HTMLElement).closest?.('.weather-hdr-pill') &&
+        !(target as HTMLElement).closest?.('.hdr-overflow-pop')
       ) {
         onCloseWeather();
       }
@@ -440,6 +636,71 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     window.addEventListener('mousedown', onOutsideMouseDown);
     return () => window.removeEventListener('mousedown', onOutsideMouseDown);
   }, [powerOpen, onClosePower]);
+
+  // Close unified header widget popover on outside click or Escape
+  useEffect(() => {
+    if (!openStandaloneWidgetId) return;
+    const onOutsideMouseDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        widgetPopRef.current &&
+        target &&
+        !widgetPopRef.current.contains(target) &&
+        !target.closest?.('.hdr-widget-pill') &&
+        !target.closest?.('.hdr-overflow-pop')
+      ) {
+        if (onToggleHeaderWidget) {
+          onToggleHeaderWidget(null);
+        } else {
+          setInternalActiveWidgetId(null);
+        }
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        if (onToggleHeaderWidget) {
+          onToggleHeaderWidget(null);
+        } else {
+          setInternalActiveWidgetId(null);
+        }
+      }
+    };
+    window.addEventListener('mousedown', onOutsideMouseDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onOutsideMouseDown);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [openStandaloneWidgetId, onToggleHeaderWidget]);
+
+  // Close overflow dropdown on outside click or Escape
+  useEffect(() => {
+    if (!overflowOpen) return;
+    const onOutsideMouseDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        overflowPopRef.current &&
+        target &&
+        !overflowPopRef.current.contains(target) &&
+        !target.closest?.('.hdr-overflow-btn')
+      ) {
+        setOverflowOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setOverflowOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onOutsideMouseDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onOutsideMouseDown);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [overflowOpen]);
 
   const handleSelectTemplate = (tplId: SpaceTemplateId) => {
     setNewSpaceTemplate(tplId);
@@ -620,71 +881,412 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
     }
   };
 
+  const activeSpaceObj = spaces.find((s) => s.id === space) ?? null;
+  const resolvedHeaderWidgets = useMemo(
+    () => headerWidgets ?? resolveSpaceHeaderWidgets(activeSpaceObj),
+    [headerWidgets, activeSpaceObj],
+  );
+
+  const headerWidthMap = useMemo<Partial<Record<SpaceWidgetId, number>>>(
+    () => ({
+      batteries:
+        inlinePeriphs.length === 0 ? 88 : inlinePeriphs.length === 1 ? 92 : 142,
+      weather: 68,
+      media: media?.hasSession ? 154 : 92,
+      audio_mixer: 76,
+      clipboard: clips && clips.length > 0 ? 96 : 82,
+      pc_health: telem ? 94 : 72,
+      top_processes: 98,
+      game_combos: 88,
+      notes: 96,
+      timer: 82,
+      network: network ? 106 : 86,
+      quick_toggles: 96,
+    }),
+    [inlinePeriphs.length, media?.hasSession, clips?.length, telem, network],
+  );
+
+  const slotPlan = useMemo(
+    () =>
+      planHeaderWidgetSlots(
+        resolvedHeaderWidgets,
+        headerBounds.leftAvailPx,
+        headerBounds.rightAvailPx,
+        headerWidthMap,
+      ),
+    [resolvedHeaderWidgets, headerBounds.leftAvailPx, headerBounds.rightAvailPx, headerWidthMap],
+  );
+
+  const measureElementAnchorX = (el: HTMLElement | null): number | null => {
+    const headerEl = headerRef.current;
+    if (!el || !headerEl) return null;
+    const hRect = headerEl.getBoundingClientRect();
+    const eRect = el.getBoundingClientRect();
+    if (hRect.width <= 0 || eRect.width <= 0) return null;
+    return eRect.left - hRect.left + eRect.width / 2;
+  };
+
+  const closeStandaloneHeaderWidget = () => {
+    if (onToggleHeaderWidget) {
+      if (currentHeaderWidgetId !== null) onToggleHeaderWidget(null);
+    } else {
+      setInternalActiveWidgetId(null);
+    }
+  };
+
+  const handleSelectHeaderWidget = (id: SpaceWidgetId, anchorEl: HTMLElement | null) => {
+    const anchorX = measureElementAnchorX(anchorEl);
+    setOverflowOpen(false);
+
+    if (id === 'batteries') {
+      closeStandaloneHeaderWidget();
+      if (weatherOpen) onCloseWeather();
+      setPeriphAnchorX(anchorX);
+      onTogglePeriph();
+      return;
+    }
+
+    if (id === 'weather') {
+      closeStandaloneHeaderWidget();
+      if (periphOpen) onClosePeriph();
+      setWeatherAnchorX(anchorX);
+      onToggleWeather();
+      return;
+    }
+
+    if (weatherOpen) onCloseWeather();
+    if (periphOpen) onClosePeriph();
+    setPopoverAnchorX(anchorX);
+
+    if (onToggleHeaderWidget) {
+      onToggleHeaderWidget(currentHeaderWidgetId === id ? null : id);
+    } else {
+      setInternalActiveWidgetId((prev) => (prev === id ? null : id));
+    }
+  };
+
+  const getWidgetMeta = (id: SpaceWidgetId) =>
+    SPACE_WIDGET_CATALOG.find((w) => w.id === id);
+
+  const renderWidgetIcon = (id: SpaceWidgetId) => {
+    switch (id) {
+      case 'weather':
+        return (
+          <WeatherConditionIcon
+            condition={weather?.available ? weather.conditionIcon : 'cloud'}
+            className="ic14 weather-hdr-ic"
+          />
+        );
+      case 'batteries':
+        return <PeripheralDeviceIcon kind={inlinePeriphs[0]?.kind} className="ic14" />;
+      case 'media':
+        return <MusicNoteIcon className="ic14" />;
+      case 'audio_mixer':
+        return (
+          <VolIcon
+            muted={audio?.masterMuted}
+            level={audio?.masterVolume}
+            className="ic14"
+          />
+        );
+      case 'clipboard':
+        return <PasteIcon className="ic14" />;
+      case 'pc_health':
+        return <TaskmgrIcon className="ic14" />;
+      case 'top_processes':
+        return <LayersIcon className="ic14" />;
+      case 'game_combos':
+        return <GamepadIcon className="ic14" />;
+      case 'notes':
+        return <NoteChecklistIcon className="ic14" />;
+      case 'timer':
+        return <TimerIcon className="ic14" />;
+      case 'network':
+        return (
+          <NetIcon
+            kind={network?.kind}
+            connected={network?.online ?? true}
+            className="ic14"
+          />
+        );
+      case 'quick_toggles':
+        return <BoltToggleIcon className="ic14" />;
+    }
+  };
+
+  const renderWidgetSummaryValue = (id: SpaceWidgetId): string => {
+    switch (id) {
+      case 'weather':
+        return weatherPillTemp;
+      case 'batteries':
+        return visiblePeriphs.length > 0 ? `${visiblePeriphs[0].percent}%` : 'Звук';
+      case 'media':
+        return media?.hasSession ? media.title || 'Медиа' : 'Медиа';
+      case 'audio_mixer':
+        return audio ? (audio.masterMuted ? '0%' : `${audio.masterVolume}%`) : 'Звук';
+      case 'clipboard':
+        return clips && clips.length > 0 ? `Буфер · ${clips.length}` : 'Буфер';
+      case 'pc_health':
+        return telem ? `CPU ${telem.cpuPct}%` : 'ПК';
+      case 'top_processes':
+        return 'Процессы';
+      case 'game_combos':
+        return 'Связки';
+      case 'notes': {
+        const openTodos = (quickNotes?.todos ?? []).filter((t) => !t.done).length;
+        return openTodos > 0 ? `Дела · ${openTodos}` : 'Заметки';
+      }
+      case 'timer':
+        return focusTimer.formatted;
+      case 'network':
+        if (!network) return 'Сеть';
+        if (!network.online) return 'Офлайн';
+        return network.pingMs !== null ? `${network.pingMs} мс` : formatRate(network.rxBytesPerSec);
+      case 'quick_toggles':
+        return 'Тумблеры';
+    }
+  };
+
+  const renderHeaderPill = (entry: SpaceHeaderWidget) => {
+    const id = entry.id;
+    if (id === 'batteries') {
+      return (
+        <button
+          key={id}
+          type="button"
+          className={`hdr-widget-pill periph-pill ${periphOpen ? 'open' : ''} ${hasLowBat ? 'has-low-bat' : ''}`}
+          title="Беспроводные устройства и вывод звука"
+          onClick={(e) => handleSelectHeaderWidget('batteries', e.currentTarget)}
+        >
+          {inlinePeriphs.length === 0 ? (
+            <>
+              <HeadphonesIcon className="ic14" />
+              <span>{activeDev?.shortName || 'Звук'}</span>
+            </>
+          ) : (
+            <>
+              {inlinePeriphs.map((p, idx) => {
+                const isLow = isLowBatteryPercent(p.percent);
+                return (
+                  <React.Fragment key={p.id || `${p.name}-${idx}`}>
+                    {idx > 0 && <span className="periph-sep" />}
+                    <PeripheralDeviceIcon kind={p.kind} className="ic14" />
+                    {p.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
+                    <span className={isLow ? 'periph-low-txt' : undefined}>{p.percent}%</span>
+                    <span className="bat-track">
+                      <i
+                        className="bat-fill"
+                        style={
+                          {
+                            ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
+                            background: isLow ? '#FB7185' : getBatteryColor(p.percent),
+                          } as React.CSSProperties
+                        }
+                      />
+                    </span>
+                  </React.Fragment>
+                );
+              })}
+              {extraPeriphCount > 0 && (
+                <span className="periph-more-badge">+{extraPeriphCount}</span>
+              )}
+            </>
+          )}
+        </button>
+      );
+    }
+
+    if (id === 'weather') {
+      return (
+        <button
+          key={id}
+          type="button"
+          className={`hdr-widget-pill weather-hdr-pill ${weatherOpen ? 'open' : ''} ${weather?.available && weather.stale ? 'stale' : ''}`}
+          data-condition={weather?.available ? weather.conditionIcon : undefined}
+          title={
+            weather?.available
+              ? `${weatherHeaderCity}: ${weather.conditionLabel}`
+              : 'Погода'
+          }
+          aria-label="Погода"
+          aria-expanded={weatherOpen}
+          onClick={(e) => handleSelectHeaderWidget('weather', e.currentTarget)}
+        >
+          <WeatherConditionIcon
+            condition={weather?.available ? weather.conditionIcon : 'cloud'}
+            className="ic14 weather-hdr-ic"
+          />
+          <span>{weatherPillTemp}</span>
+        </button>
+      );
+    }
+
+    if (id === 'media') {
+      const isOpen = openStandaloneWidgetId === 'media';
+      return (
+        <div
+          key={id}
+          className={`hdr-widget-pill hdr-media-pill ${isOpen ? 'open' : ''}`}
+        >
+          <button
+            type="button"
+            className="hdr-media-main"
+            aria-expanded={isOpen}
+            title={
+              media?.hasSession
+                ? `${media.title || 'Медиа'}${media.artist ? ` — ${media.artist}` : ''}`
+                : 'Медиаплеер'
+            }
+            onClick={(e) =>
+              handleSelectHeaderWidget('media', e.currentTarget.parentElement ?? e.currentTarget)
+            }
+          >
+            {media?.hasSession && media.thumbnail ? (
+              <img src={media.thumbnail} alt="" className="hdr-media-art" draggable={false} />
+            ) : (
+              <MusicNoteIcon className="ic14" />
+            )}
+            <span className="hdr-pill-lbl hdr-media-lbl">
+              {media?.hasSession ? media.title || 'Медиа' : 'Медиа'}
+            </span>
+          </button>
+          {media?.hasSession && (
+            <button
+              type="button"
+              className="hdr-media-play-btn"
+              aria-label={media.isPlaying ? 'Пауза' : 'Воспроизвести'}
+              title={media.isPlaying ? 'Пауза' : 'Воспроизвести'}
+              onClick={(e) => {
+                e.stopPropagation();
+                ipc<MediaState>('media_action', { action: 'toggle' })
+                  .then((next) => onSetMedia?.(next))
+                  .catch((err) => onShowToast?.(formatIpcError(err)));
+              }}
+            >
+              {media.isPlaying ? <PauseIcon size={11} /> : <PlaySmallIcon size={11} />}
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    const isOpen = openStandaloneWidgetId === id;
+    const isTimerRunning = id === 'timer' && focusTimer.state.running;
+    const isToggleActive =
+      id === 'quick_toggles' && Boolean(quickToggles?.keepAwake || audio?.micMuted);
+    const meta = getWidgetMeta(id);
+
+    return (
+      <button
+        key={id}
+        type="button"
+        className={`hdr-widget-pill ${isOpen ? 'open' : ''} ${isTimerRunning ? 'running' : ''} ${isToggleActive ? 'has-flag' : ''}`}
+        title={meta?.label}
+        aria-label={meta?.label}
+        aria-expanded={isOpen}
+        onClick={(e) => handleSelectHeaderWidget(id, e.currentTarget)}
+      >
+        {renderWidgetIcon(id)}
+        <span className={`hdr-pill-lbl ${id === 'timer' || id === 'network' ? 'mono' : ''}`}>
+          {renderWidgetSummaryValue(id)}
+        </span>
+      </button>
+    );
+  };
+
+  const renderOverflowButton = (side: 'left' | 'right') => {
+    if (slotPlan.overflow.length === 0 || slotPlan.overflowSide !== side) return null;
+    return (
+      <button
+        type="button"
+        className={`hdr-widget-pill hdr-overflow-btn ${overflowOpen ? 'open' : ''}`}
+        title={`Ещё виджеты (${slotPlan.overflow.length})`}
+        aria-label={`Ещё виджеты (${slotPlan.overflow.length})`}
+        aria-expanded={overflowOpen}
+        onClick={(e) => {
+          const anchorX = measureElementAnchorX(e.currentTarget);
+          setOverflowAnchorX(anchorX);
+          setOverflowAnchorSide(side);
+          if (weatherOpen) onCloseWeather();
+          if (periphOpen) onClosePeriph();
+          closeStandaloneHeaderWidget();
+          setOverflowOpen((v) => !v);
+        }}
+      >
+        <span>+{slotPlan.overflow.length}</span>
+      </button>
+    );
+  };
+
+  const renderStandalonePopoverBody = (id: SpaceWidgetId): React.ReactNode => {
+    const custom = renderHeaderWidgetPopover?.(id);
+    if (custom !== undefined && custom !== null) {
+      return custom;
+    }
+    switch (id) {
+      case 'notes':
+        return (
+          <NotesWidgetCard
+            mode="popover"
+            quickNotes={quickNotes}
+            onConfigUpdated={onConfigUpdated}
+            onShowToast={onShowToast}
+          />
+        );
+      case 'timer':
+        return <TimerWidgetCard mode="popover" onShowToast={onShowToast} />;
+      case 'network':
+        return (
+          <NetworkWidgetCard
+            mode="popover"
+            network={network}
+            onSetNetwork={onSetNetwork}
+            onShowToast={onShowToast}
+          />
+        );
+      case 'quick_toggles':
+        return (
+          <QuickTogglesWidgetCard
+            mode="popover"
+            audio={audio}
+            quickToggles={quickToggles}
+            onSetAudio={onSetAudio}
+            onSetQuickToggles={onSetQuickToggles}
+            onShowToast={onShowToast}
+          />
+        );
+      default: {
+        const meta = getWidgetMeta(id);
+        return (
+          <div className="nw-popover-fallback">
+            <div className="periph-pop-title">{meta?.label ?? id}</div>
+            <div className="nw-empty-sub">{meta?.description ?? 'Виджет активен'}</div>
+          </div>
+        );
+      }
+    }
+  };
+
+  const activePopoverId = openStandaloneWidgetId ?? lastOpenWidgetIdRef.current;
+  const activePopoverWidth = getHeaderPopoverWidth(activePopoverId);
+  const activePopoverLeft = clampHeaderPopoverLeft(
+    popoverAnchorX,
+    activePopoverWidth,
+    headerBounds.headerWidthPx,
+  );
+  const periphPopLeft = clampHeaderPopoverLeft(periphAnchorX, 308, headerBounds.headerWidthPx);
+  const weatherPopLeft = clampHeaderPopoverLeft(weatherAnchorX, 360, headerBounds.headerWidthPx);
+  const overflowPopLeft = clampHeaderPopoverLeft(overflowAnchorX, 240, headerBounds.headerWidthPx);
+
   return (
     <>
-      <header className="start-header">
-        <div className="hdr-left">
-          <button
-            type="button"
-            className={`periph-pill ${periphOpen ? 'open' : ''} ${hasLowBat ? 'has-low-bat' : ''}`}
-            title="Беспроводные устройства и вывод звука"
-            onClick={onTogglePeriph}
-          >
-            {inlinePeriphs.length === 0 ? (
-              <>
-                <HeadphonesIcon className="ic14" />
-                <span>{activeDev?.shortName || 'Звук'}</span>
-              </>
-            ) : (
-              <>
-                {inlinePeriphs.map((p, idx) => {
-                  const isLow = isLowBatteryPercent(p.percent);
-                  return (
-                    <React.Fragment key={p.id || `${p.name}-${idx}`}>
-                      {idx > 0 && <span className="periph-sep" />}
-                      <PeripheralDeviceIcon kind={p.kind} className="ic14" />
-                      {p.charging && <ChargingBoltIcon className="ic12 periph-charge-ic" />}
-                      <span className={isLow ? 'periph-low-txt' : undefined}>{p.percent}%</span>
-                      <span className="bat-track">
-                        <i
-                          className="bat-fill"
-                          style={
-                            {
-                              ['--pct' as string]: Math.max(0, Math.min(1, p.percent / 100)),
-                              background: isLow ? '#FB7185' : getBatteryColor(p.percent),
-                            } as React.CSSProperties
-                          }
-                        />
-                      </span>
-                    </React.Fragment>
-                  );
-                })}
-                {extraPeriphCount > 0 && (
-                  <span className="periph-more-badge">+{extraPeriphCount}</span>
-                )}
-              </>
-            )}
-          </button>
-
-          <button
-            type="button"
-            className={`weather-hdr-pill ${weatherOpen ? 'open' : ''} ${weather?.available && weather.stale ? 'stale' : ''}`}
-            data-condition={weather?.available ? weather.conditionIcon : undefined}
-            title={
-              weather?.available
-                ? `${weatherHeaderCity}: ${weather.conditionLabel}`
-                : 'Погода'
-            }
-            aria-label="Погода"
-            aria-expanded={weatherOpen}
-            onClick={onToggleWeather}
-          >
-            <WeatherConditionIcon
-              condition={weather?.available ? weather.conditionIcon : 'cloud'}
-              className="ic14 weather-hdr-ic"
-            />
-            <span>{weatherPillTemp}</span>
-          </button>
+      <header ref={headerRef} className="start-header">
+        <div
+          className="hdr-slot-left"
+          style={{ maxWidth: `${headerBounds.leftAvailPx}px` }}
+        >
+          {slotPlan.left.map((entry) => renderHeaderPill(entry))}
+          {renderOverflowButton('left')}
         </div>
 
         <nav
@@ -697,7 +1299,9 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
               ? {
                   opacity: 0,
                   pointerEvents: 'none',
-                  transform: reducedMotion ? undefined : 'translate3d(-6px, 0, 0) scale(0.985)',
+                  transform: reducedMotion
+                    ? 'translate3d(-50%, -50%, 0)'
+                    : 'translate3d(-50%, -50%, 0) translate3d(-6px, 0, 0) scale(0.985)',
                   transition: reducedMotion
                     ? 'opacity 110ms ease'
                     : 'opacity 140ms var(--ease-out), transform 140ms var(--ease-out)',
@@ -792,7 +1396,22 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
           </button>
         </nav>
 
-        <div className={`hdr-right ${powerOpen ? 'power-open' : ''}`}>
+        <div
+          className="hdr-slot-right"
+          aria-hidden={powerOpen}
+          style={{
+            right: `${headerBounds.rightSlotAnchorPx}px`,
+            maxWidth: `${headerBounds.rightAvailPx}px`,
+            ...(powerOpen
+              ? { opacity: 0, pointerEvents: 'none' }
+              : {}),
+          }}
+        >
+          {slotPlan.right.map((entry) => renderHeaderPill(entry))}
+          {renderOverflowButton('right')}
+        </div>
+
+        <div ref={hdrRightRef} className={`hdr-right ${powerOpen ? 'power-open' : ''}`}>
           <div className="hdr-tools-group">
             <button
               type="button"
@@ -1189,6 +1808,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
           ref={periphPopRef}
           className="periph-pop"
           data-phase={periphPresence.phase}
+          style={{ left: `${periphPopLeft}px` }}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="periph-pop-head">
@@ -1328,6 +1948,7 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
           data-phase={weatherPresence.phase}
           role="dialog"
           aria-label="Погода и прогноз"
+          style={{ left: `${weatherPopLeft}px` }}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="whp-head">
@@ -1548,6 +2169,57 @@ export const StartHeader: React.FC<StartHeaderProps> = ({
               {weatherRefreshing ? 'Загрузка прогноза…' : weather?.error || 'Погода недоступна'}
             </div>
           )}
+        </div>
+      )}
+
+      {/* HEADER WIDGET OVERFLOW DROPDOWN */}
+      {overflowPresence.mounted && slotPlan.overflow.length > 0 && (
+        <div
+          ref={overflowPopRef}
+          className={`hdr-overflow-pop ${overflowAnchorSide === 'right' ? 'from-right' : 'from-left'}`}
+          data-phase={overflowPresence.phase}
+          role="menu"
+          aria-label="Дополнительные виджеты шапки"
+          style={{ left: `${overflowPopLeft}px` }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="periph-pop-title">Виджеты шапки</div>
+          {slotPlan.overflow.map((entry) => {
+            const meta = getWidgetMeta(entry.id);
+            return (
+              <button
+                key={entry.id}
+                type="button"
+                role="menuitem"
+                className="pp-row"
+                onClick={(e) => handleSelectHeaderWidget(entry.id, e.currentTarget)}
+              >
+                <span className="pp-ic">{renderWidgetIcon(entry.id)}</span>
+                <div className="pp-meta">
+                  <div className="pp-name">{meta?.label ?? entry.id}</div>
+                  <div className="pp-sub">{renderWidgetSummaryValue(entry.id)}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* UNIFIED STANDALONE HEADER WIDGET POPOVER */}
+      {widgetPopPresence.mounted && activePopoverId && (
+        <div
+          ref={widgetPopRef}
+          className="hdr-widget-pop"
+          data-phase={widgetPopPresence.phase}
+          role="dialog"
+          aria-label={getWidgetMeta(activePopoverId)?.label ?? activePopoverId}
+          style={{
+            left: `${activePopoverLeft}px`,
+            width: `${activePopoverWidth}px`,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {renderStandalonePopoverBody(activePopoverId)}
         </div>
       )}
     </>

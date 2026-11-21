@@ -12,6 +12,7 @@ import {
   iconCache,
   ipc,
   isCacheIconKey,
+  isTauri,
   loadGameCover,
   movePinInSpace,
   pasteClipboardEntry,
@@ -20,23 +21,30 @@ import {
   setClipboardPaused,
   setInputDevice,
   setSessionState,
+  setSpaceWidgetLayout,
   type AudioDeviceInfo,
   type AudioState,
   type ClipboardEntry,
+  type HeaderWidgetSide,
   type IndexedApp,
   type MediaState,
+  type NetworkSnapshot,
   type PeripheralBattery,
   type PinItem,
+  type QuickTogglesState,
   type SpaceConfig,
+  type SpaceHeaderWidget,
   type SpaceWidgetId,
   type SteamGame,
   type TelemetryState,
   type TestBarConfig,
   type TileSection,
+  type TileSize,
   type TopProcessInfo,
   type WeatherSnapshot,
 } from '../../lib/ipc';
 import {
+  buildGameComboLaunchPayload,
   buildSparklinePath,
   computeGameCardTilt,
   computeInterpolatedMediaSec,
@@ -57,11 +65,13 @@ import {
   getClipboardKindLabel,
   getGpuTempStatusPill,
   getHonestShiftBadge,
+  getSpaceWidgetPlacement,
   getTelemetryLevelClass,
   getTelemetryStatusPill,
   hasExceededDragThreshold,
   hexColorToRgbString,
   isLowBatteryPercent,
+  moveHeaderWidget,
   moveSpaceWidget,
   normalizeSessionVolumeScalar,
   partitionSpaceItemsBySection,
@@ -71,12 +81,15 @@ import {
   resolveClipboardKind,
   resolveCustomColorRgb,
   resolveProcessKillPids,
+  resolveSpaceHeaderWidgets,
   selectDisplayedGames,
+  setHeaderWidgetSide,
+  setSpaceWidgetPlacement,
   SPACE_WIDGET_CATALOG,
-  toggleSpaceWidget,
   validateGameComboInput,
   type GameLibraryFilter,
   type MovePinInSpaceParams,
+  type SpaceWidgetPlacement,
   type TelemetryHistory,
 } from '../../lib/startLogic';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
@@ -116,6 +129,12 @@ import {
   XIcon10,
 } from '../Icons';
 import { ObsidianSlider } from '../ObsidianSlider';
+import {
+  NetworkWidgetCard,
+  NotesWidgetCard,
+  QuickTogglesWidgetCard,
+  TimerWidgetCard,
+} from './NewWidgetCards';
 import { SpotCard, trackTilePointer, type SpotCardProps } from './SpotCard';
 
 type BentoSpotCardProps = SpotCardProps & { bentoIndex?: number };
@@ -250,6 +269,8 @@ export interface StartSpacesProps {
   periphsRefreshing?: boolean;
   weather: WeatherSnapshot | null;
   weatherRefreshing?: boolean;
+  network?: NetworkSnapshot | null;
+  quickToggles?: QuickTogglesState | null;
   editMode: boolean;
   shiftHeld: boolean;
   widgetBuilderOpen: boolean;
@@ -264,10 +285,17 @@ export interface StartSpacesProps {
   onSetMedia: (media: MediaState) => void;
   onSetTelem: (telem: TelemetryState) => void;
   onSetClips: (clips: ClipboardEntry[]) => void;
+  onSetNetwork?: (network: NetworkSnapshot) => void;
+  onSetQuickToggles?: (toggles: QuickTogglesState) => void;
   onRefreshWeather: () => Promise<void>;
   onRefreshPeriphs: () => Promise<void>;
   onToggleWidgetBuilder: (open: boolean) => void;
   onSetSpaceWidgets: (spaceId: string, widgets: SpaceWidgetId[]) => Promise<void>;
+  onSetSpaceWidgetLayout?: (
+    spaceId: string,
+    widgets: SpaceWidgetId[],
+    headerWidgets: SpaceHeaderWidget[],
+  ) => Promise<void>;
   onShowToast: (msg: string) => void;
   startVisible?: boolean;
   startAnimSettled?: boolean;
@@ -284,59 +312,133 @@ export interface StartSpacesProps {
   onEditPin?: (item: PinItem, spaceKey: string) => void;
 }
 
-export const StartSpaces: React.FC<StartSpacesProps> = ({
+export interface StandaloneWidgetCardProps {
+  widgetId: SpaceWidgetId;
+  bentoIndex?: number;
+  mode?: 'card' | 'popover';
+  spaceId?: string;
+  activeSpace?: SpaceConfig;
+  config?: TestBarConfig | null;
+  games?: SteamGame[];
+  apps?: IndexedApp[];
+  audio?: AudioState | null;
+  media?: MediaState | null;
+  telem?: TelemetryState | null;
+  clips?: ClipboardEntry[];
+  periphs?: PeripheralBattery[];
+  periphsRefreshing?: boolean;
+  weather?: WeatherSnapshot | null;
+  weatherRefreshing?: boolean;
+  network?: NetworkSnapshot | null;
+  quickToggles?: QuickTogglesState | null;
+  startVisible?: boolean;
+  startAnimSettled?: boolean;
+  iconMap?: Record<string, string>;
+  onSetAudio?: (audio: AudioState, fromServer?: boolean) => void;
+  onSetMedia?: (media: MediaState) => void;
+  onSetTelem?: (telem: TelemetryState) => void;
+  onSetClips?: (clips: ClipboardEntry[]) => void;
+  onSetNetwork?: (network: NetworkSnapshot) => void;
+  onSetQuickToggles?: (toggles: QuickTogglesState) => void;
+  onRefreshWeather?: () => Promise<void>;
+  onRefreshPeriphs?: () => Promise<void>;
+  onResolveIconKeys?: (keys: string[]) => void;
+  onSetConfig?: (config: TestBarConfig) => void;
+  onAudioDragStateChange?: (sliderKey: string, dragging: boolean) => void;
+  onHideBatteryDevice?: (id: string) => void;
+  onShowToast?: (msg: string) => void;
+  onLaunchPin?: (item: PinItem) => void;
+  onOpenTileContext?: (e: React.MouseEvent, item: PinItem, spaceKey: string) => void;
+}
+
+interface UseSpaceWidgetCardsParams {
+  space: string;
+  config: TestBarConfig | null;
+  games: SteamGame[];
+  apps: IndexedApp[];
+  audio: AudioState | null;
+  media: MediaState | null;
+  telem: TelemetryState | null;
+  clips: ClipboardEntry[];
+  periphs: PeripheralBattery[];
+  periphsRefreshing: boolean;
+  weather: WeatherSnapshot | null;
+  weatherRefreshing: boolean;
+  network: NetworkSnapshot | null;
+  quickToggles: QuickTogglesState | null;
+  spaceWidgets: SpaceWidgetId[];
+  isGamesLayout: boolean;
+  editMode: boolean;
+  startVisible: boolean;
+  startAnimSettled: boolean;
+  iconMap?: Record<string, string>;
+  onSetAudio: (audio: AudioState, fromServer?: boolean) => void;
+  onSetMedia: (media: MediaState) => void;
+  onSetTelem: (telem: TelemetryState) => void;
+  onSetClips: (clips: ClipboardEntry[]) => void;
+  onSetNetwork?: (network: NetworkSnapshot) => void;
+  onSetQuickToggles?: (toggles: QuickTogglesState) => void;
+  onRefreshWeather: () => Promise<void>;
+  onRefreshPeriphs: () => Promise<void>;
+  onResolveIconKeys?: (keys: string[]) => void;
+  onSetConfig?: (config: TestBarConfig) => void;
+  onAudioDragStateChange?: (sliderKey: string, dragging: boolean) => void;
+  onHideBatteryDevice?: (id: string) => void;
+  onShowToast: (msg: string) => void;
+  onLaunchPin: (item: PinItem) => void;
+  onOpenTileContext: (e: React.MouseEvent, item: PinItem, spaceKey: string) => void;
+  getDragClasses: (spaceKey: string, idx: number, itemId?: string) => string;
+  makeDragProps: (
+    spaceKey: string,
+    idx: number,
+    itemId: string,
+    section: TileSection | null,
+    label: string,
+  ) => React.HTMLAttributes<HTMLElement>;
+  suppressClickUntilRef: React.MutableRefObject<number>;
+}
+
+function useSpaceWidgetCards({
   space,
-  activeSpace,
   config,
   games,
+  apps,
   audio,
   media,
   telem,
   clips,
   periphs,
-  periphsRefreshing = false,
+  periphsRefreshing,
   weather,
-  weatherRefreshing = false,
+  weatherRefreshing,
+  network,
+  quickToggles,
+  spaceWidgets,
+  isGamesLayout,
   editMode,
-  shiftHeld,
-  widgetBuilderOpen,
-  isRunning,
-  resolveIconForPin,
-  onLaunchPin,
-  onOpenFolder,
-  onOpenFolderInExplorer,
-  onOpenDrawer,
-  onOpenTileContext,
+  startVisible,
+  startAnimSettled,
+  iconMap,
   onSetAudio,
   onSetMedia,
   onSetTelem,
   onSetClips,
+  onSetNetwork,
+  onSetQuickToggles,
   onRefreshWeather,
   onRefreshPeriphs,
-  onToggleWidgetBuilder,
-  onSetSpaceWidgets,
-  onShowToast,
-  startVisible = true,
-  startAnimSettled = true,
-  onAudioDragStateChange,
-  spaceDir = 0,
-  rapidSwitch = false,
-  iconMap,
-  apps = [],
   onResolveIconKeys,
   onSetConfig,
-  onOptimisticReorder,
-  onOptimisticMovePin,
+  onAudioDragStateChange,
   onHideBatteryDevice,
-}) => {
-  const reducedMotion = useReducedMotion();
-
-  const [gameFilter, setGameFilter] = useState<GameLibraryFilter>('recent');
+  onShowToast,
+  onLaunchPin,
+  onOpenTileContext,
+  getDragClasses,
+  makeDragProps,
+  suppressClickUntilRef,
+}: UseSpaceWidgetCardsParams) {
   const [copiedClipId, setCopiedClipId] = useState<string | null>(null);
-  const [activeDrag, setActiveDrag] = useState<ActivePointerDrag | null>(null);
-  const pointerDragCleanupRef = useRef<(() => void) | null>(null);
-  const suppressClickUntilRef = useRef<number>(0);
-  const dragGhostRef = useRef<HTMLDivElement | null>(null);
   const [killError, setKillError] = useState<{ space: string; message: string } | null>(null);
 
   // Safe 2-click armed process kill & combo delete
@@ -370,24 +472,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
   // Telemetry 60s rolling sparkline ring buffer
   const [telemHistory, setTelemHistory] = useState<TelemetryHistory>(EMPTY_TELEMETRY_HISTORY);
-
-  // Widget Configurator popover
-  const widgetPopRef = useRef<HTMLDivElement>(null);
-  const widgetPopPresence = useAnimatedPresence(widgetBuilderOpen, 95);
-  const [savingWidgets, setSavingWidgets] = useState(false);
-
-  // Lazy Steam/Epic/GOG cover art cache
-  const mountedRef = useRef(true);
-  const [loadedCovers, setLoadedCovers] = useState<Record<string, string>>({});
-  const requestedCoversRef = useRef<Set<string>>(new Set());
   const requestedIconsRef = useRef<Set<string>>(new Set());
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
 
   // Inline Game Combo builder sheet
   const [comboBuilderOpen, setComboBuilderOpen] = useState(false);
@@ -399,55 +484,19 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
   const [comboError, setComboError] = useState<string | null>(null);
   const [comboSaving, setComboSaving] = useState(false);
 
-  const spaceWidgets = activeSpace.widgets ?? [];
-  const hasWidgets = spaceWidgets.length > 0;
   const hasAudioWidget = spaceWidgets.includes('audio_mixer');
   const hasAudioDevices = (audio?.devices.length ?? 0) > 0;
   const hasAudioHydrated = audio !== null;
-  const isGamesLayout = activeSpace.layoutKind === 'games';
   const weatherUnits: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
 
-  // Reset transient space-local states on space switch or hide
+  // Reset widget-local transient states on space switch or hide
   useEffect(() => {
     setKillError(null);
     setArmedKillKey(null);
     setArmedComboDeleteId(null);
     setDevOverflowOpen(false);
     setComboBuilderOpen(false);
-    if (pointerDragCleanupRef.current) {
-      pointerDragCleanupRef.current();
-      pointerDragCleanupRef.current = null;
-    }
-    setActiveDrag(null);
   }, [space, startVisible]);
-
-  // Dismiss widget builder on outside click or Escape
-  useEffect(() => {
-    if (!widgetBuilderOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (
-        widgetPopRef.current &&
-        target &&
-        !widgetPopRef.current.contains(target) &&
-        !target.closest?.('.sec-act-widgets')
-      ) {
-        onToggleWidgetBuilder(false);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onToggleWidgetBuilder(false);
-      }
-    };
-    window.addEventListener('mousedown', onPointerDown);
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => {
-      window.removeEventListener('mousedown', onPointerDown);
-      window.removeEventListener('keydown', onKeyDown, true);
-    };
-  }, [widgetBuilderOpen, onToggleWidgetBuilder]);
 
   // Suppress segmented-pill & slider mount/hydration glide on space switch, Start open, or first audio hydration
   useEffect(() => {
@@ -480,15 +529,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     };
   }, [space, startVisible, startAnimSettled, hasAudioDevices, hasAudioHydrated, hasAudioWidget]);
 
-  // Cleanup arming, drag & audio throttle timers on unmount
+  // Cleanup arming & audio throttle timers on unmount
   useEffect(() => {
     return () => {
       if (armedKillTimerRef.current !== null) window.clearTimeout(armedKillTimerRef.current);
       if (armedComboTimerRef.current !== null) window.clearTimeout(armedComboTimerRef.current);
-      if (pointerDragCleanupRef.current) {
-        pointerDragCleanupRef.current();
-        pointerDragCleanupRef.current = null;
-      }
       audioThrottleTimersRef.current.forEach((id) => window.clearTimeout(id));
       audioThrottleTimersRef.current.clear();
       audioPendingSendRef.current.clear();
@@ -647,10 +692,6 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
   }, [audio?.sessions, telem?.topProcesses, telem?.gpuProcesses, iconMap, onResolveIconKeys]);
 
-  const displayedGames = useMemo(
-    () => selectDisplayedGames(games, gameFilter),
-    [games, gameFilter],
-  );
   const studioProcesses = useMemo(
     () =>
       telem?.gpuProcesses && telem.gpuProcesses.length > 0
@@ -662,66 +703,6 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     () => filterClipboardEntries(clips, clipQuery),
     [clips, clipQuery],
   );
-
-  // Idle pre-warm top 6 recent Steam covers after boot
-  useEffect(() => {
-    if (games.length === 0) return;
-    const timer = window.setTimeout(() => {
-      if (!mountedRef.current) return;
-      const topRecent = selectDisplayedGames(games, 'recent').slice(0, 6);
-      for (const g of topRecent) {
-        if (g.coverData || !g.coverPath || requestedCoversRef.current.has(g.coverPath)) continue;
-        const path = g.coverPath;
-        requestedCoversRef.current.add(path);
-        loadGameCover(path)
-          .then((uri) => {
-            if (!uri || !mountedRef.current) {
-              requestedCoversRef.current.delete(path);
-              return;
-            }
-            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
-          })
-          .catch(() => {
-            requestedCoversRef.current.delete(path);
-          });
-      }
-    }, 2200);
-    return () => window.clearTimeout(timer);
-  }, [games]);
-
-  // Lazy load remaining game covers AFTER the 190ms space slide finishes
-  useEffect(() => {
-    if (!startVisible || !isGamesLayout) return;
-    const toLoad = displayedGames.filter(
-      (g) =>
-        !g.coverData &&
-        Boolean(g.coverPath) &&
-        !requestedCoversRef.current.has(g.coverPath!),
-    );
-    if (toLoad.length === 0) return;
-
-    const deferTimer = window.setTimeout(() => {
-      if (!mountedRef.current) return;
-      toLoad.forEach((g) => {
-        const path = g.coverPath!;
-        if (requestedCoversRef.current.has(path)) return;
-        requestedCoversRef.current.add(path);
-        loadGameCover(path)
-          .then((uri) => {
-            if (!uri || !mountedRef.current) {
-              requestedCoversRef.current.delete(path);
-              return;
-            }
-            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
-          })
-          .catch(() => {
-            requestedCoversRef.current.delete(path);
-          });
-      });
-    }, 210);
-
-    return () => window.clearTimeout(deferTimer);
-  }, [startVisible, isGamesLayout, displayedGames]);
 
   // Combo picker catalog (installed apps + games)
   const comboPickerOptions = useMemo(() => {
@@ -841,421 +822,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
   };
 
-  const handlePinTileClick = useCallback(
-    (item: PinItem, eventShift: boolean) => {
-      if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
-        return;
-      }
-      if (editMode) return;
-      if (item.kind === 'folder') {
-        if (eventShift || shiftHeld) {
-          onOpenFolderInExplorer(item.target);
-        } else {
-          onOpenFolder(item.target);
-        }
-        return;
-      }
-      onLaunchPin(item);
-    },
-    [editMode, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
-  );
 
-  // Always-on pointer-based pin reordering (6px threshold, Main <-> Bottom & Hero <-> Compact, immune to Tauri v2 dragDropEnabled)
-  const handlePinPointerDown = (
-    e: React.PointerEvent<HTMLElement>,
-    spaceKey: string,
-    idx: number,
-    itemId: string,
-    fromSection: TileSection | null,
-    label: string,
-  ) => {
-    if (e.button !== 0 || typeof window === 'undefined') return;
-    const targetEl = e.target as HTMLElement | null;
-    if (targetEl && targetEl.closest('button, input, select, textarea, a')) {
-      return;
-    }
-    if (pointerDragCleanupRef.current) {
-      pointerDragCleanupRef.current();
-      pointerDragCleanupRef.current = null;
-    }
 
-    const startX = e.clientX;
-    const startY = e.clientY;
-    let active = false;
-    let currentOverIdx: number | null = null;
-    let currentOverId: string | null = null;
-    let currentOverSection: TileSection | null = null;
-    let lastX = startX;
-    let lastY = startY;
 
-    const positionGhost = (x: number, y: number) => {
-      const ghost = dragGhostRef.current;
-      if (ghost) {
-        ghost.style.transform = `translate3d(${Math.round(x + 12)}px, ${Math.round(y + 12)}px, 0)`;
-      }
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      lastX = ev.clientX;
-      lastY = ev.clientY;
-      if (!active) {
-        if (!hasExceededDragThreshold(startX, startY, ev.clientX, ev.clientY)) {
-          return;
-        }
-        active = true;
-        if (typeof document !== 'undefined') {
-          document.body.classList.add('is-reordering-pins');
-        }
-        setActiveDrag({
-          spaceKey,
-          fromIdx: idx,
-          fromId: itemId,
-          fromSection,
-          overIdx: null,
-          overId: null,
-          overSection: null,
-          label,
-        });
-        requestAnimationFrame(() => positionGhost(lastX, lastY));
-      } else {
-        positionGhost(ev.clientX, ev.clientY);
-      }
-
-      const hit =
-        typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
-      const dropTile = hit?.closest?.<HTMLElement>('[data-drag-space][data-drag-idx]');
-      let nextOverIdx: number | null = null;
-      let nextOverId: string | null = null;
-      let nextOverSection: TileSection | null = null;
-
-      if (dropTile && dropTile.dataset.dragSpace === spaceKey) {
-        const parsed = Number.parseInt(dropTile.dataset.dragIdx ?? '', 10);
-        const targetId = dropTile.dataset.dragId || null;
-        const rawSec = dropTile.dataset.dragSection;
-        const targetSec: TileSection | null =
-          rawSec === 'main' || rawSec === 'bottom' ? rawSec : null;
-        if (spaceKey !== 'game_combos' && targetId && targetId !== itemId) {
-          nextOverIdx = Number.isInteger(parsed) ? parsed : null;
-          nextOverId = targetId;
-          nextOverSection = targetSec;
-        } else if (spaceKey === 'game_combos' && Number.isInteger(parsed) && parsed !== idx) {
-          nextOverIdx = parsed;
-          nextOverId = targetId;
-        }
-      } else if (spaceKey !== 'game_combos') {
-        const dropZone = hit?.closest?.<HTMLElement>('[data-drop-space][data-drop-section]');
-        if (dropZone && dropZone.dataset.dropSpace === spaceKey) {
-          const zoneSec: TileSection | null =
-            dropZone.dataset.dropSection === 'bottom'
-              ? 'bottom'
-              : dropZone.dataset.dropSection === 'main'
-                ? 'main'
-                : null;
-          if (zoneSec && zoneSec !== fromSection) {
-            nextOverSection = zoneSec;
-          }
-        }
-      }
-
-      if (
-        nextOverIdx !== currentOverIdx ||
-        nextOverId !== currentOverId ||
-        nextOverSection !== currentOverSection
-      ) {
-        currentOverIdx = nextOverIdx;
-        currentOverId = nextOverId;
-        currentOverSection = nextOverSection;
-        setActiveDrag({
-          spaceKey,
-          fromIdx: idx,
-          fromId: itemId,
-          fromSection,
-          overIdx: nextOverIdx,
-          overId: nextOverId,
-          overSection: nextOverSection,
-          label,
-        });
-      }
-    };
-
-    const cleanup = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onCancel);
-      if (typeof document !== 'undefined') {
-        document.body.classList.remove('is-reordering-pins');
-      }
-      pointerDragCleanupRef.current = null;
-    };
-
-    const onCancel = () => {
-      cleanup();
-      if (active) {
-        setActiveDrag(null);
-      }
-    };
-
-    const onUp = () => {
-      cleanup();
-      if (!active) return;
-      suppressClickUntilRef.current =
-        typeof performance !== 'undefined' ? performance.now() + 260 : 0;
-      setActiveDrag(null);
-
-      if (spaceKey === 'game_combos') {
-        const req = computePointerReorderRequest(
-          { spaceKey, idx },
-          currentOverIdx !== null ? { spaceKey, idx: currentOverIdx } : null,
-        );
-        if (req) {
-          onOptimisticReorder?.(req.space, req.fromIdx, req.toIdx);
-          ipc<TestBarConfig>('reorder_pins', req)
-            .then((updated) => {
-              if (updated) onSetConfig?.(updated);
-            })
-            .catch(() => {
-              ipc<TestBarConfig>('get_config')
-                .then((fresh) => {
-                  if (fresh) onSetConfig?.(fresh);
-                })
-                .catch(() => {});
-              onShowToast('Не удалось изменить порядок');
-            });
-        }
-        return;
-      }
-
-      if (itemId && (currentOverId || (currentOverSection && currentOverSection !== fromSection))) {
-        const moveReq: MovePinInSpaceParams = {
-          space: spaceKey,
-          fromId: itemId,
-          toId: currentOverId ?? null,
-          targetSection: currentOverSection ?? fromSection ?? 'main',
-        };
-        onOptimisticMovePin?.(moveReq);
-        movePinInSpace(moveReq)
-          .then((updated) => {
-            if (updated) onSetConfig?.(updated);
-          })
-          .catch(() => {
-            ipc<TestBarConfig>('get_config')
-              .then((fresh) => {
-                if (fresh) onSetConfig?.(fresh);
-              })
-              .catch(() => {});
-            onShowToast('Не удалось изменить порядок');
-          });
-      }
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onCancel);
-    pointerDragCleanupRef.current = cleanup;
-  };
-
-  const getDragClasses = (spaceKey: string, idx: number, itemId?: string): string => {
-    if (!activeDrag || activeDrag.spaceKey !== spaceKey) return '';
-    if (spaceKey === 'game_combos') {
-      if (activeDrag.fromIdx === idx) return ' is-dragging';
-      if (activeDrag.overIdx === idx) return ' drag-over';
-      return '';
-    }
-    if (itemId && activeDrag.fromId === itemId) return ' is-dragging';
-    if (itemId && activeDrag.overId === itemId) return ' drag-over';
-    return '';
-  };
-
-  const makeDragProps = (
-    spaceKey: string,
-    idx: number,
-    itemId: string,
-    section: TileSection | null,
-    label: string,
-  ) => ({
-    'data-drag-space': spaceKey,
-    'data-drag-idx': idx,
-    'data-drag-id': itemId,
-    'data-drag-section': section ?? '',
-    onPointerDown: (e: React.PointerEvent<HTMLElement>) =>
-      handlePinPointerDown(e, spaceKey, idx, itemId, section, label),
-  });
-
-  const renderEmptyStrip = (message: string) => (
-    <div className="space-empty-inline">
-      <span>{message}</span>
-      <button type="button" className="pin-any-btn" onClick={onOpenDrawer}>
-        <PlusIcon className="ic12" />
-        <span>Добавить</span>
-      </button>
-    </div>
-  );
-
-  const renderTileGlyph = (item: PinItem, size: 'hero' | 'compact' | 'quick') => {
-    const iconSizeClass = size === 'hero' ? 'ic24' : size === 'compact' ? 'ic20' : 'ic18';
-    const imgClass =
-      size === 'hero'
-        ? 'native-ic-lg custom-tile-img'
-        : size === 'compact'
-          ? 'native-ic custom-tile-img'
-          : 'native-ic-sm custom-tile-img';
-
-    if (item.customIcon === 'custom_image' && item.iconData) {
-      return <img src={item.iconData} alt="" className={imgClass} draggable={false} />;
-    }
-    const customSvg = item.customIcon ? renderCustomTileIcon(item.customIcon, iconSizeClass) : null;
-    if (customSvg) {
-      return customSvg;
-    }
-    const nativeIc = resolveIconForPin(item);
-    if (nativeIc) {
-      const nativeClass =
-        size === 'hero' ? 'native-ic-lg' : size === 'compact' ? 'native-ic' : 'native-ic-sm';
-      return <img src={nativeIc} alt="" className={nativeClass} draggable={false} />;
-    }
-    const fallbackPx = size === 'hero' ? 24 : size === 'compact' ? 20 : 17;
-    return (
-      <FallbackAppIcon
-        iconKey={item.iconKey}
-        kind={item.kind}
-        target={item.target}
-        size={fallbackPx}
-        color={item.customColor ?? undefined}
-      />
-    );
-  };
-
-  const renderTile = (item: PinItem, idx: number, spaceKey: string, isHero: boolean) => {
-    const running = isRunning(item);
-    const customRgb = resolveCustomColorRgb(item.customColor);
-    const isFolder = item.kind === 'folder';
-    const isFile = item.kind === 'file';
-    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
-
-    const tileStyle: React.CSSProperties = {
-      ['--tile-rgb' as string]: customRgb || item.accentRgb || '139,150,248',
-      ...(customRgb ? { ['--tile-custom-rgb' as string]: customRgb } : {}),
-    } as React.CSSProperties;
-
-    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
-    const icBoxCls = [
-      'tile-ic',
-      isFolder && !isCustomImg ? 'is-folder-ic' : '',
-      isFile && !isCustomImg ? 'is-file-ic' : '',
-    ]
-      .filter(Boolean)
-      .join(' ');
-
-    return (
-      <div
-        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
-        role="button"
-        tabIndex={0}
-        className={`app-tile ${isHero ? 'hero' : 'compact'}${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
-        style={tileStyle}
-        onMouseMove={trackTilePointer}
-        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
-        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
-        onKeyDown={(e) => {
-          if (e.target === e.currentTarget && isActivateKey(e)) {
-            e.preventDefault();
-            handlePinTileClick(item, e.shiftKey);
-          }
-        }}
-        onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
-      >
-        {editMode && (
-          <button
-            type="button"
-            className="tile-del"
-            title="Открепить"
-            aria-label={`Открепить ${item.title}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
-                .then((updated) => onSetConfig?.(updated))
-                .catch(() => onShowToast('Не удалось открепить элемент'));
-            }}
-          >
-            <XIcon10 />
-          </button>
-        )}
-        <div className={icBoxCls}>
-          {renderTileGlyph(item, isHero ? 'hero' : 'compact')}
-          {running && <span className="run-pill" aria-hidden="true" />}
-        </div>
-        <div className="tile-meta">
-          <div className="tile-name">{item.title}</div>
-          <div className={`tile-sub ${honestAlt ? 'has-alt' : ''}`}>
-            {shiftHeld && honestAlt ? honestAlt : item.subtitle}
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  const renderQuickLink = (item: PinItem, idx: number, spaceKey: string) => {
-    const customRgb = resolveCustomColorRgb(item.customColor);
-    const isFolder = item.kind === 'folder';
-    const isFile = item.kind === 'file';
-    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
-    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
-    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
-    const qIcCls = [
-      'qlink-ic',
-      isFolder && !isCustomImg ? 'is-folder-ic' : '',
-      isFile && !isCustomImg ? 'is-file-ic' : '',
-    ]
-      .filter(Boolean)
-      .join(' ');
-    return (
-      <div
-        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
-        role="button"
-        tabIndex={0}
-        className={`qlink${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
-        style={
-          customRgb
-            ? ({ ['--tile-custom-rgb' as string]: customRgb } as React.CSSProperties)
-            : undefined
-        }
-        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
-        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
-        onKeyDown={(e) => {
-          if (e.target === e.currentTarget && isActivateKey(e)) {
-            e.preventDefault();
-            handlePinTileClick(item, e.shiftKey);
-          }
-        }}
-        onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
-      >
-        {editMode && (
-          <button
-            type="button"
-            className="tile-del tile-del-sm"
-            title="Открепить"
-            aria-label={`Открепить ${item.title}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
-                .then((updated) => onSetConfig?.(updated))
-                .catch(() => onShowToast('Не удалось открепить элемент'));
-            }}
-          >
-            <XIcon10 />
-          </button>
-        )}
-        <span className={qIcCls}>{renderTileGlyph(item, 'quick')}</span>
-        <div className="qlink-meta">
-          <div className="qlink-name">{item.title}</div>
-          <div className={`qlink-sub ${shiftHeld && honestAlt ? 'alt-on' : ''}`}>
-            {shiftHeld && honestAlt ? honestAlt : item.subtitle}
-          </div>
-        </div>
-      </div>
-    );
-  };
 
   const renderAudioDeviceBar = () => {
     if (!audio) {
@@ -2831,7 +2400,11 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     );
   };
 
-  const renderWidgetById = (widgetId: SpaceWidgetId, bentoIndex: number): React.ReactNode => {
+  const renderWidgetById = (
+    widgetId: SpaceWidgetId,
+    bentoIndex: number,
+    mode: 'card' | 'popover' = 'card',
+  ): React.ReactNode => {
     switch (widgetId) {
       case 'media':
         return <React.Fragment key={widgetId}>{renderMediaCard(bentoIndex)}</React.Fragment>;
@@ -2841,9 +2414,9 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
             {renderAudioMixerCard(bentoIndex, {
               title: isGamesLayout ? 'Игровой звук и голос' : 'Звук и микшер',
               showDeviceSwitcher: !isGamesLayout,
-              showMicToggle: activeSpace.id === 'studio' || isGamesLayout || !spaceWidgets.includes('media'),
+              showMicToggle: space === 'studio' || isGamesLayout || !spaceWidgets.includes('media'),
               showSessions:
-                activeSpace.id !== 'studio' || !spaceWidgets.includes('top_processes'),
+                space !== 'studio' || !spaceWidgets.includes('top_processes'),
             })}
           </React.Fragment>
         );
@@ -2852,7 +2425,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
       case 'pc_health':
         return (
           <React.Fragment key={widgetId}>
-            {renderTelemetryCard(bentoIndex, activeSpace.id === 'studio' ? 'headroom' : 'full')}
+            {renderTelemetryCard(bentoIndex, space === 'studio' ? 'headroom' : 'full')}
           </React.Fragment>
         );
       case 'top_processes':
@@ -2860,8 +2433,8 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           <React.Fragment key={widgetId}>
             {renderProcessConsumersCard(
               bentoIndex,
-              activeSpace.id === 'studio' ? 'gpu' : 'ram',
-              activeSpace.id,
+              space === 'studio' ? 'gpu' : 'ram',
+              space,
             )}
           </React.Fragment>
         );
@@ -2871,17 +2444,875 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
         return <React.Fragment key={widgetId}>{renderWeatherCard(bentoIndex)}</React.Fragment>;
       case 'batteries':
         return <React.Fragment key={widgetId}>{renderBatteriesCard(bentoIndex)}</React.Fragment>;
+      case 'notes':
+        return (
+          <NotesWidgetCard
+            key={widgetId}
+            mode={mode}
+            bentoIndex={bentoIndex}
+            quickNotes={config?.quickNotes}
+            onConfigUpdated={onSetConfig}
+            onShowToast={onShowToast}
+          />
+        );
+      case 'timer':
+        return (
+          <TimerWidgetCard
+            key={widgetId}
+            mode={mode}
+            bentoIndex={bentoIndex}
+            onShowToast={onShowToast}
+          />
+        );
+      case 'network':
+        return (
+          <NetworkWidgetCard
+            key={widgetId}
+            mode={mode}
+            bentoIndex={bentoIndex}
+            network={network}
+            onSetNetwork={onSetNetwork}
+            onShowToast={onShowToast}
+          />
+        );
+      case 'quick_toggles':
+        return (
+          <QuickTogglesWidgetCard
+            key={widgetId}
+            mode={mode}
+            bentoIndex={bentoIndex}
+            audio={audio}
+            quickToggles={quickToggles}
+            onSetAudio={onSetAudio}
+            onSetQuickToggles={onSetQuickToggles}
+            onShowToast={onShowToast}
+          />
+        );
       default:
         return null;
     }
   };
 
-  const handleToggleWidget = async (widgetId: SpaceWidgetId) => {
+  return { renderWidgetById };
+}
+
+const noopSync = () => {};
+const noopAsync = async () => {};
+const noopDragClasses = () => '';
+const noopDragProps = (): React.HTMLAttributes<HTMLElement> => ({});
+
+export const StandaloneWidgetCard: React.FC<StandaloneWidgetCardProps> = ({
+  widgetId,
+  bentoIndex = 1,
+  mode = 'popover',
+  spaceId,
+  activeSpace,
+  config = null,
+  games = [],
+  apps = [],
+  audio = null,
+  media = null,
+  telem = null,
+  clips = [],
+  periphs = [],
+  periphsRefreshing = false,
+  weather = null,
+  weatherRefreshing = false,
+  network = null,
+  quickToggles = null,
+  startVisible = true,
+  startAnimSettled = true,
+  iconMap,
+  onSetAudio = noopSync,
+  onSetMedia = noopSync,
+  onSetTelem = noopSync,
+  onSetClips = noopSync,
+  onSetNetwork,
+  onSetQuickToggles,
+  onRefreshWeather = noopAsync,
+  onRefreshPeriphs = noopAsync,
+  onResolveIconKeys,
+  onSetConfig,
+  onAudioDragStateChange,
+  onHideBatteryDevice,
+  onShowToast = noopSync,
+  onLaunchPin,
+  onOpenTileContext,
+}) => {
+  const suppressClickUntilRef = useRef<number>(0);
+  const resolvedSpaceId = spaceId ?? activeSpace?.id ?? '';
+  const isGamesLayout = activeSpace?.layoutKind === 'games' || resolvedSpaceId === 'games';
+  const spaceWidgets = useMemo(() => [widgetId], [widgetId]);
+
+  const fallbackLaunchPin = useCallback(
+    (item: PinItem) => {
+      if (item.kind === 'combo') {
+        const comboPayload = buildGameComboLaunchPayload(item);
+        if (!comboPayload) {
+          onShowToast('В связке нет целей для запуска');
+          return;
+        }
+        ipc(comboPayload.command, comboPayload.args).catch(() => {
+          onShowToast('Не удалось запустить связку');
+        });
+        return;
+      }
+      if (item.target) {
+        ipc('launch_app', { target: item.target }).catch(() => {
+          onShowToast('Не удалось запустить элемент');
+        });
+      }
+    },
+    [onShowToast],
+  );
+
+  const fallbackTileContext = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+  }, []);
+
+  const { renderWidgetById } = useSpaceWidgetCards({
+    space: resolvedSpaceId,
+    config,
+    games,
+    apps,
+    audio,
+    media,
+    telem,
+    clips,
+    periphs,
+    periphsRefreshing,
+    weather,
+    weatherRefreshing,
+    network,
+    quickToggles,
+    spaceWidgets,
+    isGamesLayout,
+    editMode: false,
+    startVisible,
+    startAnimSettled,
+    iconMap,
+    onSetAudio,
+    onSetMedia,
+    onSetTelem,
+    onSetClips,
+    onSetNetwork,
+    onSetQuickToggles,
+    onRefreshWeather,
+    onRefreshPeriphs,
+    onResolveIconKeys,
+    onSetConfig,
+    onAudioDragStateChange,
+    onHideBatteryDevice,
+    onShowToast,
+    onLaunchPin: onLaunchPin ?? fallbackLaunchPin,
+    onOpenTileContext: onOpenTileContext ?? fallbackTileContext,
+    getDragClasses: noopDragClasses,
+    makeDragProps: noopDragProps,
+    suppressClickUntilRef,
+  });
+
+  return <>{renderWidgetById(widgetId, bentoIndex, mode)}</>;
+};
+
+export function renderStandaloneWidgetCard(
+  widgetId: SpaceWidgetId,
+  props: Omit<StandaloneWidgetCardProps, 'widgetId'> = {},
+): React.ReactNode {
+  return <StandaloneWidgetCard widgetId={widgetId} {...props} />;
+}
+
+export const StartSpaces: React.FC<StartSpacesProps> = ({
+  space,
+  activeSpace,
+  config,
+  games,
+  audio,
+  media,
+  telem,
+  clips,
+  periphs,
+  periphsRefreshing = false,
+  weather,
+  weatherRefreshing = false,
+  network = null,
+  quickToggles = null,
+  editMode,
+  shiftHeld,
+  widgetBuilderOpen,
+  isRunning,
+  resolveIconForPin,
+  onLaunchPin,
+  onOpenFolder,
+  onOpenFolderInExplorer,
+  onOpenDrawer,
+  onOpenTileContext,
+  onSetAudio,
+  onSetMedia,
+  onSetTelem,
+  onSetClips,
+  onSetNetwork,
+  onSetQuickToggles,
+  onRefreshWeather,
+  onRefreshPeriphs,
+  onToggleWidgetBuilder,
+  onSetSpaceWidgets,
+  onSetSpaceWidgetLayout,
+  onShowToast,
+  startVisible = true,
+  startAnimSettled = true,
+  onAudioDragStateChange,
+  spaceDir = 0,
+  rapidSwitch = false,
+  iconMap,
+  apps = [],
+  onResolveIconKeys,
+  onSetConfig,
+  onOptimisticReorder,
+  onOptimisticMovePin,
+  onHideBatteryDevice,
+}) => {
+  const reducedMotion = useReducedMotion();
+
+  const [gameFilter, setGameFilter] = useState<GameLibraryFilter>('recent');
+  const [activeDrag, setActiveDrag] = useState<ActivePointerDrag | null>(null);
+  const pointerDragCleanupRef = useRef<(() => void) | null>(null);
+  const suppressClickUntilRef = useRef<number>(0);
+  const dragGhostRef = useRef<HTMLDivElement | null>(null);
+
+  // Widget Configurator popover
+  const widgetPopRef = useRef<HTMLDivElement>(null);
+  const widgetPopPresence = useAnimatedPresence(widgetBuilderOpen, 95);
+  const [savingWidgets, setSavingWidgets] = useState(false);
+
+  // Lazy Steam/Epic/GOG cover art cache
+  const mountedRef = useRef(true);
+  const [loadedCovers, setLoadedCovers] = useState<Record<string, string>>({});
+  const requestedCoversRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (pointerDragCleanupRef.current) {
+        pointerDragCleanupRef.current();
+        pointerDragCleanupRef.current = null;
+      }
+    };
+  }, []);
+
+  const spaceWidgets = activeSpace.widgets ?? [];
+  const spaceHeaderWidgets = useMemo(
+    () => resolveSpaceHeaderWidgets(activeSpace),
+    [activeSpace],
+  );
+  const hasWidgets = spaceWidgets.length > 0;
+  const isGamesLayout = activeSpace.layoutKind === 'games';
+
+  // Reset active pointer drag on space switch or hide
+  useEffect(() => {
+    if (pointerDragCleanupRef.current) {
+      pointerDragCleanupRef.current();
+      pointerDragCleanupRef.current = null;
+    }
+    setActiveDrag(null);
+  }, [space, startVisible]);
+
+  // Dismiss widget builder on outside click or Escape
+  useEffect(() => {
+    if (!widgetBuilderOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        widgetPopRef.current &&
+        target &&
+        !widgetPopRef.current.contains(target) &&
+        !target.closest?.('.sec-act-widgets')
+      ) {
+        onToggleWidgetBuilder(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onToggleWidgetBuilder(false);
+      }
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [widgetBuilderOpen, onToggleWidgetBuilder]);
+
+  const displayedGames = useMemo(
+    () => selectDisplayedGames(games, gameFilter),
+    [games, gameFilter],
+  );
+
+  // Idle pre-warm top 6 recent Steam covers after boot
+  useEffect(() => {
+    if (games.length === 0) return;
+    const timer = window.setTimeout(() => {
+      if (!mountedRef.current) return;
+      const topRecent = selectDisplayedGames(games, 'recent').slice(0, 6);
+      for (const g of topRecent) {
+        if (g.coverData || !g.coverPath || requestedCoversRef.current.has(g.coverPath)) continue;
+        const path = g.coverPath;
+        requestedCoversRef.current.add(path);
+        loadGameCover(path)
+          .then((uri) => {
+            if (!uri || !mountedRef.current) {
+              requestedCoversRef.current.delete(path);
+              return;
+            }
+            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
+          })
+          .catch(() => {
+            requestedCoversRef.current.delete(path);
+          });
+      }
+    }, 2200);
+    return () => window.clearTimeout(timer);
+  }, [games]);
+
+  // Lazy load remaining game covers AFTER the 190ms space slide finishes
+  useEffect(() => {
+    if (!startVisible || !isGamesLayout) return;
+    const toLoad = displayedGames.filter(
+      (g) =>
+        !g.coverData &&
+        Boolean(g.coverPath) &&
+        !requestedCoversRef.current.has(g.coverPath!),
+    );
+    if (toLoad.length === 0) return;
+
+    const deferTimer = window.setTimeout(() => {
+      if (!mountedRef.current) return;
+      toLoad.forEach((g) => {
+        const path = g.coverPath!;
+        if (requestedCoversRef.current.has(path)) return;
+        requestedCoversRef.current.add(path);
+        loadGameCover(path)
+          .then((uri) => {
+            if (!uri || !mountedRef.current) {
+              requestedCoversRef.current.delete(path);
+              return;
+            }
+            setLoadedCovers((prev) => (prev[path] === uri ? prev : { ...prev, [path]: uri }));
+          })
+          .catch(() => {
+            requestedCoversRef.current.delete(path);
+          });
+      });
+    }, 210);
+
+    return () => window.clearTimeout(deferTimer);
+  }, [startVisible, isGamesLayout, displayedGames]);
+
+  const handlePinTileClick = useCallback(
+    (item: PinItem, eventShift: boolean) => {
+      if (typeof performance !== 'undefined' && performance.now() < suppressClickUntilRef.current) {
+        return;
+      }
+      if (editMode) return;
+      if (item.kind === 'folder') {
+        if (eventShift || shiftHeld) {
+          onOpenFolderInExplorer(item.target);
+        } else {
+          onOpenFolder(item.target);
+        }
+        return;
+      }
+      onLaunchPin(item);
+    },
+    [editMode, shiftHeld, onOpenFolder, onOpenFolderInExplorer, onLaunchPin],
+  );
+
+  // Always-on pointer-based pin reordering (6px threshold, Main <-> Bottom & Hero <-> Compact <-> Small, immune to Tauri v2 dragDropEnabled)
+  const handlePinPointerDown = (
+    e: React.PointerEvent<HTMLElement>,
+    spaceKey: string,
+    idx: number,
+    itemId: string,
+    fromSection: TileSection | null,
+    label: string,
+  ) => {
+    if (e.button !== 0 || typeof window === 'undefined') return;
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl && targetEl.closest('button, input, select, textarea, a')) {
+      return;
+    }
+    if (pointerDragCleanupRef.current) {
+      pointerDragCleanupRef.current();
+      pointerDragCleanupRef.current = null;
+    }
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+    let currentOverIdx: number | null = null;
+    let currentOverId: string | null = null;
+    let currentOverSection: TileSection | null = null;
+    let lastX = startX;
+    let lastY = startY;
+
+    const positionGhost = (x: number, y: number) => {
+      const ghost = dragGhostRef.current;
+      if (ghost) {
+        ghost.style.transform = `translate3d(${Math.round(x + 12)}px, ${Math.round(y + 12)}px, 0)`;
+      }
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      if (!active) {
+        if (!hasExceededDragThreshold(startX, startY, ev.clientX, ev.clientY)) {
+          return;
+        }
+        active = true;
+        if (typeof document !== 'undefined') {
+          document.body.classList.add('is-reordering-pins');
+        }
+        setActiveDrag({
+          spaceKey,
+          fromIdx: idx,
+          fromId: itemId,
+          fromSection,
+          overIdx: null,
+          overId: null,
+          overSection: null,
+          label,
+        });
+        requestAnimationFrame(() => positionGhost(lastX, lastY));
+      } else {
+        positionGhost(ev.clientX, ev.clientY);
+      }
+
+      const hit =
+        typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
+      const dropTile = hit?.closest?.<HTMLElement>('[data-drag-space][data-drag-idx]');
+      let nextOverIdx: number | null = null;
+      let nextOverId: string | null = null;
+      let nextOverSection: TileSection | null = null;
+
+      if (dropTile && dropTile.dataset.dragSpace === spaceKey) {
+        const parsed = Number.parseInt(dropTile.dataset.dragIdx ?? '', 10);
+        const targetId = dropTile.dataset.dragId || null;
+        const rawSec = dropTile.dataset.dragSection;
+        const targetSec: TileSection | null =
+          rawSec === 'main' || rawSec === 'bottom' ? rawSec : null;
+        if (spaceKey !== 'game_combos' && targetId && targetId !== itemId) {
+          nextOverIdx = Number.isInteger(parsed) ? parsed : null;
+          nextOverId = targetId;
+          nextOverSection = targetSec;
+        } else if (spaceKey === 'game_combos' && Number.isInteger(parsed) && parsed !== idx) {
+          nextOverIdx = parsed;
+          nextOverId = targetId;
+        }
+      } else if (spaceKey !== 'game_combos') {
+        const dropZone = hit?.closest?.<HTMLElement>('[data-drop-space][data-drop-section]');
+        if (dropZone && dropZone.dataset.dropSpace === spaceKey) {
+          const zoneSec: TileSection | null =
+            dropZone.dataset.dropSection === 'bottom'
+              ? 'bottom'
+              : dropZone.dataset.dropSection === 'main'
+                ? 'main'
+                : null;
+          if (zoneSec && zoneSec !== fromSection) {
+            nextOverSection = zoneSec;
+          }
+        }
+      }
+
+      if (
+        nextOverIdx !== currentOverIdx ||
+        nextOverId !== currentOverId ||
+        nextOverSection !== currentOverSection
+      ) {
+        currentOverIdx = nextOverIdx;
+        currentOverId = nextOverId;
+        currentOverSection = nextOverSection;
+        setActiveDrag({
+          spaceKey,
+          fromIdx: idx,
+          fromId: itemId,
+          fromSection,
+          overIdx: nextOverIdx,
+          overId: nextOverId,
+          overSection: nextOverSection,
+          label,
+        });
+      }
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      if (typeof document !== 'undefined') {
+        document.body.classList.remove('is-reordering-pins');
+      }
+      pointerDragCleanupRef.current = null;
+    };
+
+    const onCancel = () => {
+      cleanup();
+      if (active) {
+        setActiveDrag(null);
+      }
+    };
+
+    const onUp = () => {
+      cleanup();
+      if (!active) return;
+      suppressClickUntilRef.current =
+        typeof performance !== 'undefined' ? performance.now() + 260 : 0;
+      setActiveDrag(null);
+
+      if (spaceKey === 'game_combos') {
+        const req = computePointerReorderRequest(
+          { spaceKey, idx },
+          currentOverIdx !== null ? { spaceKey, idx: currentOverIdx } : null,
+        );
+        if (req) {
+          onOptimisticReorder?.(req.space, req.fromIdx, req.toIdx);
+          ipc<TestBarConfig>('reorder_pins', req)
+            .then((updated) => {
+              if (updated) onSetConfig?.(updated);
+            })
+            .catch(() => {
+              ipc<TestBarConfig>('get_config')
+                .then((fresh) => {
+                  if (fresh) onSetConfig?.(fresh);
+                })
+                .catch(() => {});
+              onShowToast('Не удалось изменить порядок');
+            });
+        }
+        return;
+      }
+
+      if (itemId && (currentOverId || (currentOverSection && currentOverSection !== fromSection))) {
+        const moveReq: MovePinInSpaceParams = {
+          space: spaceKey,
+          fromId: itemId,
+          toId: currentOverId ?? null,
+          targetSection: currentOverSection ?? fromSection ?? 'main',
+        };
+        onOptimisticMovePin?.(moveReq);
+        movePinInSpace(moveReq)
+          .then((updated) => {
+            if (updated) onSetConfig?.(updated);
+          })
+          .catch(() => {
+            ipc<TestBarConfig>('get_config')
+              .then((fresh) => {
+                if (fresh) onSetConfig?.(fresh);
+              })
+              .catch(() => {});
+            onShowToast('Не удалось изменить порядок');
+          });
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    pointerDragCleanupRef.current = cleanup;
+  };
+
+  const getDragClasses = (spaceKey: string, idx: number, itemId?: string): string => {
+    if (!activeDrag || activeDrag.spaceKey !== spaceKey) return '';
+    if (spaceKey === 'game_combos') {
+      if (activeDrag.fromIdx === idx) return ' is-dragging';
+      if (activeDrag.overIdx === idx) return ' drag-over';
+      return '';
+    }
+    if (itemId && activeDrag.fromId === itemId) return ' is-dragging';
+    if (itemId && activeDrag.overId === itemId) return ' drag-over';
+    return '';
+  };
+
+  const makeDragProps = (
+    spaceKey: string,
+    idx: number,
+    itemId: string,
+    section: TileSection | null,
+    label: string,
+  ) => ({
+    'data-drag-space': spaceKey,
+    'data-drag-idx': idx,
+    'data-drag-id': itemId,
+    'data-drag-section': section ?? '',
+    onPointerDown: (e: React.PointerEvent<HTMLElement>) =>
+      handlePinPointerDown(e, spaceKey, idx, itemId, section, label),
+  });
+
+  const renderEmptyStrip = (message: string) => (
+    <div className="space-empty-inline">
+      <span>{message}</span>
+      <button type="button" className="pin-any-btn" onClick={onOpenDrawer}>
+        <PlusIcon className="ic12" />
+        <span>Добавить</span>
+      </button>
+    </div>
+  );
+
+  const resolveEffectiveTileSize = (item: PinItem): TileSize => {
+    if (item.tileSize === 'hero' || item.tileSize === 'compact' || item.tileSize === 'small') {
+      return item.tileSize;
+    }
+    const fallback = config?.defaultTileSize;
+    if (fallback === 'hero' || fallback === 'compact' || fallback === 'small') {
+      return fallback;
+    }
+    return 'compact';
+  };
+
+  const renderTileGlyph = (item: PinItem, size: 'hero' | 'compact' | 'small' | 'quick') => {
+    const iconSizeClass =
+      size === 'hero' ? 'ic24' : size === 'compact' || size === 'small' ? 'ic20' : 'ic18';
+    const imgClass =
+      size === 'hero'
+        ? 'native-ic-lg custom-tile-img'
+        : size === 'compact' || size === 'small'
+          ? 'native-ic custom-tile-img'
+          : 'native-ic-sm custom-tile-img';
+
+    if (item.customIcon === 'custom_image' && item.iconData) {
+      return <img src={item.iconData} alt="" className={imgClass} draggable={false} />;
+    }
+    const customSvg = item.customIcon ? renderCustomTileIcon(item.customIcon, iconSizeClass) : null;
+    if (customSvg) {
+      return customSvg;
+    }
+    const nativeIc = resolveIconForPin(item);
+    if (nativeIc) {
+      const nativeClass =
+        size === 'hero'
+          ? 'native-ic-lg'
+          : size === 'compact' || size === 'small'
+            ? 'native-ic'
+            : 'native-ic-sm';
+      return <img src={nativeIc} alt="" className={nativeClass} draggable={false} />;
+    }
+    const fallbackPx = size === 'hero' ? 24 : size === 'compact' || size === 'small' ? 20 : 17;
+    return (
+      <FallbackAppIcon
+        iconKey={item.iconKey}
+        kind={item.kind}
+        target={item.target}
+        size={fallbackPx}
+        color={item.customColor ?? undefined}
+      />
+    );
+  };
+
+  const renderTile = (item: PinItem, idx: number, spaceKey: string) => {
+    const effectiveSize = resolveEffectiveTileSize(item);
+    const isSmall = effectiveSize === 'small';
+    const running = isRunning(item);
+    const customRgb = resolveCustomColorRgb(item.customColor);
+    const isFolder = item.kind === 'folder';
+    const isFile = item.kind === 'file';
+    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
+    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+
+    const tileStyle: React.CSSProperties = {
+      ['--tile-rgb' as string]: customRgb || item.accentRgb || '139,150,248',
+      ...(customRgb ? { ['--tile-custom-rgb' as string]: customRgb } : {}),
+    } as React.CSSProperties;
+
+    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
+    const icBoxCls = [
+      'tile-ic',
+      isFolder && !isCustomImg ? 'is-folder-ic' : '',
+      isFile && !isCustomImg ? 'is-file-ic' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return (
+      <div
+        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
+        role="button"
+        tabIndex={0}
+        className={`app-tile ${effectiveSize}${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
+        style={tileStyle}
+        title={isSmall ? item.title : undefined}
+        onMouseMove={trackTilePointer}
+        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
+        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
+        onKeyDown={(e) => {
+          if (e.target === e.currentTarget && isActivateKey(e)) {
+            e.preventDefault();
+            handlePinTileClick(item, e.shiftKey);
+          }
+        }}
+        onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
+      >
+        {editMode && (
+          <button
+            type="button"
+            className={`tile-del${isSmall ? ' tile-del-sm' : ''}`}
+            title="Открепить"
+            aria-label={`Открепить ${item.title}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
+                .then((updated) => onSetConfig?.(updated))
+                .catch(() => onShowToast('Не удалось открепить элемент'));
+            }}
+          >
+            <XIcon10 />
+          </button>
+        )}
+        <div className={icBoxCls}>
+          {renderTileGlyph(item, effectiveSize)}
+          {running && <span className="run-pill" aria-hidden="true" />}
+        </div>
+        <div className="tile-meta">
+          <div className="tile-name">{item.title}</div>
+          {!isSmall && (
+            <div className={`tile-sub ${honestAlt ? 'has-alt' : ''}`}>
+              {shiftHeld && honestAlt ? honestAlt : item.subtitle}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderQuickLink = (item: PinItem, idx: number, spaceKey: string) => {
+    const customRgb = resolveCustomColorRgb(item.customColor);
+    const isFolder = item.kind === 'folder';
+    const isFile = item.kind === 'file';
+    const isCustomImg = item.customIcon === 'custom_image' && Boolean(item.iconData);
+    const itemSection: TileSection = item.section === 'bottom' ? 'bottom' : 'main';
+    const honestAlt = isFolder ? 'Проводник Windows' : getHonestShiftBadge(item);
+    const qIcCls = [
+      'qlink-ic',
+      isFolder && !isCustomImg ? 'is-folder-ic' : '',
+      isFile && !isCustomImg ? 'is-file-ic' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    return (
+      <div
+        key={item.id || `tile-${spaceKey}-${item.title}-${idx}`}
+        role="button"
+        tabIndex={0}
+        className={`qlink${customRgb ? ' has-custom-color' : ''}${getDragClasses(spaceKey, idx, item.id)}`}
+        style={
+          customRgb
+            ? ({ ['--tile-custom-rgb' as string]: customRgb } as React.CSSProperties)
+            : undefined
+        }
+        {...makeDragProps(spaceKey, idx, item.id, itemSection, item.title)}
+        onClick={(e) => handlePinTileClick(item, e.shiftKey)}
+        onKeyDown={(e) => {
+          if (e.target === e.currentTarget && isActivateKey(e)) {
+            e.preventDefault();
+            handlePinTileClick(item, e.shiftKey);
+          }
+        }}
+        onContextMenu={(e) => onOpenTileContext(e, item, spaceKey)}
+      >
+        {editMode && (
+          <button
+            type="button"
+            className="tile-del tile-del-sm"
+            title="Открепить"
+            aria-label={`Открепить ${item.title}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              ipc<TestBarConfig>('remove_pin', { space: spaceKey, itemId: item.id })
+                .then((updated) => onSetConfig?.(updated))
+                .catch(() => onShowToast('Не удалось открепить элемент'));
+            }}
+          >
+            <XIcon10 />
+          </button>
+        )}
+        <span className={qIcCls}>{renderTileGlyph(item, 'quick')}</span>
+        <div className="qlink-meta">
+          <div className="qlink-name">{item.title}</div>
+          <div className={`qlink-sub ${shiftHeld && honestAlt ? 'alt-on' : ''}`}>
+            {shiftHeld && honestAlt ? honestAlt : item.subtitle}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const { renderWidgetById } = useSpaceWidgetCards({
+    space,
+    config,
+    games,
+    apps,
+    audio,
+    media,
+    telem,
+    clips,
+    periphs,
+    periphsRefreshing,
+    weather,
+    weatherRefreshing,
+    network,
+    quickToggles,
+    spaceWidgets,
+    isGamesLayout,
+    editMode,
+    startVisible,
+    startAnimSettled,
+    iconMap,
+    onSetAudio,
+    onSetMedia,
+    onSetTelem,
+    onSetClips,
+    onSetNetwork,
+    onSetQuickToggles,
+    onRefreshWeather,
+    onRefreshPeriphs,
+    onResolveIconKeys,
+    onSetConfig,
+    onAudioDragStateChange,
+    onHideBatteryDevice,
+    onShowToast,
+    onLaunchPin,
+    onOpenTileContext,
+    getDragClasses,
+    makeDragProps,
+    suppressClickUntilRef,
+  });
+
+  const applyWidgetLayout = async (
+    nextWidgets: SpaceWidgetId[],
+    nextHeaderWidgets: SpaceHeaderWidget[],
+  ) => {
     if (savingWidgets) return;
-    const nextWidgets = toggleSpaceWidget(spaceWidgets, widgetId);
     setSavingWidgets(true);
     try {
-      await onSetSpaceWidgets(activeSpace.id, nextWidgets);
+      if (onSetSpaceWidgetLayout) {
+        await onSetSpaceWidgetLayout(activeSpace.id, nextWidgets, nextHeaderWidgets);
+      } else if (isTauri()) {
+        const updated = await setSpaceWidgetLayout(activeSpace.id, nextWidgets, nextHeaderWidgets);
+        onSetConfig?.(updated);
+      } else {
+        await onSetSpaceWidgets(activeSpace.id, nextWidgets);
+        if (config && onSetConfig) {
+          onSetConfig({
+            ...config,
+            spaces: config.spaces.map((s) =>
+              s.id === activeSpace.id
+                ? { ...s, widgets: nextWidgets, headerWidgets: nextHeaderWidgets }
+                : s,
+            ),
+          });
+        }
+      }
     } catch {
       onShowToast('Не удалось обновить виджеты');
     } finally {
@@ -2889,27 +3320,57 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     }
   };
 
-  const handleMoveWidget = async (widgetId: SpaceWidgetId, direction: 'up' | 'down') => {
-    if (savingWidgets) return;
+  const handleSetWidgetPlacement = (
+    widgetId: SpaceWidgetId,
+    placement: SpaceWidgetPlacement,
+    side?: HeaderWidgetSide,
+  ) => {
+    const next = setSpaceWidgetPlacement(spaceWidgets, spaceHeaderWidgets, widgetId, placement, side);
+    void applyWidgetLayout(next.widgets, next.headerWidgets);
+  };
+
+  const handleSetHeaderWidgetSide = (widgetId: SpaceWidgetId, side: HeaderWidgetSide) => {
+    const nextHeaderWidgets = setHeaderWidgetSide(spaceHeaderWidgets, widgetId, side);
+    void applyWidgetLayout(spaceWidgets, nextHeaderWidgets);
+  };
+
+  const handleMoveWidgetGroup = (
+    widgetId: SpaceWidgetId,
+    placement: 'top' | 'side',
+    direction: 'up' | 'down',
+  ) => {
+    if (placement === 'top') {
+      const nextHeaderWidgets = moveHeaderWidget(spaceHeaderWidgets, widgetId, direction);
+      if (
+        nextHeaderWidgets.length === spaceHeaderWidgets.length &&
+        nextHeaderWidgets.every((w, i) => w.id === spaceHeaderWidgets[i]?.id)
+      ) {
+        return;
+      }
+      void applyWidgetLayout(spaceWidgets, nextHeaderWidgets);
+      return;
+    }
     const nextWidgets = moveSpaceWidget(spaceWidgets, widgetId, direction);
     if (nextWidgets.every((w, i) => w === spaceWidgets[i])) return;
-    setSavingWidgets(true);
-    try {
-      await onSetSpaceWidgets(activeSpace.id, nextWidgets);
-    } catch {
-      onShowToast('Не удалось изменить порядок виджетов');
-    } finally {
-      setSavingWidgets(false);
-    }
+    void applyWidgetLayout(nextWidgets, spaceHeaderWidgets);
   };
 
   const orderedWidgetCatalog = useMemo(() => {
-    const enabled = spaceWidgets
+    const sideEnabled = spaceWidgets
       .map((id) => SPACE_WIDGET_CATALOG.find((w) => w.id === id))
       .filter((w): w is (typeof SPACE_WIDGET_CATALOG)[number] => Boolean(w));
-    const disabled = SPACE_WIDGET_CATALOG.filter((w) => !spaceWidgets.includes(w.id));
-    return [...enabled, ...disabled];
-  }, [spaceWidgets]);
+    const sideSet = new Set(spaceWidgets);
+    const topEnabled = spaceHeaderWidgets
+      .filter((hw) => !sideSet.has(hw.id))
+      .map((hw) => SPACE_WIDGET_CATALOG.find((w) => w.id === hw.id))
+      .filter((w): w is (typeof SPACE_WIDGET_CATALOG)[number] => Boolean(w));
+    const activeSet = new Set<SpaceWidgetId>([
+      ...spaceWidgets,
+      ...spaceHeaderWidgets.map((hw) => hw.id),
+    ]);
+    const disabled = SPACE_WIDGET_CATALOG.filter((w) => !activeSet.has(w.id));
+    return [...sideEnabled, ...topEnabled, ...disabled];
+  }, [spaceWidgets, spaceHeaderWidgets]);
 
   const dragGhost =
     activeDrag && typeof document !== 'undefined'
@@ -3122,9 +3583,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
               </div>
             ) : (
               <div className="mixed-tile-grid">
-                {mainItems.map((p, i) =>
-                  renderTile(p, i, activeSpace.id, p.tileSize === 'hero'),
-                )}
+                {mainItems.map((p, i) => renderTile(p, i, activeSpace.id))}
               </div>
             )}
           </div>
@@ -3170,7 +3629,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
         {hasWidgets && (
           <div className={`bento-col widgets-col${spaceWidgets.length >= 4 ? ' widgets-scrollable' : ''}`}>
-            {spaceWidgets.map((widgetId, idx) => renderWidgetById(widgetId, idx + 1))}
+            {spaceWidgets.map((widgetId, idx) => renderWidgetById(widgetId, idx + 1, 'card'))}
           </div>
         )}
       </div>
@@ -3198,52 +3657,128 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
 
           <div className="widget-cfg-list">
             {orderedWidgetCatalog.map((opt) => {
-              const enabledIdx = spaceWidgets.indexOf(opt.id);
-              const enabled = enabledIdx >= 0;
+              const { placement, side: currentSide } = getSpaceWidgetPlacement(
+                spaceWidgets,
+                spaceHeaderWidgets,
+                opt.id,
+              );
+              const groupIdx =
+                placement === 'side'
+                  ? spaceWidgets.indexOf(opt.id)
+                  : placement === 'top'
+                    ? spaceHeaderWidgets.findIndex((hw) => hw.id === opt.id)
+                    : -1;
+              const groupLen =
+                placement === 'side'
+                  ? spaceWidgets.length
+                  : placement === 'top'
+                    ? spaceHeaderWidgets.length
+                    : 0;
+
               return (
                 <div
                   key={opt.id}
-                  className={`widget-cfg-row ${enabled ? 'enabled' : ''}`}
+                  className={`widget-cfg-row ${placement !== 'off' ? 'enabled' : ''} place-${placement}`}
                 >
-                  {enabled && (
-                    <div className="widget-cfg-arrows">
-                      <button
-                        type="button"
-                        className="widget-move-btn"
-                        disabled={savingWidgets || enabledIdx === 0}
-                        title="Выше"
-                        aria-label={`Поднять ${opt.label}`}
-                        onClick={() => void handleMoveWidget(opt.id, 'up')}
+                  <div className="widget-cfg-top">
+                    {placement !== 'off' && (
+                      <div className="widget-cfg-arrows">
+                        <button
+                          type="button"
+                          className="widget-move-btn"
+                          disabled={savingWidgets || groupIdx <= 0}
+                          title="Выше в группе"
+                          aria-label={`Поднять ${opt.label}`}
+                          onClick={() => handleMoveWidgetGroup(opt.id, placement, 'up')}
+                        >
+                          <ArrowUpIcon size={10} />
+                        </button>
+                        <button
+                          type="button"
+                          className="widget-move-btn"
+                          disabled={savingWidgets || groupIdx < 0 || groupIdx >= groupLen - 1}
+                          title="Ниже в группе"
+                          aria-label={`Опустить ${opt.label}`}
+                          onClick={() => handleMoveWidgetGroup(opt.id, placement, 'down')}
+                        >
+                          <ArrowDownIcon size={10} />
+                        </button>
+                      </div>
+                    )}
+                    <div className="widget-cfg-meta">
+                      <div className="widget-cfg-name">{opt.label}</div>
+                      <div className="widget-cfg-desc">{opt.description}</div>
+                    </div>
+                    <div
+                      className="widget-place-seg"
+                      role="radiogroup"
+                      aria-label={`Размещение ${opt.label}`}
+                    >
+                      {(
+                        [
+                          { id: 'off', label: 'Выкл' },
+                          { id: 'top', label: 'Сверху' },
+                          { id: 'side', label: 'Справа' },
+                        ] as const
+                      ).map((modeOpt) => {
+                        const active = placement === modeOpt.id;
+                        return (
+                          <button
+                            key={modeOpt.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            disabled={savingWidgets}
+                            className={`widget-place-btn ${active ? 'active' : ''}`}
+                            onClick={() =>
+                              handleSetWidgetPlacement(
+                                opt.id,
+                                modeOpt.id,
+                                modeOpt.id === 'top' ? currentSide : undefined,
+                              )
+                            }
+                          >
+                            {modeOpt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {placement === 'top' && (
+                    <div className="widget-side-row">
+                      <span className="widget-side-lbl">Сторона в шапке</span>
+                      <div
+                        className="widget-side-seg"
+                        role="radiogroup"
+                        aria-label={`Сторона ${opt.label}`}
                       >
-                        <ArrowUpIcon size={10} />
-                      </button>
-                      <button
-                        type="button"
-                        className="widget-move-btn"
-                        disabled={savingWidgets || enabledIdx === spaceWidgets.length - 1}
-                        title="Ниже"
-                        aria-label={`Опустить ${opt.label}`}
-                        onClick={() => void handleMoveWidget(opt.id, 'down')}
-                      >
-                        <ArrowDownIcon size={10} />
-                      </button>
+                        {(
+                          [
+                            { id: 'left', label: 'Л', title: 'Слева от вкладок' },
+                            { id: 'auto', label: 'А', title: 'Авто — свободное место' },
+                            { id: 'right', label: 'П', title: 'Справа от вкладок' },
+                          ] as const
+                        ).map((sideOpt) => {
+                          const active = currentSide === sideOpt.id;
+                          return (
+                            <button
+                              key={sideOpt.id}
+                              type="button"
+                              role="radio"
+                              aria-checked={active}
+                              title={sideOpt.title}
+                              disabled={savingWidgets}
+                              className={`widget-side-btn ${active ? 'active' : ''}`}
+                              onClick={() => handleSetHeaderWidgetSide(opt.id, sideOpt.id)}
+                            >
+                              {sideOpt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
-                  <div className="widget-cfg-meta">
-                    <div className="widget-cfg-name">{opt.label}</div>
-                    <div className="widget-cfg-desc">{opt.description}</div>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={enabled}
-                    aria-label={opt.label}
-                    disabled={savingWidgets}
-                    className={`glass-switch ${enabled ? 'on' : ''}`}
-                    onClick={() => void handleToggleWidget(opt.id)}
-                  >
-                    <span className="glass-switch-thumb" />
-                  </button>
                 </div>
               );
             })}

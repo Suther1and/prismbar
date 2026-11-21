@@ -4,11 +4,13 @@ import type {
   ClipboardEntry,
   ClipboardKind,
   DiskHeadroomInfo,
+  HeaderWidgetSide,
   IndexedApp,
   MediaState,
   PeripheralBattery,
   PinItem,
   SpaceConfig,
+  SpaceHeaderWidget,
   SpaceLayoutKind,
   SpaceWidgetId,
   TelemetryState,
@@ -312,6 +314,10 @@ export const SPACE_WIDGET_CATALOG: readonly SpaceWidgetOption[] = [
   { id: 'game_combos', label: 'Игровые связки', description: 'Запуск наборов программ в 1 клик' },
   { id: 'weather', label: 'Погода', description: 'Текущая погода и прогноз на 3 дня' },
   { id: 'batteries', label: 'Батареи устройств', description: 'Заряд мыши, наушников и геймпадов' },
+  { id: 'notes', label: 'Заметки и дела', description: 'Быстрые записи и чек-лист задач' },
+  { id: 'timer', label: 'Таймер фокуса', description: 'Обратный отсчёт и пресеты времени' },
+  { id: 'network', label: 'Сеть и пинг', description: 'Скорость трафика, IP и задержка' },
+  { id: 'quick_toggles', label: 'Быстрые тумблеры', description: 'Микрофон, питание, скриншот и корзина' },
 ] as const;
 
 export const BUILTIN_SPACES = [
@@ -1688,4 +1694,270 @@ export function shouldResetExplorerOnReopen(
     return true;
   }
   return nowMs - closedAtMs >= ttlMs;
+}
+
+// ===================== V3.2 DUAL-MODE HEADER & SIDE WIDGET PLANNING =====================
+
+export const HEADER_WIDGET_GAP_PX = 6;
+export const HEADER_OVERFLOW_BADGE_PX = 38;
+export const DEFAULT_HEADER_WIDGET_WIDTH_PX = 92;
+
+export type SpaceWidgetPlacement = 'off' | 'top' | 'side';
+
+export interface SpaceWidgetLayoutState {
+  widgets: SpaceWidgetId[];
+  headerWidgets: SpaceHeaderWidget[];
+}
+
+export interface PlannedHeaderWidgetSlots {
+  left: SpaceHeaderWidget[];
+  right: SpaceHeaderWidget[];
+  overflow: SpaceHeaderWidget[];
+  overflowSide: 'left' | 'right' | null;
+  leftUsedPx: number;
+  rightUsedPx: number;
+}
+
+function normalizeHeaderSide(side: unknown): HeaderWidgetSide {
+  return side === 'left' || side === 'right' || side === 'auto' ? side : 'auto';
+}
+
+/**
+ * Resolves a Space's top-header widget list, preserving explicit empty arrays in v4
+ * while falling back to `batteries` + `weather` on pre-v4 configs without `headerWidgets`.
+ */
+export function resolveSpaceHeaderWidgets(
+  space: Pick<SpaceConfig, 'widgets' | 'headerWidgets'> | null | undefined,
+): SpaceHeaderWidget[] {
+  const sideSet = new Set<SpaceWidgetId>(space?.widgets ?? []);
+  if (Array.isArray(space?.headerWidgets)) {
+    const out: SpaceHeaderWidget[] = [];
+    const seen = new Set<SpaceWidgetId>();
+    for (const entry of space.headerWidgets) {
+      if (!entry || !entry.id || sideSet.has(entry.id) || seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      out.push({ id: entry.id, side: normalizeHeaderSide(entry.side) });
+    }
+    return out;
+  }
+  const fallbackIds: SpaceWidgetId[] = ['batteries', 'weather'];
+  return fallbackIds
+    .filter((id) => !sideSet.has(id))
+    .map((id) => ({ id, side: 'left' as const }));
+}
+
+export function getSpaceWidgetPlacement(
+  widgets: readonly SpaceWidgetId[],
+  headerWidgets: readonly SpaceHeaderWidget[],
+  widgetId: SpaceWidgetId,
+): { placement: SpaceWidgetPlacement; side: HeaderWidgetSide } {
+  if (widgets.includes(widgetId)) {
+    return { placement: 'side', side: 'auto' };
+  }
+  const headerEntry = headerWidgets.find((h) => h.id === widgetId);
+  if (headerEntry) {
+    return { placement: 'top', side: normalizeHeaderSide(headerEntry.side) };
+  }
+  return { placement: 'off', side: 'auto' };
+}
+
+/**
+ * Assigns a widget exclusively to `'off'`, `'top'` (header), or `'side'` (right rail),
+ * enforcing mutual exclusivity between `widgets` and `headerWidgets`.
+ */
+export function setSpaceWidgetPlacement(
+  widgets: readonly SpaceWidgetId[],
+  headerWidgets: readonly SpaceHeaderWidget[],
+  widgetId: SpaceWidgetId,
+  placement: SpaceWidgetPlacement,
+  side: HeaderWidgetSide = 'auto',
+): SpaceWidgetLayoutState {
+  const cleanSide = normalizeHeaderSide(side);
+  const withoutSide = widgets.filter((w) => w !== widgetId);
+  const withoutHeader = headerWidgets.filter((h) => h.id !== widgetId);
+
+  if (placement === 'off') {
+    return {
+      widgets: withoutSide,
+      headerWidgets: withoutHeader,
+    };
+  }
+
+  if (placement === 'side') {
+    return {
+      widgets: widgets.includes(widgetId) ? [...widgets] : [...withoutSide, widgetId],
+      headerWidgets: withoutHeader,
+    };
+  }
+
+  const existingIdx = headerWidgets.findIndex((h) => h.id === widgetId);
+  if (existingIdx >= 0) {
+    const nextHeader = headerWidgets.map((h, idx) =>
+      idx === existingIdx ? { ...h, side: cleanSide } : h,
+    );
+    return {
+      widgets: withoutSide,
+      headerWidgets: nextHeader,
+    };
+  }
+
+  return {
+    widgets: withoutSide,
+    headerWidgets: [...withoutHeader, { id: widgetId, side: cleanSide }],
+  };
+}
+
+export function setHeaderWidgetSide(
+  headerWidgets: readonly SpaceHeaderWidget[],
+  widgetId: SpaceWidgetId,
+  side: HeaderWidgetSide,
+): SpaceHeaderWidget[] {
+  const cleanSide = normalizeHeaderSide(side);
+  return headerWidgets.map((entry) =>
+    entry.id === widgetId ? { ...entry, side: cleanSide } : entry,
+  );
+}
+
+export function moveHeaderWidget(
+  headerWidgets: readonly SpaceHeaderWidget[],
+  widgetId: SpaceWidgetId,
+  direction: 'up' | 'down',
+): SpaceHeaderWidget[] {
+  const idx = headerWidgets.findIndex((h) => h.id === widgetId);
+  if (idx < 0) return [...headerWidgets];
+  const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (targetIdx < 0 || targetIdx >= headerWidgets.length) return [...headerWidgets];
+  const next = headerWidgets.slice();
+  const [moved] = next.splice(idx, 1);
+  next.splice(targetIdx, 0, moved);
+  return next;
+}
+
+/**
+ * Allocates compact header pills into left and right pockets without overflowing either pocket.
+ * Honors explicit `'left'` / `'right'` sides and `'auto'` (left-first then right), reserving
+ * `38px` for the `+N` badge whenever any widget overflows.
+ */
+export function planHeaderWidgetSlots(
+  entries: readonly SpaceHeaderWidget[],
+  leftAvailPx: number,
+  rightAvailPx: number,
+  widthMap: Partial<Record<SpaceWidgetId, number>> = {},
+): PlannedHeaderWidgetSlots {
+  const safeLeft = Number.isFinite(leftAvailPx) ? Math.max(0, Math.floor(leftAvailPx)) : 0;
+  const safeRight = Number.isFinite(rightAvailPx) ? Math.max(0, Math.floor(rightAvailPx)) : 0;
+
+  const deduped: SpaceHeaderWidget[] = [];
+  const seen = new Set<SpaceWidgetId>();
+  for (const entry of entries) {
+    if (!entry || !entry.id || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    deduped.push({ id: entry.id, side: normalizeHeaderSide(entry.side) });
+  }
+
+  if (deduped.length === 0) {
+    return {
+      left: [],
+      right: [],
+      overflow: [],
+      overflowSide: null,
+      leftUsedPx: 0,
+      rightUsedPx: 0,
+    };
+  }
+
+  const getPillWidth = (id: SpaceWidgetId): number => {
+    const raw = widthMap[id];
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0
+      ? Math.ceil(raw)
+      : DEFAULT_HEADER_WIDGET_WIDTH_PX;
+  };
+
+  const runPass = (badgeSide: 'left' | 'right' | null): PlannedHeaderWidgetSlots => {
+    const left: SpaceHeaderWidget[] = [];
+    const right: SpaceHeaderWidget[] = [];
+    const overflow: SpaceHeaderWidget[] = [];
+    let leftPillsPx = 0;
+    let rightPillsPx = 0;
+
+    const badgeTotalForPocket = (side: 'left' | 'right', pillCount: number, pillsPx: number) => {
+      if (badgeSide !== side) return pillsPx;
+      return pillCount === 0
+        ? HEADER_OVERFLOW_BADGE_PX
+        : pillsPx + HEADER_WIDGET_GAP_PX + HEADER_OVERFLOW_BADGE_PX;
+    };
+
+    const tryPushLeft = (entry: SpaceHeaderWidget): boolean => {
+      const w = getPillWidth(entry.id);
+      const nextPillsPx = left.length === 0 ? w : leftPillsPx + HEADER_WIDGET_GAP_PX + w;
+      const totalNeeded = badgeTotalForPocket('left', left.length + 1, nextPillsPx);
+      if (totalNeeded <= safeLeft) {
+        left.push(entry);
+        leftPillsPx = nextPillsPx;
+        return true;
+      }
+      return false;
+    };
+
+    const tryPushRight = (entry: SpaceHeaderWidget): boolean => {
+      const w = getPillWidth(entry.id);
+      const nextPillsPx = right.length === 0 ? w : rightPillsPx + HEADER_WIDGET_GAP_PX + w;
+      const totalNeeded = badgeTotalForPocket('right', right.length + 1, nextPillsPx);
+      if (totalNeeded <= safeRight) {
+        right.push(entry);
+        rightPillsPx = nextPillsPx;
+        return true;
+      }
+      return false;
+    };
+
+    for (const entry of deduped) {
+      if (entry.side === 'left') {
+        if (!tryPushLeft(entry)) overflow.push(entry);
+      } else if (entry.side === 'right') {
+        if (!tryPushRight(entry)) overflow.push(entry);
+      } else if (!tryPushLeft(entry) && !tryPushRight(entry)) {
+        overflow.push(entry);
+      }
+    }
+
+    const leftUsedPx =
+      badgeSide === 'left'
+        ? badgeTotalForPocket('left', left.length, leftPillsPx)
+        : leftPillsPx;
+    const rightUsedPx =
+      badgeSide === 'right'
+        ? badgeTotalForPocket('right', right.length, rightPillsPx)
+        : rightPillsPx;
+
+    return {
+      left,
+      right,
+      overflow,
+      overflowSide: overflow.length > 0 ? badgeSide : null,
+      leftUsedPx,
+      rightUsedPx,
+    };
+  };
+
+  const pass1 = runPass(null);
+  if (pass1.overflow.length === 0) {
+    return pass1;
+  }
+
+  const preferRight = pass1.overflow.some((e) => e.side === 'right' || e.side === 'auto');
+  let badgeSide: 'left' | 'right' | null = null;
+  if (preferRight) {
+    if (safeRight >= HEADER_OVERFLOW_BADGE_PX) {
+      badgeSide = 'right';
+    } else if (safeLeft >= HEADER_OVERFLOW_BADGE_PX) {
+      badgeSide = 'left';
+    }
+  } else if (safeLeft >= HEADER_OVERFLOW_BADGE_PX) {
+    badgeSide = 'left';
+  } else if (safeRight >= HEADER_OVERFLOW_BADGE_PX) {
+    badgeSide = 'right';
+  }
+
+  return runPass(badgeSide);
 }
