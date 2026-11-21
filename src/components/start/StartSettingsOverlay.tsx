@@ -1,6 +1,14 @@
-import React, { useEffect, useState } from 'react';
-import { formatIpcError } from '../../lib/flyoutLogic';
-import type { GlassDepth, SecondaryTaskbarMode, TestBarConfig } from '../../lib/ipc';
+import React, { useEffect, useRef, useState } from 'react';
+import '../../styles/widgets.css';
+import { formatCityOptionSubtitle, formatIpcError } from '../../lib/flyoutLogic';
+import {
+  searchWeatherCities,
+  setTaskbarWidgets,
+  type GlassDepth,
+  type SecondaryTaskbarMode,
+  type TestBarConfig,
+  type WeatherCityOption,
+} from '../../lib/ipc';
 import { useAnimatedPresence } from '../../lib/useAnimatedPresence';
 import {
   AppsGridIcon,
@@ -29,6 +37,7 @@ export interface StartSettingsOverlayProps {
     clockShowWeekday?: boolean;
     startRememberSpace?: boolean;
   }) => Promise<void>;
+  onSetTaskbarWidgets?: (params: Parameters<typeof setTaskbarWidgets>[0]) => Promise<void>;
   onRefreshIndexes: () => Promise<void>;
   onRestoreTrayApp: (key: string) => Promise<void>;
   onRestoreAllTrayApps: () => Promise<void>;
@@ -108,6 +117,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   onSetSecondaryMode,
   onSetAutostart,
   onSetAppearance,
+  onSetTaskbarWidgets = (params) => setTaskbarWidgets(params).then(() => {}),
   onRefreshIndexes,
   onRestoreTrayApp,
   onRestoreAllTrayApps,
@@ -120,12 +130,55 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   const [activeTab, setActiveTab] = useState<SettingsTabId>('appearance');
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [cityQuery, setCityQuery] = useState('');
+  const [cityResults, setCityResults] = useState<WeatherCityOption[]>([]);
+  const [citySearching, setCitySearching] = useState(false);
+  const [citySearchError, setCitySearchError] = useState<string | null>(null);
+  const citySearchSeqRef = useRef(0);
 
   useEffect(() => {
     if (open) {
       setSettingsError(null);
+    } else {
+      setCityQuery('');
+      setCityResults([]);
+      setCitySearching(false);
+      setCitySearchError(null);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open || activeTab !== 'bar') return;
+    const trimmed = cityQuery.trim();
+    if (trimmed.length < 2) {
+      citySearchSeqRef.current += 1;
+      setCityResults([]);
+      setCitySearching(false);
+      setCitySearchError(null);
+      return;
+    }
+    const seq = ++citySearchSeqRef.current;
+    setCitySearching(true);
+    setCitySearchError(null);
+    const timer = window.setTimeout(() => {
+      searchWeatherCities(trimmed)
+        .then((res) => {
+          if (citySearchSeqRef.current !== seq) return;
+          setCityResults(Array.isArray(res) ? res : []);
+        })
+        .catch((err) => {
+          if (citySearchSeqRef.current !== seq) return;
+          setCityResults([]);
+          setCitySearchError(formatIpcError(err));
+        })
+        .finally(() => {
+          if (citySearchSeqRef.current === seq) {
+            setCitySearching(false);
+          }
+        });
+    }, 260);
+    return () => window.clearTimeout(timer);
+  }, [open, activeTab, cityQuery]);
 
   if (!mounted) return null;
 
@@ -140,6 +193,12 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   const clockShowWeekday = config?.clockShowWeekday ?? false;
   const startRememberSpace = config?.startRememberSpace ?? false;
   const hiddenTrayKeys = config?.hiddenTrayKeys ?? [];
+  const tw = config?.taskbarWidgets;
+  const showWeather = tw?.showWeather !== false;
+  const showBatteries = tw?.showBatteries === true;
+  const showTelemetry = tw?.showTelemetry === true;
+  const weatherCity = tw?.weatherCity?.trim() ?? '';
+  const weatherUnits: 'c' | 'f' = tw?.weatherUnits === 'f' ? 'f' : 'c';
 
   const activeMeta = SETTINGS_TABS.find((t) => t.id === activeTab) ?? SETTINGS_TABS[0];
 
@@ -392,6 +451,190 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                         <span className="set-seg-hint">{hint}</span>
                       </button>
                     ))}
+                  </div>
+                </div>
+
+                <div className="set-group">
+                  <div className="set-group-title">Виджеты панели задач</div>
+                  <div className="set-toggle-list">
+                    <div className="set-toggle-row">
+                      <div>
+                        <div className="set-row-title">Погода на панели</div>
+                        <div className="set-row-desc">Температура и прогноз на основной панели</div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={showWeather}
+                        aria-label="Погода на панели"
+                        disabled={busyKey === 'tw:showWeather'}
+                        className={`glass-switch ${showWeather ? 'on' : ''}`}
+                        onClick={() =>
+                          void runAction('tw:showWeather', () =>
+                            onSetTaskbarWidgets({ showWeather: !showWeather }),
+                          )
+                        }
+                      >
+                        <span className="glass-switch-thumb" />
+                      </button>
+                    </div>
+
+                    {showWeather && (
+                      <div className="set-weather-config">
+                        <div className="set-weather-row">
+                          <span className="set-weather-city-badge">
+                            Город: <strong>{weatherCity || 'Автоопределение'}</strong>
+                          </span>
+                          <div className="set-unit-seg" role="radiogroup" aria-label="Единицы температуры">
+                            <button
+                              type="button"
+                              role="radio"
+                              aria-checked={weatherUnits === 'c'}
+                              className={`set-unit-btn ${weatherUnits === 'c' ? 'active' : ''}`}
+                              disabled={busyKey === 'tw:units'}
+                              onClick={() =>
+                                void runAction('tw:units', () =>
+                                  onSetTaskbarWidgets({ weatherUnits: 'c' }),
+                                )
+                              }
+                            >
+                              °C
+                            </button>
+                            <button
+                              type="button"
+                              role="radio"
+                              aria-checked={weatherUnits === 'f'}
+                              className={`set-unit-btn ${weatherUnits === 'f' ? 'active' : ''}`}
+                              disabled={busyKey === 'tw:units'}
+                              onClick={() =>
+                                void runAction('tw:units', () =>
+                                  onSetTaskbarWidgets({ weatherUnits: 'f' }),
+                                )
+                              }
+                            >
+                              °F
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="set-city-search-row">
+                          <input
+                            type="text"
+                            className="weather-city-input"
+                            value={cityQuery}
+                            onChange={(e) => setCityQuery(e.target.value)}
+                            placeholder="Выбрать город…"
+                            aria-label="Поиск города для погоды"
+                          />
+                          <button
+                            type="button"
+                            className="pin-any-btn"
+                            disabled={busyKey === 'tw:autoCity' || (!weatherCity && tw?.weatherLat == null)}
+                            onClick={() => {
+                              setCityQuery('');
+                              setCityResults([]);
+                              void runAction('tw:autoCity', () =>
+                                onSetTaskbarWidgets({
+                                  weatherCity: '',
+                                  weatherLat: null,
+                                  weatherLon: null,
+                                }),
+                              );
+                            }}
+                          >
+                            Автоопределение
+                          </button>
+                        </div>
+
+                        {citySearching && (
+                          <div className="weather-city-msg">Поиск городов…</div>
+                        )}
+                        {citySearchError && (
+                          <div className="weather-city-msg err" role="alert">
+                            {citySearchError}
+                          </div>
+                        )}
+                        {!citySearching &&
+                          !citySearchError &&
+                          cityQuery.trim().length >= 2 &&
+                          cityResults.length === 0 && (
+                            <div className="weather-city-msg">Город не найден</div>
+                          )}
+                        {cityResults.length > 0 && (
+                          <div className="set-city-results">
+                            {cityResults.map((opt, idx) => {
+                              const sub = formatCityOptionSubtitle(opt);
+                              return (
+                                <button
+                                  key={`${opt.name}-${opt.lat}-${opt.lon}-${idx}`}
+                                  type="button"
+                                  className="weather-city-opt"
+                                  disabled={busyKey === 'tw:city'}
+                                  onClick={() => {
+                                    setCityQuery('');
+                                    setCityResults([]);
+                                    void runAction('tw:city', () =>
+                                      onSetTaskbarWidgets({
+                                        weatherCity: opt.name,
+                                        weatherLat: opt.lat,
+                                        weatherLon: opt.lon,
+                                      }),
+                                    );
+                                  }}
+                                >
+                                  <span className="weather-city-opt-name">{opt.name}</span>
+                                  {sub && <span className="weather-city-opt-sub">{sub}</span>}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="set-toggle-row">
+                      <div>
+                        <div className="set-row-title">Заряд беспроводных устройств</div>
+                        <div className="set-row-desc">Мышь, наушники и геймпады в области трея</div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={showBatteries}
+                        aria-label="Заряд беспроводных устройств"
+                        disabled={busyKey === 'tw:showBatteries'}
+                        className={`glass-switch ${showBatteries ? 'on' : ''}`}
+                        onClick={() =>
+                          void runAction('tw:showBatteries', () =>
+                            onSetTaskbarWidgets({ showBatteries: !showBatteries }),
+                          )
+                        }
+                      >
+                        <span className="glass-switch-thumb" />
+                      </button>
+                    </div>
+
+                    <div className="set-toggle-row">
+                      <div>
+                        <div className="set-row-title">Мини-статус ПК</div>
+                        <div className="set-row-desc">Загрузка CPU и температура GPU на панели</div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={showTelemetry}
+                        aria-label="Мини-статус ПК"
+                        disabled={busyKey === 'tw:showTelemetry'}
+                        className={`glass-switch ${showTelemetry ? 'on' : ''}`}
+                        onClick={() =>
+                          void runAction('tw:showTelemetry', () =>
+                            onSetTaskbarWidgets({ showTelemetry: !showTelemetry }),
+                          )
+                        }
+                      >
+                        <span className="glass-switch-thumb" />
+                      </button>
+                    </div>
                   </div>
                 </div>
               </>

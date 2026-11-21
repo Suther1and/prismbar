@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import '../styles/widgets.css';
 import {
   buildCalendarMonthGrid,
   computeCalendarSlideDir,
@@ -14,6 +15,7 @@ import {
 } from '../lib/calendarLogic';
 import {
   AUDIO_PEAK_POLL_MS,
+  BATTERY_LIST_MAX_HEIGHT,
   canOpenFileLocation,
   canRunAsAdmin,
   collectAppContextPids,
@@ -21,9 +23,13 @@ import {
   computeFlyoutCardHeight,
   computeNextContextFocusIdx,
   computeTrayFlyoutHeight,
+  computeWeatherTempBarRange,
+  formatCityOptionSubtitle,
   formatIpcError,
   formatMediaTime,
+  formatPeripheralSourceLabel,
   formatTrayHeaderLabel,
+  formatWeatherWindLabel,
   getFlyoutExitMs,
   INITIAL_FLYOUT_ANIM_STATE,
   interpolateMediaPosition,
@@ -49,8 +55,11 @@ import {
 import {
   animateSurfaceIn,
   animateSurfaceOut,
+  applyConfigUpdate,
   fetchIconsBatch,
   getAudioPeaks,
+  getPeripheralBatteries,
+  getWeather,
   hideTrayApp,
   iconCache,
   ipc,
@@ -58,9 +67,12 @@ import {
   launchNewWindow,
   minimizeOtherWindows,
   onEvent,
+  refreshPeripheralBatteries,
+  searchWeatherCities,
   seekMedia,
   setInputDevice,
   setSessionState,
+  setTaskbarWidgets,
   snapWindow,
   surfaceCommitAck,
   surfaceExitAck,
@@ -76,13 +88,18 @@ import {
   type MediaState,
   type NetworkInfo,
   type OpenWindowInfo,
+  type PeripheralBattery,
   type SessionAlert,
+  type TestBarConfig,
   type TrayAppItem,
+  type WeatherCityOption,
+  type WeatherSnapshot,
 } from '../lib/ipc';
 import { mergeAudioStateRespectingLocks } from '../lib/startLogic';
 import {
   buildPinFromAppContext,
   computePreviewCardWidth,
+  formatWeatherTempLabel,
   PREVIEW_CARD_HEIGHT,
   PREVIEW_MAX_VISIBLE_CARDS,
   type AppContextPayload,
@@ -94,12 +111,15 @@ import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
   BellIcon,
+  BluetoothIcon,
+  ChargingBoltIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockRecentIcon,
   CloseWindowIcon,
+  DropletIcon,
   ExternalWindowIcon,
   EyeOffIcon,
   FallbackAppIcon,
@@ -113,10 +133,13 @@ import {
   NativeTrayIcon,
   NextTrackIcon,
   PauseIcon,
+  PeripheralDeviceIcon,
   PinIcon,
   PlaySmallIcon,
   PrevTrackIcon,
+  RefreshIcon,
   RestoreIcon,
+  SearchIcon,
   SettingsGearIcon,
   ShieldIcon,
   SnapLeftIcon,
@@ -125,6 +148,8 @@ import {
   TopmostIcon,
   UnpinIcon,
   VolIcon,
+  WeatherConditionIcon,
+  WindIcon,
   XIcon10,
 } from './Icons';
 import { ObsidianSlider } from './ObsidianSlider';
@@ -191,6 +216,17 @@ function measureCardHeight(el: HTMLElement, kind: FlyoutKind): number | null {
     });
   }
 
+  if (kind === 'battery') {
+    const inner = el.querySelector<HTMLElement>('.bat-list');
+    return computeFlyoutCardHeight({
+      cardScrollHeight: el.scrollHeight,
+      borderY,
+      innerScrollHeight: inner?.scrollHeight,
+      innerClientHeight: inner?.clientHeight,
+      innerMaxHeight: BATTERY_LIST_MAX_HEIGHT,
+    });
+  }
+
   return computeFlyoutCardHeight({
     cardScrollHeight: el.scrollHeight,
     borderY,
@@ -225,6 +261,17 @@ export const FlyoutView: React.FC = () => {
   const [closingHwnds, setClosingHwnds] = useState<Record<number, true>>({});
   const [jumpList, setJumpList] = useState<JumpListItem[]>([]);
   const [alerts, setAlerts] = useState<SessionAlert[]>([]);
+  const [config, setConfig] = useState<TestBarConfig | null>(null);
+  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState<boolean>(false);
+  const [weatherCityOpen, setWeatherCityOpen] = useState<boolean>(false);
+  const [weatherCityQuery, setWeatherCityQuery] = useState<string>('');
+  const [weatherCityResults, setWeatherCityResults] = useState<WeatherCityOption[]>([]);
+  const [weatherCitySearching, setWeatherCitySearching] = useState<boolean>(false);
+  const [weatherCityError, setWeatherCityError] = useState<string | null>(null);
+  const [periphBatteries, setPeriphBatteries] = useState<PeripheralBattery[]>([]);
+  const [periphHydrated, setPeriphHydrated] = useState<boolean>(false);
+  const [periphRefreshing, setPeriphRefreshing] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [ctxFocusIdx, setCtxFocusIdx] = useState<number>(-1);
   const [calDir, setCalDir] = useState<-1 | 0 | 1>(0);
@@ -255,6 +302,8 @@ export const FlyoutView: React.FC = () => {
   const previewMonitorRef = useRef<'primary' | 'secondary' | undefined>(undefined);
   const trayCtxItemRef = useRef<TrayAppItem | null>(null);
   const devMenuOpenRef = useRef<boolean>(false);
+  const weatherCityOpenRef = useRef<boolean>(false);
+  const weatherCitySearchSeqRef = useRef<number>(0);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const ctxActionsRef = useRef<ContextActionEntry[]>([]);
   const ctxFocusIdxRef = useRef<number>(-1);
@@ -277,6 +326,7 @@ export const FlyoutView: React.FC = () => {
   previewGroupKeyRef.current = previewGroupKey;
   trayCtxItemRef.current = trayCtxItem;
   devMenuOpenRef.current = devMenuOpen;
+  weatherCityOpenRef.current = weatherCityOpen;
   ctxFocusIdxRef.current = ctxFocusIdx;
 
   const trayCtxPresence = useAnimatedPresence(Boolean(trayCtxItem), 95);
@@ -350,6 +400,10 @@ export const FlyoutView: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    ipc<TestBarConfig>('get_config')
+      .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+      .catch(() => {});
+
     // Background idle pre-warm for Tray apps & icons so first `^` click renders instantly with zero empty flash
     const trayPrewarmTimer = window.setTimeout(() => {
       ipc<TrayAppItem[]>('get_tray_apps')
@@ -479,6 +533,38 @@ export const FlyoutView: React.FC = () => {
           setCalDir(0);
           setCalView({ year: now.getFullYear(), month: now.getMonth() });
           setSelectedDate(now);
+        } else if (r.kind === 'weather') {
+          setWeatherCityOpen(false);
+          setWeatherCityQuery('');
+          setWeatherCityResults([]);
+          setWeatherCityError(null);
+          setWeatherLoading(true);
+          ipc<TestBarConfig>('get_config')
+            .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+            .catch(() => {});
+          getWeather({ force: false })
+            .then((snap) => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'weather') {
+                setWeather(snap);
+              }
+            })
+            .catch(() => {})
+            .finally(() => {
+              if (renderSeqRef.current === nextSeq || activeKindRef.current === 'weather') {
+                setWeatherLoading(false);
+              }
+            });
+        } else if (r.kind === 'battery') {
+          getPeripheralBatteries()
+            .then((items) => {
+              if (Array.isArray(items)) {
+                setPeriphBatteries(items);
+              }
+              setPeriphHydrated(true);
+            })
+            .catch(() => {
+              setPeriphHydrated(true);
+            });
         } else if (r.kind === 'preview') {
           const payload = (r.payload ?? {}) as PreviewFlyoutPayload;
           const wins = payload.group?.windows ?? [];
@@ -622,6 +708,7 @@ export const FlyoutView: React.FC = () => {
           setAnim((prev) => reduceFlyoutHideComplete(prev, hideSeq));
           setTrayCtxItem(null);
           setDevMenuOpen(false);
+          setWeatherCityOpen(false);
           setActionError(null);
           setClosingHwnds({});
           setCtxFocusIdx(-1);
@@ -644,6 +731,7 @@ export const FlyoutView: React.FC = () => {
         setJumpListReady(true);
         setTrayCtxItem(null);
         setDevMenuOpen(false);
+        setWeatherCityOpen(false);
         setActionError(null);
         setClosingHwnds({});
         setCtxFocusIdx(-1);
@@ -677,6 +765,21 @@ export const FlyoutView: React.FC = () => {
       }),
       onEvent<NetworkInfo>('network-updated', setNet),
       onEvent<SessionAlert[]>('session-alerts-updated', setAlerts),
+      onEvent<TestBarConfig>('config-updated', (next) =>
+        setConfig((prev) => applyConfigUpdate(prev, next)),
+      ),
+      onEvent<WeatherSnapshot>('weather-updated', (snap) => {
+        if (snap) {
+          setWeather(snap);
+          setWeatherLoading(false);
+        }
+      }),
+      onEvent<PeripheralBattery[]>('peripherals-updated', (items) => {
+        if (!Array.isArray(items)) return;
+        setPeriphBatteries(items);
+        setPeriphHydrated(true);
+        setPeriphRefreshing(false);
+      }),
       onEvent<AppWindowGroup[]>('windows-updated', (groups) => {
         if (activeKindRef.current !== 'preview') return;
         const key = previewGroupKeyRef.current;
@@ -699,6 +802,9 @@ export const FlyoutView: React.FC = () => {
         } else if (devMenuOpenRef.current) {
           e.preventDefault();
           setDevMenuOpen(false);
+        } else if (weatherCityOpenRef.current) {
+          e.preventDefault();
+          setWeatherCityOpen(false);
         } else {
           ipc('close_flyout').catch(() => {});
         }
@@ -765,7 +871,9 @@ export const FlyoutView: React.FC = () => {
       isBarContextKind(req.kind) ||
       req.kind === 'sound' ||
       req.kind === 'quick' ||
-      req.kind === 'calendar';
+      req.kind === 'calendar' ||
+      req.kind === 'weather' ||
+      req.kind === 'battery';
 
     let measuredCardHeight: number | undefined;
     if (shouldMeasure && cardRef.current) {
@@ -976,7 +1084,41 @@ export const FlyoutView: React.FC = () => {
   const req = anim.req;
   const isClosing = anim.phase === 'closing';
 
-  // Auto-fit flyout height for dynamic post-open content (Jump List, audio sessions, media strip, alerts)
+  // Debounced city search when Weather Flyout inline city picker is open
+  useEffect(() => {
+    if (anim.phase !== 'open' || anim.req?.kind !== 'weather' || !weatherCityOpen) return;
+    const trimmed = weatherCityQuery.trim();
+    if (trimmed.length < 2) {
+      weatherCitySearchSeqRef.current += 1;
+      setWeatherCityResults([]);
+      setWeatherCitySearching(false);
+      setWeatherCityError(null);
+      return;
+    }
+    const seq = ++weatherCitySearchSeqRef.current;
+    setWeatherCitySearching(true);
+    setWeatherCityError(null);
+    const timer = window.setTimeout(() => {
+      searchWeatherCities(trimmed)
+        .then((res) => {
+          if (weatherCitySearchSeqRef.current !== seq) return;
+          setWeatherCityResults(Array.isArray(res) ? res : []);
+        })
+        .catch((err) => {
+          if (weatherCitySearchSeqRef.current !== seq) return;
+          setWeatherCityResults([]);
+          setWeatherCityError(formatIpcError(err));
+        })
+        .finally(() => {
+          if (weatherCitySearchSeqRef.current === seq) {
+            setWeatherCitySearching(false);
+          }
+        });
+    }, 260);
+    return () => window.clearTimeout(timer);
+  }, [anim.phase, anim.req?.kind, weatherCityOpen, weatherCityQuery]);
+
+  // Auto-fit flyout height for dynamic post-open content (Jump List, audio sessions, media strip, alerts, weather, battery)
   useEffect(() => {
     if (!req || isClosing || anim.phase === 'closed' || !jumpListReady) return;
     const needsAutoHeight =
@@ -984,7 +1126,9 @@ export const FlyoutView: React.FC = () => {
       isBarContextKind(req.kind) ||
       req.kind === 'sound' ||
       req.kind === 'quick' ||
-      req.kind === 'calendar';
+      req.kind === 'calendar' ||
+      req.kind === 'weather' ||
+      req.kind === 'battery';
     if (!needsAutoHeight) return;
     const el = cardRef.current;
     if (!el) return;
@@ -1001,7 +1145,7 @@ export const FlyoutView: React.FC = () => {
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
-    const innerScroll = el.querySelector<HTMLElement>('.ctx-scroll, .qs-mixer-scroll');
+    const innerScroll = el.querySelector<HTMLElement>('.ctx-scroll, .qs-mixer-scroll, .bat-list');
     if (innerScroll) ro.observe(innerScroll);
     return () => ro.disconnect();
   }, [
@@ -1021,6 +1165,16 @@ export const FlyoutView: React.FC = () => {
     media?.canSeek,
     media?.durationSec,
     alerts.length,
+    weather?.available,
+    weather?.hourly.length,
+    weather?.daily.length,
+    weather?.stale,
+    weatherCityOpen,
+    weatherCityResults.length,
+    weatherCitySearching,
+    weatherCityError,
+    periphBatteries.length,
+    periphHydrated,
   ]);
 
   // Dynamic compact tray height (128px min normally, smoothly expands to 184px+ ONLY while tray right-click menu is open)
@@ -1959,6 +2113,394 @@ export const FlyoutView: React.FC = () => {
             <BellIcon className="ic14" />
             <span>Уведомления Windows</span>
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 4B. WEATHER FORECAST FLYOUT (340px, 18px radius, inline city search, 12h + 5d)
+  if (req.kind === 'weather') {
+    const units: 'c' | 'f' = config?.taskbarWidgets?.weatherUnits === 'f' ? 'f' : 'c';
+    const unitLetter = units === 'f' ? 'F' : 'C';
+    const configuredCity = config?.taskbarWidgets?.weatherCity?.trim() ?? '';
+    const isAutoLocation = !configuredCity && config?.taskbarWidgets?.weatherLat == null;
+    const headerCity = weather?.city?.trim() || configuredCity || 'Погода';
+
+    const dailyRows = weather?.daily.slice(0, 5) ?? [];
+    const weekMinC =
+      dailyRows.length > 0 ? Math.min(...dailyRows.map((d) => d.tempMinC)) : 0;
+    const weekMaxC =
+      dailyRows.length > 0 ? Math.max(...dailyRows.map((d) => d.tempMaxC)) : 0;
+
+    const refreshWeatherNow = () => {
+      if (weatherLoading) return;
+      setWeatherLoading(true);
+      getWeather({ force: true })
+        .then((snap) => setWeather(snap))
+        .catch(() => {})
+        .finally(() => setWeatherLoading(false));
+    };
+
+    const selectWeatherCity = (opt: WeatherCityOption) => {
+      setWeatherCityError(null);
+      setWeatherCityOpen(false);
+      setWeatherLoading(true);
+      setTaskbarWidgets({
+        weatherCity: opt.name,
+        weatherLat: opt.lat,
+        weatherLon: opt.lon,
+      })
+        .then((updated) => {
+          setConfig((prev) => applyConfigUpdate(prev, updated));
+          return getWeather({
+            city: opt.name,
+            lat: opt.lat,
+            lon: opt.lon,
+            force: true,
+          });
+        })
+        .then((snap) => setWeather(snap))
+        .catch((err) => setWeatherCityError(formatIpcError(err)))
+        .finally(() => setWeatherLoading(false));
+    };
+
+    const resetWeatherToAuto = () => {
+      setWeatherCityError(null);
+      setWeatherCityOpen(false);
+      setWeatherLoading(true);
+      setTaskbarWidgets({
+        weatherCity: '',
+        weatherLat: null,
+        weatherLon: null,
+      })
+        .then((updated) => {
+          setConfig((prev) => applyConfigUpdate(prev, updated));
+          return getWeather({ force: true });
+        })
+        .then((snap) => setWeather(snap))
+        .catch((err) => setWeatherCityError(formatIpcError(err)))
+        .finally(() => setWeatherLoading(false));
+    };
+
+    return (
+      <div className="flyout-root" data-space="personal" data-visible="true">
+        <div
+          key={anim.renderSeq}
+          ref={cardRef}
+          className="flyout-card weather-card"
+          data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
+          style={cardOriginStyle}
+        >
+          <div className="wf-head">
+            <div className="wf-head-meta">
+              <span className="wf-title" title={headerCity}>
+                {headerCity}
+              </span>
+              {weather?.available && weather.stale && (
+                <span className="wf-badge stale">Офлайн</span>
+              )}
+            </div>
+            <div className="wf-head-actions">
+              <button
+                type="button"
+                className={`wf-icon-btn ${weatherCityOpen ? 'active' : ''}`}
+                aria-label="Выбрать город"
+                aria-expanded={weatherCityOpen}
+                onClick={() => setWeatherCityOpen((v) => !v)}
+              >
+                <SearchIcon className="ic14" />
+              </button>
+              <button
+                type="button"
+                className={`wf-icon-btn ${weatherLoading ? 'spinning' : ''}`}
+                aria-label="Обновить прогноз"
+                disabled={weatherLoading}
+                onClick={refreshWeatherNow}
+              >
+                <RefreshIcon className="ic14" />
+              </button>
+            </div>
+          </div>
+
+          {weatherCityOpen && (
+            <div className="weather-city-drawer">
+              <div className="weather-city-search-row">
+                <input
+                  type="text"
+                  className="weather-city-input"
+                  value={weatherCityQuery}
+                  onChange={(e) => setWeatherCityQuery(e.target.value)}
+                  placeholder="Поиск города…"
+                  aria-label="Поиск города"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  className={`weather-auto-btn ${isAutoLocation ? 'active' : ''}`}
+                  onClick={resetWeatherToAuto}
+                >
+                  Авто
+                </button>
+              </div>
+
+              {weatherCitySearching && (
+                <div className="weather-city-msg">Поиск городов…</div>
+              )}
+
+              {weatherCityError && (
+                <div className="weather-city-msg err" role="alert">
+                  {weatherCityError}
+                </div>
+              )}
+
+              {!weatherCitySearching &&
+                !weatherCityError &&
+                weatherCityQuery.trim().length >= 2 &&
+                weatherCityResults.length === 0 && (
+                  <div className="weather-city-msg">Ничего не найдено</div>
+                )}
+
+              {weatherCityResults.length > 0 && (
+                <div className="weather-city-results">
+                  {weatherCityResults.map((opt, idx) => {
+                    const sub = formatCityOptionSubtitle(opt);
+                    return (
+                      <button
+                        key={`${opt.name}-${opt.lat}-${opt.lon}-${idx}`}
+                        type="button"
+                        className="weather-city-opt"
+                        onClick={() => selectWeatherCity(opt)}
+                      >
+                        <span className="weather-city-opt-name">{opt.name}</span>
+                        {sub && <span className="weather-city-opt-sub">{sub}</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {weather?.available ? (
+            <>
+              <div className="weather-hero" data-condition={weather.conditionIcon}>
+                <div className="weather-hero-left">
+                  <WeatherConditionIcon
+                    condition={weather.conditionIcon}
+                    className="ic34 weather-hero-ic"
+                  />
+                  <div className="weather-temp-big">
+                    {formatWeatherTempLabel(weather.tempC, units)}
+                    <span className="weather-unit-tag">{unitLetter}</span>
+                  </div>
+                </div>
+                <div className="weather-hero-right">
+                  <div className="weather-cond-label" title={weather.conditionLabel}>
+                    {weather.conditionLabel}
+                  </div>
+                  <div className="weather-feels">
+                    Ощущается как {formatWeatherTempLabel(weather.feelsLikeC, units)}
+                  </div>
+                  <div className="weather-metrics">
+                    <span className="weather-metric" title="Влажность">
+                      <DropletIcon className="ic12" />
+                      <span>{weather.humidity}%</span>
+                    </span>
+                    <span className="weather-metric" title="Ветер">
+                      <WindIcon className="ic12" />
+                      <span>{formatWeatherWindLabel(weather.windKmh)}</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {weather.hourly.length > 0 && (
+                <div className="weather-hourly-strip" aria-label="Почасовой прогноз">
+                  {weather.hourly.slice(0, 12).map((h, idx) => (
+                    <div key={`${h.time}-${idx}`} className="weather-hour-cell">
+                      <span className="weather-hour-time">{h.time}</span>
+                      <WeatherConditionIcon condition={h.conditionIcon} className="ic16" />
+                      <span className="weather-hour-temp">
+                        {formatWeatherTempLabel(h.tempC, units)}
+                      </span>
+                      <span className={`weather-hour-precip ${h.precipProb >= 20 ? 'wet' : ''}`}>
+                        {h.precipProb}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {dailyRows.length > 0 && (
+                <div className="weather-daily-list" aria-label="Прогноз на 5 дней">
+                  {dailyRows.map((d, idx) => {
+                    const bar = computeWeatherTempBarRange(
+                      d.tempMinC,
+                      d.tempMaxC,
+                      weekMinC,
+                      weekMaxC,
+                    );
+                    return (
+                      <div key={d.date || `day-${idx}`} className="weather-day-row">
+                        <span className="weather-day-label">{d.label}</span>
+                        <WeatherConditionIcon condition={d.conditionIcon} className="ic14" />
+                        <span className={`weather-day-precip ${d.precipProb >= 20 ? 'wet' : ''}`}>
+                          {d.precipProb > 0 ? `${d.precipProb}%` : '—'}
+                        </span>
+                        <span className="weather-day-min">
+                          {formatWeatherTempLabel(d.tempMinC, units)}
+                        </span>
+                        <div className="weather-range-track" aria-hidden="true">
+                          <div
+                            className="weather-range-fill"
+                            style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
+                          />
+                        </div>
+                        <span className="weather-day-max">
+                          {formatWeatherTempLabel(d.tempMaxC, units)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="weather-empty">
+              <WeatherConditionIcon condition="cloud" className="ic24" />
+              <div>{weatherLoading ? 'Загрузка прогноза…' : 'Нет данных о погоде'}</div>
+              {weather?.error && <div className="weather-empty-err">{weather.error}</div>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 4C. WIRELESS PERIPHERAL BATTERIES FLYOUT (304px, 16px radius)
+  if (req.kind === 'battery') {
+    const handleRefreshBatteries = () => {
+      if (periphRefreshing) return;
+      setPeriphRefreshing(true);
+      refreshPeripheralBatteries()
+        .then((items) => {
+          if (Array.isArray(items)) setPeriphBatteries(items);
+          setPeriphHydrated(true);
+        })
+        .catch(() => {})
+        .finally(() => setPeriphRefreshing(false));
+    };
+
+    return (
+      <div className="flyout-root" data-space="personal" data-visible="true">
+        <div
+          key={anim.renderSeq}
+          ref={cardRef}
+          className="flyout-card battery-card"
+          data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
+          style={cardOriginStyle}
+        >
+          <div className="wf-head">
+            <div className="wf-head-meta">
+              <span className="wf-title">Беспроводные устройства</span>
+              {periphBatteries.length > 0 && (
+                <span className="wf-badge count">{periphBatteries.length}</span>
+              )}
+            </div>
+            <button
+              type="button"
+              className={`wf-icon-btn ${periphRefreshing ? 'spinning' : ''}`}
+              aria-label="Обновить устройства"
+              disabled={periphRefreshing}
+              onClick={handleRefreshBatteries}
+            >
+              <RefreshIcon className="ic14" />
+            </button>
+          </div>
+
+          {periphBatteries.length === 0 ? (
+            <div className="bat-empty">
+              <div className="bat-empty-ic">
+                <BluetoothIcon className="ic18" />
+              </div>
+              <span>
+                {periphHydrated
+                  ? 'Беспроводные устройства не найдены'
+                  : 'Поиск подключённых устройств…'}
+              </span>
+            </div>
+          ) : (
+            <div className="bat-list">
+              {periphBatteries.map((dev, idx) => {
+                const pct = Math.max(0, Math.min(100, Math.round(dev.percent)));
+                const isLow = pct < 20;
+                const itemCls = [
+                  'bat-item',
+                  isLow ? 'low' : '',
+                  dev.charging ? 'charging' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+                const fillCls = [
+                  'bat-bar-fill',
+                  dev.charging ? 'charging' : isLow ? 'low' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+
+                return (
+                  <div key={dev.id || `bat-${dev.name}-${idx}`} className={itemCls}>
+                    <div className="bat-item-top">
+                      <div className="bat-ic-box">
+                        <PeripheralDeviceIcon kind={dev.kind} className="ic16" />
+                      </div>
+                      <div className="bat-meta">
+                        <div className="bat-name" title={dev.name}>
+                          {dev.name}
+                        </div>
+                        <div className="bat-badges-row">
+                          <span className="bat-source-badge">
+                            {formatPeripheralSourceLabel(dev.source)}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="bat-pct-wrap">
+                        {dev.charging && <ChargingBoltIcon className="ic12 bat-bolt" />}
+                        <span className="bat-pct">{pct}%</span>
+                      </div>
+                    </div>
+
+                    <div className="bat-bar-track" aria-hidden="true">
+                      <div
+                        className={fillCls}
+                        style={{ transform: `scaleX(${pct / 100})` }}
+                      />
+                    </div>
+
+                    {dev.subLevels && dev.subLevels.length > 0 && (
+                      <div className="bat-sublevels">
+                        {dev.subLevels.map((sub, sIdx) => {
+                          const subPct = Math.max(0, Math.min(100, Math.round(sub.percent)));
+                          return (
+                            <span
+                              key={`${sub.label}-${sIdx}`}
+                              className={`bat-sub-chip ${subPct < 20 ? 'low' : ''}`}
+                            >
+                              <span className="bat-sub-lbl">{sub.label}</span>
+                              <span>{subPct}%</span>
+                              {sub.charging && <ChargingBoltIcon className="ic12" />}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     );

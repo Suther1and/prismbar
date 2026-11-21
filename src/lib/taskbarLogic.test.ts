@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { mergeTaskbarItems, type AppWindowGroup, type MergedBarItem } from './ipc';
 import {
+  BATTERY_FLYOUT_HEIGHT,
+  BATTERY_FLYOUT_WIDTH,
   buildAppContextMenuRequest,
   buildBarContextMenuRequest,
   buildPinFromAppContext,
@@ -13,11 +15,15 @@ import {
   createTaskbarOrderMemory,
   EDGE_CENTERED_MIN_WIDTH,
   filterGroupsForMonitor,
+  formatBatteryPillSummary,
+  formatMiniTelemetryLabel,
   formatSoundNetworkTooltip,
   formatTaskbarClock,
+  formatWeatherTempLabel,
   getPreviewHoverDelayMs,
   getTaskbarItemStateClass,
   getTaskbarRootClassName,
+  isInteractiveFlyoutActive,
   isSoundFlyoutActive,
   planSoundFeedbackAction,
   PREVIEW_CARD_HEIGHT,
@@ -35,6 +41,8 @@ import {
   stabilizeTaskbarItemsOrder,
   VOLUME_OSD_HEIGHT,
   VOLUME_OSD_WIDTH,
+  WEATHER_FLYOUT_HEIGHT,
+  WEATHER_FLYOUT_WIDTH,
   type AppContextPayload,
   type PreviewFlyoutPayload,
 } from './taskbarLogic';
@@ -593,5 +601,143 @@ describe('Volume OSD preemption vs open Quick Sound & wheel volume math', () => 
     const ctxPayload = ctxReq.payload as AppContextPayload;
     expect(ctxPayload.target).toBe(sparkSecondaryGroup.exePath);
     expect(ctxPayload.windows.map((w) => w.hwnd)).toEqual([909]);
+  });
+});
+
+describe('Taskbar optional widgets: weather, peripheral batteries, mini telemetry & flyout preemption', () => {
+  it('registers weather and battery as interactive flyouts with fixed dimensions', () => {
+    expect(WEATHER_FLYOUT_WIDTH).toBe(340);
+    expect(WEATHER_FLYOUT_HEIGHT).toBe(404);
+    expect(BATTERY_FLYOUT_WIDTH).toBe(304);
+    expect(BATTERY_FLYOUT_HEIGHT).toBe(250);
+
+    expect(isInteractiveFlyoutActive('weather')).toBe(true);
+    expect(isInteractiveFlyoutActive('battery')).toBe(true);
+    expect(shouldOpenVolumeOsd('weather')).toBe(false);
+    expect(shouldOpenVolumeOsd('battery')).toBe(false);
+
+    const running = makeRunningItem();
+    expect(shouldTriggerPreviewHover(running, false, 'weather')).toBe(false);
+    expect(shouldTriggerPreviewHover(running, false, 'battery')).toBe(false);
+  });
+
+  it('formats Celsius and Fahrenheit temperature labels cleanly without -0 or jitter', () => {
+    expect(formatWeatherTempLabel(14.2, 'c')).toBe('14°');
+    expect(formatWeatherTempLabel(14.0, 'f')).toBe('57°');
+    expect(formatWeatherTempLabel(0, 'f')).toBe('32°');
+    expect(formatWeatherTempLabel(-0.3, 'c')).toBe('0°');
+    expect(formatWeatherTempLabel(-10.6, 'c')).toBe('-11°');
+    expect(formatWeatherTempLabel(null, 'c')).toBe('—°');
+    expect(formatWeatherTempLabel(undefined, 'f')).toBe('—°');
+    expect(formatWeatherTempLabel(Number.NaN, 'c')).toBe('—°');
+  });
+
+  it('summarizes peripheral batteries picking lowest active level with low/critical/charging flags', () => {
+    expect(formatBatteryPillSummary(null)).toBeNull();
+    expect(formatBatteryPillSummary([])).toBeNull();
+    expect(
+      formatBatteryPillSummary([
+        {
+          id: 'bt-offline',
+          name: 'Headset',
+          kind: 'headphones',
+          percent: 50,
+          charging: false,
+          source: 'bluetooth',
+          connected: false,
+        },
+      ]),
+    ).toBeNull();
+
+    const single = formatBatteryPillSummary([
+      {
+        id: 'razer-mouse',
+        name: 'Razer Basilisk V3 Pro 35K',
+        kind: 'mouse',
+        percent: 78.6,
+        charging: true,
+        source: 'razer_hid',
+        connected: true,
+      },
+    ]);
+    expect(single).not.toBeNull();
+    expect(single?.percent).toBe(79);
+    expect(single?.percentStr).toBe('79%');
+    expect(single?.charging).toBe(true);
+    expect(single?.low).toBe(false);
+    expect(single?.critical).toBe(false);
+    expect(single?.count).toBe(1);
+    expect(single?.ariaLabel).toContain('Razer Basilisk V3 Pro 35K: 79% (заряжается)');
+
+    // Picks lowest % across connected devices, breaking ties in favor of non-charging
+    const multi = formatBatteryPillSummary([
+      {
+        id: 'airpods',
+        name: 'AirPods Max',
+        kind: 'headphones',
+        percent: 82,
+        charging: false,
+        source: 'bluetooth',
+        connected: true,
+      },
+      {
+        id: 'kbd',
+        name: 'Keychron K2',
+        kind: 'keyboard',
+        percent: 15,
+        charging: true,
+        source: 'bluetooth',
+        connected: true,
+      },
+      {
+        id: 'mouse',
+        name: 'Razer Mouse',
+        kind: 'mouse',
+        percent: 15,
+        charging: false,
+        source: 'razer_hid',
+        connected: true,
+      },
+    ]);
+    expect(multi?.device.id).toBe('mouse');
+    expect(multi?.percentStr).toBe('15%');
+    expect(multi?.charging).toBe(false);
+    expect(multi?.low).toBe(true);
+    expect(multi?.critical).toBe(false);
+    expect(multi?.count).toBe(3);
+
+    const critical = formatBatteryPillSummary([
+      {
+        id: 'pad',
+        name: 'Xbox Controller',
+        kind: 'gamepad',
+        percent: 8,
+        charging: false,
+        source: 'xinput',
+        connected: true,
+      },
+    ]);
+    expect(critical?.low).toBe(true);
+    expect(critical?.critical).toBe(true);
+  });
+
+  it('formats mini PC telemetry label with GPU temperature or RAM fallback', () => {
+    expect(formatMiniTelemetryLabel(null)).toBe('CPU —%');
+    expect(
+      formatMiniTelemetryLabel({
+        cpuPct: 14.4,
+        ramPct: 48,
+        gpuAvailable: true,
+        gpuTempC: 46.2,
+      }),
+    ).toBe('CPU 14% · 46°');
+    expect(
+      formatMiniTelemetryLabel({
+        cpuPct: 22.8,
+        ramPct: 61.4,
+        gpuAvailable: false,
+        gpuTempC: 0,
+      }),
+    ).toBe('CPU 23% · RAM 61%');
   });
 });

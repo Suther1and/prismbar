@@ -1,8 +1,19 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { BellIcon, ChevronLeftIcon, ChevronRightIcon, NativeTrayIcon } from '../components/Icons';
+import {
+  BellIcon,
+  ChargingBoltIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  DropletIcon,
+  NativeTrayIcon,
+  PeripheralDeviceIcon,
+  WeatherConditionIcon,
+  WindIcon,
+} from '../components/Icons';
 import { TaskbarView } from '../components/TaskbarView';
+import { StartSettingsOverlay } from '../components/start/StartSettingsOverlay';
 import {
   isCacheIconKey,
   type AppWindowGroup,
@@ -11,6 +22,7 @@ import {
   type OpenWindowInfo,
 } from './ipc';
 import {
+  BATTERY_LIST_MAX_HEIGHT,
   canOpenFileLocation,
   canRunAsAdmin,
   collectAppContextPids,
@@ -18,13 +30,17 @@ import {
   computeFlyoutCardHeight,
   computeNextContextFocusIdx,
   computeTrayFlyoutHeight,
+  computeWeatherTempBarRange,
   CONTEXT_FLYOUT_EXIT_MS,
   FLYOUT_EXIT_MS,
   FLYOUT_MAX_CARD_HEIGHT,
   FLYOUT_ROOT_PAD_LOGICAL,
+  formatCityOptionSubtitle,
   formatIpcError,
   formatMediaTime,
+  formatPeripheralSourceLabel,
   formatTrayHeaderLabel,
+  formatWeatherWindLabel,
   getActiveDeviceIndex,
   getFlyoutExitMs,
   INITIAL_FLYOUT_ANIM_STATE,
@@ -221,10 +237,12 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
     expect(tbHtml).toContain('tb-sheen');
     expect(tbHtml).toContain('tb-hover-pill');
     expect(tbHtml).toContain('tb-sep');
+    expect(tbHtml).toContain('tb-weather-pill');
+    expect(tbHtml).toContain('tb-widget-sep');
     expect(tbHtml).not.toContain('tb-tray-sep');
     expect(tbHtml).not.toContain('tb-multi');
 
-    // Monitor 2 Option A: Start + Clock only (no tray chevron, lang pill, or sound/net pill)
+    // Monitor 2 Option A: Start + Clock only (no tray chevron, lang pill, sound/net pill, or optional widgets)
     const secHtml = renderToStaticMarkup(
       createElement(TaskbarView, { monitorOverride: 'secondary' }),
     );
@@ -233,6 +251,9 @@ describe('Preview mouse-leave contract, TaskbarView SSR smoke & context menu gua
     expect(secHtml).toContain('tb-clock');
     expect(secHtml).not.toContain('tb-lang-btn');
     expect(secHtml).not.toContain('tb-sound-btn');
+    expect(secHtml).not.toContain('tb-weather-pill');
+    expect(secHtml).not.toContain('tb-bat-pill');
+    expect(secHtml).not.toContain('tb-telem-pill');
     expect(secHtml).not.toContain('Фоновые приложения');
 
     // Win11 NotifyIconSettings tray icon keys resolve through IconCache batch fetcher
@@ -452,5 +473,124 @@ describe('Tray 6-column layout, Hide key, OSD, 4+ Audio Devices & Media interpol
       const html = renderToStaticMarkup(createElement(Icon));
       expect(html).toContain('<svg');
     }
+  });
+});
+
+describe('Weather & Battery flyout logic, formatters, temperature range bars & icon SVG smoke', () => {
+  it('handles weather and battery flyout lifecycle transitions and dynamic list height caps', () => {
+    expect(getFlyoutExitMs('weather')).toBe(FLYOUT_EXIT_MS);
+    expect(getFlyoutExitMs('battery')).toBe(FLYOUT_EXIT_MS);
+    expect(BATTERY_LIST_MAX_HEIGHT).toBe(360);
+
+    const weatherOpen = reduceFlyoutShow(
+      INITIAL_FLYOUT_ANIM_STATE,
+      makeReq('weather', { width: 340, height: 404 }),
+    );
+    expect(weatherOpen.phase).toBe('open');
+    expect(weatherOpen.renderSeq).toBe(1);
+
+    const batteryOpen = reduceFlyoutShow(
+      weatherOpen,
+      makeReq('battery', { width: 304, height: 250 }),
+    );
+    expect(batteryOpen.phase).toBe('open');
+    expect(batteryOpen.renderSeq).toBe(2);
+    expect(batteryOpen.req?.kind).toBe('battery');
+
+    const closing = reduceFlyoutHideStart(batteryOpen);
+    const closed = reduceFlyoutHideComplete(closing, 2);
+    expect(closed.phase).toBe('closed');
+    expect(closed.req).toBeNull();
+
+    // Battery list expands up to BATTERY_LIST_MAX_HEIGHT without overflowing card ceiling
+    expect(
+      computeFlyoutCardHeight({
+        cardScrollHeight: 248,
+        borderY: 2,
+        innerScrollHeight: 420,
+        innerClientHeight: 180,
+        innerMaxHeight: BATTERY_LIST_MAX_HEIGHT,
+      }),
+    ).toBe(430);
+  });
+
+  it('formats peripheral source badges, wind speed, city subtitles & daily temperature range bars', () => {
+    expect(formatPeripheralSourceLabel('bluetooth')).toBe('Bluetooth');
+    expect(formatPeripheralSourceLabel('razer_hid')).toBe('USB HID');
+    expect(formatPeripheralSourceLabel('logitech_hidpp')).toBe('USB HID');
+    expect(formatPeripheralSourceLabel('xinput')).toBe('XInput');
+    expect(formatPeripheralSourceLabel('')).toBe('Беспроводное');
+
+    expect(formatWeatherWindLabel(12.6)).toBe('13 км/ч');
+    expect(formatWeatherWindLabel(null)).toBe('— км/ч');
+
+    expect(
+      formatCityOptionSubtitle({
+        name: 'Москва',
+        admin1: 'Москва',
+        country: 'Россия',
+      }),
+    ).toBe('Россия');
+    expect(
+      formatCityOptionSubtitle({
+        name: 'Алматы',
+        admin1: 'Алматы',
+        country: 'Казахстан',
+      }),
+    ).toBe('Казахстан');
+    expect(
+      formatCityOptionSubtitle({
+        name: 'Остин',
+        admin1: 'Техас',
+        country: 'США',
+      }),
+    ).toBe('Техас, США');
+
+    expect(computeWeatherTempBarRange(10, 20, 0, 20)).toEqual({
+      leftPct: 50,
+      widthPct: 50,
+    });
+    expect(computeWeatherTempBarRange(5, 5, 5, 5)).toEqual({
+      leftPct: 0,
+      widthPct: 100,
+    });
+    expect(computeWeatherTempBarRange(0, 1, 0, 40)).toEqual({
+      leftPct: 0,
+      widthPct: 12,
+    });
+  });
+
+  it('renders crisp weather and peripheral SVG icons without emoji', () => {
+    for (const cond of ['sun', 'moon', 'partly-cloudy-day', 'rain', 'snow', 'storm'] as const) {
+      const html = renderToStaticMarkup(createElement(WeatherConditionIcon, { condition: cond }));
+      expect(html).toContain('<svg');
+    }
+    for (const kind of ['mouse', 'headphones', 'keyboard', 'gamepad', 'other'] as const) {
+      const html = renderToStaticMarkup(createElement(PeripheralDeviceIcon, { kind }));
+      expect(html).toContain('<svg');
+    }
+    expect(renderToStaticMarkup(createElement(WindIcon))).toContain('<svg');
+    expect(renderToStaticMarkup(createElement(DropletIcon))).toContain('<svg');
+    expect(renderToStaticMarkup(createElement(ChargingBoltIcon))).toContain('<svg');
+
+    const settingsHtml = renderToStaticMarkup(
+      createElement(StartSettingsOverlay, {
+        open: true,
+        config: null,
+        onClose: () => {},
+        onSetBarMode: async () => {},
+        onSetSecondaryMode: async () => {},
+        onSetAutostart: async () => {},
+        onSetAppearance: async () => {},
+        onRefreshIndexes: async () => {},
+        onRestoreTrayApp: async () => {},
+        onRestoreAllTrayApps: async () => {},
+        onExportConfig: async () => {},
+        onImportConfig: async () => {},
+        onRestoreWindowsAndExit: () => {},
+      }),
+    );
+    expect(settingsHtml).toContain('Настройки');
+    expect(settingsHtml).toContain('Панель и мониторы');
   });
 });
