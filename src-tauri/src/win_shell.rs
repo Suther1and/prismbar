@@ -16,7 +16,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
-    DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
+    DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_NCRENDERING_POLICY,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -2045,6 +2045,7 @@ pub fn restore_native_taskbar_nonblocking() {
     RESTORE_IN_PROGRESS.store(true, Ordering::SeqCst);
     unregister_appbar();
     show_native_taskbars_and_restore_workarea(None);
+    ensure_native_start_menu_healthy();
     if let Ok(slot) = APPBAR_MSG_WINDOW.try_lock() {
         if let Some(wnd) = slot.as_ref() {
             wnd.request_close_nonblocking();
@@ -2061,6 +2062,7 @@ fn restore_native_taskbar_internal(explicit_workarea: Option<PixelRect>, flush_o
         flush_orphaned_appbars();
     }
     show_native_taskbars_and_restore_workarea(explicit_workarea);
+    ensure_native_start_menu_healthy();
     NATIVE_HIDDEN.store(false, Ordering::SeqCst);
 }
 
@@ -3077,9 +3079,111 @@ pub(crate) fn build_tagged_escape_inputs() -> [INPUT; 2] {
     ]
 }
 
+/// Pure repair decision for `StartMenuExperienceHost.exe`'s persistent `CoreWindow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartMenuVisibilityAction {
+    /// `WS_VISIBLE` is already set (`IsWindowVisible == true`) — Win11 DWM cloaking/uncloaking works normally.
+    AlreadyHealthy,
+    /// `WS_VISIBLE` was cleared while DWM-cloaked (`!visible && cloaked != 0`):
+    /// restore `WS_VISIBLE` with `ShowWindowAsync(SW_SHOWNOACTIVATE)` without popping Start open.
+    RestoreVisibleOnly,
+    /// `WS_VISIBLE` was cleared and DWM is uncloaked (`!visible && cloaked == 0`):
+    /// restore `WS_VISIBLE` with `ShowWindowAsync(SW_SHOWNOACTIVATE)` and immediately dismiss
+    /// (`WM_CANCELMODE` + `dismiss_native_start_menu`) so Start does not remain open on screen.
+    RestoreVisibleAndDismiss,
+}
+
+/// Pure testable decision helper determining whether `StartMenuExperienceHost.exe`'s
+/// persistent `CoreWindow` needs `WS_VISIBLE` restored (and dismissed if uncloaked).
+pub fn should_restore_start_menu_visibility(
+    is_visible: bool,
+    cloaked_flags: u32,
+) -> StartMenuVisibilityAction {
+    if is_visible {
+        StartMenuVisibilityAction::AlreadyHealthy
+    } else if cloaked_flags != 0 {
+        StartMenuVisibilityAction::RestoreVisibleOnly
+    } else {
+        StartMenuVisibilityAction::RestoreVisibleAndDismiss
+    }
+}
+
+/// Returns `true` strictly for the UWP `CoreWindow` class used by Windows 11 Start Menu,
+/// excluding hidden Win32 helper classes (`IME`, `MSCTFIME UI`, etc.) inside the same process.
+pub fn is_start_menu_core_window_class(class_name: &str) -> bool {
+    class_name == "Windows.UI.Core.CoreWindow"
+}
+
+/// Ensures Windows 11's persistent `StartMenuExperienceHost.exe` `CoreWindow` retains `WS_VISIBLE`
+/// so native Win+Start DWM uncloaking works cleanly after TestBar exits or recovers from a crash.
+/// Lock-free and thread-free (`EnumWindows` + `ShowWindowAsync` + `PostMessageW`), safe for panic hooks.
+pub fn ensure_native_start_menu_healthy() {
+    unsafe {
+        let mut repairs: Vec<(isize, StartMenuVisibilityAction)> = Vec::new();
+        extern "system" fn collect_broken_start_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                let mut cls_buf = [0u16; 64];
+                let cls_len = GetClassNameW(hwnd, &mut cls_buf);
+                if cls_len <= 0 {
+                    return BOOL(1);
+                }
+                let cls = String::from_utf16_lossy(&cls_buf[..cls_len as usize]);
+                if !is_start_menu_core_window_class(&cls) || !is_hwnd_native_start_menu(hwnd) {
+                    return BOOL(1);
+                }
+                let is_visible = IsWindowVisible(hwnd).as_bool();
+                if is_visible {
+                    return BOOL(1);
+                }
+                // Default to cloaked=1 if DwmGetWindowAttribute fails so we restore WS_VISIBLE
+                // silently without unnecessarily shifting focus.
+                let mut cloaked: u32 = 1;
+                let mut queried: u32 = 0;
+                if DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED,
+                    &mut queried as *mut u32 as *mut c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+                .is_ok()
+                {
+                    cloaked = queried;
+                }
+                let action = should_restore_start_menu_visibility(is_visible, cloaked);
+                if action != StartMenuVisibilityAction::AlreadyHealthy {
+                    let out = &mut *(lparam.0 as *mut Vec<(isize, StartMenuVisibilityAction)>);
+                    out.push((hwnd.0 as isize, action));
+                }
+            }
+            BOOL(1)
+        }
+
+        let _ = EnumWindows(
+            Some(collect_broken_start_windows),
+            LPARAM(&mut repairs as *mut Vec<(isize, StartMenuVisibilityAction)> as isize),
+        );
+
+        for (hwnd_raw, action) in repairs {
+            let hwnd = HWND(hwnd_raw as *mut _);
+            match action {
+                StartMenuVisibilityAction::AlreadyHealthy => {}
+                StartMenuVisibilityAction::RestoreVisibleOnly => {
+                    let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+                }
+                StartMenuVisibilityAction::RestoreVisibleAndDismiss => {
+                    let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+                    let _ = PostMessageW(hwnd, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                    dismiss_native_start_menu(hwnd_raw, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Dismisses Immersive Windows 11 `StartMenuExperienceHost.exe` cleanly (100% AD-2 compliant).
-/// Windows 11 ignores `ShowWindowAsync(SW_HIDE)` on Immersive UWP Start Menu, but Start
-/// auto-dismisses immediately the moment foreground focus moves away from it.
+/// Never call `ShowWindowAsync(SW_HIDE)` on `StartMenuExperienceHost.exe` — `SW_HIDE` clears
+/// `WS_VISIBLE` on its persistent `CoreWindow` and breaks Win11 DWM uncloaking even after TestBar exits;
+/// Start auto-dismisses immediately the moment foreground focus moves away from it.
 /// 1. Moves foreground focus to `fallback_focus_hwnd` (if valid, visible, non-iconic, and not
 ///    itself `StartMenuExperienceHost.exe`), otherwise falls back to `GetShellWindow()`.
 /// 2. If `StartMenuExperienceHost.exe` is STILL foreground after focus transfer, sends a single
@@ -3191,7 +3295,6 @@ unsafe extern "system" fn win_event_start_guard_proc(
             return;
         }
         let _ = PostMessageW(hwnd, WM_CANCELMODE, WPARAM(0), LPARAM(0));
-        let _ = ShowWindowAsync(hwnd, SW_HIDE);
         let _ = HOOK_EVENT_SENDER.try_with(|slot| {
             if let Ok(guard) = slot.try_borrow() {
                 if let Some(sender) = guard.as_ref() {
@@ -5606,5 +5709,82 @@ mod tests {
         let second = refresh_foreground_elevated_state();
         assert_eq!(first, second);
         assert_eq!(is_foreground_elevated(), second);
+    }
+
+    #[test]
+    fn start_menu_health_decision_and_guard_never_calls_sw_hide() {
+        // Already visible: healthy regardless of cloaked flag
+        assert_eq!(
+            should_restore_start_menu_visibility(true, 0),
+            StartMenuVisibilityAction::AlreadyHealthy
+        );
+        assert_eq!(
+            should_restore_start_menu_visibility(true, 2),
+            StartMenuVisibilityAction::AlreadyHealthy
+        );
+
+        // Hidden + cloaked: restore WS_VISIBLE silently without dismissing/focusing
+        assert_eq!(
+            should_restore_start_menu_visibility(false, 1),
+            StartMenuVisibilityAction::RestoreVisibleOnly
+        );
+        assert_eq!(
+            should_restore_start_menu_visibility(false, 2),
+            StartMenuVisibilityAction::RestoreVisibleOnly
+        );
+        assert_eq!(
+            should_restore_start_menu_visibility(false, u32::MAX),
+            StartMenuVisibilityAction::RestoreVisibleOnly
+        );
+
+        // Hidden + uncloaked: restore WS_VISIBLE and immediately cancel/dismiss
+        assert_eq!(
+            should_restore_start_menu_visibility(false, 0),
+            StartMenuVisibilityAction::RestoreVisibleAndDismiss
+        );
+
+        // Strictly targets persistent UWP CoreWindow, never IME/helper windows
+        assert!(is_start_menu_core_window_class("Windows.UI.Core.CoreWindow"));
+        assert!(!is_start_menu_core_window_class("IME"));
+        assert!(!is_start_menu_core_window_class("MSCTFIME UI"));
+        assert!(!is_start_menu_core_window_class(""));
+
+        // Verify win_event_start_guard_proc does not invoke SW_HIDE anywhere in its code
+        let src = include_str!("win_shell.rs");
+        let start = src
+            .find("\nunsafe extern \"system\" fn win_event_start_guard_proc(")
+            .expect("win_event_start_guard_proc must exist");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n/// Low-level keyboard & mouse hook thread")
+            .expect("end of win_event_start_guard_proc");
+        let body = &tail[..end];
+        let has_sw_hide_code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("SW_HIDE"));
+        assert!(
+            !has_sw_hide_code,
+            "win_event_start_guard_proc must never call SW_HIDE on StartMenuExperienceHost.exe"
+        );
+        assert!(body.contains("WM_CANCELMODE"));
+        assert!(body.contains("NativeStartSuppressed"));
+
+        // Verify both internal & nonblocking restore paths call ensure_native_start_menu_healthy
+        for fn_sig in [
+            "\npub fn restore_native_taskbar_nonblocking()",
+            "\nfn restore_native_taskbar_internal(",
+        ] {
+            let fn_start = src.find(fn_sig).expect("restore function must exist");
+            let fn_tail = &src[fn_start..];
+            let fn_end = fn_tail.find("\n}\n").expect("restore function end");
+            assert!(
+                fn_tail[..fn_end].contains("ensure_native_start_menu_healthy()"),
+                "{fn_sig} must call ensure_native_start_menu_healthy()"
+            );
+        }
+
+        // Smoke-check live execution (non-blocking no-op when Start CoreWindow is healthy/absent)
+        ensure_native_start_menu_healthy();
     }
 }

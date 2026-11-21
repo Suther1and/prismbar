@@ -352,7 +352,7 @@ export const PlaySmallIcon: React.FC<{ className?: string; size?: number }> = ({
     viewBox="0 0 24 24"
     fill="currentColor"
   >
-    <path d="M7 5.2c0-.9.98-1.45 1.75-.98l10.2 6.3a1.15 1.15 0 0 1 0 1.96l-10.2 6.3A1.15 1.15 0 0 1 7 17.8V5.2z" />
+    <path d="M7 5.96A1.15 1.15 0 0 1 8.77 4.99l9.38 6.04a1.15 1.15 0 0 1 0 1.94l-9.38 6.04A1.15 1.15 0 0 1 7 18.04V5.96Z" />
   </svg>
 );
 
