@@ -6,8 +6,11 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -547,8 +550,128 @@ pub fn sanitize_accent_hex_rgb(
     }
 }
 
+#[cfg(target_os = "windows")]
 const AUTOSTART_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
 const AUTOSTART_VALUE_NAME: &str = "TestBar";
+
+pub const MAC_COMMAND_KEY_ANY: &str = "any";
+pub const MAC_COMMAND_KEY_LEFT: &str = "left";
+pub const MAC_COMMAND_KEY_RIGHT: &str = "right";
+pub const MAC_COMMAND_KEY_DISABLED: &str = "disabled";
+
+pub const MAC_WINDOW_POSITION_CENTER: &str = "center";
+pub const MAC_WINDOW_POSITION_BOTTOM: &str = "bottom";
+
+pub const MAC_TERMINAL_AUTO: &str = "auto";
+pub const MAC_TERMINAL_TERMINAL: &str = "terminal";
+pub const MAC_TERMINAL_ITERM: &str = "iterm";
+pub const MAC_TERMINAL_WARP: &str = "warp";
+pub const MAC_TERMINAL_GHOSTTY: &str = "ghostty";
+
+pub fn default_mac_command_key() -> String {
+    MAC_COMMAND_KEY_ANY.to_string()
+}
+
+pub fn normalize_mac_command_key(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "left" => MAC_COMMAND_KEY_LEFT,
+        "right" => MAC_COMMAND_KEY_RIGHT,
+        "disabled" => MAC_COMMAND_KEY_DISABLED,
+        _ => MAC_COMMAND_KEY_ANY,
+    }
+}
+
+pub fn validate_mac_command_key(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "any" => Ok(MAC_COMMAND_KEY_ANY),
+        "left" => Ok(MAC_COMMAND_KEY_LEFT),
+        "right" => Ok(MAC_COMMAND_KEY_RIGHT),
+        "disabled" => Ok(MAC_COMMAND_KEY_DISABLED),
+        other => Err(format!(
+            "Недопустимый режим клавиши Command: '{other}' (допустимы: any, left, right, disabled)"
+        )),
+    }
+}
+
+pub fn default_mac_window_position() -> String {
+    MAC_WINDOW_POSITION_CENTER.to_string()
+}
+
+pub fn normalize_mac_window_position(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bottom" => MAC_WINDOW_POSITION_BOTTOM,
+        _ => MAC_WINDOW_POSITION_CENTER,
+    }
+}
+
+pub fn validate_mac_window_position(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "center" => Ok(MAC_WINDOW_POSITION_CENTER),
+        "bottom" => Ok(MAC_WINDOW_POSITION_BOTTOM),
+        other => Err(format!(
+            "Недопустимая позиция окна: '{other}' (допустимы: center, bottom)"
+        )),
+    }
+}
+
+pub fn default_mac_terminal_app() -> String {
+    MAC_TERMINAL_AUTO.to_string()
+}
+
+pub fn normalize_mac_terminal_app(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "terminal" => MAC_TERMINAL_TERMINAL,
+        "iterm" => MAC_TERMINAL_ITERM,
+        "warp" => MAC_TERMINAL_WARP,
+        "ghostty" => MAC_TERMINAL_GHOSTTY,
+        _ => MAC_TERMINAL_AUTO,
+    }
+}
+
+pub fn validate_mac_terminal_app(raw: &str) -> Result<&'static str, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(MAC_TERMINAL_AUTO),
+        "terminal" => Ok(MAC_TERMINAL_TERMINAL),
+        "iterm" => Ok(MAC_TERMINAL_ITERM),
+        "warp" => Ok(MAC_TERMINAL_WARP),
+        "ghostty" => Ok(MAC_TERMINAL_GHOSTTY),
+        other => Err(format!(
+            "Недопустимый терминал: '{other}' (допустимы: auto, terminal, iterm, warp, ghostty)"
+        )),
+    }
+}
+
+pub fn set_mac_settings_in_config(
+    cfg: &mut TestBarConfig,
+    mac_command_key: Option<String>,
+    mac_window_position: Option<String>,
+    mac_terminal_app: Option<String>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    if let Some(cmd) = mac_command_key {
+        let valid = validate_mac_command_key(&cmd)?;
+        if cfg.mac_command_key != valid {
+            cfg.mac_command_key = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(pos) = mac_window_position {
+        let valid = validate_mac_window_position(&pos)?;
+        if cfg.mac_window_position != valid {
+            cfg.mac_window_position = valid.to_string();
+            changed = true;
+        }
+    }
+    if let Some(term) = mac_terminal_app {
+        let valid = validate_mac_terminal_app(&term)?;
+        if cfg.mac_terminal_app != valid {
+            cfg.mac_terminal_app = valid.to_string();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -780,6 +903,12 @@ pub struct TestBarConfig {
     pub custom_spaces: Vec<CustomSpace>,
     #[serde(default)]
     pub pinned_clipboard: Vec<String>,
+    #[serde(default = "default_mac_command_key")]
+    pub mac_command_key: String, // "any" | "left" | "right" | "disabled"
+    #[serde(default = "default_mac_window_position")]
+    pub mac_window_position: String, // "center" | "bottom"
+    #[serde(default = "default_mac_terminal_app")]
+    pub mac_terminal_app: String, // "auto" | "terminal" | "iterm" | "warp" | "ghostty"
 }
 
 fn find_first_existing(candidates: &[PathBuf]) -> Option<String> {
@@ -792,18 +921,42 @@ fn find_first_existing(candidates: &[PathBuf]) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn user_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(r"C:\Users\Public"))
 }
 
+#[cfg(not(target_os = "windows"))]
+fn user_home() -> PathBuf {
+    dirs::home_dir()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(target_os = "windows")]
 fn local_appdata() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(|| user_home().join(r"AppData\Local"))
 }
 
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn local_appdata() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| user_home().join("Library").join("Application Support"))
+}
+
+#[cfg(target_os = "windows")]
 fn roaming_appdata() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| user_home().join(r"AppData\Roaming"))
 }
 
+#[cfg(not(target_os = "windows"))]
+fn roaming_appdata() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| user_home().join("Library").join("Application Support"))
+}
+
+#[cfg(target_os = "windows")]
 fn read_registry_sz(root: HKEY, subkey: &str, value_name: &str) -> Option<String> {
     let subkey_w = to_wide_nul(subkey);
     let value_w = if value_name.is_empty() {
@@ -919,6 +1072,7 @@ pub fn browser_display_info(
     }
 }
 
+#[cfg(target_os = "windows")]
 struct DetectedBrowser {
     title: String,
     target: String,
@@ -926,6 +1080,7 @@ struct DetectedBrowser {
     accent_rgb: String,
 }
 
+#[cfg(target_os = "windows")]
 fn detect_default_browser() -> Option<DetectedBrowser> {
     let prog_id = read_registry_sz(
         HKEY_CURRENT_USER,
@@ -997,6 +1152,7 @@ fn detect_default_browser() -> Option<DetectedBrowser> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn detect_adobe_photoshop(pf: &Path) -> Vec<PathBuf> {
     let mut dirs_found = Vec::new();
     let adobe_dir = pf.join("Adobe");
@@ -1015,6 +1171,7 @@ fn detect_adobe_photoshop(pf: &Path) -> Vec<PathBuf> {
     dirs_found
 }
 
+#[cfg(target_os = "windows")]
 fn detect_app_target(name_key: &str) -> String {
     let local = local_appdata();
     let roaming = roaming_appdata();
@@ -2339,6 +2496,22 @@ pub fn normalize_and_migrate(cfg: &mut TestBarConfig) -> bool {
         changed = true;
     }
 
+    let desired_mac_cmd = normalize_mac_command_key(&cfg.mac_command_key);
+    if cfg.mac_command_key != desired_mac_cmd {
+        cfg.mac_command_key = desired_mac_cmd.to_string();
+        changed = true;
+    }
+    let desired_mac_pos = normalize_mac_window_position(&cfg.mac_window_position);
+    if cfg.mac_window_position != desired_mac_pos {
+        cfg.mac_window_position = desired_mac_pos.to_string();
+        changed = true;
+    }
+    let desired_mac_term = normalize_mac_terminal_app(&cfg.mac_terminal_app);
+    if cfg.mac_terminal_app != desired_mac_term {
+        cfg.mac_terminal_app = desired_mac_term.to_string();
+        changed = true;
+    }
+
     changed
 }
 
@@ -2366,6 +2539,7 @@ fn trim_frecency_map(map: &mut HashMap<String, FrecencyEntry>) -> bool {
     changed
 }
 
+#[cfg(target_os = "windows")]
 fn default_modular_spaces() -> Vec<SpaceConfig> {
     let home = user_home();
     let downloads = dirs::download_dir()
@@ -2558,38 +2732,450 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
     ]
 }
 
-impl Default for TestBarConfig {
-    fn default() -> Self {
-        let mut taskbar = vec![pin(
-            "tb-explorer",
-            "app",
-            "Проводник",
-            "Файлы и диски",
-            detect_app_target("explorer"),
-            "Новое окно",
-            "245,158,11",
-            "explorer",
-        )];
-        if let Some(browser) = detect_default_browser() {
-            taskbar.push(pin(
-                "tb-browser",
+#[cfg(target_os = "macos")]
+fn detect_mac_app_bundle(names: &[&str]) -> String {
+    let home = user_home();
+    let roots = [
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+        PathBuf::from("/System/Applications/Utilities"),
+        PathBuf::from("/System/Library/CoreServices"),
+        home.join("Applications"),
+    ];
+    let mut candidates = Vec::new();
+    for name in names {
+        let p = Path::new(name);
+        if p.is_absolute() {
+            candidates.push(p.to_path_buf());
+        } else {
+            for root in &roots {
+                candidates.push(root.join(name));
+            }
+        }
+    }
+    find_first_existing(&candidates).unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn detect_mac_browser_pin() -> Option<PinItem> {
+    let candidates: &[(&str, &str, &str, &str)] = &[
+        ("Arc.app", "Arc", "129,140,248", "browser"),
+        ("Google Chrome.app", "Google Chrome", "56,189,248", "chrome"),
+        ("Brave Browser.app", "Brave", "249,115,22", "brave"),
+        ("Firefox.app", "Firefox", "249,115,22", "firefox"),
+        ("Safari.app", "Safari", "56,189,248", "browser"),
+    ];
+    for &(bundle, title, rgb, icon_key) in candidates {
+        let target = detect_mac_app_bundle(&[bundle]);
+        if !target.is_empty() {
+            return Some(pin(
+                "p-browser",
                 "app",
-                &browser.title,
+                title,
                 "Браузер",
-                browser.target,
+                target,
                 "Новое окно",
-                &browser.accent_rgb,
-                &browser.icon_key,
+                rgb,
+                icon_key,
             ));
         }
-        taskbar.extend([
-            pin("tb-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
-            pin("tb-vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
-            pin("tb-telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
-            pin("tb-discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
-            pin("tb-spotify", "app", "Spotify", "Музыка", detect_app_target("spotify"), "", "52,211,153", "spotify"),
-        ]);
+    }
+    None
+}
 
+#[cfg(target_os = "macos")]
+fn default_modular_spaces() -> Vec<SpaceConfig> {
+    let home = user_home();
+    let downloads = dirs::download_dir()
+        .unwrap_or_else(|| home.join("Downloads"))
+        .to_string_lossy()
+        .to_string();
+    let documents = dirs::document_dir()
+        .unwrap_or_else(|| home.join("Documents"))
+        .to_string_lossy()
+        .to_string();
+    let desktop = dirs::desktop_dir()
+        .unwrap_or_else(|| home.join("Desktop"))
+        .to_string_lossy()
+        .to_string();
+
+    let finder_target = detect_mac_app_bundle(&["Finder.app"]);
+    let terminal_target =
+        detect_mac_app_bundle(&["Warp.app", "Ghostty.app", "iTerm.app", "Terminal.app"]);
+    let vscode_target = detect_mac_app_bundle(&["Visual Studio Code.app"]);
+    let cursor_target = detect_mac_app_bundle(&["Cursor.app"]);
+    let telegram_target = detect_mac_app_bundle(&["Telegram.app"]);
+    let discord_target = detect_mac_app_bundle(&["Discord.app"]);
+    let obsidian_target = detect_mac_app_bundle(&["Obsidian.app"]);
+    let figma_target = detect_mac_app_bundle(&["Figma.app"]);
+    let activity_target = detect_mac_app_bundle(&["Activity Monitor.app"]);
+    let settings_target =
+        detect_mac_app_bundle(&["System Settings.app", "System Preferences.app"]);
+
+    let mut personal_items = Vec::new();
+    if let Some(browser) = detect_mac_browser_pin() {
+        personal_items.push(browser);
+    }
+    personal_items.extend([
+        pin(
+            "p-finder",
+            "app",
+            "Finder",
+            "Файлы и диски",
+            finder_target,
+            "Новое окно",
+            "56,189,248",
+            "explorer",
+        ),
+        pin(
+            "p-terminal",
+            "app",
+            "Терминал",
+            "Консоль",
+            terminal_target.clone(),
+            "Новое окно",
+            "52,211,153",
+            "terminal",
+        ),
+        pin(
+            "p-vscode",
+            "app",
+            "VS Code",
+            "Редактор",
+            vscode_target.clone(),
+            "Новое окно",
+            "56,189,248",
+            "vscode",
+        ),
+        pin(
+            "p-cursor",
+            "app",
+            "Cursor",
+            "AI-редактор",
+            cursor_target.clone(),
+            "",
+            "129,140,248",
+            "cursor",
+        ),
+        pin(
+            "p-telegram",
+            "app",
+            "Telegram",
+            "Мессенджер",
+            telegram_target,
+            "",
+            "56,189,248",
+            "telegram",
+        ),
+        pin(
+            "p-discord",
+            "app",
+            "Discord",
+            "Голос и чаты",
+            discord_target,
+            "",
+            "99,102,241",
+            "discord",
+        ),
+        pin(
+            "p-obsidian",
+            "app",
+            "Obsidian",
+            "Заметки",
+            obsidian_target,
+            "",
+            "167,139,250",
+            "obsidian",
+        ),
+        pin(
+            "p-desktop",
+            "folder",
+            "Рабочий стол",
+            "Файлы",
+            desktop.clone(),
+            "Скопировать путь",
+            "52,211,153",
+            "folder",
+        ),
+        pin(
+            "p-downloads",
+            "folder",
+            "Загрузки",
+            "Папка",
+            downloads.clone(),
+            "Скопировать путь",
+            "56,189,248",
+            "folder",
+        ),
+        pin(
+            "p-docs",
+            "folder",
+            "Документы",
+            "Папка",
+            documents.clone(),
+            "Скопировать путь",
+            "245,158,11",
+            "folder",
+        ),
+        pin(
+            "p-apps",
+            "folder",
+            "Программы",
+            "Приложения",
+            "/Applications".to_string(),
+            "Скопировать путь",
+            "129,140,248",
+            "folder",
+        ),
+    ]);
+    let mut personal_items = retain_resolved_pins(personal_items);
+    let mut personal_main_idx = 0usize;
+    for item in &mut personal_items {
+        if item.kind == "folder" {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        } else {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+            if personal_main_idx < 2 {
+                item.tile_size = Some(TILE_SIZE_HERO.to_string());
+            }
+            personal_main_idx += 1;
+        }
+    }
+
+    let mut work_items = retain_resolved_pins(vec![
+        pin(
+            "w-dl",
+            "folder",
+            "Загрузки",
+            "Свежие файлы",
+            downloads,
+            "Открыть в терминале",
+            "245,158,11",
+            "folder",
+        ),
+        pin(
+            "w-docs",
+            "folder",
+            "Документы",
+            "Основная папка",
+            documents,
+            "Открыть в терминале",
+            "245,158,11",
+            "folder",
+        ),
+        pin(
+            "w-desktop",
+            "folder",
+            "Рабочий стол",
+            "Файлы и ярлыки",
+            desktop,
+            "Открыть в терминале",
+            "56,189,248",
+            "folder",
+        ),
+        pin(
+            "w-vscode",
+            "app",
+            "VS Code",
+            "Редактор",
+            vscode_target,
+            "Новое окно",
+            "56,189,248",
+            "vscode",
+        ),
+        pin(
+            "w-cursor",
+            "app",
+            "Cursor",
+            "AI-редактор",
+            cursor_target,
+            "",
+            "129,140,248",
+            "cursor",
+        ),
+        pin(
+            "w-terminal",
+            "app",
+            "Терминал",
+            "Консоль",
+            terminal_target.clone(),
+            "Новое окно",
+            "52,211,153",
+            "terminal",
+        ),
+        pin(
+            "w-activity",
+            "app",
+            "Мониторинг системы",
+            "Процессы и нагрузка",
+            activity_target.clone(),
+            "",
+            "129,140,248",
+            "cpu",
+        ),
+    ]);
+    for item in &mut work_items {
+        item.section = Some(
+            if item.kind == "app" {
+                TILE_SECTION_BOTTOM
+            } else {
+                TILE_SECTION_MAIN
+            }
+            .to_string(),
+        );
+    }
+
+    let mut studio_items = retain_resolved_pins(vec![
+        pin(
+            "s-figma",
+            "app",
+            "Figma",
+            "Интерфейсы",
+            figma_target,
+            "",
+            "168,85,247",
+            "figma",
+        ),
+        pin(
+            "s-settings",
+            "app",
+            "Системные настройки",
+            "Параметры macOS",
+            settings_target,
+            "",
+            "52,211,153",
+            "settings",
+        ),
+        pin(
+            "s-terminal",
+            "app",
+            "Терминал",
+            "Консоль",
+            terminal_target,
+            "Новое окно",
+            "52,211,153",
+            "terminal",
+        ),
+        pin(
+            "s-activity",
+            "app",
+            "Мониторинг системы",
+            "Процессы и память",
+            activity_target,
+            "",
+            "129,140,248",
+            "cpu",
+        ),
+    ]);
+    let mut studio_main_idx = 0usize;
+    for item in &mut studio_items {
+        if matches!(item.id.as_str(), "s-terminal" | "s-activity") {
+            item.section = Some(TILE_SECTION_BOTTOM.to_string());
+        } else {
+            item.section = Some(TILE_SECTION_MAIN.to_string());
+            if studio_main_idx < 2 {
+                item.tile_size = Some(TILE_SIZE_HERO.to_string());
+            }
+            studio_main_idx += 1;
+        }
+    }
+
+    let personal_widgets = vec!["clipboard".to_string(), "notes".to_string()];
+    let work_widgets = vec![
+        "pc_health".to_string(),
+        "top_processes".to_string(),
+        "timer".to_string(),
+    ];
+    let studio_widgets = vec![
+        "quick_toggles".to_string(),
+        "weather".to_string(),
+        "batteries".to_string(),
+    ];
+
+    vec![
+        SpaceConfig {
+            id: "personal".to_string(),
+            name: "Личное".to_string(),
+            accent_hex: "#818CF8".to_string(),
+            accent_rgb: "129,140,248".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: true,
+            bottom_section_title: Some("Быстрый доступ".to_string()),
+            header_widgets: default_space_header_widgets(&personal_widgets),
+            widgets: personal_widgets,
+            items: personal_items,
+        },
+        SpaceConfig {
+            id: "work".to_string(),
+            name: "Работа".to_string(),
+            accent_hex: "#38BDF8".to_string(),
+            accent_rgb: "56,189,248".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: false,
+            bottom_section_title: Some("Приложения".to_string()),
+            widgets: work_widgets,
+            header_widgets: vec![SpaceHeaderWidget {
+                id: "network".to_string(),
+                side: HEADER_WIDGET_SIDE_LEFT.to_string(),
+            }],
+            items: work_items,
+        },
+        SpaceConfig {
+            id: "studio".to_string(),
+            name: "Утилиты".to_string(),
+            accent_hex: "#34D399".to_string(),
+            accent_rgb: "52,211,153".to_string(),
+            layout_kind: SPACE_LAYOUT_GRID.to_string(),
+            show_hero_row: true,
+            bottom_section_title: Some("Инструменты".to_string()),
+            widgets: studio_widgets,
+            header_widgets: vec![],
+            items: studio_items,
+        },
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn default_taskbar_pins_for_platform() -> Vec<PinItem> {
+    let mut taskbar = vec![pin(
+        "tb-explorer",
+        "app",
+        "Проводник",
+        "Файлы и диски",
+        detect_app_target("explorer"),
+        "Новое окно",
+        "245,158,11",
+        "explorer",
+    )];
+    if let Some(browser) = detect_default_browser() {
+        taskbar.push(pin(
+            "tb-browser",
+            "app",
+            &browser.title,
+            "Браузер",
+            browser.target,
+            "Новое окно",
+            &browser.accent_rgb,
+            &browser.icon_key,
+        ));
+    }
+    taskbar.extend([
+        pin("tb-wt", "app", "Терминал", "Консоль", detect_app_target("wt"), "От админа", "52,211,153", "terminal"),
+        pin("tb-vscode", "app", "VS Code", "Редактор", detect_app_target("vscode"), "Новое окно", "56,189,248", "vscode"),
+        pin("tb-telegram", "app", "Telegram", "Мессенджер", detect_app_target("telegram"), "", "56,189,248", "telegram"),
+        pin("tb-discord", "app", "Discord", "Голос и чаты", detect_app_target("discord"), "", "99,102,241", "discord"),
+        pin("tb-spotify", "app", "Spotify", "Музыка", detect_app_target("spotify"), "", "52,211,153", "spotify"),
+    ]);
+    retain_resolved_pins(taskbar)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_taskbar_pins_for_platform() -> Vec<PinItem> {
+    Vec::new()
+}
+
+impl Default for TestBarConfig {
+    fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             revision: 0,
@@ -2613,7 +3199,7 @@ impl Default for TestBarConfig {
             hidden_tray_keys: vec![],
             hidden_battery_ids: vec![],
             frecency: HashMap::new(),
-            taskbar_pins: retain_resolved_pins(taskbar),
+            taskbar_pins: default_taskbar_pins_for_platform(),
             spaces: default_modular_spaces(),
             taskbar_widgets: TaskbarWidgetSettings::default(),
             personal_pins: vec![],
@@ -2626,6 +3212,9 @@ impl Default for TestBarConfig {
             game_combos: vec![],
             custom_spaces: vec![],
             pinned_clipboard: vec![],
+            mac_command_key: default_mac_command_key(),
+            mac_window_position: default_mac_window_position(),
+            mac_terminal_app: default_mac_terminal_app(),
         }
     }
 }
@@ -4220,6 +4809,7 @@ pub fn format_autostart_command(exe_path: &Path) -> Result<String, String> {
     Ok(format!("\"{cleaned}\""))
 }
 
+#[cfg(target_os = "windows")]
 pub fn classify_autostart_delete_error(code: WIN32_ERROR) -> Result<(), String> {
     if code == ERROR_SUCCESS || code == ERROR_FILE_NOT_FOUND {
         Ok(())
@@ -4232,8 +4822,10 @@ pub fn classify_autostart_delete_error(code: WIN32_ERROR) -> Result<(), String> 
     }
 }
 
+#[cfg(target_os = "windows")]
 struct RegKeyGuard(HKEY);
 
+#[cfg(target_os = "windows")]
 impl Drop for RegKeyGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
@@ -4244,10 +4836,12 @@ impl Drop for RegKeyGuard {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn to_wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(target_os = "windows")]
 fn set_windows_autostart_at(
     subkey_str: &str,
     value_name_str: &str,
@@ -4332,6 +4926,7 @@ fn set_windows_autostart_at(
     }
 }
 
+#[cfg(target_os = "windows")]
 pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
     let exe = if enable {
         std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?
@@ -4339,6 +4934,122 @@ pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
         PathBuf::new()
     };
     set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, enable)
+}
+
+pub fn resolve_macos_bundle_executable(exe_path: &Path) -> PathBuf {
+    let raw = exe_path.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PathBuf::new();
+    }
+    let components: Vec<std::path::Component<'_>> = exe_path.components().collect();
+    for (idx, comp) in components.iter().enumerate() {
+        let name = comp.as_os_str().to_string_lossy();
+        if name.to_ascii_lowercase().ends_with(".app") {
+            let mut app_root = PathBuf::new();
+            for c in &components[..=idx] {
+                app_root.push(c.as_os_str());
+            }
+            let exe_name = exe_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "TestBar".to_string());
+            let candidate = app_root.join("Contents").join("MacOS").join(exe_name);
+            if candidate == exe_path || candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    exe_path.to_path_buf()
+}
+
+fn escape_xml_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+pub fn build_macos_launch_agent_plist(exe_path: &Path) -> Result<String, String> {
+    let resolved = resolve_macos_bundle_executable(exe_path);
+    let raw = resolved.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("autostart executable path is empty".to_string());
+    }
+    if trimmed.contains('\0') {
+        return Err("autostart executable path contains NUL byte".to_string());
+    }
+    let escaped = escape_xml_text(trimmed);
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.testbar.shell</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{escaped}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_launch_agent_plist_path() -> PathBuf {
+    user_home()
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.testbar.shell.plist")
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_autostart_at(
+    plist_path: &Path,
+    exe_path: &Path,
+    enable: bool,
+) -> Result<(), String> {
+    if enable {
+        let plist = build_macos_launch_agent_plist(exe_path)?;
+        ensure_parent_dir(plist_path)?;
+        let tmp = sibling_tmp_path(plist_path);
+        fs::write(&tmp, plist.as_bytes()).map_err(|e| format!("write LaunchAgent tmp: {e}"))?;
+        if let Err(err) = fs::rename(&tmp, plist_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("rename LaunchAgent plist: {err}"));
+        }
+        Ok(())
+    } else {
+        match fs::remove_file(plist_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("remove LaunchAgent plist: {err}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_autostart(enable: bool) -> Result<(), String> {
+    let exe = if enable {
+        std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?
+    } else {
+        PathBuf::new()
+    };
+    set_macos_autostart_at(&macos_launch_agent_plist_path(), &exe, enable)
 }
 
 fn ensure_parent_dir(p: &Path) -> Result<(), String> {
@@ -4359,6 +5070,7 @@ fn path_exists_including_reparse(path: &str) -> bool {
     fs::symlink_metadata(p).is_ok() || p.exists()
 }
 
+#[cfg(target_os = "windows")]
 fn looks_like_local_fs_path(target: &str) -> bool {
     let t = target.trim().trim_matches('"');
     let bytes = t.as_bytes();
@@ -4369,6 +5081,7 @@ fn looks_like_local_fs_path(target: &str) -> bool {
         || t.starts_with(r"\\")
 }
 
+#[cfg(target_os = "windows")]
 fn is_non_app_uri(target: &str) -> bool {
     let low = target.trim().to_ascii_lowercase();
     low.starts_with("http://")
@@ -4378,6 +5091,7 @@ fn is_non_app_uri(target: &str) -> bool {
         || low.starts_with("mailto:")
 }
 
+#[cfg(target_os = "windows")]
 fn pin_target_needs_healing(target: &str) -> bool {
     let trimmed = target.trim();
     if trimmed.is_empty() {
@@ -4396,6 +5110,7 @@ fn pin_target_needs_healing(target: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
 fn normalize_match_token(raw: &str) -> String {
     raw.trim()
         .to_lowercase()
@@ -4404,6 +5119,7 @@ fn normalize_match_token(raw: &str) -> String {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
 fn is_uninstaller_or_helper_label(name_or_target: &str) -> bool {
     let low = name_or_target.to_lowercase();
     low.contains("uninstall")
@@ -4415,6 +5131,7 @@ fn is_uninstaller_or_helper_label(name_or_target: &str) -> bool {
         || low.contains("setup.exe")
 }
 
+#[cfg(target_os = "windows")]
 fn canonical_detect_key_for_pin(pin: &PinItem) -> Option<&'static str> {
     let id_norm = normalize_match_token(&pin.id);
     let title_norm = normalize_match_token(&pin.title);
@@ -4446,6 +5163,7 @@ fn canonical_detect_key_for_pin(pin: &PinItem) -> Option<&'static str> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn alias_tokens_for_pin(pin: &PinItem) -> Vec<String> {
     let mut out = Vec::new();
     let mut push = |s: &str| {
@@ -4499,6 +5217,7 @@ fn alias_tokens_for_pin(pin: &PinItem) -> Vec<String> {
     out
 }
 
+#[cfg(target_os = "windows")]
 fn apply_healed_target(
     pin: &mut PinItem,
     new_target: String,
@@ -4553,6 +5272,7 @@ fn apply_healed_target(
     changed
 }
 
+#[cfg(target_os = "windows")]
 fn try_heal_single_pin(
     pin: &mut PinItem,
     installed_apps: &[crate::apps_indexer::IndexedApp],
@@ -4723,6 +5443,7 @@ fn try_heal_single_pin(
 /// v2 `spaces`, legacy lists, and `customSpaces`) by matching against live running windows,
 /// indexed installed apps, and canonical disk locations.
 /// Returns `true` iff at least one pin was repaired or enriched.
+#[cfg(target_os = "windows")]
 pub fn heal_broken_pins(
     cfg: &mut TestBarConfig,
     installed_apps: &[crate::apps_indexer::IndexedApp],
@@ -4762,7 +5483,13 @@ pub fn heal_broken_pins(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "windows")]
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    #[cfg(target_os = "macos")]
+    const DEFAULT_SPACES_COUNT: usize = 3;
+    #[cfg(not(target_os = "macos"))]
+    const DEFAULT_SPACES_COUNT: usize = 4;
 
     fn make_temp_dir(tag: &str) -> PathBuf {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4796,7 +5523,7 @@ mod tests {
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(cfg.revision, 0);
         assert_eq!(cfg.bar_mode, "dock");
-        assert_eq!(cfg.spaces.len(), 4);
+        assert_eq!(cfg.spaces.len(), DEFAULT_SPACES_COUNT);
         assert!(!cfg.spaces[0].items.is_empty());
         assert!(!normalize_and_migrate(&mut cfg));
 
@@ -4824,7 +5551,7 @@ mod tests {
         let parsed: TestBarConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.bar_mode, "dock");
         assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(parsed.spaces.len(), 4);
+        assert_eq!(parsed.spaces.len(), DEFAULT_SPACES_COUNT);
     }
 
     #[test]
@@ -5482,11 +6209,15 @@ mod tests {
         assert!(format_autostart_command(Path::new(r#"C:\bad"quote\testbar.exe"#)).is_err());
         assert!(format_autostart_command(Path::new(r#""C:\TestBar\testbar.exe""#)).is_err());
 
-        assert!(classify_autostart_delete_error(ERROR_SUCCESS).is_ok());
-        assert!(classify_autostart_delete_error(ERROR_FILE_NOT_FOUND).is_ok());
-        assert!(classify_autostart_delete_error(ERROR_ACCESS_DENIED).is_err());
+        #[cfg(target_os = "windows")]
+        {
+            assert!(classify_autostart_delete_error(ERROR_SUCCESS).is_ok());
+            assert!(classify_autostart_delete_error(ERROR_FILE_NOT_FOUND).is_ok());
+            assert!(classify_autostart_delete_error(ERROR_ACCESS_DENIED).is_err());
+        }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn autostart_registry_roundtrip_on_isolated_temp_subkey() {
         use windows::Win32::System::Registry::{
@@ -5841,6 +6572,7 @@ mod tests {
         assert!(import_config_json("{broken").is_err());
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn heal_broken_pins_repairs_spark_cursor_yandex_unity_and_spaces() {
         use crate::apps_indexer::IndexedApp;
@@ -6125,13 +6857,13 @@ mod tests {
         // Blank/empty spaces never remain empty after normalize_and_migrate
         let mut blank: TestBarConfig = serde_json::from_str("{}").expect("empty object");
         assert!(normalize_and_migrate(&mut blank));
-        assert_eq!(blank.spaces.len(), 4);
+        assert_eq!(blank.spaces.len(), DEFAULT_SPACES_COUNT);
     }
 
     #[test]
     fn space_crud_templates_last_space_guard_cap_and_reorder() {
         let mut cfg = TestBarConfig::default();
-        assert_eq!(cfg.spaces.len(), 4);
+        assert_eq!(cfg.spaces.len(), DEFAULT_SPACES_COUNT);
 
         // Create from templates with deduped widgets & unique slug id
         let created_work = create_space_from_template(
@@ -7309,5 +8041,65 @@ mod tests {
         assert!(toggle_quick_todo(&mut cfg, "t-1"));
         assert!(clear_done_quick_todos(&mut cfg));
         assert!(cfg.quick_notes.todos.is_empty());
+    }
+
+    #[test]
+    fn mac_settings_defaults_validation_normalization_and_launch_agent_plist() {
+        let mut cfg = TestBarConfig::default();
+        assert_eq!(cfg.mac_command_key, "any");
+        assert_eq!(cfg.mac_window_position, "center");
+        assert_eq!(cfg.mac_terminal_app, "auto");
+
+        assert!(set_mac_settings_in_config(
+            &mut cfg,
+            Some("  LEFT ".to_string()),
+            Some("bottom".to_string()),
+            Some("Warp".to_string()),
+        )
+        .unwrap());
+        assert_eq!(cfg.mac_command_key, "left");
+        assert_eq!(cfg.mac_window_position, "bottom");
+        assert_eq!(cfg.mac_terminal_app, "warp");
+
+        // Idempotent no-op
+        assert!(!set_mac_settings_in_config(
+            &mut cfg,
+            Some("left".to_string()),
+            Some("bottom".to_string()),
+            Some("warp".to_string()),
+        )
+        .unwrap());
+
+        // Reject invalid values
+        assert!(set_mac_settings_in_config(&mut cfg, Some("ctrl".into()), None, None).is_err());
+        assert!(set_mac_settings_in_config(&mut cfg, None, Some("top".into()), None).is_err());
+        assert!(set_mac_settings_in_config(&mut cfg, None, None, Some("kitty".into())).is_err());
+
+        // Dirty JSON normalization
+        let dirty = r#"{"macCommandKey":"bogus","macWindowPosition":"floating","macTerminalApp":"cmd"}"#;
+        let parsed = import_config_json(dirty).expect("import dirty mac fields");
+        assert_eq!(parsed.mac_command_key, "any");
+        assert_eq!(parsed.mac_window_position, "center");
+        assert_eq!(parsed.mac_terminal_app, "auto");
+
+        // LaunchAgent bundle path & XML escaping
+        let resolved = resolve_macos_bundle_executable(Path::new(
+            "/Applications/TestBar & Co.app/Contents/MacOS/TestBar",
+        ));
+        assert!(resolved
+            .to_string_lossy()
+            .ends_with("TestBar & Co.app/Contents/MacOS/TestBar")
+            || resolved
+                .to_string_lossy()
+                .ends_with(r"TestBar & Co.app\Contents\MacOS\TestBar"));
+
+        let plist = build_macos_launch_agent_plist(Path::new(
+            "/Applications/TestBar & <Dev>.app/Contents/MacOS/TestBar",
+        ))
+        .expect("build plist");
+        assert!(plist.contains("<string>com.testbar.shell</string>"));
+        assert!(plist.contains("&amp; &lt;Dev&gt;.app"));
+        assert!(plist.contains("<true/>"));
+        assert!(build_macos_launch_agent_plist(Path::new("   ")).is_err());
     }
 }

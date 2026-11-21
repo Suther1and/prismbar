@@ -1,19 +1,52 @@
+#[cfg(target_os = "windows")]
 pub mod apps_indexer;
+#[cfg(target_os = "windows")]
 pub mod audio;
+#[cfg(target_os = "windows")]
 pub mod backdrop;
+#[cfg(target_os = "windows")]
 pub mod battery;
 pub mod config;
+#[cfg(target_os = "windows")]
 pub mod coordinator;
+#[cfg(target_os = "windows")]
 pub mod file_explorer;
+#[cfg(target_os = "windows")]
 pub mod icon_cache;
+#[cfg(target_os = "windows")]
 pub mod media;
+#[cfg(target_os = "windows")]
 pub mod network_monitor;
+#[cfg(target_os = "windows")]
 pub mod quick_toggles;
+#[cfg(target_os = "windows")]
 pub mod system_widgets;
+#[cfg(target_os = "windows")]
 pub mod telemetry;
+#[cfg(target_os = "windows")]
 pub mod weather;
+#[cfg(target_os = "windows")]
 pub mod win_shell;
+#[cfg(target_os = "windows")]
 pub mod windows_tracker;
+
+#[path = "macos/command_tap.rs"]
+pub mod mac_command_tap;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(target_os = "macos")]
+pub fn run(_hide_native: bool) {
+    macos::app::run();
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) static WIN32_TOPMOST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "windows")]
+mod windows_desktop {
+    use super::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,9 +92,6 @@ const MAX_ICON_SOURCES_ENTRIES: usize = 2048;
 const MAX_JUMP_LIST_CACHE_ENTRIES: usize = 128;
 
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) static WIN32_TOPMOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -7393,3 +7423,11 @@ mod integration_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+}
+
+#[cfg(target_os = "windows")]
+pub use windows_desktop::{
+    compute_secondary_taskbar_bounds, run, run_watchdog_mode, ActiveSurfaceMetrics, AppState,
+    FlyoutHideEvent, FlyoutRequest, PatchArg, PendingSurfaceExit, StartSentSnapshot,
+    StartShownEvent, StartStateEvent,
+};
