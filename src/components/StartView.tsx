@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { applyAppearanceToDocument } from '../lib/appearance';
 import { canOpenFileLocation, canRunAsAdmin, formatIpcError } from '../lib/flyoutLogic';
 import {
   animateSurfaceIn,
@@ -11,7 +12,9 @@ import {
   fetchIconsBatch,
   findMatchingGroupForPin,
   fsOpenInExplorer,
+  getNetworkSnapshot,
   getPeripheralBatteries,
+  getQuickTogglesState,
   getWeather,
   hideBatteryDevice,
   iconCache,
@@ -32,6 +35,7 @@ import {
   restoreAllTrayApps,
   restoreTrayApp,
   setAppearanceSettings,
+  setSpaceWidgetLayout,
   setSpaceWidgets,
   setTaskbarWidgets,
   surfaceExitAck,
@@ -45,9 +49,12 @@ import {
   type IndexedApp,
   type IndexedFile,
   type MediaState,
+  type NetworkSnapshot,
   type PeripheralBattery,
   type PinItem,
+  type QuickTogglesState,
   type SecondaryTaskbarMode,
+  type SpaceHeaderWidget,
   type SpaceLayoutKind,
   type SpaceWidgetId,
   type StartShownEvent,
@@ -86,6 +93,7 @@ import {
   resolveConfiguredSpaces,
   resolveCustomColorRgb,
   resolvePinAction,
+  resolveSpaceHeaderWidgets,
   settleStartOpen,
   shouldResetExplorerOnReopen,
   START_ENTER_ANIM_MS,
@@ -102,6 +110,7 @@ import {
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
+  AppsGridIcon,
   ArrowDownIcon,
   ArrowUpIcon,
   CloseWindowIcon,
@@ -129,7 +138,7 @@ import { StartFileExplorer } from './start/StartFileExplorer';
 import { StartHeader } from './start/StartHeader';
 import { StartPinDrawer } from './start/StartPinDrawer';
 import { StartSettingsOverlay } from './start/StartSettingsOverlay';
-import { StartSpaces } from './start/StartSpaces';
+import { renderStandaloneWidgetCard, StartSpaces } from './start/StartSpaces';
 
 const EMPTY_RANKED_SEARCH: RankedSearchResult = {
   items: [],
@@ -231,6 +240,8 @@ export const StartView: React.FC = () => {
   const [periphsRefreshing, setPeriphsRefreshing] = useState(false);
   const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
   const [weatherRefreshing, setWeatherRefreshing] = useState(false);
+  const [network, setNetwork] = useState<NetworkSnapshot | null>(null);
+  const [quickToggles, setQuickToggles] = useState<QuickTogglesState | null>(null);
   const [iconMap, setIconMap] = useState<Record<string, string>>({});
 
   // Non-remounting Paint-Sync animation state (hidden at 0 opacity at boot inside Tauri)
@@ -249,6 +260,7 @@ export const StartView: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [periphOpen, setPeriphOpen] = useState(false);
   const [weatherOpen, setWeatherOpen] = useState(false);
+  const [activeHeaderWidgetId, setActiveHeaderWidgetId] = useState<SpaceWidgetId | null>(null);
   const [powerOpen, setPowerOpen] = useState(false);
   const [armedPower, setArmedPower] = useState<ArmedPowerKind>(null);
   const [addingSpace, setAddingSpace] = useState(false);
@@ -454,7 +466,10 @@ export const StartView: React.FC = () => {
 
   // 2-layer ambient aura crossfade state
   const spaceTheme = ['personal', 'work', 'studio', 'games'].includes(space) ? space : 'custom';
+  const customAuraRgb =
+    config?.accentMode === 'custom' ? normalizeRgbTriplet(config?.accentRgb) : null;
   const targetAuraRgb =
+    customAuraRgb ??
     normalizeRgbTriplet(activeSpace?.accentRgb) ??
     BUILTIN_SPACE_AURA_RGB[space] ??
     '167, 139, 250';
@@ -487,6 +502,9 @@ export const StartView: React.FC = () => {
 
   const handleApplyConfig = useCallback((next: TestBarConfig) => {
     setConfig((prev) => applyConfigUpdate(prev, next));
+    if (typeof document !== 'undefined') {
+      applyAppearanceToDocument(next);
+    }
   }, []);
 
   const handleOptimisticReorder = useCallback(
@@ -521,6 +539,7 @@ export const StartView: React.FC = () => {
     setArmedPower(null);
     setPeriphOpen(false);
     setWeatherOpen(false);
+    setActiveHeaderWidgetId(null);
     setAddingSpace(false);
     setManagingSpaceId(null);
     setWidgetBuilderOpen(false);
@@ -987,6 +1006,69 @@ export const StartView: React.FC = () => {
       .catch(() => {});
   }, [needsWeather, weatherKey, weather]);
 
+  const activeHeaderWidgets = useMemo(
+    () => (activeSpace ? resolveSpaceHeaderWidgets(activeSpace) : []),
+    [activeSpace],
+  );
+  const activeSpaceHasNetwork = useMemo(
+    () =>
+      Boolean(
+        activeSpace?.widgets?.includes('network') ||
+          activeHeaderWidgets.some((w) => w.id === 'network') ||
+          activeHeaderWidgetId === 'network',
+      ),
+    [activeSpace?.widgets, activeHeaderWidgets, activeHeaderWidgetId],
+  );
+  const activeSpaceHasQuickToggles = useMemo(
+    () =>
+      Boolean(
+        activeSpace?.widgets?.includes('quick_toggles') ||
+          activeHeaderWidgets.some((w) => w.id === 'quick_toggles') ||
+          activeHeaderWidgetId === 'quick_toggles',
+      ),
+    [activeSpace?.widgets, activeHeaderWidgets, activeHeaderWidgetId],
+  );
+
+  // Lazy-poll network throughput + TCP ping ONLY while Start is visible & network widget is active
+  useEffect(() => {
+    if (anim.phase === 'hidden' || !activeSpaceHasNetwork) return;
+    let cancelled = false;
+    let tick = 0;
+    const poll = () => {
+      const probePing = tick % 2 === 0;
+      tick += 1;
+      getNetworkSnapshot(probePing)
+        .then((snap) => {
+          if (!cancelled && mountedRef.current) {
+            setNetwork(snap);
+          }
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = window.setInterval(poll, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [anim.phase, activeSpaceHasNetwork]);
+
+  // Lazy-fetch system quick toggles ONLY while Start is visible & quick_toggles widget is active
+  useEffect(() => {
+    if (anim.phase === 'hidden' || !activeSpaceHasQuickToggles) return;
+    let cancelled = false;
+    getQuickTogglesState()
+      .then((st) => {
+        if (!cancelled && mountedRef.current) {
+          setQuickToggles(st);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [anim.phase, activeSpaceHasQuickToggles]);
+
   const handleSelectWeatherCity = useCallback(
     async (city: WeatherCityOption) => {
       try {
@@ -1229,6 +1311,7 @@ export const StartView: React.FC = () => {
       explorerSessionRef.current = null;
       setPeriphOpen(false);
       setWeatherOpen(false);
+      setActiveHeaderWidgetId(null);
       setPowerOpen(false);
       setArmedPower(null);
       setTileCtx(null);
@@ -1486,7 +1569,13 @@ export const StartView: React.FC = () => {
       setEditCustomColor(item.customColor ?? null);
       setEditCustomIcon(item.customIcon ?? null);
       setEditIconData(item.customIcon === 'custom_image' ? (item.iconData ?? null) : null);
-      setEditTileSize(item.tileSize === 'hero' ? 'hero' : 'compact');
+      setEditTileSize(
+        item.tileSize === 'hero'
+          ? 'hero'
+          : item.tileSize === 'small'
+            ? 'small'
+            : 'compact',
+      );
       setEditSection(item.section === 'bottom' ? 'bottom' : 'main');
       setEditRunAsAdmin(Boolean(item.runAsAdmin));
       setPickingCustomImg(false);
@@ -1644,25 +1733,53 @@ export const StartView: React.FC = () => {
     }
 
     if (spaceKey !== 'game_combos' && item.kind !== 'combo') {
-      const isHeroTile = item.tileSize === 'hero';
-      actions.push({
-        id: 'toggle-size',
-        label: isHeroTile ? 'Сделать обычной' : 'Сделать крупной',
-        icon: isHeroTile ? <RestoreIcon className="ic14" /> : <MaximizeIcon className="ic14" />,
-        run: () => {
-          updatePin({
-            space: spaceKey,
-            pinId: item.id,
-            tileSize: isHeroTile ? 'compact' : 'hero',
-          })
-            .then((next) => {
-              handleApplyConfig(next);
-              showToast(isHeroTile ? 'Обычный размер плитки' : 'Крупная плитка');
-            })
-            .catch((err) => showToast(formatIpcError(err)));
-          setTileCtx(null);
+      const curSize =
+        item.tileSize === 'hero'
+          ? 'hero'
+          : item.tileSize === 'small'
+            ? 'small'
+            : 'compact';
+      const sizeOptions = [
+        {
+          size: 'small' as const,
+          label: 'Сделать маленькой',
+          toast: 'Маленькая плитка',
+          icon: <AppsGridIcon className="ic14" />,
         },
-      });
+        {
+          size: 'compact' as const,
+          label: 'Сделать средней',
+          toast: 'Средняя плитка',
+          icon: <RestoreIcon className="ic14" />,
+        },
+        {
+          size: 'hero' as const,
+          label: 'Сделать большой',
+          toast: 'Большая плитка',
+          icon: <MaximizeIcon className="ic14" />,
+        },
+      ];
+      for (const opt of sizeOptions) {
+        if (opt.size === curSize) continue;
+        actions.push({
+          id: `size-${opt.size}`,
+          label: opt.label,
+          icon: opt.icon,
+          run: () => {
+            updatePin({
+              space: spaceKey,
+              pinId: item.id,
+              tileSize: opt.size,
+            })
+              .then((next) => {
+                handleApplyConfig(next);
+                showToast(opt.toast);
+              })
+              .catch((err) => showToast(formatIpcError(err)));
+            setTileCtx(null);
+          },
+        });
+      }
 
       const isBottomTile = item.section === 'bottom';
       actions.push({
@@ -1890,7 +2007,12 @@ export const StartView: React.FC = () => {
           run: () => {
             ipc<TestBarConfig>('add_pin', {
               space: activeSpace.id,
-              item: { ...pinCandidate, id: `pin-${Date.now()}`, iconData: null },
+              item: {
+                ...pinCandidate,
+                id: `pin-${Date.now()}`,
+                iconData: null,
+                tileSize: config?.defaultTileSize ?? 'compact',
+              },
             })
               .then((next) => {
                 handleApplyConfig(next);
@@ -2151,6 +2273,8 @@ export const StartView: React.FC = () => {
           setDrawerOpen(false);
         } else if (settingsOpen) {
           setSettingsOpen(false);
+        } else if (activeHeaderWidgetId) {
+          setActiveHeaderWidgetId(null);
         } else if (weatherOpen) {
           setWeatherOpen(false);
         } else if (periphOpen) {
@@ -2180,6 +2304,7 @@ export const StartView: React.FC = () => {
         !managingSpaceId &&
         !widgetBuilderOpen &&
         activeExplorerPath === null &&
+        !activeHeaderWidgetId &&
         !periphOpen &&
         !weatherOpen &&
         !powerOpen &&
@@ -2219,6 +2344,7 @@ export const StartView: React.FC = () => {
         !addingSpace &&
         !managingSpaceId &&
         !widgetBuilderOpen &&
+        !activeHeaderWidgetId &&
         !weatherOpen &&
         !emptyCtx &&
         activeExplorerPath === null &&
@@ -2309,6 +2435,7 @@ export const StartView: React.FC = () => {
           accentRgb: '242,180,75',
           iconKey: 'folder',
           iconData: null,
+          tileSize: config?.defaultTileSize ?? 'compact',
         },
       });
       handleApplyConfig(updated);
@@ -2345,6 +2472,7 @@ export const StartView: React.FC = () => {
           accentRgb: '82,184,242',
           iconKey: isExe ? baseName.toLowerCase() : 'file',
           iconData: null,
+          tileSize: config?.defaultTileSize ?? 'compact',
         },
       });
       handleApplyConfig(updated);
@@ -2373,6 +2501,7 @@ export const StartView: React.FC = () => {
         accentRgb: '167,139,250',
         iconKey: 'url',
         iconData: null,
+        tileSize: config?.defaultTileSize ?? 'compact',
       },
     });
     handleApplyConfig(updated);
@@ -2400,6 +2529,7 @@ export const StartView: React.FC = () => {
           iconKey: app.iconKey || app.name.toLowerCase(),
           iconData: null,
           matchAumid: app.aumid ?? null,
+          tileSize: config?.defaultTileSize ?? 'compact',
         },
       });
       handleApplyConfig(updated);
@@ -2473,6 +2603,19 @@ export const StartView: React.FC = () => {
     }
   };
 
+  const handleSetSpaceWidgetLayout = async (
+    spaceId: string,
+    widgets: SpaceWidgetId[],
+    headerWidgets: SpaceHeaderWidget[],
+  ) => {
+    try {
+      const updated = await setSpaceWidgetLayout(spaceId, widgets, headerWidgets);
+      handleApplyConfig(updated);
+    } catch (err) {
+      showToast(formatIpcError(err));
+    }
+  };
+
   const handleOpenWidgetBuilder = useCallback(
     (spaceId: string) => {
       if (spaceRef.current !== spaceId) {
@@ -2482,6 +2625,7 @@ export const StartView: React.FC = () => {
       explorerSessionRef.current = null;
       setManagingSpaceId(null);
       setAddingSpace(false);
+      setActiveHeaderWidgetId(null);
       setWidgetBuilderOpen(true);
     },
     [selectSpace],
@@ -2534,15 +2678,18 @@ export const StartView: React.FC = () => {
     [],
   );
 
+  const isCustomAccent = config?.accentMode === 'custom';
   const activeAccentHex = activeSpace?.accentHex?.trim() || '#52B8F2';
   const activeAccentRgb = normalizeRgbTriplet(activeSpace?.accentRgb) ?? '82, 184, 242';
   const spaceAccentStyle = useMemo(
     () =>
-      ({
-        ['--accent' as string]: activeAccentHex,
-        ['--accent-rgb' as string]: activeAccentRgb,
-      }) as React.CSSProperties,
-    [activeAccentHex, activeAccentRgb],
+      isCustomAccent
+        ? ({} as React.CSSProperties)
+        : ({
+            ['--accent' as string]: activeAccentHex,
+            ['--accent-rgb' as string]: activeAccentRgb,
+          } as React.CSSProperties),
+    [isCustomAccent, activeAccentHex, activeAccentRgb],
   );
 
   const startVisible = anim.phase !== 'hidden';
@@ -2554,11 +2701,18 @@ export const StartView: React.FC = () => {
       data-space={spaceTheme}
       data-visible={startVisible ? 'true' : 'false'}
       style={spaceAccentStyle}
-      onClick={() => {
+      onClick={(e) => {
         if (searchCtx) setSearchCtx(null);
         if (tileCtx) setTileCtx(null);
         if (emptyCtx) setEmptyCtx(null);
         if (tileEdit) setTileEdit(null);
+        const target = e.target as HTMLElement | null;
+        if (
+          activeHeaderWidgetId &&
+          !target?.closest('.hdr-widget-pop, .hdr-overflow-pop, .hdr-widget-pill')
+        ) {
+          setActiveHeaderWidgetId(null);
+        }
         if (powerOpen) {
           setPowerOpen(false);
           setArmedPower(null);
@@ -2577,7 +2731,7 @@ export const StartView: React.FC = () => {
         e.preventDefault();
         if (
           target?.closest(
-            '.app-tile, .qlink, .game-card, .combo-row, .space-tab, .v3-explorer-slot, .search-backdrop, .settings-backdrop, .tile-edit-backdrop, .ctx-card, .tile-ctx-menu, .periph-pop, .weather-hdr-pop, .power-pop, .space-pop, .drawer-sheet, .widget-builder-sheet, .combo-builder-sheet',
+            '.app-tile, .qlink, .game-card, .combo-row, .space-tab, .v3-explorer-slot, .search-backdrop, .settings-backdrop, .tile-edit-backdrop, .ctx-card, .tile-ctx-menu, .periph-pop, .weather-hdr-pop, .power-pop, .space-pop, .hdr-widget-pop, .hdr-overflow-pop, .hdr-widget-pill, .drawer-sheet, .widget-builder-sheet, .combo-builder-sheet',
           )
         ) {
           return;
@@ -2589,6 +2743,7 @@ export const StartView: React.FC = () => {
         setWeatherOpen(false);
         setPowerOpen(false);
         setArmedPower(null);
+        setActiveHeaderWidgetId(null);
         setEmptyCtxIdx(0);
         setEmptyCtx({ x: pos.x, y: pos.y });
       }}
@@ -2614,10 +2769,18 @@ export const StartView: React.FC = () => {
         <StartHeader
           space={space}
           spaces={resolvedSpaces}
+          headerWidgets={activeHeaderWidgets}
           periphs={periphs}
           periphsRefreshing={periphsRefreshing}
           hiddenBatteryIds={config?.hiddenBatteryIds}
           audio={audio}
+          media={media}
+          telem={telem}
+          clips={clips}
+          network={network}
+          quickNotes={config?.quickNotes ?? null}
+          quickToggles={quickToggles}
+          activeHeaderWidgetId={activeHeaderWidgetId}
           periphOpen={periphOpen}
           weather={weather}
           weatherRefreshing={weatherRefreshing}
@@ -2637,9 +2800,19 @@ export const StartView: React.FC = () => {
           addingSpace={addingSpace}
           managingSpaceId={managingSpaceId}
           onSelectSpace={selectSpace}
+          onToggleHeaderWidget={(wid) => {
+            setActiveHeaderWidgetId((cur) => (cur === wid ? null : wid));
+            setPeriphOpen(false);
+            setWeatherOpen(false);
+            setPowerOpen(false);
+            setArmedPower(null);
+            setAddingSpace(false);
+            setManagingSpaceId(null);
+          }}
           onTogglePeriph={() => {
             setPeriphOpen((v) => !v);
             setWeatherOpen(false);
+            setActiveHeaderWidgetId(null);
           }}
           onClosePeriph={() => setPeriphOpen(false)}
           onRefreshPeriphs={handleRefreshPeriphs}
@@ -2647,6 +2820,7 @@ export const StartView: React.FC = () => {
           onToggleWeather={() => {
             setWeatherOpen((v) => !v);
             setPeriphOpen(false);
+            setActiveHeaderWidgetId(null);
           }}
           onCloseWeather={() => setWeatherOpen(false)}
           onRefreshWeather={handleRefreshWeather}
@@ -2658,6 +2832,50 @@ export const StartView: React.FC = () => {
               .then(setAudio)
               .catch((err) => showToast(formatIpcError(err)));
           }}
+          onSetMedia={setMedia}
+          onSetAudio={handleSetAudioFromChild}
+          onSetNetwork={setNetwork}
+          onSetQuickToggles={setQuickToggles}
+          onConfigUpdated={handleApplyConfig}
+          onShowToast={showToast}
+          renderHeaderWidgetPopover={(wid) =>
+            renderStandaloneWidgetCard(wid, {
+              mode: 'popover',
+              spaceId: space,
+              activeSpace,
+              config,
+              games,
+              apps,
+              audio,
+              media,
+              telem,
+              clips,
+              periphs,
+              periphsRefreshing,
+              weather,
+              weatherRefreshing,
+              network,
+              quickToggles,
+              startVisible,
+              startAnimSettled: anim.phase === 'open',
+              iconMap,
+              onSetAudio: handleSetAudioFromChild,
+              onSetMedia: setMedia,
+              onSetTelem: setTelem,
+              onSetClips: setClips,
+              onSetNetwork: setNetwork,
+              onSetQuickToggles: setQuickToggles,
+              onRefreshWeather: handleRefreshWeather,
+              onRefreshPeriphs: handleRefreshPeriphs,
+              onResolveIconKeys: handleResolveIconKeys,
+              onSetConfig: handleApplyConfig,
+              onAudioDragStateChange: handleAudioDragStateChange,
+              onHideBatteryDevice: handleHideBatteryDevice,
+              onShowToast: showToast,
+              onLaunchPin: launchPin,
+              onOpenTileContext: openTileContextMenu,
+            })
+          }
           onOpenSearch={() => {
             setSearchTrigger('click');
             setSearchOpen(true);
@@ -2668,6 +2886,7 @@ export const StartView: React.FC = () => {
             setWidgetBuilderOpen(false);
             setWeatherOpen(false);
             setPeriphOpen(false);
+            setActiveHeaderWidgetId(null);
             setTileCtx(null);
             setEmptyCtx(null);
             setTileEdit(null);
@@ -2684,6 +2903,7 @@ export const StartView: React.FC = () => {
             setWidgetBuilderOpen(false);
             setWeatherOpen(false);
             setPeriphOpen(false);
+            setActiveHeaderWidgetId(null);
             setTileCtx(null);
             setEmptyCtx(null);
             setTileEdit(null);
@@ -2697,6 +2917,7 @@ export const StartView: React.FC = () => {
             setWidgetBuilderOpen(false);
             setWeatherOpen(false);
             setPeriphOpen(false);
+            setActiveHeaderWidgetId(null);
             setTileCtx(null);
             setEmptyCtx(null);
             setTileEdit(null);
@@ -2706,6 +2927,7 @@ export const StartView: React.FC = () => {
             setArmedPower(null);
             setWeatherOpen(false);
             setPeriphOpen(false);
+            setActiveHeaderWidgetId(null);
           }}
           onClosePower={() => {
             setPowerOpen(false);
@@ -2718,6 +2940,7 @@ export const StartView: React.FC = () => {
               setManagingSpaceId(null);
               setPeriphOpen(false);
               setWeatherOpen(false);
+              setActiveHeaderWidgetId(null);
               setTileCtx(null);
               setEmptyCtx(null);
               setTileEdit(null);
@@ -2729,6 +2952,7 @@ export const StartView: React.FC = () => {
               setAddingSpace(false);
               setPeriphOpen(false);
               setWeatherOpen(false);
+              setActiveHeaderWidgetId(null);
               setTileCtx(null);
               setEmptyCtx(null);
               setTileEdit(null);
@@ -2746,6 +2970,7 @@ export const StartView: React.FC = () => {
           onClick={() => {
             if (periphOpen) setPeriphOpen(false);
             if (weatherOpen) setWeatherOpen(false);
+            if (activeHeaderWidgetId) setActiveHeaderWidgetId(null);
             if (powerOpen) {
               setPowerOpen(false);
               setArmedPower(null);
@@ -2782,6 +3007,7 @@ export const StartView: React.FC = () => {
                         accentRgb: activeSpace?.accentRgb || '56,189,248',
                         iconKey: 'folder',
                         iconData: null,
+                        tileSize: config?.defaultTileSize ?? 'compact',
                       },
                     });
                     handleApplyConfig(next);
@@ -2807,6 +3033,8 @@ export const StartView: React.FC = () => {
               periphsRefreshing={periphsRefreshing}
               weather={weather}
               weatherRefreshing={weatherRefreshing}
+              network={network}
+              quickToggles={quickToggles}
               editMode={editMode}
               shiftHeld={shiftHeld}
               widgetBuilderOpen={widgetBuilderOpen}
@@ -2827,11 +3055,17 @@ export const StartView: React.FC = () => {
               onSetMedia={setMedia}
               onSetTelem={setTelem}
               onSetClips={setClips}
+              onSetNetwork={setNetwork}
+              onSetQuickToggles={setQuickToggles}
               onShowToast={showToast}
               onRefreshWeather={handleRefreshWeather}
               onRefreshPeriphs={handleRefreshPeriphs}
-              onToggleWidgetBuilder={(open) => setWidgetBuilderOpen(open)}
+              onToggleWidgetBuilder={(open) => {
+                if (open) setActiveHeaderWidgetId(null);
+                setWidgetBuilderOpen(open);
+              }}
               onSetSpaceWidgets={handleSetSpaceWidgets}
+              onSetSpaceWidgetLayout={handleSetSpaceWidgetLayout}
               startVisible={startVisible}
               startAnimSettled={anim.phase === 'open'}
               onAudioDragStateChange={handleAudioDragStateChange}
@@ -2912,6 +3146,16 @@ export const StartView: React.FC = () => {
               handleApplyConfig(next);
               showToast('Конфигурация импортирована');
             }
+          }}
+          onOpenSpaceWidgets={(targetId) => {
+            setSettingsOpen(false);
+            if (spaceRef.current !== targetId) selectSpace(targetId);
+            setActiveExplorerPath(null);
+            explorerSessionRef.current = null;
+            setManagingSpaceId(null);
+            setAddingSpace(false);
+            setActiveHeaderWidgetId(null);
+            setWidgetBuilderOpen(true);
           }}
           onRestoreWindowsAndExit={() => {
             ipc('restore_windows_taskbar_and_exit').catch((err) =>
@@ -3020,8 +3264,12 @@ export const StartView: React.FC = () => {
                           {editPinTitle.trim() || editCtx.item.title}
                         </span>
                         <span className="tile-edit-preview-sub">
-                          {editTileSize === 'hero' ? 'Крупная' : 'Обычная'} ·{' '}
-                          {editSection === 'bottom' ? 'Нижний блок' : 'Верхний блок'}
+                          {editTileSize === 'hero'
+                            ? 'Большая'
+                            : editTileSize === 'small'
+                              ? 'Маленькая'
+                              : 'Средняя'}{' '}
+                          · {editSection === 'bottom' ? 'Нижний блок' : 'Верхний блок'}
                         </span>
                       </div>
                     </div>
@@ -3059,11 +3307,20 @@ export const StartView: React.FC = () => {
                       <button
                         type="button"
                         role="radio"
+                        aria-checked={editTileSize === 'small'}
+                        className={`space-seg-btn ${editTileSize === 'small' ? 'active' : ''}`}
+                        onClick={() => setEditTileSize('small')}
+                      >
+                        Маленькая
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
                         aria-checked={editTileSize === 'compact'}
                         className={`space-seg-btn ${editTileSize === 'compact' ? 'active' : ''}`}
                         onClick={() => setEditTileSize('compact')}
                       >
-                        Обычная
+                        Средняя
                       </button>
                       <button
                         type="button"
@@ -3072,7 +3329,7 @@ export const StartView: React.FC = () => {
                         className={`space-seg-btn ${editTileSize === 'hero' ? 'active' : ''}`}
                         onClick={() => setEditTileSize('hero')}
                       >
-                        Крупная
+                        Большая
                       </button>
                     </div>
                   </div>
