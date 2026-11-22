@@ -27,6 +27,7 @@ const MACOS_UNSUPPORTED_WIDGETS: ReadonlySet<SpaceWidgetId> = new Set([
   'audio_mixer',
   'media',
   'game_combos',
+  'notes',
 ]);
 
 const ALL_SPACE_WIDGET_IDS: readonly SpaceWidgetId[] = SPACE_WIDGET_CATALOG.map((w) => w.id);

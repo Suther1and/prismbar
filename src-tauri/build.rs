@@ -14,6 +14,8 @@ fn main() {
             "CoreFoundation",
             "ApplicationServices",
             "QuickLookThumbnailing",
+            "QuartzCore",
+            "Carbon",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

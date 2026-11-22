@@ -1364,10 +1364,11 @@ describe('startLogic animations, unlimited grids, Shift layer, Power & custom sp
   it('adapts widgets, templates, path targets, and shift badges cleanly for macOS', () => {
     expect(getAvailableSpaceWidgetIds('windows')).toHaveLength(12);
     const macWidgetIds = getAvailableSpaceWidgetIds('macos');
-    expect(macWidgetIds).toHaveLength(9);
+    expect(macWidgetIds).toHaveLength(8);
     expect(macWidgetIds).not.toContain('audio_mixer');
     expect(macWidgetIds).not.toContain('media');
     expect(macWidgetIds).not.toContain('game_combos');
+    expect(macWidgetIds).not.toContain('notes');
     expect(getSupportedSpaceWidgetCatalog('macos').map((w) => w.id)).toEqual(macWidgetIds);
     expect(getSpaceWidgetCatalog('macos').map((w) => w.id)).toEqual(macWidgetIds);
 

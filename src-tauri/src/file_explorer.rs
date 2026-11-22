@@ -575,8 +575,8 @@ fn sort_entries(entries: &mut [FileEntry], sort_by: Option<&str>, sort_dir: Opti
         .unwrap_or(false);
 
     entries.sort_by(|a, b| {
-        // Directories always appear before files.
-        if a.is_dir != b.is_dir {
+        // Directories appear before files for name/size/type; date sort interleaves chronologically.
+        if field != "date" && a.is_dir != b.is_dir {
             return b.is_dir.cmp(&a.is_dir);
         }
 
@@ -1719,5 +1719,37 @@ mod tests {
         let g_changed = ExplorerComGuard::from_hresult(RPC_E_CHANGED_MODE);
         assert!(g_changed.is_usable());
         assert!(!g_changed.should_uninit);
+    }
+
+    #[test]
+    fn date_sort_interleaves_dirs_and_files_chronologically() {
+        let mk = |name: &str, is_dir: bool, modified_ms: u64| FileEntry {
+            name: name.to_string(),
+            path: format!(r"C:\Test\{name}"),
+            is_dir,
+            is_hidden: false,
+            size_bytes: 0,
+            modified_ms,
+            extension: String::new(),
+            category: if is_dir { "folder" } else { "file" }.to_string(),
+            has_preview: false,
+        };
+        let mut entries = vec![
+            mk("OldFolder", true, 100),
+            mk("NewFile.txt", false, 300),
+            mk("NewFolder", true, 250),
+            mk("OlderFile.txt", false, 150),
+        ];
+
+        sort_entries(&mut entries, Some("date"), Some("desc"));
+        let names_desc: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names_desc,
+            vec!["NewFile.txt", "NewFolder", "OlderFile.txt", "OldFolder"]
+        );
+
+        sort_entries(&mut entries, Some("name"), Some("asc"));
+        assert!(entries[0].is_dir && entries[1].is_dir);
+        assert!(!entries[2].is_dir && !entries[3].is_dir);
     }
 }

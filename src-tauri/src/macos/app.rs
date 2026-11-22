@@ -23,8 +23,7 @@ use super::weather::{self, WeatherCityOption, WeatherSnapshot};
 
 const START_WIDTH_LOGICAL: f64 = 1188.0;
 const START_HEIGHT_LOGICAL: f64 = 728.0;
-const START_EXIT_ANIM_MS: u64 = 140;
-const START_BLUR_GRACE_MS: u64 = 180;
+const START_BLUR_GRACE_MS: u64 = 220;
 const PERIODIC_REINDEX_INTERVAL_SECS: u64 = 15 * 60;
 const MAX_ICON_SOURCES_ENTRIES: usize = 2048;
 
@@ -32,6 +31,7 @@ const TRAY_ICON_PNG: &[u8] = include_bytes!("../../icons/32x32.png");
 
 static MONOTONIC_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 static TAP_CALLBACK_CTX: OnceLock<TapCallbackContext> = OnceLock::new();
+static RESIGN_OBSERVER_APP: OnceLock<AppHandle> = OnceLock::new();
 
 struct TapCallbackContext {
     app: AppHandle,
@@ -349,6 +349,15 @@ where
     Ok((candidate, true))
 }
 
+fn sync_window_blur(app: &AppHandle, glass_depth: &str) {
+    let blur_enabled = !glass_depth.trim().eq_ignore_ascii_case("solid");
+    if let Some(win) = app.get_webview_window("start") {
+        if let Ok(ns_win) = win.ns_window() {
+            bridge_ffi::set_blur_enabled(ns_win, blur_enabled);
+        }
+    }
+}
+
 fn position_start_window(app: &AppHandle, position_mode: &str) {
     if let Some(win) = app.get_webview_window("start") {
         if let Ok(ns_win) = win.ns_window() {
@@ -385,6 +394,7 @@ fn show_start(app: &AppHandle) {
             cfg.hidden_battery_ids.clone(),
         )
     };
+    let blur_enabled = !cfg_snapshot.glass_depth.trim().eq_ignore_ascii_case("solid");
     position_start_window(app, &position_mode);
 
     let _ = app.emit(
@@ -393,7 +403,7 @@ fn show_start(app: &AppHandle) {
             open: true,
             gen: show_gen,
             monitor: Some("primary".to_string()),
-            immediate: false,
+            immediate: true,
         },
     );
     let _ = app.emit_to("start", "config-updated", &cfg_snapshot);
@@ -402,9 +412,8 @@ fn show_start(app: &AppHandle) {
 
     if let Some(win) = app.get_webview_window("start") {
         let _ = win.show();
-        let _ = win.set_focus();
         if let Ok(ns_win) = win.ns_window() {
-            bridge_ffi::show_and_focus_window(ns_win);
+            bridge_ffi::show_and_focus_window(ns_win, blur_enabled);
         }
     }
 
@@ -450,41 +459,17 @@ fn finish_hide_start(app: &AppHandle) {
     }
     if let Some(win) = app.get_webview_window("start") {
         let _ = win.hide();
-    }
-    if st.restore_focus_on_hide.swap(false, Ordering::AcqRel) {
-        let prev_pid = st.prev_frontmost_pid.load(Ordering::Acquire);
-        let own_pid = std::process::id() as i32;
-        if prev_pid > 0 && prev_pid != own_pid {
-            let _ = bridge_ffi::activate_pid(prev_pid);
+        if let Ok(ns_win) = win.ns_window() {
+            bridge_ffi::hide_window(ns_win, false);
         }
     }
 }
 
-fn hide_start(app: &AppHandle, immediate: bool, restore_prev_focus: bool) {
+fn hide_start(app: &AppHandle, _immediate: bool, yield_app_focus: bool) {
     let st = app.state::<MacAppState>();
-    let was_open = st.start_open.swap(false, Ordering::AcqRel);
+    st.start_open.store(false, Ordering::Release);
     let hide_gen = st.start_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    st.restore_focus_on_hide
-        .store(restore_prev_focus, Ordering::Release);
-
-    if immediate {
-        let _ = app.emit(
-            "start-state",
-            StartStateEvent {
-                open: false,
-                gen: hide_gen,
-                monitor: None,
-                immediate: true,
-            },
-        );
-        finish_hide_start(app);
-        return;
-    }
-
-    if !was_open {
-        st.restore_focus_on_hide.store(false, Ordering::Release);
-        return;
-    }
+    st.restore_focus_on_hide.store(false, Ordering::Release);
 
     let _ = app.emit(
         "start-state",
@@ -492,40 +477,80 @@ fn hide_start(app: &AppHandle, immediate: bool, restore_prev_focus: bool) {
             open: false,
             gen: hide_gen,
             monitor: None,
-            immediate: false,
+            immediate: true,
         },
     );
 
-    let h_hide = app.clone();
-    let gen_ref = Arc::clone(&st.start_gen);
-    let open_ref = Arc::clone(&st.start_open);
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(START_EXIT_ANIM_MS)).await;
-        if gen_ref.load(Ordering::SeqCst) != hide_gen || open_ref.load(Ordering::Acquire) {
-            return;
+    if let Some(win) = app.get_webview_window("start") {
+        let _ = win.hide();
+        if let Ok(ns_win) = win.ns_window() {
+            bridge_ffi::hide_window(ns_win, yield_app_focus);
         }
-        let h = h_hide.clone();
-        let _ = h_hide.run_on_main_thread(move || {
-            let st_m = h.state::<MacAppState>();
-            if st_m.start_gen.load(Ordering::SeqCst) == hide_gen
-                && !st_m.start_open.load(Ordering::Acquire)
-            {
-                finish_hide_start(&h);
-            }
-        });
+    }
+}
+
+async fn hide_start_and_wait(app: &AppHandle, yield_app_focus: bool) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let h = app.clone();
+    let dispatched = app.run_on_main_thread(move || {
+        hide_start(&h, true, yield_app_focus);
+        let _ = tx.send(());
     });
+    if dispatched.is_ok() {
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(120));
+        })
+        .await;
+    }
+}
+
+fn dismiss_on_focus_loss(app: &AppHandle) {
+    let st = app.state::<MacAppState>();
+    if st.modal_picker_depth.load(Ordering::Acquire) > 0 {
+        return;
+    }
+    let ns_visible = app
+        .get_webview_window("start")
+        .and_then(|w| w.ns_window().ok())
+        .map(bridge_ffi::is_window_visible)
+        .unwrap_or(false);
+    if !st.start_open.load(Ordering::Acquire) && !ns_visible {
+        return;
+    }
+    let elapsed = monotonic_ms().saturating_sub(st.last_show_ms.load(Ordering::Acquire));
+    if elapsed < START_BLUR_GRACE_MS {
+        return;
+    }
+    hide_start(app, true, false);
+}
+
+extern "C" fn on_app_resign_active(_ctx: *mut std::ffi::c_void) {
+    if let Some(app) = RESIGN_OBSERVER_APP.get() {
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            dismiss_on_focus_loss(&h);
+        });
+    }
 }
 
 fn apply_toggle_start(app: &AppHandle, force: Option<bool>) {
     let st = app.state::<MacAppState>();
-    let currently_open = st.start_open.load(Ordering::Acquire);
+    let ns_visible = app
+        .get_webview_window("start")
+        .and_then(|w| w.ns_window().ok())
+        .map(bridge_ffi::is_window_visible)
+        .unwrap_or(false);
+    let currently_open = st.start_open.load(Ordering::Acquire) || ns_visible;
     let want_open = force.unwrap_or(!currently_open);
     if want_open == currently_open {
         if want_open {
+            let blur_enabled = !lock_unpoisoned(&st.config)
+                .glass_depth
+                .trim()
+                .eq_ignore_ascii_case("solid");
             if let Some(win) = app.get_webview_window("start") {
-                let _ = win.set_focus();
                 if let Ok(ns_win) = win.ns_window() {
-                    bridge_ffi::show_and_focus_window(ns_win);
+                    bridge_ffi::show_and_focus_window(ns_win, blur_enabled);
                 }
             }
         }
@@ -534,7 +559,7 @@ fn apply_toggle_start(app: &AppHandle, force: Option<bool>) {
     if want_open {
         show_start(app);
     } else {
-        hide_start(app, false, true);
+        hide_start(app, true, true);
     }
 }
 
@@ -558,6 +583,10 @@ extern "C" fn on_cg_tap_event(
             }
             3 => {
                 machine.on_mouse_down();
+                false
+            }
+            4 => {
+                machine.on_secure_input();
                 false
             }
             _ => false,
@@ -806,6 +835,11 @@ fn set_appearance_settings(
     if let Some(err) = inner_err {
         return Err(err);
     }
+    let h = app.clone();
+    let depth = updated.glass_depth.clone();
+    let _ = app.run_on_main_thread(move || {
+        sync_window_blur(&h, &depth);
+    });
     Ok(updated)
 }
 
@@ -1765,8 +1799,10 @@ async fn import_config_dialog(app: AppHandle) -> Result<Option<TestBarConfig>, S
         }
         let h_pos = h_app.clone();
         let pos = updated.mac_window_position.clone();
+        let depth = updated.glass_depth.clone();
         let _ = h_app.run_on_main_thread(move || {
             position_start_window(&h_pos, &pos);
+            sync_window_blur(&h_pos, &depth);
         });
         Ok(Some(updated))
     })
@@ -1806,11 +1842,8 @@ async fn launch_item(
     _as_admin: Option<bool>,
     close_start: Option<bool>,
 ) -> Result<(), String> {
-    if close_start.unwrap_or(false) {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false, false);
-        });
+    if close_start.unwrap_or(true) {
+        hide_start_and_wait(&app, false).await;
     }
     tauri::async_runtime::spawn_blocking(move || launcher::launch_item(&target, args.as_deref()))
         .await
@@ -1825,10 +1858,7 @@ async fn launch_new_window(
     close_start: Option<bool>,
 ) -> Result<(), String> {
     if close_start.unwrap_or(true) {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false, false);
-        });
+        hide_start_and_wait(&app, false).await;
     }
     tauri::async_runtime::spawn_blocking(move || {
         launcher::launch_new_window(&exe_path, args.as_deref())
@@ -1840,10 +1870,7 @@ async fn launch_new_window(
 #[tauri::command]
 async fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
     if targets.iter().any(|t| !t.trim().is_empty()) {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            hide_start(&h, false, false);
-        });
+        hide_start_and_wait(&app, false).await;
     }
     tauri::async_runtime::spawn_blocking(move || launcher::launch_combo(&targets))
         .await
@@ -1851,7 +1878,8 @@ async fn launch_combo(app: AppHandle, targets: Vec<String>) -> Result<(), String
 }
 
 #[tauri::command]
-async fn open_location(path: String) -> Result<(), String> {
+async fn open_location(app: AppHandle, path: String) -> Result<(), String> {
+    hide_start_and_wait(&app, false).await;
     tauri::async_runtime::spawn_blocking(move || launcher::open_location(&path))
         .await
         .map_err(|e| format!("task join error: {e}"))?
@@ -1862,6 +1890,7 @@ async fn open_terminal_at(app: AppHandle, path: String) -> Result<(), String> {
     let terminal_pref = lock_unpoisoned(&app.state::<MacAppState>().config)
         .mac_terminal_app
         .clone();
+    hide_start_and_wait(&app, false).await;
     tauri::async_runtime::spawn_blocking(move || {
         launcher::open_terminal_at(&path, &terminal_pref)
     })
@@ -1870,7 +1899,8 @@ async fn open_terminal_at(app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn power_action(action: String) -> Result<(), String> {
+async fn power_action(app: AppHandle, action: String) -> Result<(), String> {
+    hide_start_and_wait(&app, false).await;
     tauri::async_runtime::spawn_blocking(move || launcher::power_action(&action))
         .await
         .map_err(|e| format!("task join error: {e}"))?
@@ -1948,18 +1978,7 @@ async fn paste_clipboard_entry(app: AppHandle, text: String) -> Result<(), Strin
         .state::<MacAppState>()
         .prev_frontmost_pid
         .load(Ordering::Acquire);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let h = app.clone();
-    let dispatched = app.run_on_main_thread(move || {
-        hide_start(&h, true, false);
-        let _ = tx.send(());
-    });
-    if dispatched.is_ok() {
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            let _ = rx.recv_timeout(std::time::Duration::from_millis(200));
-        })
-        .await;
-    }
+    hide_start_and_wait(&app, false).await;
 
     tauri::async_runtime::spawn_blocking(move || {
         clipboard::copy_to_clipboard(&text)?;
@@ -2016,7 +2035,8 @@ async fn get_file_thumbnails(
 }
 
 #[tauri::command]
-async fn fs_open_item(path: String) -> Result<(), String> {
+async fn fs_open_item(app: AppHandle, path: String) -> Result<(), String> {
+    hide_start_and_wait(&app, false).await;
     tauri::async_runtime::spawn_blocking(move || file_explorer::fs_open_item(&path))
         .await
         .map_err(|e| format!("task join error: {e}"))?
@@ -2053,7 +2073,8 @@ async fn fs_trash_items(paths: Vec<String>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-async fn fs_open_in_explorer(path: String) -> Result<(), String> {
+async fn fs_open_in_explorer(app: AppHandle, path: String) -> Result<(), String> {
+    hide_start_and_wait(&app, false).await;
     tauri::async_runtime::spawn_blocking(move || file_explorer::fs_open_in_explorer(&path))
         .await
         .map_err(|e| format!("task join error: {e}"))?
@@ -2193,6 +2214,7 @@ pub fn run() {
     let initial_pinned_clipboard = initial_cfg.pinned_clipboard.clone();
     let initial_tap_mode = CommandTapMode::from_config_str(&initial_cfg.mac_command_key);
     let initial_pos_mode = initial_cfg.mac_window_position.clone();
+    let initial_glass_depth = initial_cfg.glass_depth.clone();
 
     let start_open = Arc::new(AtomicBool::new(false));
     let start_gen = Arc::new(AtomicU64::new(0));
@@ -2398,6 +2420,7 @@ pub fn run() {
                         &initial_pos_mode,
                     );
                 }
+                sync_window_blur(&handle, &initial_glass_depth);
                 let h_blur = handle.clone();
                 start_win.on_window_event(move |ev| match ev {
                     tauri::WindowEvent::CloseRequested { api, .. } => {
@@ -2405,23 +2428,14 @@ pub fn run() {
                         hide_start(&h_blur, true, true);
                     }
                     tauri::WindowEvent::Focused(false) => {
-                        let st = h_blur.state::<MacAppState>();
-                        if st.modal_picker_depth.load(Ordering::Acquire) > 0 {
-                            return;
-                        }
-                        if !st.start_open.load(Ordering::Acquire) {
-                            return;
-                        }
-                        let elapsed =
-                            monotonic_ms().saturating_sub(st.last_show_ms.load(Ordering::Acquire));
-                        if elapsed < START_BLUR_GRACE_MS {
-                            return;
-                        }
-                        hide_start(&h_blur, false, false);
+                        dismiss_on_focus_loss(&h_blur);
                     }
                     _ => {}
                 });
             }
+
+            let _ = RESIGN_OBSERVER_APP.set(handle.clone());
+            bridge_ffi::register_resign_active_observer(on_app_resign_active, std::ptr::null_mut());
 
             // Start lone-Command CGEventTap listener (re-tried every 2s until Accessibility granted)
             let _ = TAP_CALLBACK_CTX.set(TapCallbackContext {

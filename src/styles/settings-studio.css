@@ -67,6 +67,7 @@
   font-family: inherit;
   font-size: 12px;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .studio-search-input::placeholder {

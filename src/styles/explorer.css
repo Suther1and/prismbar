@@ -255,6 +255,7 @@
   font-family: var(--font-mono);
   font-size: 12px;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .fx-path-edit-btn {
@@ -352,6 +353,7 @@
   font-family: inherit;
   font-size: 12px;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .fx-search-input::placeholder {
@@ -496,6 +498,7 @@
   font-size: 12px;
   outline: none;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .fx-new-folder-input:focus {
@@ -1027,6 +1030,7 @@
   font-size: 12px;
   outline: none;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .fx-grid-card .fx-rename-input {

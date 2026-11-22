@@ -5,6 +5,7 @@ import {
   computeVirtualGridRange,
   computeVirtualListRange,
   createHistoryState,
+  defaultSortDirForField,
   filterDirectoryEntries,
   formatFileDate,
   formatFileSize,
@@ -290,5 +291,12 @@ describe('POSIX history normalization and navigation', () => {
 
     const fwd = navigateHistoryForward(h);
     expect(fwd.path).toBe('/Users/alex/Desktop/');
+  });
+
+  it('picks newest/largest desc for date and size and asc for name and type', () => {
+    expect(defaultSortDirForField('date')).toBe('desc');
+    expect(defaultSortDirForField('size')).toBe('desc');
+    expect(defaultSortDirForField('name')).toBe('asc');
+    expect(defaultSortDirForField('type')).toBe('asc');
   });
 });

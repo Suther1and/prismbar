@@ -392,6 +392,7 @@
   font-size: 12px;
   outline: none;
   user-select: text;
+  -webkit-user-select: text;
   transition: border-color 140ms ease, box-shadow 140ms ease;
 }
 .weather-city-input:focus {

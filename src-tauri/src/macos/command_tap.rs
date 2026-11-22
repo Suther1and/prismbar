@@ -12,7 +12,7 @@ pub const CG_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 pub const CG_FLAG_MASK_OTHER_MODIFIERS: u64 =
     CG_FLAG_MASK_SHIFT | CG_FLAG_MASK_CONTROL | CG_FLAG_MASK_ALTERNATE;
 
-pub const MAX_COMMAND_TAP_DURATION_MS: u64 = 320;
+pub const MAX_COMMAND_TAP_DURATION_MS: u64 = 280;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandTapMode {
@@ -107,10 +107,24 @@ impl CommandTapMachine {
         }
     }
 
+    pub fn on_key_up(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.tainted = true;
+        }
+    }
+
     pub fn on_mouse_down(&mut self) {
         if let Some(active) = &mut self.active {
             active.tainted = true;
         }
+    }
+
+    pub fn on_secure_input(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.tainted = true;
+        }
+        self.active = None;
+        self.cmd_was_down = false;
     }
 
     pub fn on_flags_changed(&mut self, key_code: u16, flags: u64, now_ms: u64) -> bool {
@@ -185,9 +199,9 @@ mod tests {
         ));
         assert!(machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, NON_COALESCED_BIT, 1120));
 
-        // Right Command tap (exactly at 320ms boundary)
+        // Right Command tap (exactly at 280ms boundary)
         assert!(!machine.on_flags_changed(KEY_CODE_RIGHT_COMMAND, CG_FLAG_MASK_COMMAND, 2000));
-        assert!(machine.on_flags_changed(KEY_CODE_RIGHT_COMMAND, 0, 2320));
+        assert!(machine.on_flags_changed(KEY_CODE_RIGHT_COMMAND, 0, 2280));
     }
 
     #[test]
@@ -267,11 +281,11 @@ mod tests {
     }
 
     #[test]
-    fn hold_over_320ms_times_out_and_suppresses() {
+    fn hold_over_280ms_times_out_and_suppresses() {
         let mut machine = CommandTapMachine::new(CommandTapMode::Any);
 
         assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, CG_FLAG_MASK_COMMAND, 1000));
-        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, 0, 1321));
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, 0, 1281));
     }
 
     #[test]
@@ -311,5 +325,24 @@ mod tests {
         assert!(!machine.on_flags_changed(KEY_CODE_RIGHT_COMMAND, CG_FLAG_MASK_COMMAND, 130));
         assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, CG_FLAG_MASK_COMMAND, 170));
         assert!(!machine.on_flags_changed(KEY_CODE_RIGHT_COMMAND, 0, 200));
+    }
+
+    #[test]
+    fn key_up_and_secure_input_taint_active_press_and_reset_cleanly() {
+        let mut machine = CommandTapMachine::new(CommandTapMode::Any);
+
+        // KeyUp while Command is held taints the tap
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, CG_FLAG_MASK_COMMAND, 100));
+        machine.on_key_up();
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, 0, 180));
+
+        // Secure Input active while Command is held clears active tap & state
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, CG_FLAG_MASK_COMMAND, 300));
+        machine.on_secure_input();
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, 0, 360));
+
+        // Subsequent normal tap works cleanly
+        assert!(!machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, CG_FLAG_MASK_COMMAND, 500));
+        assert!(machine.on_flags_changed(KEY_CODE_LEFT_COMMAND, 0, 580));
     }
 }

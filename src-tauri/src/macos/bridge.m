@@ -5,6 +5,8 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <QuickLookThumbnailing/QuickLookThumbnailing.h>
+#import <QuartzCore/QuartzCore.h>
+#import <Carbon/Carbon.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,12 +24,138 @@ typedef void (*TbMacKeyEventCallback)(
     void *ctx
 );
 
+typedef void (*TbMacVoidCallback)(void *ctx);
+
 static inline void tb_run_on_main_sync(dispatch_block_t block) {
     if ([NSThread isMainThread]) {
         block();
     } else {
         dispatch_sync(dispatch_get_main_queue(), block);
     }
+}
+
+static NSString * const kTbBlurBackdropIdentifier = @"tb_mac_blur_backdrop";
+static id g_resign_observer = nil;
+static TbMacVoidCallback g_resign_cb = NULL;
+static void *g_resign_ctx = NULL;
+
+static void tb_clear_webview_backgrounds(NSView *view) {
+    if (!view || [view isKindOfClass:[NSVisualEffectView class]]) {
+        return;
+    }
+    if ([[view identifier] isEqualToString:kTbBlurBackdropIdentifier]) {
+        return;
+    }
+
+    [view setWantsLayer:YES];
+    CALayer *layer = [view layer];
+    if (layer) {
+        [layer setOpaque:NO];
+        [layer setBackgroundColor:[[NSColor clearColor] CGColor]];
+    }
+
+    Class wk_class = NSClassFromString(@"WKWebView");
+    NSString *cls_name = NSStringFromClass([view class]);
+    if ((wk_class && [view isKindOfClass:wk_class]) ||
+        (cls_name && [cls_name containsString:@"WKWebView"])) {
+        @try {
+            [view setValue:@NO forKey:@"drawsBackground"];
+        } @catch (NSException *ex) {
+            (void)ex;
+        }
+        SEL under_page_sel = NSSelectorFromString(@"setUnderPageBackgroundColor:");
+        if ([view respondsToSelector:under_page_sel]) {
+            @try {
+                [view setValue:[NSColor clearColor] forKey:@"underPageBackgroundColor"];
+            } @catch (NSException *ex) {
+                (void)ex;
+            }
+        }
+    }
+
+    NSArray<NSView *> *children = [[view subviews] copy];
+    for (NSView *child in children) {
+        tb_clear_webview_backgrounds(child);
+    }
+}
+
+static NSImage *tb_rounded_mask_image(CGFloat radius) {
+    CGFloat edge = radius * 2.0 + 2.0;
+    NSSize size = NSMakeSize(edge, edge);
+    NSImage *mask = [NSImage imageWithSize:size
+                                   flipped:NO
+                            drawingHandler:^BOOL(NSRect dstRect) {
+                                [[NSColor clearColor] setFill];
+                                NSRectFill(dstRect);
+                                [[NSColor blackColor] setFill];
+                                NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:dstRect
+                                                                                     xRadius:radius
+                                                                                     yRadius:radius];
+                                [path fill];
+                                return YES;
+                            }];
+    [mask setCapInsets:NSEdgeInsetsMake(radius, radius, radius, radius)];
+    [mask setResizingMode:NSImageResizingModeStretch];
+    return mask;
+}
+
+static NSVisualEffectView *tb_find_blur_view(NSView *content_view) {
+    if (!content_view) {
+        return nil;
+    }
+    for (NSView *sub in [content_view subviews]) {
+        if ([sub isKindOfClass:[NSVisualEffectView class]] &&
+            [[sub identifier] isEqualToString:kTbBlurBackdropIdentifier]) {
+            return (NSVisualEffectView *)sub;
+        }
+    }
+    return nil;
+}
+
+static void tb_ensure_visual_effect_view(NSWindow *win, bool blur_enabled) {
+    if (!win) {
+        return;
+    }
+    NSView *content = [win contentView];
+    if (!content) {
+        return;
+    }
+    NSRect frame = NSInsetRect([content bounds], 24.0, 24.0);
+    if (frame.size.width <= 0.0 || frame.size.height <= 0.0) {
+        frame = [content bounds];
+    }
+    if (frame.size.width <= 0.0 || frame.size.height <= 0.0) {
+        return;
+    }
+
+    NSVisualEffectView *vev = tb_find_blur_view(content);
+    if (!vev) {
+        vev = [[NSVisualEffectView alloc] initWithFrame:frame];
+        [vev setIdentifier:kTbBlurBackdropIdentifier];
+        [vev setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+        [vev setMaterial:NSVisualEffectMaterialHUDWindow];
+        [vev setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+        [vev setState:NSVisualEffectStateActive];
+        NSAppearance *dark = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+        if (dark) {
+            [vev setAppearance:dark];
+        }
+        [vev setMaskImage:tb_rounded_mask_image(26.0)];
+        [vev setWantsLayer:YES];
+        CALayer *vev_layer = [vev layer];
+        if (vev_layer) {
+            [vev_layer setCornerRadius:26.0];
+            [vev_layer setMasksToBounds:YES];
+        }
+        [content addSubview:vev positioned:NSWindowBelow relativeTo:nil];
+    } else {
+        [vev setFrame:frame];
+    }
+
+    [vev setMaterial:NSVisualEffectMaterialHUDWindow];
+    [vev setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+    [vev setState:NSVisualEffectStateActive];
+    [vev setHidden:blur_enabled ? NO : YES];
 }
 
 void tb_mac_configure_start_window(void *ns_window_ptr) {
@@ -44,21 +172,25 @@ void tb_mac_configure_start_window(void *ns_window_ptr) {
             [win setBackgroundColor:[NSColor clearColor]];
             [win setHasShadow:NO];
             [win setLevel:NSFloatingWindowLevel];
+            [win setHidesOnDeactivate:NO];
             [win setCollectionBehavior:(
                 NSWindowCollectionBehaviorCanJoinAllSpaces |
                 NSWindowCollectionBehaviorFullScreenAuxiliary |
-                NSWindowCollectionBehaviorTransient
+                NSWindowCollectionBehaviorTransient |
+                NSWindowCollectionBehaviorIgnoresCycle
             )];
             NSAppearance *dark = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
             if (dark) {
                 [win setAppearance:dark];
             }
             [win setMovable:NO];
+            tb_clear_webview_backgrounds([win contentView]);
+            tb_ensure_visual_effect_view(win, true);
         }
     });
 }
 
-void tb_mac_show_and_focus_window(void *ns_window_ptr) {
+void tb_mac_set_blur_enabled(void *ns_window_ptr, bool enabled) {
     if (!ns_window_ptr) {
         return;
     }
@@ -68,12 +200,99 @@ void tb_mac_show_and_focus_window(void *ns_window_ptr) {
             if (!win) {
                 return;
             }
+            tb_clear_webview_backgrounds([win contentView]);
+            tb_ensure_visual_effect_view(win, enabled);
+        }
+    });
+}
+
+void tb_mac_show_and_focus_window(void *ns_window_ptr, bool blur_enabled) {
+    if (!ns_window_ptr) {
+        return;
+    }
+    tb_run_on_main_sync(^{
+        @autoreleasepool {
+            NSWindow *win = (__bridge NSWindow *)ns_window_ptr;
+            if (!win) {
+                return;
+            }
+            tb_clear_webview_backgrounds([win contentView]);
+            tb_ensure_visual_effect_view(win, blur_enabled);
+            [win setOpaque:NO];
+            [win setBackgroundColor:[NSColor clearColor]];
+            [win setHasShadow:NO];
+            [[NSApplication sharedApplication] unhideWithoutActivation];
+            [win setAlphaValue:1.0];
+            [win setLevel:NSFloatingWindowLevel];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
 #pragma clang diagnostic pop
-            [win orderFrontRegardless];
             [win makeKeyAndOrderFront:nil];
+            [win orderFrontRegardless];
+        }
+    });
+}
+
+void tb_mac_hide_window(void *ns_window_ptr, bool yield_app_focus) {
+    if (!ns_window_ptr) {
+        return;
+    }
+    tb_run_on_main_sync(^{
+        @autoreleasepool {
+            NSWindow *win = (__bridge NSWindow *)ns_window_ptr;
+            if (win) {
+                [win setAlphaValue:0.0];
+                [win orderOut:nil];
+            }
+            if (yield_app_focus) {
+                [[NSApplication sharedApplication] hide:nil];
+            }
+        }
+    });
+}
+
+bool tb_mac_is_window_visible(void *ns_window_ptr) {
+    if (!ns_window_ptr) {
+        return false;
+    }
+    __block bool vis = false;
+    tb_run_on_main_sync(^{
+        @autoreleasepool {
+            NSWindow *win = (__bridge NSWindow *)ns_window_ptr;
+            if (win) {
+                vis = ([win isVisible] && [win alphaValue] > 0.01) ? true : false;
+            }
+        }
+    });
+    return vis;
+}
+
+void tb_mac_register_resign_active_observer(TbMacVoidCallback cb, void *ctx) {
+    if (!cb) {
+        return;
+    }
+    tb_run_on_main_sync(^{
+        @autoreleasepool {
+            g_resign_cb = cb;
+            g_resign_ctx = ctx;
+            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+            if (g_resign_observer) {
+                [nc removeObserver:g_resign_observer];
+                g_resign_observer = nil;
+            }
+            g_resign_observer = [nc
+                addObserverForName:NSApplicationDidResignActiveNotification
+                            object:[NSApplication sharedApplication]
+                             queue:nil
+                        usingBlock:^(NSNotification * _Nonnull note) {
+                            (void)note;
+                            TbMacVoidCallback fn = g_resign_cb;
+                            void *c = g_resign_ctx;
+                            if (fn) {
+                                fn(c);
+                            }
+                        }];
         }
     });
 }
@@ -322,7 +541,8 @@ uint8_t *tb_mac_thumbnail_png_for_path(const char *path_utf8, int32_t size, size
             }
         }
 
-        return tb_mac_icon_png_for_path(path_utf8, target_size, out_len);
+        (void)target_size;
+        return NULL;
     }
 }
 
@@ -455,15 +675,28 @@ static CGEventRef tb_event_tap_callback(
         return event;
     }
 
+    if (IsSecureEventInputEnabled()) {
+        TbMacKeyEventCallback cb = g_tap_cb;
+        void *ctx = g_tap_ctx;
+        if (cb != NULL) {
+            uint64_t now_ms = (uint64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ULL);
+            cb(4, 0, 0, now_ms, ctx);
+        }
+        return event;
+    }
+
     int32_t kind = 0;
     if (type == kCGEventFlagsChanged) {
         kind = 1;
-    } else if (type == kCGEventKeyDown) {
+    } else if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
         kind = 2;
     } else if (
         type == kCGEventLeftMouseDown ||
         type == kCGEventRightMouseDown ||
-        type == kCGEventOtherMouseDown
+        type == kCGEventOtherMouseDown ||
+        type == kCGEventLeftMouseDragged ||
+        type == kCGEventRightMouseDragged ||
+        type == kCGEventScrollWheel
     ) {
         kind = 3;
     }
@@ -513,14 +746,18 @@ bool tb_mac_start_command_tap(TbMacKeyEventCallback cb, void *ctx) {
             CGEventMask mask =
                 CGEventMaskBit(kCGEventFlagsChanged) |
                 CGEventMaskBit(kCGEventKeyDown) |
+                CGEventMaskBit(kCGEventKeyUp) |
                 CGEventMaskBit(kCGEventLeftMouseDown) |
                 CGEventMaskBit(kCGEventRightMouseDown) |
-                CGEventMaskBit(kCGEventOtherMouseDown);
+                CGEventMaskBit(kCGEventOtherMouseDown) |
+                CGEventMaskBit(kCGEventLeftMouseDragged) |
+                CGEventMaskBit(kCGEventRightMouseDragged) |
+                CGEventMaskBit(kCGEventScrollWheel);
 
             CFMachPortRef tap = CGEventTapCreate(
                 kCGSessionEventTap,
                 kCGHeadInsertEventTap,
-                kCGEventTapOptionListenOnly,
+                kCGEventTapOptionDefault,
                 mask,
                 tb_event_tap_callback,
                 NULL

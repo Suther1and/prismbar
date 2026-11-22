@@ -4,9 +4,16 @@ use std::ffi::{c_char, c_void, CStr, CString};
 /// Callback signature invoked on the dedicated `CGEventTap` thread in `bridge.m`.
 pub type TbMacKeyEventCallback = extern "C" fn(i32, u16, u64, u64, *mut c_void);
 
+/// Callback signature invoked for AppKit notifications (e.g. `NSApplicationDidResignActiveNotification`).
+pub type TbMacVoidCallback = extern "C" fn(*mut c_void);
+
 extern "C" {
     pub fn tb_mac_configure_start_window(ns_window_ptr: *mut c_void);
-    pub fn tb_mac_show_and_focus_window(ns_window_ptr: *mut c_void);
+    pub fn tb_mac_set_blur_enabled(ns_window_ptr: *mut c_void, enabled: bool);
+    pub fn tb_mac_show_and_focus_window(ns_window_ptr: *mut c_void, blur_enabled: bool);
+    pub fn tb_mac_hide_window(ns_window_ptr: *mut c_void, yield_app_focus: bool);
+    pub fn tb_mac_is_window_visible(ns_window_ptr: *mut c_void) -> bool;
+    pub fn tb_mac_register_resign_active_observer(cb: TbMacVoidCallback, ctx: *mut c_void);
     pub fn tb_mac_position_start_window(
         ns_window_ptr: *mut c_void,
         width: f64,
@@ -89,13 +96,48 @@ pub fn configure_start_window(ns_window_ptr: *mut c_void) {
     }
 }
 
-/// Activates the accessory app and focuses the Start window on top of other apps.
-pub fn show_and_focus_window(ns_window_ptr: *mut c_void) {
+/// Enables or disables the native `NSVisualEffectView` backdrop behind the Start chassis.
+pub fn set_blur_enabled(ns_window_ptr: *mut c_void, enabled: bool) {
     if ns_window_ptr.is_null() {
         return;
     }
     unsafe {
-        tb_mac_show_and_focus_window(ns_window_ptr);
+        tb_mac_set_blur_enabled(ns_window_ptr, enabled);
+    }
+}
+
+/// Activates the accessory app and focuses the Start window on top of other apps.
+pub fn show_and_focus_window(ns_window_ptr: *mut c_void, blur_enabled: bool) {
+    if ns_window_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        tb_mac_show_and_focus_window(ns_window_ptr, blur_enabled);
+    }
+}
+
+/// Immediately orders out and hides the native `NSWindow` (optionally yielding app focus).
+pub fn hide_window(ns_window_ptr: *mut c_void, yield_app_focus: bool) {
+    if ns_window_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        tb_mac_hide_window(ns_window_ptr, yield_app_focus);
+    }
+}
+
+/// Returns whether the native `NSWindow` is currently ordered on screen with non-zero alpha.
+pub fn is_window_visible(ns_window_ptr: *mut c_void) -> bool {
+    if ns_window_ptr.is_null() {
+        return false;
+    }
+    unsafe { tb_mac_is_window_visible(ns_window_ptr) }
+}
+
+/// Registers an observer for `NSApplicationDidResignActiveNotification`.
+pub fn register_resign_active_observer(cb: TbMacVoidCallback, ctx: *mut c_void) {
+    unsafe {
+        tb_mac_register_resign_active_observer(cb, ctx);
     }
 }
 

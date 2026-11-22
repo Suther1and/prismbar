@@ -411,3 +411,7 @@ export function formatFileDate(modifiedMs: number, nowMs: number = Date.now()): 
 
   return `${pad2(date.getDate())}.${pad2(date.getMonth() + 1)}.${date.getFullYear()} ${hhmm}`;
 }
+
+export function defaultSortDirForField(field: ExplorerSortBy): ExplorerSortDir {
+  return field === 'date' || field === 'size' ? 'desc' : 'asc';
+}

@@ -473,6 +473,12 @@ export const StartView: React.FC = () => {
   configRef.current = config;
   spaceRef.current = space;
 
+  useEffect(() => {
+    if (config && typeof document !== 'undefined') {
+      applyAppearanceToDocument(config);
+    }
+  }, [config]);
+
   const resolvedSpaces = useMemo(
     () => resolveConfiguredSpaces(config, platform),
     [config, platform],
@@ -774,6 +780,11 @@ export const StartView: React.FC = () => {
             setWidgetBuilderOpen(false);
             setActiveExplorerPath(null);
             explorerSessionRef.current = null;
+          }
+          if (isMac) {
+            setAnim((prev) => settleStartOpen(reduceStartState(prev, ev), ev.gen));
+            hydrateSecondaryData();
+            return;
           }
           setAnim((prev) => reduceStartState(prev, ev));
 

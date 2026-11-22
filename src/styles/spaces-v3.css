@@ -2179,6 +2179,7 @@
   line-height: 1.4;
   outline: none;
   user-select: text;
+  -webkit-user-select: text;
   color-scheme: dark;
   transition: border-color 140ms ease, box-shadow 140ms ease;
 }
@@ -2214,6 +2215,7 @@
   font-size: 11.5px;
   outline: none;
   user-select: text;
+  -webkit-user-select: text;
   transition: border-color 140ms ease;
 }
 .nw-todo-input:focus {

@@ -3080,7 +3080,7 @@ fn default_modular_spaces() -> Vec<SpaceConfig> {
         }
     }
 
-    let personal_widgets = vec!["clipboard".to_string(), "notes".to_string()];
+    let personal_widgets = vec!["clipboard".to_string()];
     let work_widgets = vec![
         "pc_health".to_string(),
         "top_processes".to_string(),

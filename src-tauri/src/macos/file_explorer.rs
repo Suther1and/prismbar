@@ -428,7 +428,7 @@ fn sort_entries(entries: &mut [FileEntry], sort_by: Option<&str>, sort_dir: Opti
         .unwrap_or(false);
 
     entries.sort_by(|a, b| {
-        if a.is_dir != b.is_dir {
+        if field != "date" && a.is_dir != b.is_dir {
             return b.is_dir.cmp(&a.is_dir);
         }
 
@@ -670,6 +670,9 @@ pub fn get_file_thumbnails(paths: Vec<String>, size: u32) -> HashMap<String, Str
                 .unwrap_or_default()
         };
         let (_, try_thumbnail) = classify_entry(is_dir, &ext);
+        if !is_app_bundle && !try_thumbnail {
+            continue;
+        }
         let key = ThumbCacheKey {
             norm_path: norm_path.clone(),
             modified_ms,
@@ -711,7 +714,7 @@ pub fn get_file_thumbnails(paths: Vec<String>, size: u32) -> HashMap<String, Str
             out.insert(item.raw_path, existing_uri.clone());
             continue;
         }
-        let uri_opt = if item.is_app_bundle || !item.try_thumbnail {
+        let uri_opt = if item.is_app_bundle {
             bridge_ffi::icon_png_for_path(&item.norm_path, clamped_size as i32)
         } else {
             bridge_ffi::thumbnail_png_for_path(&item.norm_path, clamped_size as i32)
@@ -1002,5 +1005,54 @@ mod tests {
         assert_eq!(entries[0].name, "Docs");
         assert_eq!(entries[1].name, "file2.txt");
         assert_eq!(entries[2].name, "file10.txt");
+    }
+
+    #[test]
+    fn date_sort_interleaves_dirs_and_files_chronologically() {
+        let mut old_dir = build_file_entry("OldFolder".into(), "/OldFolder".into(), None, true);
+        old_dir.modified_ms = 100;
+        let mut new_file = build_file_entry("NewFile.txt".into(), "/NewFile.txt".into(), None, false);
+        new_file.modified_ms = 300;
+        let mut new_dir = build_file_entry("NewFolder".into(), "/NewFolder".into(), None, true);
+        new_dir.modified_ms = 250;
+        let mut older_file =
+            build_file_entry("OlderFile.txt".into(), "/OlderFile.txt".into(), None, false);
+        older_file.modified_ms = 150;
+
+        let mut entries = vec![old_dir, new_file, new_dir, older_file];
+        sort_entries(&mut entries, Some("date"), Some("desc"));
+        let names_desc: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names_desc,
+            vec!["NewFile.txt", "NewFolder", "OlderFile.txt", "OldFolder"]
+        );
+
+        sort_entries(&mut entries, Some("name"), Some("asc"));
+        assert!(entries[0].is_dir && entries[1].is_dir);
+        assert!(!entries[2].is_dir && !entries[3].is_dir);
+    }
+
+    #[test]
+    fn get_file_thumbnails_skips_plain_dirs_and_text_files() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("testbar_mac_thumb_skip_{uniq}"));
+        let txt = dir.join("note.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&txt, b"hello").unwrap();
+
+        let res = get_file_thumbnails(
+            vec![
+                dir.to_string_lossy().to_string(),
+                txt.to_string_lossy().to_string(),
+            ],
+            48,
+        );
+        assert!(res.is_empty());
+
+        let _ = fs::remove_file(&txt);
+        let _ = fs::remove_dir(&dir);
     }
 }

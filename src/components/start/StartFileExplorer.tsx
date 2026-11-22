@@ -3,6 +3,7 @@ import {
   computeVirtualGridRange,
   computeVirtualListRange,
   createHistoryState,
+  defaultSortDirForField,
   filterDirectoryEntries,
   formatFileDate,
   formatFileSize,
@@ -231,8 +232,8 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
   const [viewMode, setViewMode] = useState<ExplorerViewMode>(
     () => initialSession?.viewMode ?? 'list',
   );
-  const [sortBy, setSortBy] = useState<ExplorerSortBy>(() => initialSession?.sortBy ?? 'name');
-  const [sortDir, setSortDir] = useState<ExplorerSortDir>(() => initialSession?.sortDir ?? 'asc');
+  const [sortBy, setSortBy] = useState<ExplorerSortBy>(() => initialSession?.sortBy ?? 'date');
+  const [sortDir, setSortDir] = useState<ExplorerSortDir>(() => initialSession?.sortDir ?? 'desc');
   const [showHidden, setShowHidden] = useState(false);
   const [filterQuery, setFilterQuery] = useState('');
   const [selectedPath, setSelectedPath] = useState<string | null>(
@@ -651,6 +652,9 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
     const cache = thumbLruRef.current;
 
     for (const entry of visibleEntries) {
+      if (isMac && !entry.hasPreview && entry.category !== 'app') {
+        continue;
+      }
       const key = makeThumbCacheKey(entry, thumbSize);
       if (seenKeys.has(key)) continue;
       seenKeys.add(key);
@@ -1322,7 +1326,7 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     } else {
       setSortBy(field);
-      setSortDir('asc');
+      setSortDir(defaultSortDirForField(field));
     }
   };
 
@@ -1617,7 +1621,11 @@ export const StartFileExplorer: React.FC<StartFileExplorerProps> = ({
                   className="fx-sort-select"
                   aria-label="Сортировка"
                   value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as ExplorerSortBy)}
+                  onChange={(e) => {
+                    const nextField = e.target.value as ExplorerSortBy;
+                    setSortBy(nextField);
+                    setSortDir(defaultSortDirForField(nextField));
+                  }}
                 >
                   {SORT_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>

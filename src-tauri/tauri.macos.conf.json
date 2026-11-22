@@ -10,7 +10,7 @@
         "decorations": false,
         "transparent": true,
         "shadow": false,
-        "alwaysOnTop": true,
+        "alwaysOnTop": false,
         "skipTaskbar": true,
         "resizable": false,
         "dragDropEnabled": false,

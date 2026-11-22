@@ -2904,6 +2904,7 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
     if (targetEl && targetEl.closest('button, input, select, textarea, a')) {
       return;
     }
+    window.getSelection?.()?.removeAllRanges();
     if (pointerDragCleanupRef.current) {
       pointerDragCleanupRef.current();
       pointerDragCleanupRef.current = null;
@@ -2933,6 +2934,10 @@ export const StartSpaces: React.FC<StartSpacesProps> = ({
           return;
         }
         active = true;
+        ev.preventDefault();
+        if (typeof window !== 'undefined') {
+          window.getSelection?.()?.removeAllRanges();
+        }
         if (typeof document !== 'undefined') {
           document.body.classList.add('is-reordering-pins');
         }
