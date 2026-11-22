@@ -403,7 +403,7 @@ pub fn merge_nvml_process_lists(
 
 fn is_excluded_telemetry_process(raw_name: &str) -> bool {
     let low = raw_name.trim().to_ascii_lowercase();
-    if low.starts_with("testbar") && low.ends_with(".exe") {
+    if (low.starts_with("testbar") || low.starts_with("prismbar")) && low.ends_with(".exe") {
         return true;
     }
     matches!(
@@ -1581,6 +1581,8 @@ mod tests {
         assert!(is_excluded_telemetry_process("testbar.exe"));
         assert!(is_excluded_telemetry_process("TestBar-v2.exe"));
         assert!(is_excluded_telemetry_process("testbar_dev.exe"));
+        assert!(is_excluded_telemetry_process("prismbar.exe"));
+        assert!(is_excluded_telemetry_process("PrismBar.exe"));
         assert!(!is_excluded_telemetry_process("chrome.exe"));
 
         invalidate_telemetry_cache();

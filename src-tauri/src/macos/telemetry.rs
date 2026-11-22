@@ -177,6 +177,8 @@ fn is_excluded_process(pid: u32, raw_name: &str, normalized_name: &str) -> bool 
     let norm_low = normalized_name.trim().to_ascii_lowercase();
     raw_low == "testbar"
         || norm_low == "testbar"
+        || raw_low == "prismbar"
+        || norm_low == "prismbar"
         || raw_low == "kernel_task"
         || norm_low == "kernel_task"
 }
@@ -552,6 +554,13 @@ mod tests {
                 pid: 200,
                 raw_name: "TestBar".into(),
                 exe_path: Some("/Applications/TestBar.app/Contents/MacOS/TestBar".into()),
+                mem_bytes: 4 * GIB,
+                cpu_pct_normalized: 1.0,
+            },
+            RawProcessSample {
+                pid: 201,
+                raw_name: "PrismBar".into(),
+                exe_path: Some("/Applications/PrismBar.app/Contents/MacOS/PrismBar".into()),
                 mem_bytes: 4 * GIB,
                 cpu_pct_normalized: 1.0,
             },

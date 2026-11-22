@@ -553,7 +553,9 @@ pub fn sanitize_accent_hex_rgb(
 #[cfg(target_os = "windows")]
 const AUTOSTART_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
-const AUTOSTART_VALUE_NAME: &str = "TestBar";
+const AUTOSTART_VALUE_NAME: &str = "PrismBar";
+#[cfg(target_os = "windows")]
+const LEGACY_AUTOSTART_VALUE_NAME: &str = "TestBar";
 
 pub const MAC_COMMAND_KEY_ANY: &str = "any";
 pub const MAC_COMMAND_KEY_LEFT: &str = "left";
@@ -3220,6 +3222,10 @@ impl Default for TestBarConfig {
 }
 
 pub fn config_path() -> PathBuf {
+    roaming_appdata().join("PrismBar").join("config.json")
+}
+
+pub fn legacy_config_path() -> PathBuf {
     roaming_appdata().join("TestBar").join("config.json")
 }
 
@@ -3264,8 +3270,20 @@ pub fn load_config_from(path: &Path) -> TestBarConfig {
     cfg
 }
 
+pub fn load_config_with_migration(primary: &Path, legacy: &Path) -> TestBarConfig {
+    if primary.exists() {
+        return load_config_from(primary);
+    }
+    if legacy.exists() {
+        let cfg = load_config_from(legacy);
+        let _ = save_config_to(primary, &cfg);
+        return cfg;
+    }
+    load_config_from(primary)
+}
+
 pub fn load_config() -> TestBarConfig {
-    load_config_from(&config_path())
+    load_config_with_migration(&config_path(), &legacy_config_path())
 }
 
 fn is_retryable_rename_error(err: &std::io::Error) -> bool {
@@ -4933,6 +4951,12 @@ pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
     } else {
         PathBuf::new()
     };
+    let _ = set_windows_autostart_at(
+        AUTOSTART_RUN_SUBKEY,
+        LEGACY_AUTOSTART_VALUE_NAME,
+        &exe,
+        false,
+    );
     set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, enable)
 }
 
@@ -4954,7 +4978,7 @@ pub fn resolve_macos_bundle_executable(exe_path: &Path) -> PathBuf {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| "TestBar".to_string());
+                .unwrap_or_else(|| "PrismBar".to_string());
             let candidate = app_root.join("Contents").join("MacOS").join(exe_name);
             if candidate == exe_path || candidate.is_file() {
                 return candidate;
@@ -4996,7 +5020,7 @@ pub fn build_macos_launch_agent_plist(exe_path: &Path) -> Result<String, String>
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.testbar.shell</string>
+  <string>com.prismbar.shell</string>
   <key>ProgramArguments</key>
   <array>
     <string>{escaped}</string>
@@ -5011,6 +5035,14 @@ pub fn build_macos_launch_agent_plist(exe_path: &Path) -> Result<String, String>
 
 #[cfg(target_os = "macos")]
 pub fn macos_launch_agent_plist_path() -> PathBuf {
+    user_home()
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.prismbar.shell.plist")
+}
+
+#[cfg(target_os = "macos")]
+pub fn legacy_macos_launch_agent_plist_path() -> PathBuf {
     user_home()
         .join("Library")
         .join("LaunchAgents")
@@ -5049,6 +5081,7 @@ pub fn set_macos_autostart(enable: bool) -> Result<(), String> {
     } else {
         PathBuf::new()
     };
+    let _ = fs::remove_file(legacy_macos_launch_agent_plist_path());
     set_macos_autostart_at(&macos_launch_agent_plist_path(), &exe, enable)
 }
 
@@ -8116,12 +8149,36 @@ mod tests {
                 .ends_with(r"TestBar & Co.app\Contents\MacOS\TestBar"));
 
         let plist = build_macos_launch_agent_plist(Path::new(
-            "/Applications/TestBar & <Dev>.app/Contents/MacOS/TestBar",
+            "/Applications/PrismBar & <Dev>.app/Contents/MacOS/PrismBar",
         ))
         .expect("build plist");
-        assert!(plist.contains("<string>com.testbar.shell</string>"));
+        assert!(plist.contains("<string>com.prismbar.shell</string>"));
         assert!(plist.contains("&amp; &lt;Dev&gt;.app"));
         assert!(plist.contains("<true/>"));
         assert!(build_macos_launch_agent_plist(Path::new("   ")).is_err());
+    }
+
+    #[test]
+    fn legacy_testbar_config_migrates_seamlessly_to_prismbar() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("prismbar_legacy_migrate_{uniq}"));
+        let legacy = root.join("TestBar").join("config.json");
+        let primary = root.join("PrismBar").join("config.json");
+
+        let mut old_cfg = TestBarConfig::default();
+        old_cfg.theme_preset = "emerald".to_string();
+        old_cfg.glass_depth = "crystal".to_string();
+        save_config_to(&legacy, &old_cfg).expect("write legacy config");
+        assert!(!primary.exists());
+
+        let migrated = load_config_with_migration(&primary, &legacy);
+        assert_eq!(migrated.theme_preset, "emerald");
+        assert_eq!(migrated.glass_depth, "crystal");
+        assert!(primary.exists(), "migrated PrismBar config must be persisted");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -3,7 +3,7 @@
     "windows": [
       {
         "label": "start",
-        "title": "TestBar",
+        "title": "PrismBar",
         "url": "index.html?view=start&platform=macos",
         "width": 1188,
         "height": 728,

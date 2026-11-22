@@ -99,7 +99,7 @@ fn http_agent() -> &'static ureq::Agent {
             .timeout_connect(Duration::from_secs(4))
             .timeout_read(HTTP_TIMEOUT)
             .timeout(Duration::from_secs(6))
-            .user_agent("TestBar/3.2 (macOS)")
+            .user_agent("PrismBar/3.3 (macOS)")
             .build()
     })
 }

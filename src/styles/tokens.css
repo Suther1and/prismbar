@@ -348,6 +348,13 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { box-shadow: 
 .tb-btn.start-on { background: rgba(var(--accent-rgb), 0.17); border-color: rgba(var(--accent-rgb), 0.38); }
 .tb-btn.dragging { opacity: 0.45; transform: scale(0.92); }
 .tb-btn.drag-over { background: rgba(var(--accent-rgb), 0.16); border-color: rgba(var(--accent-rgb), 0.52); }
+.tb-btn.drag-over-before::after,
+.tb-btn.drag-over-after::after {
+  content: ''; position: absolute; top: 8px; bottom: 8px; width: 2.5px; border-radius: 99px;
+  background: var(--accent); box-shadow: 0 0 8px rgba(var(--accent-rgb), 0.75); pointer-events: none;
+}
+.tb-btn.drag-over-before::after { left: 1px; }
+.tb-btn.drag-over-after::after { right: 1px; }
 
 @keyframes tbLaunchHop {
   0%   { transform: translate3d(0, 0, 0) scale(1, 1); }

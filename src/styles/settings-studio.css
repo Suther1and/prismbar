@@ -993,3 +993,157 @@
   border-color: rgba(var(--danger-rgb), 0.56);
   color: #FFFFFF;
 }
+
+/* ══ Start Update Banner & Settings Studio Updates Card ═══════════════════ */
+
+.start-update-banner {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  margin: 0 18px 8px;
+  border-radius: 12px;
+  background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.34);
+  color: var(--t1);
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
+.start-update-banner-lead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--t1);
+}
+
+.start-update-banner-lead svg {
+  flex-shrink: 0;
+  color: rgba(var(--accent-rgb), 0.95);
+}
+
+.start-update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.start-update-banner-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(var(--accent-rgb), 0.48);
+  background: rgba(var(--accent-rgb), 0.22);
+  color: #FFFFFF;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.start-update-banner-btn:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.32);
+  border-color: rgba(var(--accent-rgb), 0.65);
+}
+
+.start-update-banner-btn:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.studio-update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.studio-update-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.studio-update-version {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--t1);
+}
+
+.studio-update-status {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--t2);
+  line-height: 1.4;
+}
+
+.studio-update-status.available {
+  color: #93C5FD;
+}
+
+.studio-update-status.error {
+  color: #FCA5A5;
+}
+
+.studio-update-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.studio-update-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.studio-update-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--t2);
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-update-bar {
+  position: relative;
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.studio-update-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: rgb(var(--accent-rgb));
+  transition: width 160ms ease;
+}
+
+.studio-update-bar-fill.indeterminate {
+  width: 38%;
+  animation: studioUpdateIndeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes studioUpdateIndeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}

@@ -2236,7 +2236,7 @@ export const FlyoutView: React.FC = () => {
 
           <div className="cal-alerts-section">
             <div className="sec-row" style={{ marginBottom: 6 }}>
-              <span className="sec-title">События TestBar</span>
+              <span className="sec-title">События PrismBar</span>
               {alerts.length > 0 && (
                 <button
                   type="button"
@@ -3521,7 +3521,7 @@ export const FlyoutView: React.FC = () => {
       },
       {
         key: 'settings',
-        label: 'Настройки TestBar',
+        label: 'Настройки PrismBar',
         icon: <SettingsGearIcon />,
         onActivate: () => {
           ipc('open_start_settings').catch(() => {});

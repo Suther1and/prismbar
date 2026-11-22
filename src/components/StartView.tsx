@@ -5,6 +5,7 @@ import {
   animateSurfaceIn,
   animateSurfaceOut,
   applyConfigUpdate,
+  checkForUpdates,
   createSpace,
   deleteSpace,
   emptyRecycleBin,
@@ -13,6 +14,7 @@ import {
   findMatchingGroupForPin,
   fsOpenInExplorer,
   getAccessibilityStatus,
+  getAppVersion,
   getNetworkSnapshot,
   getPeripheralBatteries,
   getPlatformInfo,
@@ -21,6 +23,7 @@ import {
   hideBatteryDevice,
   iconCache,
   importConfigDialog,
+  installUpdate,
   ipc,
   isCacheIconKey,
   isNonLaunchableUwpHostExe,
@@ -69,6 +72,8 @@ import {
   type TestBarConfig,
   type TileSection,
   type TileSize,
+  type UpdateCheckResult,
+  type UpdateProgressEvent,
   type WeatherCityOption,
   type WeatherSnapshot,
 } from '../lib/ipc';
@@ -126,6 +131,7 @@ import {
   ArrowUpIcon,
   CloseWindowIcon,
   CopyIcon,
+  DownloadIcon,
   EditIcon,
   ExternalWindowIcon,
   FallbackAppIcon,
@@ -242,6 +248,14 @@ export const StartView: React.FC = () => {
   const isMac = platform === 'macos';
   const [accessibilityTrusted, setAccessibilityTrusted] = useState<boolean | null>(null);
   const [accessBannerDismissed, setAccessBannerDismissed] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>('3.3.0');
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<
+    'idle' | 'checking' | 'available' | 'up-to-date' | 'downloading' | 'installing' | 'error'
+  >('idle');
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressEvent | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
   const [config, setConfig] = useState<TestBarConfig | null>(null);
   const [groups, setGroups] = useState<AppWindowGroup[]>([]);
   const [apps, setApps] = useState<IndexedApp[]>([]);
@@ -555,6 +569,44 @@ export const StartView: React.FC = () => {
     [handleApplyConfig, showToast],
   );
 
+  const handleCheckForUpdates = useCallback(async () => {
+    setUpdateStatus('checking');
+    setUpdateError(null);
+    setUpdateProgress(null);
+    try {
+      const res = await checkForUpdates();
+      setUpdateInfo(res);
+      if (res.currentVersion) {
+        setAppVersion(res.currentVersion);
+      }
+      if (res.available && res.version) {
+        setUpdateStatus('available');
+        setUpdateBannerDismissed(false);
+      } else {
+        setUpdateStatus('up-to-date');
+      }
+    } catch (err) {
+      const msg = formatIpcError(err);
+      setUpdateError(msg);
+      setUpdateStatus('error');
+      showToast(msg);
+    }
+  }, [showToast]);
+
+  const handleInstallUpdate = useCallback(async () => {
+    setUpdateStatus('downloading');
+    setUpdateError(null);
+    setUpdateProgress({ stage: 'downloading', downloaded: 0, total: null, percent: 0 });
+    try {
+      await installUpdate();
+    } catch (err) {
+      const msg = formatIpcError(err);
+      setUpdateError(msg);
+      setUpdateStatus('error');
+      showToast(msg);
+    }
+  }, [showToast]);
+
   const resetTransientOverlays = useCallback(() => {
     setSearchOpen(false);
     setQuery('');
@@ -613,11 +665,39 @@ export const StartView: React.FC = () => {
 
   useEffect(() => {
     hydrateCoreData();
+    if (isTauri()) {
+      getAppVersion()
+        .then(setAppVersion)
+        .catch(() => {});
+    }
     const idleTimer = window.setTimeout(() => {
       hydrateSecondaryData();
     }, 1400);
+    const updateCheckTimer = isTauri()
+      ? window.setTimeout(() => {
+          checkForUpdates()
+            .then((res) => {
+              if (!mountedRef.current) return;
+              setUpdateInfo(res);
+              if (res.currentVersion) {
+                setAppVersion(res.currentVersion);
+              }
+              if (res.available && res.version) {
+                setUpdateStatus((prev) =>
+                  prev === 'downloading' || prev === 'installing' ? prev : 'available',
+                );
+                setUpdateBannerDismissed(false);
+              }
+            })
+            .catch(() => {});
+        }, 6000)
+      : null;
 
     const subs = [
+      onEvent<UpdateProgressEvent>('update-progress', (ev) => {
+        setUpdateProgress(ev);
+        setUpdateStatus(ev.stage === 'installing' ? 'installing' : 'downloading');
+      }),
       onEvent<TestBarConfig>('config-updated', (next) =>
         setConfig((prev) => applyConfigUpdate(prev, next)),
       ),
@@ -979,6 +1059,9 @@ export const StartView: React.FC = () => {
 
     return () => {
       window.clearTimeout(idleTimer);
+      if (updateCheckTimer !== null) {
+        window.clearTimeout(updateCheckTimer);
+      }
       cancelPendingOpenArm();
       cancelChassisAnims();
       if (deferredHydrateTimerRef.current !== null) {
@@ -1703,7 +1786,7 @@ export const StartView: React.FC = () => {
     if (item.kind === 'folder') {
       actions.push({
         id: 'open',
-        label: 'Открыть в TestBar',
+        label: 'Открыть в PrismBar',
         icon: <FolderSvg className="ic14" />,
         run: () => {
           setWidgetBuilderOpen(false);
@@ -1993,7 +2076,7 @@ export const StartView: React.FC = () => {
       },
       {
         id: 'settings',
-        label: 'Настройки TestBar',
+        label: 'Настройки PrismBar',
         icon: <SettingsGearIcon className="ic14" />,
         run: () => {
           setEmptyCtx(null);
@@ -2139,7 +2222,7 @@ export const StartView: React.FC = () => {
     if (item.kind === 'folder') {
       actions.push({
         id: 'open-testbar',
-        label: 'Открыть в TestBar',
+        label: 'Открыть в PrismBar',
         icon: <FolderSvg className="ic14" />,
         run: () => {
           setSearchCtx(null);
@@ -3079,7 +3162,7 @@ export const StartView: React.FC = () => {
             <div className="mac-ax-banner-lead">
               <ShieldIcon className="ic14" />
               <span>
-                Чтобы открывать TestBar одиночным нажатием ⌘ Command, разреши доступ в Настройках
+                Чтобы открывать PrismBar одиночным нажатием ⌘ Command, разреши доступ в Настройках
               </span>
             </div>
             <div className="mac-ax-banner-actions">
@@ -3103,6 +3186,54 @@ export const StartView: React.FC = () => {
             </div>
           </div>
         )}
+
+        {!updateBannerDismissed &&
+          updateInfo?.available &&
+          updateInfo.version &&
+          (updateStatus === 'available' ||
+            updateStatus === 'downloading' ||
+            updateStatus === 'installing') && (
+            <div className="start-update-banner" role="status">
+              <div className="start-update-banner-lead">
+                <DownloadIcon className="ic14" />
+                <span>
+                  {updateStatus === 'installing'
+                    ? `Устанавливаю PrismBar v${updateInfo.version}...`
+                    : updateStatus === 'downloading'
+                      ? `Скачивание обновления PrismBar v${updateInfo.version}${
+                          updateProgress?.percent != null ? ` (${updateProgress.percent}%)` : '...'
+                        }`
+                      : `Доступна новая версия PrismBar v${updateInfo.version}`}
+                </span>
+              </div>
+              <div className="start-update-banner-actions">
+                <button
+                  type="button"
+                  className="start-update-banner-btn"
+                  disabled={updateStatus !== 'available'}
+                  onClick={() => {
+                    void handleInstallUpdate();
+                  }}
+                >
+                  {updateStatus === 'installing'
+                    ? 'Установка...'
+                    : updateStatus === 'downloading'
+                      ? 'Загрузка...'
+                      : 'Обновить'}
+                </button>
+                {updateStatus === 'available' && (
+                  <button
+                    type="button"
+                    className="mac-ax-banner-close"
+                    aria-label="Скрыть уведомление об обновлении"
+                    onClick={() => setUpdateBannerDismissed(true)}
+                  >
+                    <CloseWindowIcon className="ic12" />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
         <div
           className="space-stage"
@@ -3314,6 +3445,13 @@ export const StartView: React.FC = () => {
               showToast(formatIpcError(err)),
             );
           }}
+          appVersion={appVersion}
+          updateInfo={updateInfo}
+          updateStatus={updateStatus}
+          updateProgress={updateProgress}
+          updateError={updateError}
+          onCheckForUpdates={handleCheckForUpdates}
+          onInstallUpdate={handleInstallUpdate}
         />
 
         <StartCommandPalette

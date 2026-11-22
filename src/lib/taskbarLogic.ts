@@ -379,6 +379,62 @@ export function selectWindowToFocusOnTaskbarClick(
  * Maps two taskbar item IDs onto `config.taskbarPins` indices for drag-and-drop pin reordering.
  * Unpinned running apps cannot be reordered into the pinned list.
  */
+export interface HorizontalDropCandidate {
+  id: string;
+  left: number;
+  right: number;
+}
+
+export function reorderUnpinnedIds(
+  currentIds: readonly string[],
+  fromId: string,
+  toId: string,
+): string[] {
+  if (!fromId || !toId || fromId === toId) return [...currentIds];
+  const fromIdx = currentIds.indexOf(fromId);
+  const toIdx = currentIds.indexOf(toId);
+  if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return [...currentIds];
+  const next = [...currentIds];
+  const [moved] = next.splice(fromIdx, 1);
+  next.splice(toIdx, 0, moved);
+  return next;
+}
+
+export function resolveHorizontalDropTarget(
+  candidates: readonly HorizontalDropCandidate[],
+  clientX: number,
+  sourceId: string,
+): { targetId: string; side: 'before' | 'after' } | null {
+  if (!sourceId || !Number.isFinite(clientX)) return null;
+  const source = candidates.find((c) => c.id === sourceId);
+  if (source && clientX >= source.left && clientX <= source.right) {
+    return null;
+  }
+
+  const others = candidates.filter((c) => c.id && c.id !== sourceId);
+  if (others.length === 0) return null;
+
+  for (const cand of others) {
+    if (clientX >= cand.left && clientX <= cand.right) {
+      const mid = (cand.left + cand.right) / 2;
+      return { targetId: cand.id, side: clientX < mid ? 'before' : 'after' };
+    }
+  }
+
+  let best = others[0];
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const cand of others) {
+    const dist =
+      clientX < cand.left ? cand.left - clientX : clientX > cand.right ? clientX - cand.right : 0;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = cand;
+    }
+  }
+  const mid = (best.left + best.right) / 2;
+  return { targetId: best.id, side: clientX < mid ? 'before' : 'after' };
+}
+
 export function resolvePinnedReorderIndices(
   barItems: readonly Pick<MergedBarItem, 'id' | 'pinned'>[],
   fromId: string,

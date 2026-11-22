@@ -232,7 +232,7 @@ function buildSystemCommandItems(
       id: 'cmd:refresh_indexes',
       name: 'Обновить индекс приложений',
       subtitle: isMac ? 'Пересканировать программы и файлы' : 'Пересканировать программы, игры и файлы',
-      category: 'TestBar',
+      category: 'PrismBar',
       target: 'cmd:refresh_indexes',
       args: null,
       kind: 'app',
@@ -272,11 +272,11 @@ function buildSystemCommandItems(
   commands.push(
     {
       id: 'cmd:settings',
-      name: 'Настройки TestBar',
+      name: 'Настройки PrismBar',
       subtitle: isMac
         ? 'Оформление, клавиша Command, позиция и профиль'
         : 'Панель, стекло, мониторы и резервная копия',
-      category: 'TestBar',
+      category: 'PrismBar',
       target: 'cmd:settings',
       args: null,
       kind: 'app',
@@ -287,7 +287,14 @@ function buildSystemCommandItems(
       pinned: false,
       badge: { text: 'Команда', variant: 'cmd' },
       commandId: 'settings',
-      keywords: ['настройки testbar', 'настройки', 'параметры', 'settings', 'preferences'],
+      keywords: [
+        'настройки prismbar',
+        'настройки testbar',
+        'настройки',
+        'параметры',
+        'settings',
+        'preferences',
+      ],
       frecencyKey: 'cmd:settings',
     },
     {
@@ -1570,7 +1577,7 @@ export function buildPinFromSearchItem(
         : item.source === 'game'
           ? item.subtitle || 'Игра'
           : item.commandId === 'settings'
-            ? 'TestBar'
+            ? 'PrismBar'
             : item.commandId === 'task_manager'
               ? 'Система'
               : item.subtitle || 'Приложение',

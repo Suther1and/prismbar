@@ -1602,3 +1602,30 @@ export function setMacSettings(params: {
 export function quitApp(): Promise<void> {
   return ipc<void>('quit_app');
 }
+
+export interface UpdateCheckResult {
+  available: boolean;
+  currentVersion: string;
+  version: string | null;
+  date: string | null;
+  body: string | null;
+}
+
+export interface UpdateProgressEvent {
+  stage: 'downloading' | 'installing';
+  downloaded: number;
+  total: number | null;
+  percent: number | null;
+}
+
+export function getAppVersion(): Promise<string> {
+  return ipc<string>('get_app_version');
+}
+
+export function checkForUpdates(): Promise<UpdateCheckResult> {
+  return ipc<UpdateCheckResult>('check_for_updates');
+}
+
+export function installUpdate(): Promise<void> {
+  return ipc<void>('install_update');
+}

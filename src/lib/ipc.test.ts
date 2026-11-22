@@ -21,6 +21,7 @@ import {
   addGameCombo,
   addQuickTodo,
   applyConfigUpdate,
+  checkForUpdates,
   clearDoneQuickTodos,
   clearIconCache,
   createSpace,
@@ -39,6 +40,7 @@ import {
   fsOpenItem,
   fsRenameItem,
   fsTrashItems,
+  getAppVersion,
   getAudioPeaks,
   getClipboardPaused,
   getFileThumbnails,
@@ -51,6 +53,7 @@ import {
   ICON_CACHE_MAX_ENTRIES,
   iconCache,
   importConfigDialog,
+  installUpdate,
   isCacheIconKey,
   isNonLaunchableUwpHostExe,
   launchNewWindow,
@@ -1051,6 +1054,12 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
     expect(invokeMock).toHaveBeenLastCalledWith('set_power_plan', { plan: 'balanced' });
     await triggerScreenshot();
     expect(invokeMock).toHaveBeenLastCalledWith('trigger_screenshot', undefined);
+    await getAppVersion();
+    expect(invokeMock).toHaveBeenLastCalledWith('get_app_version', undefined);
+    await checkForUpdates();
+    expect(invokeMock).toHaveBeenLastCalledWith('check_for_updates', undefined);
+    await installUpdate();
+    expect(invokeMock).toHaveBeenLastCalledWith('install_update', undefined);
   });
 
   it('binds onEvent strictly to getCurrentWebviewWindow().listen() to prevent cross-window event clobbering', async () => {

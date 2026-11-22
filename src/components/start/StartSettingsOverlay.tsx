@@ -30,6 +30,8 @@ import {
   type TaskbarWidgetsPosition,
   type TestBarConfig,
   type TileSize,
+  type UpdateCheckResult,
+  type UpdateProgressEvent,
   type WeatherCityOption,
 } from '../../lib/ipc';
 import {
@@ -82,6 +84,20 @@ export interface StartSettingsOverlayProps {
   onOpenAccessibilitySettings?: () => Promise<void>;
   onSetMacSettings?: (params: Parameters<typeof setMacSettings>[0]) => Promise<void>;
   onQuitApp?: () => void;
+  appVersion?: string;
+  updateInfo?: UpdateCheckResult | null;
+  updateStatus?:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'up-to-date'
+    | 'downloading'
+    | 'installing'
+    | 'error';
+  updateProgress?: UpdateProgressEvent | null;
+  updateError?: string | null;
+  onCheckForUpdates?: () => Promise<void>;
+  onInstallUpdate?: () => Promise<void>;
 }
 
 type SettingsTabId = 'appearance' | 'bar' | 'start' | 'devices' | 'system';
@@ -386,6 +402,13 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   onOpenAccessibilitySettings = openAccessibilitySettings,
   onSetMacSettings = (params) => setMacSettings(params).then(() => {}),
   onQuitApp,
+  appVersion = '3.3.0',
+  updateInfo = null,
+  updateStatus = 'idle',
+  updateProgress = null,
+  updateError = null,
+  onCheckForUpdates,
+  onInstallUpdate,
 }) => {
   const effectivePlatform = platform ?? detectPlatform();
   const isMac = effectivePlatform === 'macos';
@@ -404,7 +427,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
         if (tab.id === 'system') {
           return {
             ...tab,
-            subtitle: 'Автозапуск, профиль конфигурации и выход из TestBar',
+            subtitle: 'Обновления, автозапуск, профиль конфигурации и выход из PrismBar',
           };
         }
         return tab;
@@ -1340,7 +1363,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
           <div className="set-seg-3" role="radiogroup" aria-label="Режим второго монитора">
             {(
               [
-                ['testbar', 'Панель TestBar', 'Окна второго экрана'],
+                ['testbar', 'Панель PrismBar', 'Окна второго экрана'],
                 ['native', 'Штатная Windows', 'Панель Windows'],
                 ['hidden', 'Скрывать', 'Чистый экран'],
               ] as const
@@ -1436,7 +1459,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
               <div
                 className="studio-seg-2"
                 role="radiogroup"
-                aria-label="Позиция окна TestBar"
+                aria-label="Позиция окна PrismBar"
               >
                 {MAC_WINDOW_POSITION_OPTIONS.map((opt) => (
                   <button
@@ -1779,6 +1802,105 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
       ),
     },
     {
+      id: 'system-updates',
+      section: 'system',
+      keywords:
+        'обновление версия скачать проверить актуальная релиз update version check download',
+      render: () => {
+        const isChecking = updateStatus === 'checking';
+        const isDownloading = updateStatus === 'downloading';
+        const isInstalling = updateStatus === 'installing';
+        const isUpdating = isChecking || isDownloading || isInstalling;
+        const pct = updateProgress?.percent ?? null;
+        const statusText = isInstalling
+          ? 'Устанавливаю обновление и перезапускаю...'
+          : isDownloading
+            ? `Скачивание обновления v${updateInfo?.version ?? ''}${pct != null ? ` (${pct}%)` : '...'}`
+            : isChecking
+              ? 'Проверяю наличие обновлений...'
+              : updateStatus === 'available' && updateInfo?.version
+                ? `Доступна новая версия v${updateInfo.version}`
+                : updateStatus === 'up-to-date'
+                  ? 'Установлена актуальная версия'
+                  : updateStatus === 'error'
+                    ? updateError || 'Не удалось проверить обновления'
+                    : 'Облачные обновления из GitHub Releases';
+        const statusToneClass =
+          updateStatus === 'available'
+            ? 'available'
+            : updateStatus === 'error'
+              ? 'error'
+              : '';
+
+        return (
+          <div className="set-group" key="system-updates">
+            <div className="set-group-title">Обновления</div>
+            <div className="studio-update-card">
+              <div className="studio-update-head">
+                <div>
+                  <div className="studio-update-version">PrismBar v{appVersion || '3.3.0'}</div>
+                  <div className={`studio-update-status ${statusToneClass}`.trim()}>
+                    {statusText}
+                  </div>
+                </div>
+                <div className="studio-update-actions">
+                  <button
+                    type="button"
+                    className="pin-any-btn"
+                    disabled={isUpdating || !onCheckForUpdates}
+                    onClick={() => {
+                      if (onCheckForUpdates) {
+                        void runAction('updates:check', onCheckForUpdates);
+                      }
+                    }}
+                  >
+                    <RefreshIcon className="ic14" />
+                    <span>{isChecking ? 'Проверка...' : 'Проверить'}</span>
+                  </button>
+                  {updateInfo?.available && updateInfo.version && onInstallUpdate && (
+                    <button
+                      type="button"
+                      className="start-update-banner-btn"
+                      disabled={isUpdating}
+                      onClick={() => {
+                        void runAction('updates:install', onInstallUpdate);
+                      }}
+                    >
+                      {isInstalling
+                        ? 'Установка...'
+                        : isDownloading
+                          ? 'Загрузка...'
+                          : 'Обновить и перезапустить'}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {(isDownloading || isInstalling) && (
+                <div className="studio-update-progress">
+                  <div className="studio-update-progress-meta">
+                    <span>
+                      {isInstalling ? 'Установка новой версии...' : 'Загрузка обновления...'}
+                    </span>
+                    <span>{pct != null ? `${pct}%` : ''}</span>
+                  </div>
+                  <div className="studio-update-bar">
+                    <div
+                      className={`studio-update-bar-fill ${pct == null && !isInstalling ? 'indeterminate' : ''}`.trim()}
+                      style={
+                        pct != null || isInstalling
+                          ? { width: `${isInstalling ? 100 : pct}%` }
+                          : undefined
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      },
+    },
+    {
       id: 'system-autostart',
       section: 'system',
       keywords:
@@ -1790,17 +1912,17 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
             <div className="set-toggle-row">
               <div>
                 <div className="set-row-title">
-                  {isMac ? 'Автозапуск TestBar' : 'Автозапуск с Windows'}
+                  {isMac ? 'Автозапуск PrismBar' : 'Автозапуск с Windows'}
                 </div>
                 <div className="set-row-desc">
-                  Запускать TestBar автоматически при входе в систему
+                  Запускать PrismBar автоматически при входе в систему
                 </div>
               </div>
               <button
                 type="button"
                 role="switch"
                 aria-checked={autostart}
-                aria-label={isMac ? 'Автозапуск TestBar' : 'Автозапуск с Windows'}
+                aria-label={isMac ? 'Автозапуск PrismBar' : 'Автозапуск с Windows'}
                 disabled={busyKey === 'autostart'}
                 className={`glass-switch ${autostart ? 'on' : ''}`}
                 onClick={() => void runAction('autostart', () => onSetAutostart(!autostart))}
@@ -1855,7 +1977,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 <CloseWindowIcon className="ic14" />
                 <div>
                   <div className="set-row-title">Выход из приложения</div>
-                  <div className="set-row-desc">Полностью завершить фоновую работу TestBar</div>
+                  <div className="set-row-desc">Полностью завершить фоновую работу PrismBar</div>
                 </div>
               </div>
               <button
@@ -1863,7 +1985,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 className="set-recovery-btn danger"
                 onClick={() => (onQuitApp ? onQuitApp() : void quitApp())}
               >
-                Выйти из TestBar
+                Выйти из PrismBar
               </button>
             </>
           ) : (
@@ -1872,7 +1994,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
                 <RestoreWindowsIcon className="ic14" />
                 <div>
                   <div className="set-row-title">Восстановление</div>
-                  <div className="set-row-desc">Вернуть штатную панель Windows и закрыть TestBar</div>
+                  <div className="set-row-desc">Вернуть штатную панель Windows и закрыть PrismBar</div>
                 </div>
               </div>
               <button
@@ -1919,14 +2041,14 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
         className="settings-modal studio-modal"
         data-phase={phase}
         role="dialog"
-        aria-label="Настройки TestBar"
+        aria-label="Настройки PrismBar"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Sticky Left Navigation Sidebar */}
         <aside className="set-sidebar" aria-label="Разделы настроек">
           <div className="set-brand">
             <div className="set-brand-title">Настройки</div>
-            <div className="set-brand-sub">TestBar</div>
+            <div className="set-brand-sub">PrismBar</div>
           </div>
 
           <div className="studio-search-wrap">

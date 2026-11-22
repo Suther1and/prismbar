@@ -1598,14 +1598,14 @@ pub fn scan_games_lightweight() -> Vec<SteamGame> {
 
 pub fn pick_folder_dialog() -> Option<String> {
     rfd::FileDialog::new()
-        .set_title("Выбери папку для закрепления в TestBar")
+        .set_title("Выбери папку для закрепления в PrismBar")
         .pick_folder()
         .map(|p| p.to_string_lossy().to_string())
 }
 
 pub fn pick_file_dialog() -> Option<String> {
     rfd::FileDialog::new()
-        .set_title("Выбери файл или программу для закрепления в TestBar")
+        .set_title("Выбери файл или программу для закрепления в PrismBar")
         .pick_file()
         .map(|p| p.to_string_lossy().to_string())
 }

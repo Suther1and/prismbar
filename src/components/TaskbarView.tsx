@@ -60,7 +60,9 @@ import {
   NETWORK_FLYOUT_WIDTH,
   parseFocusTimerSnapshot,
   planSoundFeedbackAction,
+  reorderUnpinnedIds,
   resolveActiveTaskbarWidgets,
+  resolveHorizontalDropTarget,
   resolvePinnedReorderIndices,
   resolveTaskbarItemClick,
   resolveTaskbarMonitor,
@@ -148,6 +150,8 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const [launchingIds, setLaunchingIds] = useState<Record<string, true>>({});
   const [dragPinId, setDragPinId] = useState<string | null>(null);
   const [dragOverPinId, setDragOverPinId] = useState<string | null>(null);
+  const [dragOverSide, setDragOverSide] = useState<'before' | 'after' | null>(null);
+  const [unpinnedOrderRev, setUnpinnedOrderRev] = useState(0);
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== 'undefined' ? window.innerWidth : 1920,
   );
@@ -159,6 +163,25 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const mediaPillRef = useRef<HTMLDivElement>(null);
   const barRectRef = useRef<DOMRect | null>(null);
   const orderMemoryRef = useRef(createTaskbarOrderMemory());
+  const hydratedOrderMonitorRef = useRef<string | null>(null);
+  if (hydratedOrderMonitorRef.current !== monitor) {
+    hydratedOrderMonitorRef.current = monitor;
+    if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        const raw = window.localStorage.getItem(`prismbar-open-order-${monitor}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            orderMemoryRef.current.unpinnedIds = parsed.filter(
+              (id): id is string => typeof id === 'string' && id.length > 0,
+            );
+          }
+        }
+      } catch {
+        // Ignore storage read errors
+      }
+    }
+  }
   const sheenRef = useRef<HTMLSpanElement>(null);
   const sheenRafRef = useRef<number | null>(null);
   const sheenClientXRef = useRef<number>(0);
@@ -699,7 +722,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         ),
         orderMemoryRef.current,
       ),
-    [config, visibleGroups, groups, iconMap, monitor, isSecondary],
+    [config, visibleGroups, groups, iconMap, monitor, isSecondary, unpinnedOrderRev],
   );
   barItemsRef.current = barItems;
 
@@ -1076,9 +1099,9 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     }
   };
 
-  // Pointer-based pin reordering (works natively in Tauri v2 WebView2 even with dragDropEnabled: true)
+  // Pointer-based icon reordering for BOTH pinned & unpinned open taskbar items
   const handlePinPointerDown = (e: React.PointerEvent<HTMLButtonElement>, item: MergedBarItem) => {
-    if (!item.pinned || e.button !== 0 || typeof window === 'undefined') return;
+    if (e.button !== 0 || typeof window === 'undefined') return;
     if (pointerDragCleanupRef.current) {
       pointerDragCleanupRef.current();
       pointerDragCleanupRef.current = null;
@@ -1087,8 +1110,22 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     const startX = e.clientX;
     const startY = e.clientY;
     const sourceId = item.id;
+    const isPinnedSource = item.pinned;
+    const pointerId = e.pointerId;
+    const btnEl = e.currentTarget;
     let active = false;
     let currentOverId: string | null = null;
+    let currentOverSide: 'before' | 'after' | null = null;
+
+    const releaseCapture = () => {
+      try {
+        if (btnEl.hasPointerCapture?.(pointerId)) {
+          btnEl.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
+    };
 
     const onMove = (ev: PointerEvent) => {
       if (!active) {
@@ -1096,6 +1133,12 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
           return;
         }
         active = true;
+        window.getSelection?.()?.removeAllRanges();
+        try {
+          btnEl.setPointerCapture?.(pointerId);
+        } catch {
+          // Ignore pointer capture errors
+        }
         if (hoverTimer.current !== null) {
           window.clearTimeout(hoverTimer.current);
           hoverTimer.current = null;
@@ -1104,18 +1147,38 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         setDragPinId(sourceId);
       }
 
-      const hit =
-        typeof document !== 'undefined' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
-      const targetBtn = hit?.closest?.<HTMLElement>('[data-pin-id]');
-      const overId = targetBtn?.dataset?.pinId ?? null;
-      const nextOver = overId && overId !== sourceId ? overId : null;
-      if (nextOver !== currentOverId) {
+      const container = appsScrollRef.current;
+      const buttons = container
+        ? Array.from(
+            container.querySelectorAll<HTMLElement>(
+              `[data-bar-id][data-bar-pinned="${isPinnedSource ? '1' : '0'}"]`,
+            ),
+          )
+        : [];
+      const candidates = buttons
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            id: el.dataset.barId ?? '',
+            left: rect.left,
+            right: rect.right,
+          };
+        })
+        .filter((c) => Boolean(c.id));
+
+      const resolved = resolveHorizontalDropTarget(candidates, ev.clientX, sourceId);
+      const nextOver = resolved?.targetId ?? null;
+      const nextSide = resolved?.side ?? null;
+      if (nextOver !== currentOverId || nextSide !== currentOverSide) {
         currentOverId = nextOver;
+        currentOverSide = nextSide;
         setDragOverPinId(nextOver);
+        setDragOverSide(nextSide);
       }
     };
 
     const cleanup = () => {
+      releaseCapture();
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onCancel);
@@ -1127,6 +1190,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       if (active) {
         setDragPinId(null);
         setDragOverPinId(null);
+        setDragOverSide(null);
       }
     };
 
@@ -1137,15 +1201,57 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       const targetId = currentOverId;
       setDragPinId(null);
       setDragOverPinId(null);
-      if (targetId) {
+      setDragOverSide(null);
+      if (!targetId) return;
+
+      if (isPinnedSource) {
         const indices = resolvePinnedReorderIndices(barItemsRef.current, sourceId, targetId);
         if (indices) {
-          ipc('reorder_pins', {
+          setConfig((prev) => {
+            if (!prev?.taskbarPins) return prev;
+            const pins = [...prev.taskbarPins];
+            if (
+              indices.fromIdx < 0 ||
+              indices.toIdx < 0 ||
+              indices.fromIdx >= pins.length ||
+              indices.toIdx >= pins.length
+            ) {
+              return prev;
+            }
+            const [moved] = pins.splice(indices.fromIdx, 1);
+            pins.splice(indices.toIdx, 0, moved);
+            return { ...prev, taskbarPins: pins };
+          });
+          ipc<TestBarConfig>('reorder_pins', {
             space: 'taskbar',
             fromIdx: indices.fromIdx,
             toIdx: indices.toIdx,
-          }).catch(() => {});
+          })
+            .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+            .catch(() => {
+              ipc<TestBarConfig>('get_config')
+                .then((next) => setConfig((prev) => applyConfigUpdate(prev, next)))
+                .catch(() => {});
+            });
         }
+      } else {
+        const currentUnpinned =
+          orderMemoryRef.current.unpinnedIds.length > 0
+            ? orderMemoryRef.current.unpinnedIds
+            : barItemsRef.current.filter((b) => !b.pinned).map((b) => b.id);
+        const nextOrder = reorderUnpinnedIds(currentUnpinned, sourceId, targetId);
+        orderMemoryRef.current.unpinnedIds = nextOrder;
+        if (window.localStorage) {
+          try {
+            window.localStorage.setItem(
+              `prismbar-open-order-${monitor}`,
+              JSON.stringify(nextOrder),
+            );
+          } catch {
+            // Ignore storage write errors
+          }
+        }
+        setUnpinnedOrderRev((v) => v + 1);
       }
     };
 
@@ -1469,6 +1575,8 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
                 isLaunching ? 'launching' : '',
                 isDragging ? 'dragging' : '',
                 isDragOver ? 'drag-over' : '',
+                isDragOver && dragOverSide === 'before' ? 'drag-over-before' : '',
+                isDragOver && dragOverSide === 'after' ? 'drag-over-after' : '',
               ]
                 .filter(Boolean)
                 .join(' ');
@@ -1479,6 +1587,8 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
                   type="button"
                   className={btnCls}
                   aria-label={item.name}
+                  data-bar-id={item.id}
+                  data-bar-pinned={item.pinned ? '1' : '0'}
                   data-pin-id={item.pinned ? item.id : undefined}
                   onPointerDown={(e) => handlePinPointerDown(e, item)}
                   onClick={() => handleAppClick(item)}

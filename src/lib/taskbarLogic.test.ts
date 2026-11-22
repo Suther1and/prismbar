@@ -43,6 +43,8 @@ import {
   parseFocusTimerSnapshot,
   planSoundFeedbackAction,
   PREVIEW_CARD_HEIGHT,
+  reorderUnpinnedIds,
+  resolveHorizontalDropTarget,
   PREVIEW_HOVER_COLD_MS,
   PREVIEW_HOVER_WARM_MS,
   resolveActiveTaskbarWidgets,
@@ -1058,5 +1060,35 @@ describe('V3.2 Taskbar widgets zone, network/media/timer formatters & network/te
     expect(flyoutViewSrc).toContain('Проверить');
     expect(flyoutViewSrc).toContain('Локальный IPv4');
     expect(flyoutViewSrc).toContain('Монитор ПК');
+  });
+
+  it('reorders unpinned open app IDs and resolves horizontal drop targets with drift tolerance', () => {
+    expect(reorderUnpinnedIds(['a', 'b', 'c', 'd'], 'a', 'c')).toEqual(['b', 'c', 'a', 'd']);
+    expect(reorderUnpinnedIds(['a', 'b', 'c', 'd'], 'd', 'b')).toEqual(['a', 'd', 'b', 'c']);
+    expect(reorderUnpinnedIds(['a', 'b'], 'a', 'a')).toEqual(['a', 'b']);
+    expect(reorderUnpinnedIds(['a', 'b'], 'missing', 'b')).toEqual(['a', 'b']);
+
+    const boxes = [
+      { id: 'a', left: 10, right: 50 },
+      { id: 'b', left: 54, right: 94 },
+      { id: 'c', left: 98, right: 138 },
+    ];
+    // Staying inside source box cancels drop target
+    expect(resolveHorizontalDropTarget(boxes, 70, 'b')).toBeNull();
+    // Moving left past 'b' highlights 'a'
+    expect(resolveHorizontalDropTarget(boxes, 20, 'b')).toEqual({
+      targetId: 'a',
+      side: 'before',
+    });
+    // Clamping outside right edge still snaps cleanly to rightmost candidate
+    expect(resolveHorizontalDropTarget(boxes, 500, 'a')).toEqual({
+      targetId: 'c',
+      side: 'after',
+    });
+    // Clamping outside left edge snaps cleanly to leftmost candidate
+    expect(resolveHorizontalDropTarget(boxes, -20, 'c')).toEqual({
+      targetId: 'a',
+      side: 'before',
+    });
   });
 });

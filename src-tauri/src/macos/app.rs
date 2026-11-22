@@ -767,6 +767,29 @@ fn quit_app(app: AppHandle) {
 }
 
 #[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    crate::updater::current_app_version(&app)
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<crate::updater::UpdateCheckResult, String> {
+    crate::updater::check_for_updates(&app).await
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let app_for_hide = app.clone();
+    crate::updater::download_and_install_update(&app, move || {
+        quick_toggles::shutdown();
+        let h = app_for_hide.clone();
+        let _ = app_for_hide.run_on_main_thread(move || {
+            hide_start(&h, true, false);
+        });
+    })
+    .await
+}
+
+#[tauri::command]
 fn get_config(state: State<MacAppState>) -> TestBarConfig {
     lock_unpoisoned(&state.config).clone()
 }
@@ -1748,9 +1771,9 @@ async fn export_config_dialog(app: AppHandle) -> Result<Option<String>, String> 
     let cfg_snapshot = lock_unpoisoned(&app.state::<MacAppState>().config).clone();
     let picked = run_dialog_on_main(&app, || {
         rfd::FileDialog::new()
-            .set_title("Экспорт конфигурации TestBar")
+            .set_title("Экспорт конфигурации PrismBar")
             .add_filter("JSON", &["json"])
-            .set_file_name("testbar-config.json")
+            .set_file_name("prismbar-config.json")
             .save_file()
     })
     .await?;
@@ -1771,7 +1794,7 @@ async fn export_config_dialog(app: AppHandle) -> Result<Option<String>, String> 
 async fn import_config_dialog(app: AppHandle) -> Result<Option<TestBarConfig>, String> {
     let picked = run_dialog_on_main(&app, || {
         rfd::FileDialog::new()
-            .set_title("Импорт конфигурации TestBar")
+            .set_title("Импорт конфигурации PrismBar")
             .add_filter("JSON", &["json"])
             .pick_file()
     })
@@ -2245,6 +2268,7 @@ pub fn run() {
     };
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
@@ -2342,14 +2366,22 @@ pub fn run() {
             get_peripherals,
             get_peripheral_batteries,
             refresh_peripheral_batteries,
+            get_app_version,
+            check_for_updates,
+            install_update,
         ])
         .setup(move |app| {
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();
 
             // Build native macOS Menu Bar TrayIcon
-            let open_item =
-                MenuItem::with_id(app, "tray-open", "Открыть TestBar (⌘)", true, None::<&str>)?;
+            let open_item = MenuItem::with_id(
+                app,
+                "tray-open",
+                "Открыть PrismBar (⌘)",
+                true,
+                None::<&str>,
+            )?;
             let settings_item =
                 MenuItem::with_id(app, "tray-settings", "Настройки", true, None::<&str>)?;
             let ax_item = MenuItem::with_id(
@@ -2364,9 +2396,9 @@ pub fn run() {
             let tray_menu =
                 Menu::with_items(app, &[&open_item, &settings_item, &ax_item, &sep, &quit_item])?;
 
-            let mut tray_builder = TrayIconBuilder::with_id("testbar-tray")
+            let mut tray_builder = TrayIconBuilder::with_id("prismbar-tray")
                 .menu(&tray_menu)
-                .tooltip("TestBar")
+                .tooltip("PrismBar")
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "tray-open" => {

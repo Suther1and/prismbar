@@ -23,6 +23,7 @@ pub mod quick_toggles;
 pub mod system_widgets;
 #[cfg(target_os = "windows")]
 pub mod telemetry;
+pub mod updater;
 #[cfg(target_os = "windows")]
 pub mod weather;
 #[cfg(target_os = "windows")]
@@ -4466,9 +4467,9 @@ async fn export_config_dialog(app: AppHandle) -> Result<Option<String>, String> 
         let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
         let cfg_snapshot = lock_unpoisoned(&state.config).clone();
         let picked = rfd::FileDialog::new()
-            .set_title("Экспорт конфигурации TestBar")
+            .set_title("Экспорт конфигурации PrismBar")
             .add_filter("JSON", &["json"])
-            .set_file_name("testbar-config.json")
+            .set_file_name("prismbar-config.json")
             .save_file();
         let h = app.clone();
         let _ = app.run_on_main_thread(move || {
@@ -4492,7 +4493,7 @@ async fn import_config_dialog(app: AppHandle) -> Result<Option<TestBarConfig>, S
         let state = app.state::<AppState>();
         let _modal_guard = ModalPickerGuard::acquire(&state.coordinator);
         let picked = rfd::FileDialog::new()
-            .set_title("Импорт конфигурации TestBar")
+            .set_title("Импорт конфигурации PrismBar")
             .add_filter("JSON", &["json"])
             .pick_file();
         let h_refocus = app.clone();
@@ -5174,6 +5175,31 @@ async fn get_icon_for_path(app: AppHandle, path: String) -> Result<Option<String
     .map_err(|e| format!("task join error: {e}"))
 }
 
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    crate::updater::current_app_version(&app)
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<crate::updater::UpdateCheckResult, String> {
+    crate::updater::check_for_updates(&app).await
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let app_for_cleanup = app.clone();
+    crate::updater::download_and_install_update(&app, move || {
+        let hide_native = app_for_cleanup.state::<AppState>().hide_native;
+        quick_toggles::shutdown();
+        backdrop::shutdown();
+        win_shell::stop_shell_hook_thread();
+        if hide_native {
+            win_shell::restore_native_taskbar();
+        }
+    })
+    .await
+}
+
 pub fn run_watchdog_mode(args: WatchdogArgs) {
     win_shell::run_watchdog(args);
 }
@@ -5259,6 +5285,7 @@ pub fn run(hide_native: bool) {
     };
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -5392,6 +5419,9 @@ pub fn run(hide_native: bool) {
             power_action,
             restore_windows_taskbar_and_exit,
             get_icon_for_path,
+            get_app_version,
+            check_for_updates,
+            install_update,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -5442,7 +5472,7 @@ pub fn run(hide_native: bool) {
                                                 let _ = system_widgets::push_session_alert(
                                                     "info",
                                                     "Проводник перезапущен",
-                                                    Some("Панель TestBar и рабочая область восстановлены".to_string()),
+                                                    Some("Панель PrismBar и рабочая область восстановлены".to_string()),
                                                 );
                                                 emit_session_alerts_if_calendar_open(&h);
                                             }
