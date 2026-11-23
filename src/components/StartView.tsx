@@ -248,7 +248,7 @@ export const StartView: React.FC = () => {
   const isMac = platform === 'macos';
   const [accessibilityTrusted, setAccessibilityTrusted] = useState<boolean | null>(null);
   const [accessBannerDismissed, setAccessBannerDismissed] = useState(false);
-  const [appVersion, setAppVersion] = useState<string>('3.3.0');
+  const [appVersion, setAppVersion] = useState<string>('3.3.1');
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateStatus, setUpdateStatus] = useState<
     'idle' | 'checking' | 'available' | 'up-to-date' | 'downloading' | 'installing' | 'error'

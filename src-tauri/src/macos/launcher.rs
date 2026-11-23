@@ -141,6 +141,11 @@ pub fn launch_item(target: &str, args: Option<&str>) -> Result<(), String> {
         cmd.arg("-a").arg(&resolved).arg("--args").args(&extra_args);
     } else if !extra_args.is_empty() && Path::new(&resolved).is_file() {
         let mut bin_cmd = Command::new(&resolved);
+        if let Some(parent) = Path::new(&resolved).parent() {
+            if parent.is_dir() {
+                bin_cmd.current_dir(parent);
+            }
+        }
         bin_cmd.args(&extra_args);
         bin_cmd
             .spawn()

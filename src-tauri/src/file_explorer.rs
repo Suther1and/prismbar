@@ -1085,13 +1085,19 @@ pub fn fs_open_item(path: &str) -> Result<(), String> {
     let _com = ExplorerComGuard::init_sta();
     let verb = wide("open");
     let target = wide(&norm);
+    let work_dir_wide =
+        crate::windows_tracker::resolve_launch_working_dir(&norm).map(|d| wide(&d));
+    let work_dir_ptr = work_dir_wide
+        .as_ref()
+        .map(|w| PCWSTR(w.as_ptr()))
+        .unwrap_or_else(PCWSTR::null);
     let code = unsafe {
         ShellExecuteW(
             HWND::default(),
             PCWSTR(verb.as_ptr()),
             PCWSTR(target.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            work_dir_ptr,
             SW_SHOW,
         )
         .0 as isize

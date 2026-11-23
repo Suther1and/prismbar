@@ -2619,6 +2619,103 @@ pub fn format_shell_execute_error(code: isize, target: &str) -> String {
     }
 }
 
+enum LnkWorkDirResolution {
+    Dir(String),
+    LetShellExpand,
+    Fallback,
+}
+
+fn resolve_lnk_working_dir(lnk_path: &Path) -> LnkWorkDirResolution {
+    unsafe {
+        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER)
+        else {
+            return LnkWorkDirResolution::Fallback;
+        };
+        let Ok(pf) = link.cast::<IPersistFile>() else {
+            return LnkWorkDirResolution::Fallback;
+        };
+        let w = wide(&lnk_path.to_string_lossy());
+        if pf.Load(PCWSTR(w.as_ptr()), STGM(0)).is_err() {
+            return LnkWorkDirResolution::Fallback;
+        }
+
+        let mut wd_buf = [0u16; 1024];
+        if link.GetWorkingDirectory(&mut wd_buf).is_ok() {
+            let len = wd_buf.iter().position(|&c| c == 0).unwrap_or(wd_buf.len());
+            let wd = String::from_utf16_lossy(&wd_buf[..len]).trim().to_string();
+            if !wd.is_empty() {
+                if Path::new(&wd).is_dir() {
+                    return LnkWorkDirResolution::Dir(wd);
+                }
+                // Let Windows Shell expand environment-variable working dirs like `%USERPROFILE%`
+                // directly from the `.lnk` instead of overriding them with a fallback directory.
+                if wd.contains('%') {
+                    return LnkWorkDirResolution::LetShellExpand;
+                }
+            }
+        }
+
+        let mut path_buf = [0u16; 1024];
+        let mut fd = std::mem::zeroed();
+        if link.GetPath(&mut path_buf, &mut fd, 0).is_ok() {
+            let len = path_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(path_buf.len());
+            let target = String::from_utf16_lossy(&path_buf[..len])
+                .trim()
+                .to_string();
+            if let Some(parent) = Path::new(&target).parent() {
+                if !parent.as_os_str().is_empty() && parent.is_dir() {
+                    return LnkWorkDirResolution::Dir(parent.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    LnkWorkDirResolution::Fallback
+}
+
+/// Resolves the appropriate working directory (`lpDirectory`) for `ShellExecuteW` so launched
+/// applications never accidentally inherit PrismBar's own installation directory.
+pub fn resolve_launch_working_dir(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if is_ms_or_shell_uri(&low) || low.contains("://") {
+        return None;
+    }
+
+    let path = Path::new(trimmed);
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+    {
+        return match resolve_lnk_working_dir(path) {
+            LnkWorkDirResolution::Dir(dir) => Some(dir),
+            LnkWorkDirResolution::LetShellExpand => None,
+            LnkWorkDirResolution::Fallback => {
+                dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+            }
+        };
+    }
+
+    if path.is_dir() {
+        return Some(trimmed.to_string());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && parent.is_dir() {
+            return Some(parent.to_string_lossy().into_owned());
+        }
+    }
+
+    // Bare commands resolved via PATH (e.g. `cmd.exe`, `notepad.exe`) should start in the user's
+    // home folder rather than PrismBar's installation directory.
+    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+}
+
 pub fn launch_target_with_args(
     target: &str,
     args: Option<&str>,
@@ -2634,9 +2731,10 @@ pub fn launch_target_with_args(
     };
     let is_shell_appsfolder = low_target.starts_with("shell:appsfolder\\");
 
-    // Acquire STA COM on tokio::spawn_blocking worker threads so ShellExecuteW handles
-    // `shell:AppsFolder\...` and `ms-settings:` URIs reliably (AD-5).
+    // Acquire STA COM on tokio::spawn_blocking worker threads so ShellExecuteW and IShellLinkW
+    // handle `shell:AppsFolder\...`, `ms-settings:`, and `.lnk` working directories reliably (AD-5).
     let _com = ComGuard::init_sta();
+    let work_dir_wide = resolve_launch_working_dir(final_target.as_ref()).map(|d| wide(&d));
     unsafe {
         let verb = wide(effective_verb);
         let file = wide(final_target.as_ref());
@@ -2645,12 +2743,16 @@ pub fn launch_target_with_args(
             .as_ref()
             .map(|w| PCWSTR(w.as_ptr()))
             .unwrap_or_else(PCWSTR::null);
+        let work_dir_ptr = work_dir_wide
+            .as_ref()
+            .map(|w| PCWSTR(w.as_ptr()))
+            .unwrap_or_else(PCWSTR::null);
         let res = ShellExecuteW(
             HWND::default(),
             PCWSTR(verb.as_ptr()),
             PCWSTR(file.as_ptr()),
             params_ptr,
-            PCWSTR::null(),
+            work_dir_ptr,
             SW_SHOW,
         );
         let code = res.0 as isize;
@@ -5145,5 +5247,44 @@ mod tests {
         );
         assert_eq!(uwp_spec.args.as_deref(), Some("-p PowerShell --maximized"));
         assert_eq!(uwp_spec.verb, "open");
+    }
+
+    #[test]
+    fn resolve_launch_working_dir_prefers_target_parent_and_avoids_host_cwd() {
+        // URIs should not force a filesystem working directory
+        assert_eq!(resolve_launch_working_dir(""), None);
+        assert_eq!(resolve_launch_working_dir("https://example.com"), None);
+        assert_eq!(resolve_launch_working_dir("ms-settings:network"), None);
+        assert_eq!(
+            resolve_launch_working_dir(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+            None
+        );
+        assert_eq!(resolve_launch_working_dir("steam://rungameid/570"), None);
+
+        // Existing executable/file resolves to its own parent directory
+        let sys_dir = std::env::temp_dir().join(format!(
+            "prismbar-wd-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&sys_dir);
+        let fake_exe = sys_dir.join("info.exe");
+        std::fs::write(&fake_exe, b"").unwrap();
+
+        assert_eq!(
+            resolve_launch_working_dir(&fake_exe.to_string_lossy()).as_deref(),
+            Some(sys_dir.to_string_lossy().as_ref())
+        );
+
+        // Existing directory resolves to itself
+        assert_eq!(
+            resolve_launch_working_dir(&sys_dir.to_string_lossy()).as_deref(),
+            Some(sys_dir.to_string_lossy().as_ref())
+        );
+
+        // Bare command falls back to home dir, never host process cwd
+        let expected_home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(resolve_launch_working_dir("notepad.exe"), expected_home);
+
+        let _ = std::fs::remove_dir_all(&sys_dir);
     }
 }

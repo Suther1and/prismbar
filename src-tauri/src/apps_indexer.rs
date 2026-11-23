@@ -114,7 +114,7 @@ impl LnkResolver {
         }
     }
 
-    fn resolve_target_and_args(&self, lnk_path: &Path) -> Option<(String, String)> {
+    fn resolve_target_args_and_workdir(&self, lnk_path: &Path) -> Option<(String, String, String)> {
         unsafe {
             let w = wide(&lnk_path.to_string_lossy());
             self.persist.Load(PCWSTR(w.as_ptr()), STGM(0)).ok()?;
@@ -146,9 +146,47 @@ impl LnkResolver {
                 String::new()
             };
 
-            Some((resolved, args))
+            let mut wd_buf = [0u16; 1024];
+            let work_dir = if self.link.GetWorkingDirectory(&mut wd_buf).is_ok() {
+                let wd_len = wd_buf.iter().position(|&c| c == 0).unwrap_or(wd_buf.len());
+                String::from_utf16_lossy(&wd_buf[..wd_len])
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+
+            Some((resolved, args, work_dir))
         }
     }
+}
+
+fn normalize_dir_for_compare(dir: &str) -> String {
+    let normalized = dir.trim().trim_matches('"').replace('/', "\\");
+    let stripped = if normalized.len() > 3 {
+        normalized.trim_end_matches('\\')
+    } else {
+        normalized.as_str()
+    };
+    stripped.to_ascii_lowercase()
+}
+
+/// Returns true when a Start Menu `.lnk` shortcut must be kept as the launch target instead of
+/// unwrapping to its bare `.exe` — either because it carries CLI arguments or because it specifies
+/// a custom `WorkingDirectory` different from the `.exe`'s own folder.
+pub fn should_keep_lnk_target(exe: &str, args: &str, working_dir: &str) -> bool {
+    if !args.trim().is_empty() {
+        return true;
+    }
+    let wd_norm = normalize_dir_for_compare(working_dir);
+    if wd_norm.is_empty() {
+        return false;
+    }
+    let exe_parent = Path::new(exe)
+        .parent()
+        .map(|p| normalize_dir_for_compare(&p.to_string_lossy()))
+        .unwrap_or_default();
+    wd_norm != exe_parent
 }
 
 pub fn is_ignored_app_name(name: &str) -> bool {
@@ -533,15 +571,15 @@ pub fn scan_installed_apps_cached(
             let lnk_str = lnk.to_string_lossy().to_string();
             let resolved = lnk_resolver
                 .as_ref()
-                .and_then(|resolver| resolver.resolve_target_and_args(&lnk));
+                .and_then(|resolver| resolver.resolve_target_args_and_workdir(&lnk));
 
             let (target, icon_source) = match resolved {
-                Some((exe, args))
+                Some((exe, args, work_dir))
                     if exe.to_ascii_lowercase().ends_with(".exe") && Path::new(&exe).exists() =>
                 {
-                    // Keep the .lnk when shortcut carries required CLI arguments (e.g. Discord Update.exe),
-                    // while extracting the icon cleanly from the .lnk or resolved .exe.
-                    if args.is_empty() {
+                    // Keep the .lnk when shortcut carries required CLI arguments (e.g. Discord Update.exe)
+                    // or a custom WorkingDirectory different from the .exe's folder.
+                    if !should_keep_lnk_target(&exe, &args, &work_dir) {
                         (exe.clone(), exe)
                     } else {
                         (lnk_str.clone(), lnk_str)
@@ -2152,5 +2190,35 @@ mod tests {
         assert!(load_game_cover_data(&dir.join("missing.jpg").to_string_lossy()).is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_keep_lnk_target_preserves_custom_args_and_custom_working_dir() {
+        // Same working dir as exe folder (with or without trailing slash / different case) -> safe to unwrap
+        assert!(!should_keep_lnk_target(r"C:\QUIK_VTB\info.exe", "", ""));
+        assert!(!should_keep_lnk_target(
+            r"C:\QUIK_VTB\info.exe",
+            "",
+            r"C:\QUIK_VTB"
+        ));
+        assert!(!should_keep_lnk_target(
+            r"C:\QUIK_VTB\info.exe",
+            "",
+            r"c:/quik_vtb\"
+        ));
+
+        // Custom CLI args -> must keep .lnk
+        assert!(should_keep_lnk_target(
+            r"C:\Users\me\AppData\Local\Discord\Update.exe",
+            "--processStart Discord.exe",
+            ""
+        ));
+
+        // Custom working directory different from exe parent -> must keep .lnk
+        assert!(should_keep_lnk_target(
+            r"C:\SomeApp\bin\app.exe",
+            "",
+            r"C:\SomeApp\data"
+        ));
     }
 }
