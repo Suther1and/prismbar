@@ -87,6 +87,10 @@ const START_DEFAULT_LOGICAL_HEIGHT: f64 = 680.0 + 2.0 * START_ROOT_PAD_LOGICAL; 
 const FLYOUT_ROOT_PAD_TOTAL_LOGICAL: f64 = 2.0 * FLYOUT_ROOT_PAD_LOGICAL; // 32px (16px shadow pad on all 4 sides)
 const FLYOUT_EXIT_ANIM_MS: u64 = 130;
 const START_EXIT_ANIM_MS: u64 = 135;
+const TASKBAR_HIDE_ANIM_MS: u64 = 120;
+const TASKBAR_SHOW_ANIM_MS: u32 = 160;
+const TASKBAR_GLIDE_OFFSET_PX: f32 = 14.0;
+const TASKBAR_GLIDE_SCALE: f32 = 0.97;
 const PREVIEW_GLIDE_DURATION_MS: u64 = 115;
 const PERIODIC_REINDEX_INTERVAL_SECS: u64 = 15 * 60;
 const MAX_ICON_SOURCES_ENTRIES: usize = 2048;
@@ -117,6 +121,13 @@ pub struct StartShownEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlyoutHideEvent {
+    pub gen: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskbarVisibilityEvent {
+    pub visible: bool,
     pub gen: u64,
 }
 
@@ -180,6 +191,8 @@ pub struct AppState {
     pub pending_flyout_exit: Mutex<Option<PendingSurfaceExit>>,
     pub flyout_anim_gen: Arc<AtomicU64>,
     pub start_anim_gen: Arc<AtomicU64>,
+    pub taskbar_anim_gen: Arc<AtomicU64>,
+    pub secondary_taskbar_anim_gen: Arc<AtomicU64>,
     pub start_backdrop_shown_gen: Arc<AtomicU64>,
     pub flyout_backdrop_shown_gen: Arc<AtomicU64>,
     pub flyout_glide_gen: Arc<AtomicU64>,
@@ -366,7 +379,8 @@ fn flyout_backdrop_insets_and_radius(kind: FlyoutKind, sf: f64) -> (BackdropInse
         | FlyoutKind::Network
         | FlyoutKind::Telemetry
         | FlyoutKind::ContextApp
-        | FlyoutKind::ContextBar => 16.0,
+        | FlyoutKind::ContextBar
+        | FlyoutKind::ContextStart => 16.0,
     };
     (BackdropInsets::uniform(pad), (radius_logical * sf) as f32)
 }
@@ -1807,40 +1821,145 @@ fn apply_coordinator_actions(
         actions.taskbar_visible,
         || position_taskbar_window(app),
         |tb_vis| {
-            if !tb_vis {
-                backdrop::set_visible("taskbar", false);
-            }
-            if let Some(tb) = app.get_webview_window("taskbar") {
-                if let Some(hwnd) = win_hwnd(&tb) {
-                    win_shell::set_window_visible(hwnd, tb_vis, true);
-                    if tb_vis {
-                        backdrop::set_visible("taskbar", true);
+            let gen = st.taskbar_anim_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if tb_vis {
+                if let Some(tb) = app.get_webview_window("taskbar") {
+                    if let Some(hwnd) = win_hwnd(&tb) {
+                        win_shell::set_window_hit_transparent(hwnd, false);
+                        win_shell::set_window_visible(hwnd, true, true);
                         backdrop::sync_z_order("taskbar", hwnd);
+                        backdrop::animate_in(
+                            "taskbar",
+                            TASKBAR_SHOW_ANIM_MS,
+                            TASKBAR_GLIDE_OFFSET_PX,
+                            TASKBAR_GLIDE_SCALE,
+                        );
                     }
                 }
+                let _ = app.emit_to(
+                    "taskbar",
+                    "taskbar-visibility",
+                    TaskbarVisibilityEvent { visible: true, gen },
+                );
+            } else {
+                if let Some(tb) = app.get_webview_window("taskbar") {
+                    if let Some(hwnd) = win_hwnd(&tb) {
+                        win_shell::set_window_hit_transparent(hwnd, true);
+                    }
+                }
+                let _ = app.emit_to(
+                    "taskbar",
+                    "taskbar-visibility",
+                    TaskbarVisibilityEvent { visible: false, gen },
+                );
+                backdrop::animate_out(
+                    "taskbar",
+                    TASKBAR_HIDE_ANIM_MS as u32,
+                    TASKBAR_GLIDE_OFFSET_PX,
+                    TASKBAR_GLIDE_SCALE,
+                );
+                let h_hide = app.clone();
+                let anim_gen = Arc::clone(&st.taskbar_anim_gen);
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(TASKBAR_HIDE_ANIM_MS + 10))
+                        .await;
+                    if anim_gen.load(Ordering::SeqCst) != gen {
+                        return;
+                    }
+                    let h = h_hide.clone();
+                    let _ = h_hide.run_on_main_thread(move || {
+                        let st_inner = h.state::<AppState>();
+                        if st_inner.taskbar_anim_gen.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        backdrop::set_visible("taskbar", false);
+                        if let Some(tb) = h.get_webview_window("taskbar") {
+                            if let Some(hwnd) = win_hwnd(&tb) {
+                                win_shell::set_window_visible(hwnd, false, true);
+                                win_shell::set_window_hit_transparent(hwnd, false);
+                            }
+                        }
+                    });
+                });
             }
         },
     );
 
     if let Some(sec_vis) = actions.secondary_taskbar_visible {
+        let gen = st
+            .secondary_taskbar_anim_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
         if sec_vis {
-            sync_secondary_taskbar(app);
-        } else {
-            let was_vis = st.secondary_taskbar_visible.swap(false, Ordering::AcqRel);
-            backdrop::set_visible("taskbar-secondary", false);
             if let Some(tb2) = app.get_webview_window("taskbar-secondary") {
                 if let Some(hwnd) = win_hwnd(&tb2) {
-                    win_shell::set_window_visible(hwnd, false, true);
-                }
-                if was_vis {
-                    set_webview_memory_low(&tb2, true);
+                    win_shell::set_window_hit_transparent(hwnd, false);
                 }
             }
+            sync_secondary_taskbar(app);
+            if st.secondary_taskbar_visible.load(Ordering::Acquire) {
+                backdrop::animate_in(
+                    "taskbar-secondary",
+                    TASKBAR_SHOW_ANIM_MS,
+                    TASKBAR_GLIDE_OFFSET_PX,
+                    TASKBAR_GLIDE_SCALE,
+                );
+                let _ = app.emit_to(
+                    "taskbar-secondary",
+                    "taskbar-visibility",
+                    TaskbarVisibilityEvent { visible: true, gen },
+                );
+            }
+        } else {
+            let was_vis = st.secondary_taskbar_visible.swap(false, Ordering::AcqRel);
+            if let Some(tb2) = app.get_webview_window("taskbar-secondary") {
+                if let Some(hwnd) = win_hwnd(&tb2) {
+                    win_shell::set_window_hit_transparent(hwnd, true);
+                }
+            }
+            let _ = app.emit_to(
+                "taskbar-secondary",
+                "taskbar-visibility",
+                TaskbarVisibilityEvent { visible: false, gen },
+            );
+            backdrop::animate_out(
+                "taskbar-secondary",
+                TASKBAR_HIDE_ANIM_MS as u32,
+                TASKBAR_GLIDE_OFFSET_PX,
+                TASKBAR_GLIDE_SCALE,
+            );
+            let h_hide = app.clone();
+            let anim_gen = Arc::clone(&st.secondary_taskbar_anim_gen);
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(TASKBAR_HIDE_ANIM_MS + 10))
+                    .await;
+                if anim_gen.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let h = h_hide.clone();
+                let _ = h_hide.run_on_main_thread(move || {
+                    let st_inner = h.state::<AppState>();
+                    if st_inner.secondary_taskbar_anim_gen.load(Ordering::SeqCst) != gen {
+                        return;
+                    }
+                    backdrop::set_visible("taskbar-secondary", false);
+                    if let Some(tb2) = h.get_webview_window("taskbar-secondary") {
+                        if let Some(hwnd) = win_hwnd(&tb2) {
+                            win_shell::set_window_visible(hwnd, false, true);
+                            win_shell::set_window_hit_transparent(hwnd, false);
+                        }
+                        if was_vis {
+                            set_webview_memory_low(&tb2, true);
+                        }
+                    }
+                });
+            });
         }
     }
 
     // 3. Zero-Lag Start Menu Open: pre-hydrate cached data (including audio) -> SW_SHOW -> emit `start-shown`
     if actions.start_visible == Some(true) {
+        win_shell::clear_foreground_elevated_state();
         capture_external_foreground_hwnd(&st);
         *lock_unpoisoned(&st.pending_start_exit) = None;
         let show_gen = actions
@@ -5156,6 +5275,20 @@ fn power_action(action: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn run_winx_action(app: AppHandle, action: String) -> Result<(), String> {
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_start_and_flyout(&h, true, true);
+    });
+    if action == "desktop" {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    tauri::async_runtime::spawn_blocking(move || system_widgets::execute_winx_action(&action))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
 fn restore_windows_taskbar_and_exit(app: AppHandle, state: State<AppState>) {
     backdrop::shutdown();
     win_shell::stop_shell_hook_thread();
@@ -5221,6 +5354,7 @@ pub fn run(hide_native: bool) {
     }
 
     let initial_cfg = config::load_config();
+    let initial_autostart = initial_cfg.autostart;
     let initial_pinned_clipboard = initial_cfg.pinned_clipboard.clone();
     win_shell::set_keep_native_secondary_taskbar(
         win_shell::secondary_native_taskbar_should_stay_visible(&initial_cfg.secondary_taskbar_mode),
@@ -5233,6 +5367,8 @@ pub fn run(hide_native: bool) {
     let tray_cache_warmed = Arc::new(AtomicBool::new(false));
     let flyout_anim_gen = Arc::new(AtomicU64::new(0));
     let start_anim_gen = Arc::new(AtomicU64::new(0));
+    let taskbar_anim_gen = Arc::new(AtomicU64::new(0));
+    let secondary_taskbar_anim_gen = Arc::new(AtomicU64::new(0));
     let start_backdrop_shown_gen = Arc::new(AtomicU64::new(u64::MAX));
     let flyout_backdrop_shown_gen = Arc::new(AtomicU64::new(u64::MAX));
     let flyout_glide_gen = Arc::new(AtomicU64::new(0));
@@ -5275,6 +5411,8 @@ pub fn run(hide_native: bool) {
         pending_flyout_exit: Mutex::new(None),
         flyout_anim_gen: Arc::clone(&flyout_anim_gen),
         start_anim_gen: Arc::clone(&start_anim_gen),
+        taskbar_anim_gen: Arc::clone(&taskbar_anim_gen),
+        secondary_taskbar_anim_gen: Arc::clone(&secondary_taskbar_anim_gen),
         start_backdrop_shown_gen: Arc::clone(&start_backdrop_shown_gen),
         flyout_backdrop_shown_gen: Arc::clone(&flyout_backdrop_shown_gen),
         flyout_glide_gen: Arc::clone(&flyout_glide_gen),
@@ -5285,6 +5423,13 @@ pub fn run(hide_native: bool) {
     };
 
     let app = tauri::Builder::default()
+        // Critical Windows 11 + tao invariant (`tauri-apps/wry#1761`): tao's default
+        // `DeviceEventFilter::Unfocused` registers foreground Raw Input (`RegisterRawInputDevices`)
+        // for keyboards/mice, which causes Windows to skip our process's own `WH_KEYBOARD_LL` hook
+        // whenever `start` or `flyout` has focus — leaking `VK_LWIN` straight to native Windows Start.
+        // `DeviceEventFilter::Always` maps to `RIDEV_REMOVE` so `WH_KEYBOARD_LL` fires 100% reliably
+        // even while PrismBar's own WebView2 overlays hold foreground focus.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
@@ -5417,6 +5562,7 @@ pub fn run(hide_native: bool) {
             open_windows_notifications,
             get_network_info,
             power_action,
+            run_winx_action,
             restore_windows_taskbar_and_exit,
             get_icon_for_path,
             get_app_version,
@@ -5569,6 +5715,37 @@ pub fn run(hide_native: bool) {
                         });
                     });
                 }
+                ShellHookEvent::OpenWinXMenu => {
+                    let h = h_hook.clone();
+                    let _ = h_hook.run_on_main_thread(move || {
+                        let already_winx = lock_unpoisoned(&h.state::<AppState>().coordinator)
+                            .active_flyout()
+                            == Some(FlyoutKind::ContextStart);
+                        if already_winx {
+                            dispatch_coordinator(&h, None, |coord| coord.request_close_flyout());
+                        } else {
+                            let req = FlyoutRequest {
+                                kind: FlyoutKind::ContextStart,
+                                anchor_x_logical: 42.0,
+                                anchor_in_taskbar: true,
+                                width: 280,
+                                height: 446,
+                                no_activate: false,
+                                monitor: Some("primary".to_string()),
+                                payload: serde_json::json!({}),
+                                gen: 0,
+                                anchor_origin_x: None,
+                            };
+                            dispatch_coordinator(&h, Some(&req), |coord| {
+                                coord.request_open_flyout_on_monitor(
+                                    FlyoutKind::ContextStart,
+                                    Some("primary"),
+                                    monotonic_ms(),
+                                )
+                            });
+                        }
+                    });
+                }
                 ShellHookEvent::LockWorkstation => {
                     win_shell::lock_workstation();
                 }
@@ -5612,9 +5789,13 @@ pub fn run(hide_native: bool) {
             // Dedicated MTA WinRT SMTC worker thread (AD-5)
             media::start_media_worker();
 
-            // Pre-warm AudioState, Win11 NotifyIconSettings Tray cache, & auto-heal broken pins at startup
+            // Pre-warm AudioState, Win11 NotifyIconSettings Tray cache, auto-migrate autostart to fast
+            // Task Scheduler logon trigger in release builds, & auto-heal broken pins at startup.
             let h_warm = handle.clone();
             let _ = tauri::async_runtime::spawn_blocking(move || {
+                if !cfg!(debug_assertions) && initial_autostart {
+                    let _ = config::set_windows_autostart(true);
+                }
                 let st = h_warm.state::<AppState>();
                 let _ = sample_audio_state_with_icon_sources(&st);
                 let _ = refresh_cached_tray_apps(&h_warm, true);
@@ -5639,6 +5820,37 @@ pub fn run(hide_native: bool) {
                 run_background_index_refresh(&h_idx);
                 std::thread::sleep(std::time::Duration::from_secs(PERIODIC_REINDEX_INTERVAL_SECS));
             });
+
+            // Dedicated ~16ms-coalesced fullscreen watcher woken immediately by top-level
+            // EVENT_OBJECT_LOCATIONCHANGE / foreground / window events (no 500ms ABN delay!).
+            let h_fs = handle.clone();
+            let fs_watch_primary = Arc::clone(&fullscreen_suppressed);
+            let fs_watch_secondary = Arc::clone(&secondary_fullscreen_suppressed);
+            let _ = std::thread::Builder::new()
+                .name("prismbar-fullscreen-watcher".to_string())
+                .spawn(move || {
+                    let mut fs_seq = win_shell::current_fullscreen_activity_seq();
+                    loop {
+                        let woken = win_shell::wait_for_fullscreen_activity_or_timeout(
+                            &mut fs_seq,
+                            std::time::Duration::from_millis(1500),
+                        );
+                        if woken {
+                            std::thread::sleep(std::time::Duration::from_millis(16));
+                            fs_seq = win_shell::current_fullscreen_activity_seq();
+                        }
+                        let (fs, fg_is_own) = win_shell::detect_fullscreen_per_monitor_with_fg();
+                        if !fg_is_own
+                            && (fs.primary != fs_watch_primary.load(Ordering::Acquire)
+                                || fs.secondary != fs_watch_secondary.load(Ordering::Acquire))
+                        {
+                            let h = h_fs.clone();
+                            let _ = h_fs.run_on_main_thread(move || {
+                                let _ = reevaluate_fullscreen(&h, None);
+                            });
+                        }
+                    }
+                });
 
             // Event-driven desktop monitor: wakes immediately (~40ms coalesced) on OS foreground,
             // window create/destroy/show/hide/minimize events, and falls back to a low-overhead
@@ -5685,6 +5897,7 @@ pub fn run(hide_native: bool) {
 
                     if hide_native && !win_shell::is_restore_in_progress() {
                         win_shell::ensure_native_taskbar_hidden_if_needed();
+                        win_shell::ensure_appbar_registered_if_needed();
                     }
 
                     let (fs, fg_is_own) = win_shell::detect_fullscreen_per_monitor_with_fg();
@@ -5939,6 +6152,8 @@ mod integration_tests {
             pending_flyout_exit: Mutex::new(None),
             flyout_anim_gen: Arc::new(AtomicU64::new(0)),
             start_anim_gen: Arc::new(AtomicU64::new(0)),
+            taskbar_anim_gen: Arc::new(AtomicU64::new(0)),
+            secondary_taskbar_anim_gen: Arc::new(AtomicU64::new(0)),
             start_backdrop_shown_gen: Arc::new(AtomicU64::new(u64::MAX)),
             flyout_backdrop_shown_gen: Arc::new(AtomicU64::new(u64::MAX)),
             flyout_glide_gen: Arc::new(AtomicU64::new(0)),
@@ -7451,6 +7666,15 @@ mod integration_tests {
         assert!(data_uri.starts_with("data:image/png;base64,"));
         assert!(config::sanitize_custom_icon_data(&data_uri).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tauri_builder_disables_tao_raw_input_so_ll_keyboard_hook_fires_when_start_is_focused() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains(".device_event_filter(tauri::DeviceEventFilter::Always)"),
+            "tauri::Builder MUST set DeviceEventFilter::Always so tao's RegisterRawInputDevices does not suppress WH_KEYBOARD_LL when start/flyout is focused on Windows 11"
+        );
     }
 }
 }

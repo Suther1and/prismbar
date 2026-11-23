@@ -3753,6 +3753,109 @@ pub fn system_power_action(action: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinXActionSpec {
+    Launch {
+        target: &'static str,
+        args: Option<&'static str>,
+        as_admin: bool,
+    },
+    Terminal {
+        as_admin: bool,
+    },
+    ShowDesktop,
+    Power(&'static str),
+}
+
+/// Pure resolver mapping a PrismBar Win+X Start right-click action ID to its concrete Windows target.
+pub fn resolve_winx_action(action: &str) -> Option<WinXActionSpec> {
+    match action.trim() {
+        "apps" => Some(WinXActionSpec::Launch {
+            target: "ms-settings:appsfeatures",
+            args: None,
+            as_admin: false,
+        }),
+        "system" => Some(WinXActionSpec::Launch {
+            target: "ms-settings:about",
+            args: None,
+            as_admin: false,
+        }),
+        "device_manager" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\devmgmt.msc",
+            args: None,
+            as_admin: false,
+        }),
+        "disk_management" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\diskmgmt.msc",
+            args: None,
+            as_admin: false,
+        }),
+        "computer_management" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\compmgmt.msc",
+            args: None,
+            as_admin: false,
+        }),
+        "event_viewer" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\eventvwr.msc",
+            args: None,
+            as_admin: false,
+        }),
+        "network_connections" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\ncpa.cpl",
+            args: None,
+            as_admin: false,
+        }),
+        "terminal" => Some(WinXActionSpec::Terminal { as_admin: false }),
+        "terminal_admin" => Some(WinXActionSpec::Terminal { as_admin: true }),
+        "task_manager" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\System32\Taskmgr.exe",
+            args: None,
+            as_admin: false,
+        }),
+        "settings" => Some(WinXActionSpec::Launch {
+            target: "ms-settings:",
+            args: None,
+            as_admin: false,
+        }),
+        "explorer" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\explorer.exe",
+            args: None,
+            as_admin: false,
+        }),
+        "run" => Some(WinXActionSpec::Launch {
+            target: r"C:\Windows\explorer.exe",
+            args: Some("shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}"),
+            as_admin: false,
+        }),
+        "desktop" => Some(WinXActionSpec::ShowDesktop),
+        "lock" => Some(WinXActionSpec::Power("lock")),
+        "sleep" => Some(WinXActionSpec::Power("sleep")),
+        "reboot" => Some(WinXActionSpec::Power("reboot")),
+        "shutdown" => Some(WinXActionSpec::Power("shutdown")),
+        _ => None,
+    }
+}
+
+/// Executes a Win+X Power User menu action on Windows.
+pub fn execute_winx_action(action: &str) -> Result<(), String> {
+    let spec = resolve_winx_action(action)
+        .ok_or_else(|| format!("Неизвестное системное действие: {action}"))?;
+    match spec {
+        WinXActionSpec::Launch {
+            target,
+            args,
+            as_admin,
+        } => crate::windows_tracker::launch_target_with_args(target, args, as_admin),
+        WinXActionSpec::Terminal { as_admin } => {
+            crate::windows_tracker::launch_target_with_args("wt.exe", None, as_admin).or_else(|_| {
+                crate::windows_tracker::launch_target_with_args("powershell.exe", None, as_admin)
+            })
+        }
+        WinXActionSpec::ShowDesktop => send_win_chord(b'D' as u16),
+        WinXActionSpec::Power(p) => system_power_action(p),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4710,5 +4813,36 @@ mod tests {
             "2nd peripheral battery call within 30s TTL must hit cache immediately, took {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn resolve_winx_action_covers_all_power_user_entries_and_rejects_unknown() {
+        assert_eq!(
+            resolve_winx_action("apps"),
+            Some(WinXActionSpec::Launch {
+                target: "ms-settings:appsfeatures",
+                args: None,
+                as_admin: false,
+            })
+        );
+        assert_eq!(
+            resolve_winx_action("device_manager"),
+            Some(WinXActionSpec::Launch {
+                target: r"C:\Windows\System32\devmgmt.msc",
+                args: None,
+                as_admin: false,
+            })
+        );
+        assert_eq!(
+            resolve_winx_action("terminal"),
+            Some(WinXActionSpec::Terminal { as_admin: false })
+        );
+        assert_eq!(
+            resolve_winx_action("terminal_admin"),
+            Some(WinXActionSpec::Terminal { as_admin: true })
+        );
+        assert_eq!(resolve_winx_action("desktop"), Some(WinXActionSpec::ShowDesktop));
+        assert_eq!(resolve_winx_action("reboot"), Some(WinXActionSpec::Power("reboot")));
+        assert_eq!(resolve_winx_action("unknown_cmd"), None);
     }
 }

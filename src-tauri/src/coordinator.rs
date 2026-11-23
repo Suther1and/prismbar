@@ -43,6 +43,8 @@ pub enum FlyoutKind {
     ContextApp,
     #[serde(alias = "ctx_taskbar")]
     ContextBar,
+    #[serde(alias = "ctx_start")]
+    ContextStart,
     Osd,
 }
 
@@ -164,6 +166,16 @@ pub struct DetailedForegroundWindow {
     pub extended_rect: PixelRect,
     pub monitor_rect: PixelRect,
     pub work_area_rect: PixelRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZOrderWindowCandidate {
+    pub window: DetailedForegroundWindow,
+    pub is_topmost: bool,
+    pub is_tool_window: bool,
+    pub is_no_activate: bool,
+    pub is_transparent: bool,
+    pub is_cloaked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -293,6 +305,84 @@ pub fn classify_fullscreen_for_monitor(
     // Borderless games/engines that retain WS_CAPTION/WS_THICKFRAME while placing an un-maximized
     // frame over the entire monitor (including the reserved AppBar strip).
     !fg.is_maximized && has_reserved_appbar && fg.extended_rect == target_monitor
+}
+
+const MIN_OCCLUDING_WINDOW_DIM_PX: i32 = 100;
+
+/// Per-monitor authoritative fullscreen classifier using BOTH foreground/notification state AND
+/// top-to-bottom Z-order windows on `target_monitor`.
+///
+/// Solves multi-monitor focus loss: when a fullscreen video/game runs on Monitor 1 and the user
+/// focuses a window on Monitor 2, Monitor 1's topmost real window is still the fullscreen app so
+/// Monitor 1's taskbar stays hidden; as soon as a normal non-topmost window is brought above it on
+/// Monitor 1 (or the video exits fullscreen/minimizes), Monitor 1's taskbar reappears immediately.
+pub fn classify_fullscreen_for_monitor_zorder(
+    notification_state: NotificationState,
+    foreground: Option<&DetailedForegroundWindow>,
+    zorder_windows: &[ZOrderWindowCandidate],
+    target_monitor: PixelRect,
+    is_primary_target: bool,
+) -> bool {
+    if target_monitor.width() <= 0 || target_monitor.height() <= 0 {
+        return false;
+    }
+
+    if classify_fullscreen_for_monitor(
+        notification_state,
+        foreground,
+        target_monitor,
+        is_primary_target,
+    ) {
+        return true;
+    }
+
+    for cand in zorder_windows {
+        let w = &cand.window;
+        if !w.visible || cand.is_cloaked || w.is_own_process {
+            continue;
+        }
+        if is_shell_desktop_class(&w.class_name) {
+            continue;
+        }
+        if cand.is_tool_window || cand.is_transparent {
+            continue;
+        }
+        if w.extended_rect.width() <= 1 || w.extended_rect.height() <= 1 {
+            continue;
+        }
+
+        let on_target_monitor =
+            w.monitor_rect == target_monitor || w.extended_rect.covers(target_monitor);
+        if !on_target_monitor {
+            continue;
+        }
+
+        if !cand.is_no_activate
+            && classify_fullscreen_for_monitor(
+                NotificationState::AcceptsNotifications,
+                Some(w),
+                target_monitor,
+                is_primary_target,
+            )
+        {
+            return true;
+        }
+
+        // A real non-topmost normal app window on `target_monitor` sitting above anything below it
+        // in Z-order occludes any underlying fullscreen video/game on that monitor.
+        // Topmost floating overlays/PiP/HUDs (`is_topmost`), non-activating popups (`is_no_activate`),
+        // and tiny helper windows (<100px) do NOT occlude fullscreen windows beneath them.
+        if !cand.is_topmost
+            && !cand.is_no_activate
+            && w.monitor_rect == target_monitor
+            && w.extended_rect.width() >= MIN_OCCLUDING_WINDOW_DIM_PX
+            && w.extended_rect.height() >= MIN_OCCLUDING_WINDOW_DIM_PX
+        {
+            return false;
+        }
+    }
+
+    false
 }
 
 /// Computes effective WebView2 / UI scale factor combining monitor DPI scale and
@@ -2356,5 +2446,199 @@ mod tests {
         let fly_open = coord.request_open_flyout(FlyoutKind::Sound, 2000);
         assert_eq!(fly_open.flyout_anim_gen, Some(3));
         assert!(fly_open.start_anim_gen.unwrap() > 4);
+    }
+
+    #[test]
+    fn zorder_fullscreen_keeps_primary_suppressed_when_focus_moves_to_secondary_monitor() {
+        let mon1 = PixelRect::new(0, 0, 2560, 1440);
+        let work1 = PixelRect::new(0, 0, 2560, 1373);
+        let mon2 = PixelRect::new(2560, 0, 4480, 1080);
+
+        // User clicked a normal app on Monitor 2 while fullscreen browser video stays open on Monitor 1
+        let fg_mon2 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "Chrome_WidgetWin_1".to_string(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: mon2,
+            extended_rect: mon2,
+            monitor_rect: mon2,
+            work_area_rect: mon2,
+        };
+        let video_mon1 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "Chrome_WidgetWin_1".to_string(),
+            style: 0,
+            window_rect: mon1,
+            extended_rect: mon1,
+            monitor_rect: mon1,
+            work_area_rect: work1,
+        };
+        let topmost_hud_mon1 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "OverlayWnd".to_string(),
+            style: 0,
+            window_rect: PixelRect::new(20, 20, 320, 180),
+            extended_rect: PixelRect::new(20, 20, 320, 180),
+            monitor_rect: mon1,
+            work_area_rect: work1,
+        };
+
+        let zorder = vec![
+            ZOrderWindowCandidate {
+                window: topmost_hud_mon1,
+                is_topmost: true,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+            ZOrderWindowCandidate {
+                window: fg_mon2.clone(),
+                is_topmost: false,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+            ZOrderWindowCandidate {
+                window: video_mon1.clone(),
+                is_topmost: false,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+        ];
+
+        assert!(
+            classify_fullscreen_for_monitor_zorder(
+                NotificationState::AcceptsNotifications,
+                Some(&fg_mon2),
+                &zorder,
+                mon1,
+                true,
+            ),
+            "Monitor 1 must remain fullscreen-suppressed when focus moves to Monitor 2"
+        );
+        assert!(
+            !classify_fullscreen_for_monitor_zorder(
+                NotificationState::AcceptsNotifications,
+                Some(&fg_mon2),
+                &zorder,
+                mon2,
+                false,
+            ),
+            "Monitor 2 with a normal maximized app must NOT be treated as fullscreen"
+        );
+
+        // Bringing a normal non-topmost window ABOVE the video on Monitor 1 must restore Monitor 1 taskbar
+        let normal_mon1 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "Notepad".to_string(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: PixelRect::new(100, 100, 900, 700),
+            extended_rect: PixelRect::new(100, 100, 900, 700),
+            monitor_rect: mon1,
+            work_area_rect: work1,
+        };
+        let zorder_occluded = vec![
+            ZOrderWindowCandidate {
+                window: normal_mon1.clone(),
+                is_topmost: false,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+            ZOrderWindowCandidate {
+                window: video_mon1,
+                is_topmost: false,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+        ];
+        assert!(
+            !classify_fullscreen_for_monitor_zorder(
+                NotificationState::AcceptsNotifications,
+                Some(&normal_mon1),
+                &zorder_occluded,
+                mon1,
+                true,
+            ),
+            "Normal window brought above fullscreen video on Monitor 1 must restore taskbar"
+        );
+    }
+
+    #[test]
+    fn zorder_fullscreen_symmetric_secondary_video_with_primary_focus() {
+        let mon1 = PixelRect::new(0, 0, 2560, 1440);
+        let work1 = PixelRect::new(0, 0, 2560, 1373);
+        let mon2 = PixelRect::new(2560, 0, 4480, 1080);
+
+        let fg_mon1 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: true,
+            class_name: "CabinetWClass".to_string(),
+            style: WS_CAPTION_FLAG | WS_THICKFRAME_FLAG,
+            window_rect: work1,
+            extended_rect: work1,
+            monitor_rect: mon1,
+            work_area_rect: work1,
+        };
+        let video_mon2 = DetailedForegroundWindow {
+            visible: true,
+            is_own_process: false,
+            is_maximized: false,
+            class_name: "mpv".to_string(),
+            style: 0,
+            window_rect: mon2,
+            extended_rect: mon2,
+            monitor_rect: mon2,
+            work_area_rect: mon2,
+        };
+        let zorder = vec![
+            ZOrderWindowCandidate {
+                window: fg_mon1.clone(),
+                is_topmost: false,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+            ZOrderWindowCandidate {
+                window: video_mon2,
+                is_topmost: true,
+                is_tool_window: false,
+                is_no_activate: false,
+                is_transparent: false,
+                is_cloaked: false,
+            },
+        ];
+
+        assert!(!classify_fullscreen_for_monitor_zorder(
+            NotificationState::AcceptsNotifications,
+            Some(&fg_mon1),
+            &zorder,
+            mon1,
+            true,
+        ));
+        assert!(classify_fullscreen_for_monitor_zorder(
+            NotificationState::AcceptsNotifications,
+            Some(&fg_mon1),
+            &zorder,
+            mon2,
+            false,
+        ));
     }
 }

@@ -7,14 +7,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 #[cfg(target_os = "windows")]
-use windows::core::PCWSTR;
+use windows::core::{Interface, BSTR, HRESULT, PCWSTR, VARIANT};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, VARIANT_FALSE, WIN32_ERROR,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
     RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::TaskScheduler::{
+    IExecAction, ILogonTrigger, ITaskService, TaskScheduler, TASK_ACTION_EXEC,
+    TASK_CREATE_OR_UPDATE, TASK_INSTANCES_IGNORE_NEW, TASK_LOGON_INTERACTIVE_TOKEN,
+    TASK_RUNLEVEL_LUA, TASK_TRIGGER_LOGON,
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 4;
@@ -4944,6 +4954,193 @@ fn set_windows_autostart_at(
     }
 }
 
+const AUTOSTART_TASK_PREFIX: &str = "PrismBar_Autorun";
+
+/// Builds a stable, safe Windows Task Scheduler task name scoped to the current user
+/// so multiple local Windows accounts never overwrite each other's logon task.
+pub fn format_autostart_task_name(user_id: &str) -> String {
+    let raw_user = user_id.rsplit('\\').next().unwrap_or(user_id).trim();
+    let sanitized: String = raw_user
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(48)
+        .collect();
+    if sanitized.is_empty() {
+        AUTOSTART_TASK_PREFIX.to_string()
+    } else {
+        format!("{AUTOSTART_TASK_PREFIX}_{sanitized}")
+    }
+}
+
+/// Validates and normalizes an executable path for Task Scheduler `IExecAction::SetPath`,
+/// returning `(clean_exe_path, optional_working_dir)`.
+pub fn format_autostart_exec_path(exe_path: &Path) -> Result<(String, Option<String>), String> {
+    let raw = exe_path.to_string_lossy();
+    if raw.contains('\0') {
+        return Err("autostart executable path contains NUL byte".to_string());
+    }
+    if raw.contains('"') {
+        return Err("autostart executable path contains embedded quote".to_string());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("autostart executable path is empty".to_string());
+    }
+    let normalized = strip_verbatim_prefix(trimmed);
+    let cleaned = normalized.trim();
+    if cleaned.is_empty() {
+        return Err("autostart executable path is empty".to_string());
+    }
+    let working_dir = Path::new(cleaned)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    Ok((cleaned.to_string(), working_dir))
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_task_not_found_hresult(hr: HRESULT) -> bool {
+    hr == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+        || hr == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_current_windows_user_id() -> Option<String> {
+    let user = std::env::var("USERNAME").ok()?;
+    let user = user.trim();
+    if user.is_empty() {
+        return None;
+    }
+    let domain = std::env::var("USERDOMAIN").ok();
+    let domain = domain.as_deref().map(str::trim).unwrap_or("");
+    if domain.is_empty() {
+        Some(user.to_string())
+    } else {
+        Some(format!("{domain}\\{user}"))
+    }
+}
+
+/// Registers or removes an instant, non-elevated Windows Task Scheduler `LogonTrigger` task
+/// (`TASK_RUNLEVEL_LUA`, `TASK_LOGON_INTERACTIVE_TOKEN`, zero delay, priority 4) so PrismBar
+/// launches simultaneously with `explorer.exe` instead of waiting in Explorer's throttled `Run` queue.
+#[cfg(target_os = "windows")]
+fn set_windows_scheduled_autostart(exe_path: &Path, enable: bool) -> Result<(), String> {
+    let com = crate::windows_tracker::ComGuard::init_sta();
+    if !com.is_usable() {
+        return Err("COM initialization failed for Task Scheduler".to_string());
+    }
+    let user_id = resolve_current_windows_user_id()
+        .ok_or_else(|| "cannot determine current Windows user for Task Scheduler".to_string())?;
+    let task_name = format_autostart_task_name(&user_id);
+
+    unsafe {
+        let service: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("CoCreateInstance(TaskScheduler) failed: {e}"))?;
+        let empty = VARIANT::default();
+        service
+            .Connect(&empty, &empty, &empty, &empty)
+            .map_err(|e| format!("ITaskService::Connect failed: {e}"))?;
+        let root = service
+            .GetFolder(&BSTR::from("\\"))
+            .map_err(|e| format!("ITaskService::GetFolder(\\) failed: {e}"))?;
+
+        if enable {
+            let (exec_path, working_dir) = format_autostart_exec_path(exe_path)?;
+            let td = service
+                .NewTask(0)
+                .map_err(|e| format!("ITaskService::NewTask failed: {e}"))?;
+
+            let principal = td
+                .Principal()
+                .map_err(|e| format!("ITaskDefinition::Principal failed: {e}"))?;
+            principal
+                .SetUserId(&BSTR::from(&user_id))
+                .map_err(|e| format!("IPrincipal::SetUserId failed: {e}"))?;
+            principal
+                .SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN)
+                .map_err(|e| format!("IPrincipal::SetLogonType failed: {e}"))?;
+            principal
+                .SetRunLevel(TASK_RUNLEVEL_LUA)
+                .map_err(|e| format!("IPrincipal::SetRunLevel failed: {e}"))?;
+
+            let settings = td
+                .Settings()
+                .map_err(|e| format!("ITaskDefinition::Settings failed: {e}"))?;
+            settings
+                .SetDisallowStartIfOnBatteries(VARIANT_FALSE)
+                .map_err(|e| format!("ITaskSettings::SetDisallowStartIfOnBatteries failed: {e}"))?;
+            settings
+                .SetStopIfGoingOnBatteries(VARIANT_FALSE)
+                .map_err(|e| format!("ITaskSettings::SetStopIfGoingOnBatteries failed: {e}"))?;
+            settings
+                .SetExecutionTimeLimit(&BSTR::from("PT0S"))
+                .map_err(|e| format!("ITaskSettings::SetExecutionTimeLimit failed: {e}"))?;
+            settings
+                .SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)
+                .map_err(|e| format!("ITaskSettings::SetMultipleInstances failed: {e}"))?;
+            settings
+                .SetPriority(4)
+                .map_err(|e| format!("ITaskSettings::SetPriority failed: {e}"))?;
+            settings
+                .SetStartWhenAvailable(VARIANT_FALSE)
+                .map_err(|e| format!("ITaskSettings::SetStartWhenAvailable failed: {e}"))?;
+
+            let triggers = td
+                .Triggers()
+                .map_err(|e| format!("ITaskDefinition::Triggers failed: {e}"))?;
+            let trig = triggers
+                .Create(TASK_TRIGGER_LOGON)
+                .map_err(|e| format!("ITriggerCollection::Create(LOGON) failed: {e}"))?;
+            let logon_trig: ILogonTrigger = trig
+                .cast()
+                .map_err(|e| format!("ITrigger -> ILogonTrigger cast failed: {e}"))?;
+            logon_trig
+                .SetUserId(&BSTR::from(&user_id))
+                .map_err(|e| format!("ILogonTrigger::SetUserId failed: {e}"))?;
+
+            let actions = td
+                .Actions()
+                .map_err(|e| format!("ITaskDefinition::Actions failed: {e}"))?;
+            let action = actions
+                .Create(TASK_ACTION_EXEC)
+                .map_err(|e| format!("IActionCollection::Create(EXEC) failed: {e}"))?;
+            let exec: IExecAction = action
+                .cast()
+                .map_err(|e| format!("IAction -> IExecAction cast failed: {e}"))?;
+            exec.SetPath(&BSTR::from(&exec_path))
+                .map_err(|e| format!("IExecAction::SetPath failed: {e}"))?;
+            if let Some(wd) = working_dir {
+                let _ = exec.SetWorkingDirectory(&BSTR::from(&wd));
+            }
+
+            root.RegisterTaskDefinition(
+                &BSTR::from(&task_name),
+                &td,
+                TASK_CREATE_OR_UPDATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
+            .map_err(|e| format!("ITaskFolder::RegisterTaskDefinition failed: {e}"))?;
+            Ok(())
+        } else {
+            let res = root.DeleteTask(&BSTR::from(&task_name), 0);
+            if let Err(err) = res {
+                if !is_task_not_found_hresult(err.code()) {
+                    return Err(format!("ITaskFolder::DeleteTask({task_name}) failed: {err}"));
+                }
+            }
+            if task_name != AUTOSTART_TASK_PREFIX {
+                let _ = root.DeleteTask(&BSTR::from(AUTOSTART_TASK_PREFIX), 0);
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
     let exe = if enable {
@@ -4957,7 +5154,29 @@ pub fn set_windows_autostart(enable: bool) -> Result<(), String> {
         &exe,
         false,
     );
-    set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, enable)
+    if enable {
+        match set_windows_scheduled_autostart(&exe, true) {
+            Ok(()) => {
+                // Remove legacy HKCU\...\Run entry so Windows launches PrismBar once immediately via Task Scheduler.
+                let _ = set_windows_autostart_at(
+                    AUTOSTART_RUN_SUBKEY,
+                    AUTOSTART_VALUE_NAME,
+                    &exe,
+                    false,
+                );
+                Ok(())
+            }
+            Err(_) => {
+                // Fallback for locked-down enterprise policies where standard users cannot create scheduled tasks.
+                set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, true)
+            }
+        }
+    } else {
+        let sched_res = set_windows_scheduled_autostart(&exe, false);
+        let reg_res =
+            set_windows_autostart_at(AUTOSTART_RUN_SUBKEY, AUTOSTART_VALUE_NAME, &exe, false);
+        reg_res.and(sched_res)
+    }
 }
 
 pub fn resolve_macos_bundle_executable(exe_path: &Path) -> PathBuf {
@@ -6269,7 +6488,22 @@ mod tests {
             assert!(classify_autostart_delete_error(ERROR_SUCCESS).is_ok());
             assert!(classify_autostart_delete_error(ERROR_FILE_NOT_FOUND).is_ok());
             assert!(classify_autostart_delete_error(ERROR_ACCESS_DENIED).is_err());
+            assert!(is_task_not_found_hresult(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)));
+            assert!(is_task_not_found_hresult(HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)));
+            assert!(!is_task_not_found_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED.0)));
         }
+
+        assert_eq!(format_autostart_task_name(r"SUTHERLAND\loki2"), "PrismBar_Autorun_loki2");
+        assert_eq!(format_autostart_task_name("user.name!@#"), "PrismBar_Autorun_username");
+        assert_eq!(format_autostart_task_name("   "), "PrismBar_Autorun");
+
+        let (exec, wd) =
+            format_autostart_exec_path(Path::new(r"\\?\C:\Users\loki2\AppData\Local\PrismBar\prismbar.exe"))
+                .expect("valid exec path");
+        assert_eq!(exec, r"C:\Users\loki2\AppData\Local\PrismBar\prismbar.exe");
+        assert_eq!(wd.as_deref(), Some(r"C:\Users\loki2\AppData\Local\PrismBar"));
+        assert!(format_autostart_exec_path(Path::new("")).is_err());
+        assert!(format_autostart_exec_path(Path::new(r#"C:\bad"path\prismbar.exe"#)).is_err());
     }
 
     #[cfg(target_os = "windows")]

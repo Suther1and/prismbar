@@ -38,6 +38,7 @@ import {
   buildAppContextMenuRequest,
   buildBarContextMenuRequest,
   buildPreviewFlyoutRequest,
+  buildStartContextMenuRequest,
   CALENDAR_FLYOUT_INITIAL_HEIGHT,
   CALENDAR_FLYOUT_WIDTH,
   computeNaturalDockWidth,
@@ -152,6 +153,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   const [dragOverPinId, setDragOverPinId] = useState<string | null>(null);
   const [dragOverSide, setDragOverSide] = useState<'before' | 'after' | null>(null);
   const [unpinnedOrderRev, setUnpinnedOrderRev] = useState(0);
+  const [tbHidden, setTbHidden] = useState(false);
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== 'undefined' ? window.innerWidth : 1920,
   );
@@ -361,6 +363,11 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       }),
       onEvent<unknown>('flyout-hide', clearActiveFlyout),
       onEvent<unknown>('flyout-hide-immediate', clearActiveFlyout),
+      onEvent<{ visible: boolean; gen: number }>('taskbar-visibility', (ev) => {
+        if (ev && typeof ev.visible === 'boolean') {
+          setTbHidden(!ev.visible);
+        }
+      }),
     ];
     return () => {
       subs.forEach((p) => p.then((u) => u()));
@@ -1092,6 +1099,17 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
     ipc('open_flyout', { req }).catch(() => {});
   };
 
+  const handleStartCtx = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (hoverTimer.current !== null) {
+      window.clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+    }
+    const req = buildStartContextMenuRequest(anchorX(e.currentTarget), monitor);
+    ipc('open_flyout', { req }).catch(() => {});
+  };
+
   const handleBarClick = (e: React.MouseEvent<HTMLElement>) => {
     if ((e.target as HTMLElement).closest('button')) return;
     if (startOpen || activeFlyoutRef.current !== '') {
@@ -1518,6 +1536,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       <nav
         ref={barRef}
         className={`taskbar has-sheen ${useEdgeCentered ? 'edge-centered' : ''}`}
+        data-tb-hidden={tbHidden ? 'true' : 'false'}
         onClick={handleBarClick}
         onContextMenu={handleBarCtx}
         onPointerEnter={handleBarPointerEnter}
@@ -1557,6 +1576,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
               aria-label="Пуск"
               onMouseEnter={(e) => moveHoverPillTo(e.currentTarget)}
               onClick={() => toggleStart(undefined, monitor).catch(() => {})}
+              onContextMenu={handleStartCtx}
             >
               <span className="tb-ic">
                 <StartLogoIcon />

@@ -18,6 +18,7 @@ import {
 } from '../components/Icons';
 import { TaskbarView } from '../components/TaskbarView';
 import { StartSettingsOverlay } from '../components/start/StartSettingsOverlay';
+import { buildStartContextMenuRequest } from './taskbarLogic';
 import {
   isCacheIconKey,
   type AppWindowGroup,
@@ -51,6 +52,7 @@ import {
   interpolateMediaPosition,
   isAppContextKind,
   isBarContextKind,
+  isStartContextKind,
   OSD_AUTO_CLOSE_MS,
   partitionAudioDevices,
   PREVIEW_LEAVE_COMMAND,
@@ -659,5 +661,24 @@ describe('Weather & Battery flyout logic, formatters, temperature range bars & i
     expect(macSettingsHtml).toContain('Система');
     expect(macSettingsHtml).not.toContain('Нижняя панель');
     expect(macSettingsHtml).not.toContain('Вернуть Windows');
+  });
+
+  it('recognizes context_start / ctx_start Win+X flyout kind and builds monitor-anchored requests', () => {
+    expect(isStartContextKind('context_start')).toBe(true);
+    expect(isStartContextKind('ctx_start')).toBe(true);
+    expect(isStartContextKind('context_bar')).toBe(false);
+    expect(getFlyoutExitMs('context_start')).toBe(CONTEXT_FLYOUT_EXIT_MS);
+
+    const primaryReq = buildStartContextMenuRequest(44, 'primary');
+    expect(primaryReq.kind).toBe('context_start');
+    expect(primaryReq.monitor).toBe('primary');
+    expect(primaryReq.anchorXLogical).toBe(44);
+    expect(primaryReq.anchorInTaskbar).toBe(true);
+    expect(primaryReq.noActivate).toBe(false);
+
+    const secondaryReq = buildStartContextMenuRequest(28, 'secondary');
+    expect(secondaryReq.monitor).toBe('secondary');
+    expect(taskbarViewSrc).toContain('onContextMenu={handleStartCtx}');
+    expect(flyoutViewSrc).toContain("ipc('run_winx_action'");
   });
 });

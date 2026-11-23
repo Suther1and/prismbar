@@ -35,6 +35,7 @@ import {
   interpolateMediaPosition,
   isAppContextKind,
   isBarContextKind,
+  isStartContextKind,
   OSD_AUTO_CLOSE_MS,
   partitionAudioDevices,
   PREVIEW_CARD_CLOSE_MS,
@@ -98,6 +99,7 @@ import {
   type TrayAppItem,
   type WeatherCityOption,
   type WeatherSnapshot,
+  type WinXAction,
 } from '../lib/ipc';
 import { mergeAudioStateRespectingLocks } from '../lib/startLogic';
 import {
@@ -117,6 +119,7 @@ import {
 import { useAnimatedPresence } from '../lib/useAnimatedPresence';
 import { useReducedMotion } from '../lib/useReducedMotion';
 import {
+  AppsGridIcon,
   ArrowDownIcon,
   ArrowUpIcon,
   BellIcon,
@@ -138,6 +141,7 @@ import {
   FolderSvg,
   KillIcon,
   LayoutBarIcon,
+  LockIcon,
   MaximizeIcon,
   MicIcon,
   MinimizeOthersIcon,
@@ -149,15 +153,19 @@ import {
   PeripheralDeviceIcon,
   PinIcon,
   PlaySmallIcon,
+  PowerIcon,
   PrevTrackIcon,
+  RebootIcon,
   RefreshIcon,
   RestoreIcon,
   SearchIcon,
   SettingsGearIcon,
   ShieldIcon,
+  SleepIcon,
   SnapLeftIcon,
   SnapRightIcon,
   TaskmgrIcon,
+  TerminalIcon,
   TopmostIcon,
   UnpinIcon,
   VolIcon,
@@ -230,7 +238,7 @@ function measureCardHeight(el: HTMLElement, kind: FlyoutKind): number | null {
     if (Number.isFinite(parsed) && parsed > 0) borderY = parsed;
   }
 
-  if (isAppContextKind(kind) || isBarContextKind(kind)) {
+  if (isAppContextKind(kind) || isBarContextKind(kind) || isStartContextKind(kind)) {
     const inner = el.querySelector<HTMLElement>('.ctx-scroll');
     return computeFlyoutCardHeight({
       cardScrollHeight: el.scrollHeight,
@@ -325,6 +333,7 @@ export const FlyoutView: React.FC = () => {
   const [telemRefreshing, setTelemRefreshing] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [ctxFocusIdx, setCtxFocusIdx] = useState<number>(-1);
+  const [startPowerOpen, setStartPowerOpen] = useState<boolean>(false);
   const [calDir, setCalDir] = useState<-1 | 0 | 1>(0);
   const [calView, setCalView] = useState<CalendarMonthRef>(() => {
     const now = new Date();
@@ -518,6 +527,7 @@ export const FlyoutView: React.FC = () => {
         setTrayCtxItem((prev) => (prev === null ? prev : null));
         setTrayHover((prev) => (prev === '' ? prev : ''));
         setDevMenuOpen((prev) => (prev ? false : prev));
+        setStartPowerOpen((prev) => (prev ? false : prev));
         setActionError((prev) => (prev === null ? prev : null));
         setCtxFocusIdx((prev) => (prev === -1 ? prev : -1));
         setJumpList((prev) => (prev.length === 0 ? prev : []));
@@ -902,7 +912,7 @@ export const FlyoutView: React.FC = () => {
       }
 
       const kind = activeKindRef.current as FlyoutKind;
-      if (isAppContextKind(kind) || isBarContextKind(kind)) {
+      if (isAppContextKind(kind) || isBarContextKind(kind) || isStartContextKind(kind)) {
         const actions = ctxActionsRef.current;
         if (actions.length === 0) return;
         if (e.key === 'ArrowDown') {
@@ -960,6 +970,7 @@ export const FlyoutView: React.FC = () => {
     const shouldMeasure =
       isAppContextKind(req.kind) ||
       isBarContextKind(req.kind) ||
+      isStartContextKind(req.kind) ||
       req.kind === 'sound' ||
       req.kind === 'quick' ||
       req.kind === 'calendar' ||
@@ -1275,6 +1286,7 @@ export const FlyoutView: React.FC = () => {
     const needsAutoHeight =
       isAppContextKind(req.kind) ||
       isBarContextKind(req.kind) ||
+      isStartContextKind(req.kind) ||
       req.kind === 'sound' ||
       req.kind === 'quick' ||
       req.kind === 'calendar' ||
@@ -1316,6 +1328,7 @@ export const FlyoutView: React.FC = () => {
     audio?.inputDevices?.length,
     devMenuOpen,
     devMenuPresence.mounted,
+    startPowerOpen,
     media?.hasSession,
     media?.canSeek,
     media?.durationSec,
@@ -3580,6 +3593,272 @@ export const FlyoutView: React.FC = () => {
               {barActions[3].icon}
               <span className="ctx-item-label">{barActions[3].label}</span>
             </button>
+
+            {actionError && (
+              <div className="ctx-err" role="alert">
+                {actionError}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 8. RIGHT-CLICK ON START / WIN BUTTON (GLASS WIN+X POWER USER MENU)
+  if (isStartContextKind(req.kind)) {
+    const triggerWinX = (action: WinXAction) => {
+      setActionError(null);
+      ipc('run_winx_action', { action }).catch((err) => {
+        setActionError(formatIpcError(err));
+      });
+    };
+
+    const systemGroup: ContextActionEntry[] = [
+      {
+        key: 'apps',
+        label: 'Установленные приложения',
+        icon: <AppsGridIcon />,
+        onActivate: () => triggerWinX('apps'),
+      },
+      {
+        key: 'system',
+        label: 'Система',
+        icon: <LayoutBarIcon />,
+        onActivate: () => triggerWinX('system'),
+      },
+      {
+        key: 'device_manager',
+        label: 'Диспетчер устройств',
+        icon: <SettingsGearIcon />,
+        onActivate: () => triggerWinX('device_manager'),
+      },
+      {
+        key: 'disk_management',
+        label: 'Управление дисками',
+        icon: <DiskIcon />,
+        onActivate: () => triggerWinX('disk_management'),
+      },
+      {
+        key: 'computer_management',
+        label: 'Управление компьютером',
+        icon: <TaskmgrIcon />,
+        onActivate: () => triggerWinX('computer_management'),
+      },
+      {
+        key: 'event_viewer',
+        label: 'Просмотр событий',
+        icon: <ClockRecentIcon />,
+        onActivate: () => triggerWinX('event_viewer'),
+      },
+      {
+        key: 'network_connections',
+        label: 'Сетевые подключения',
+        icon: <EthernetIcon />,
+        onActivate: () => triggerWinX('network_connections'),
+      },
+    ];
+
+    const toolsGroup: ContextActionEntry[] = [
+      {
+        key: 'terminal',
+        label: 'Терминал',
+        icon: <TerminalIcon />,
+        onActivate: () => triggerWinX('terminal'),
+      },
+      {
+        key: 'terminal_admin',
+        label: 'Терминал (Администратор)',
+        icon: <ShieldIcon />,
+        onActivate: () => triggerWinX('terminal_admin'),
+      },
+      {
+        key: 'task_manager',
+        label: 'Диспетчер задач',
+        icon: <TaskmgrIcon />,
+        onActivate: () => triggerWinX('task_manager'),
+      },
+      {
+        key: 'settings',
+        label: 'Параметры',
+        icon: <SettingsGearIcon />,
+        onActivate: () => triggerWinX('settings'),
+      },
+      {
+        key: 'explorer',
+        label: 'Проводник',
+        icon: <FolderSvg />,
+        onActivate: () => triggerWinX('explorer'),
+      },
+      {
+        key: 'run',
+        label: 'Выполнить',
+        icon: <ExternalWindowIcon />,
+        onActivate: () => triggerWinX('run'),
+      },
+    ];
+
+    const powerSubActions: ContextActionEntry[] = [
+      {
+        key: 'lock',
+        label: 'Блок',
+        icon: <LockIcon />,
+        onActivate: () => triggerWinX('lock'),
+      },
+      {
+        key: 'sleep',
+        label: 'Сон',
+        icon: <SleepIcon />,
+        onActivate: () => triggerWinX('sleep'),
+      },
+      {
+        key: 'reboot',
+        label: 'Рестарт',
+        icon: <RebootIcon />,
+        onActivate: () => triggerWinX('reboot'),
+      },
+      {
+        key: 'shutdown',
+        label: 'Выкл',
+        icon: <PowerIcon />,
+        danger: true,
+        onActivate: () => triggerWinX('shutdown'),
+      },
+    ];
+
+    const desktopEntry: ContextActionEntry = {
+      key: 'desktop',
+      label: 'Рабочий стол',
+      icon: <MinimizeOthersIcon />,
+      onActivate: () => triggerWinX('desktop'),
+    };
+    const powerToggleEntry: ContextActionEntry = {
+      key: 'power-toggle',
+      label: 'Завершение работы',
+      icon: <PowerIcon />,
+      onActivate: () => setStartPowerOpen(true),
+    };
+
+    const allStartActions: ContextActionEntry[] = [
+      ...systemGroup,
+      ...toolsGroup,
+      desktopEntry,
+      ...(startPowerOpen ? powerSubActions : [powerToggleEntry]),
+    ];
+    ctxActionsRef.current = allStartActions;
+
+    const toolsOffset = systemGroup.length;
+    const desktopIdx = toolsOffset + toolsGroup.length;
+    const powerRowOffset = desktopIdx + 1;
+
+    return (
+      <div className="flyout-root" data-space="personal" data-visible="true" onContextMenu={handleRootContextMenu}>
+        <div
+          key={anim.renderSeq}
+          ref={cardRef}
+          className="flyout-card ctx-card"
+          data-phase={dataPhase}
+          data-enter-ready={enterReady ? 'true' : 'false'}
+          style={cardOriginStyle}
+          role="menu"
+        >
+          <div className="ctx-sec">Меню системы</div>
+
+          <div className="ctx-scroll">
+            {systemGroup.map((entry, idx) => (
+              <button
+                key={entry.key}
+                type="button"
+                role="menuitem"
+                className={`ctx-item ${ctxFocusIdx === idx ? 'focused' : ''}`}
+                onMouseEnter={() => setCtxFocusIdx(idx)}
+                onClick={entry.onActivate}
+              >
+                {entry.icon}
+                <span className="ctx-item-label">{entry.label}</span>
+              </button>
+            ))}
+
+            <div className="ctx-sep" />
+
+            {toolsGroup.map((entry, i) => {
+              const idx = toolsOffset + i;
+              return (
+                <button
+                  key={entry.key}
+                  type="button"
+                  role="menuitem"
+                  className={`ctx-item ${ctxFocusIdx === idx ? 'focused' : ''}`}
+                  onMouseEnter={() => setCtxFocusIdx(idx)}
+                  onClick={entry.onActivate}
+                >
+                  {entry.icon}
+                  <span className="ctx-item-label">{entry.label}</span>
+                </button>
+              );
+            })}
+
+            <div className="ctx-sep" />
+
+            <button
+              type="button"
+              role="menuitem"
+              className={`ctx-item ${ctxFocusIdx === desktopIdx ? 'focused' : ''}`}
+              onMouseEnter={() => setCtxFocusIdx(desktopIdx)}
+              onClick={desktopEntry.onActivate}
+            >
+              {desktopEntry.icon}
+              <span className="ctx-item-label">{desktopEntry.label}</span>
+            </button>
+
+            <div className="ctx-power-slot">
+              {!startPowerOpen ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  aria-expanded={false}
+                  className={`ctx-item ${ctxFocusIdx === powerRowOffset ? 'focused' : ''}`}
+                  onMouseEnter={() => setCtxFocusIdx(powerRowOffset)}
+                  onClick={powerToggleEntry.onActivate}
+                >
+                  {powerToggleEntry.icon}
+                  <span className="ctx-item-label">{powerToggleEntry.label}</span>
+                  <span className="ctx-item-chevron" aria-hidden="true">
+                    <ChevronRightIcon />
+                  </span>
+                </button>
+              ) : (
+                <div className="ctx-power-bar" role="group" aria-label="Питание">
+                  {powerSubActions.map((entry, i) => {
+                    const idx = powerRowOffset + i;
+                    return (
+                      <button
+                        key={entry.key}
+                        type="button"
+                        role="menuitem"
+                        className={`ctx-power-pill ${entry.danger ? 'danger' : ''} ${ctxFocusIdx === idx ? 'focused' : ''}`.trim()}
+                        onMouseEnter={() => setCtxFocusIdx(idx)}
+                        onClick={entry.onActivate}
+                      >
+                        {entry.icon}
+                        <span>{entry.label}</span>
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    className="ctx-power-back"
+                    aria-label="Назад"
+                    onClick={() => {
+                      setStartPowerOpen(false);
+                      setCtxFocusIdx(powerRowOffset);
+                    }}
+                  >
+                    <XIcon10 />
+                  </button>
+                </div>
+              )}
+            </div>
 
             {actionError && (
               <div className="ctx-err" role="alert">

@@ -31,11 +31,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
-    AttachThreadInput, CreateEventW, CreateMutexW, GetCurrentProcessId, GetCurrentThreadId,
-    OpenEventW, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, SetEvent,
-    TerminateProcess, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    SYNCHRONIZATION_ACCESS_RIGHTS,
+    AttachThreadInput, CreateEventW, CreateMutexW, GetCurrentProcessId, GetCurrentThread,
+    GetCurrentThreadId, OpenEventW, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    SetEvent, SetThreadPriority, TerminateProcess, WaitForSingleObject, EVENT_MODIFY_STATE,
+    INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, SYNCHRONIZATION_ACCESS_RIGHTS, THREAD_PRIORITY_HIGHEST,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -78,15 +78,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub use crate::coordinator::{FLYOUT_ROOT_PAD_LOGICAL, START_ROOT_PAD_LOGICAL};
 use crate::coordinator::{
-    classify_fullscreen, classify_fullscreen_for_monitor, compute_appbar_rect, BarMode,
+    classify_fullscreen, classify_fullscreen_for_monitor_zorder, compute_appbar_rect, BarMode,
     DetailedForegroundWindow, ForegroundWindowInfo, MonitorFullscreenState, NotificationState,
-    PixelRect,
+    PixelRect, ZOrderWindowCandidate,
 };
 
 pub const SINGLE_INSTANCE_MUTEX_NAME: &str = r"Local\TestBar_SingleInstance_v1";
 pub const TASKBAR_CREATED_REHIDE_DELAYS_MS: [u64; 3] = [100, 300, 650];
 pub const WM_APPBAR_CALLBACK: u32 = WM_APP + 10;
 pub const WM_APPBAR_UPDATE_MODE: u32 = WM_APP + 12;
+pub const WM_APPBAR_ENSURE_REGISTERED: u32 = WM_APP + 13;
 pub const HOOK_EVENT_CHANNEL_CAPACITY: usize = 64;
 pub const VK_DUMMY_MASK: u16 = 0xE8;
 pub const TESTBAR_INJECTED_EXTRA_INFO: usize = 0x5442_4152; // "TBAR" tag for our own SendInput chord forwards
@@ -117,6 +118,8 @@ static APPBAR_MSG_WINDOW: Mutex<Option<AppBarMessageWindow>> = Mutex::new(None);
 static HOOK_OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static WINEVENT_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WINEVENT_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static FG_IS_ELEVATED: AtomicBool = AtomicBool::new(false);
 static LAST_ELEVATED_CHECK_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -136,6 +139,13 @@ pub(crate) fn set_overlay_open_hint(open: bool) {
 
 pub fn is_foreground_elevated() -> bool {
     FG_IS_ELEVATED.load(Ordering::Acquire)
+}
+
+/// Immediately clears the cached elevated-foreground hint (called when PrismBar's own
+/// Start/Flyout takes foreground focus so a stale elevated flag can never pass a lone `Win` tap).
+pub fn clear_foreground_elevated_state() {
+    FG_IS_ELEVATED.store(false, Ordering::Release);
+    LAST_ELEVATED_CHECK_HWND.store(0, Ordering::Release);
 }
 
 /// Checks whether the current foreground window belongs to a **verified** elevated (Admin)
@@ -229,6 +239,7 @@ pub fn ensure_process_dpi_aware() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellHookEvent {
     ToggleStart,
+    OpenWinXMenu,
     LockWorkstation,
     NativeStartSuppressed(isize),
     EmergencyRestore,
@@ -1723,6 +1734,16 @@ unsafe extern "system" fn appbar_msg_wnd_proc(
                 (ctx.on_event)(ShellAppBarEvent::PositionChanged);
                 Some(LRESULT(0))
             }
+            WM_APPBAR_ENSURE_REGISTERED => {
+                if !ctx.appbar_registered.get() {
+                    ctx.shell_ops.hide_native_taskbar();
+                    apply_appbar_on_hwnd(hwnd, ctx, true, false, None);
+                    if ctx.appbar_registered.get() {
+                        (ctx.on_event)(ShellAppBarEvent::PositionChanged);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_DISPLAYCHANGE => {
                 apply_appbar_on_hwnd(hwnd, ctx, false, false, None);
                 (ctx.on_event)(ShellAppBarEvent::DisplayChanged);
@@ -1909,6 +1930,19 @@ impl AppBarMessageWindow {
         }
     }
 
+    pub fn ensure_registered(&self) {
+        if self.hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(self.hwnd as *mut _),
+                    WM_APPBAR_ENSURE_REGISTERED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
     pub fn request_close_nonblocking(&self) {
         if self.hwnd != 0 {
             unsafe {
@@ -1970,6 +2004,18 @@ pub fn update_appbar_mode(mode: BarMode) {
     let slot = APPBAR_MSG_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(wnd) = slot.as_ref() {
         wnd.update_mode(mode);
+    }
+}
+
+/// Retries AppBar registration if initial early-logon `ABM_NEW` ran before `Shell_TrayWnd` was ready.
+/// Zero-cost single atomic check once registered.
+pub fn ensure_appbar_registered_if_needed() {
+    if RESTORE_IN_PROGRESS.load(Ordering::SeqCst) || APPBAR_HWND.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let slot = APPBAR_MSG_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wnd) = slot.as_ref() {
+        wnd.ensure_registered();
     }
 }
 
@@ -2174,6 +2220,7 @@ pub struct FullscreenSnapshot {
 pub struct PerMonitorFullscreenSnapshot {
     pub notification_state: NotificationState,
     pub foreground: Option<DetailedForegroundWindow>,
+    pub zorder_windows: Vec<ZOrderWindowCandidate>,
     pub primary_monitor: PixelRect,
     pub secondary_monitor: Option<PixelRect>,
 }
@@ -2274,9 +2321,137 @@ pub fn query_fullscreen_snapshot() -> FullscreenSnapshot {
     }
 }
 
-/// Captures per-monitor fullscreen state inputs using `MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)`,
-/// `DWMWA_EXTENDED_FRAME_BOUNDS`, and `IsZoomed` so fullscreen suppression is attributed strictly
-/// to the display hosting the fullscreen foreground window.
+unsafe fn query_detailed_window_info(
+    hwnd: HWND,
+    own_pid: u32,
+    fallback_monitor: PixelRect,
+) -> Option<DetailedForegroundWindow> {
+    let visible = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
+    let is_maximized = IsZoomed(hwnd).as_bool();
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let is_own_process = pid == own_pid;
+
+    let mut cls_buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut cls_buf);
+    let class_name = if len > 0 {
+        String::from_utf16_lossy(&cls_buf[..len as usize])
+    } else {
+        String::new()
+    };
+
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let (monitor_rect, work_area_rect) = if GetMonitorInfoW(hmon, &mut info).as_bool() {
+        (
+            PixelRect::new(
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                info.rcMonitor.right,
+                info.rcMonitor.bottom,
+            ),
+            PixelRect::new(
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            ),
+        )
+    } else {
+        (fallback_monitor, fallback_monitor)
+    };
+
+    query_window_and_extended_rect(hwnd).map(|(window_rect, extended_rect)| {
+        DetailedForegroundWindow {
+            visible,
+            is_own_process,
+            is_maximized,
+            class_name,
+            style,
+            window_rect,
+            extended_rect,
+            monitor_rect,
+            work_area_rect,
+        }
+    })
+}
+
+unsafe fn query_zorder_fullscreen_candidates(
+    own_pid: u32,
+    fallback_monitor: PixelRect,
+) -> Vec<ZOrderWindowCandidate> {
+    struct EnumCtx {
+        own_pid: u32,
+        fallback_monitor: PixelRect,
+        out: Vec<ZOrderWindowCandidate>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let ctx = &mut *(lparam.0 as *mut EnumCtx);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == ctx.own_pid {
+            return BOOL(1);
+        }
+
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+        let is_transparent = (ex_style & WS_EX_TRANSPARENT.0) != 0;
+        if is_tool_window || is_transparent {
+            return BOOL(1);
+        }
+
+        let mut cloaked: u32 = 0;
+        let is_cloaked = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0;
+        if is_cloaked {
+            return BOOL(1);
+        }
+
+        let Some(window) = query_detailed_window_info(hwnd, ctx.own_pid, ctx.fallback_monitor)
+        else {
+            return BOOL(1);
+        };
+        if window.extended_rect.width() <= 1 || window.extended_rect.height() <= 1 {
+            return BOOL(1);
+        }
+
+        ctx.out.push(ZOrderWindowCandidate {
+            window,
+            is_topmost: (ex_style & WS_EX_TOPMOST.0) != 0,
+            is_tool_window,
+            is_no_activate: (ex_style & WS_EX_NOACTIVATE.0) != 0,
+            is_transparent,
+            is_cloaked,
+        });
+        BOOL(1)
+    }
+
+    let mut ctx = EnumCtx {
+        own_pid,
+        fallback_monitor,
+        out: Vec::with_capacity(24),
+    };
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut EnumCtx as isize));
+    ctx.out
+}
+
+/// Captures per-monitor fullscreen state inputs using `MonitorFromWindow`, `DWMWA_EXTENDED_FRAME_BOUNDS`,
+/// `IsZoomed`, and top-to-bottom Z-order enumeration so fullscreen suppression stays accurate on every
+/// monitor even when focus moves to another display.
 pub fn query_per_monitor_fullscreen_snapshot() -> PerMonitorFullscreenSnapshot {
     unsafe {
         let notification_state = query_user_notification_state();
@@ -2285,68 +2460,20 @@ pub fn query_per_monitor_fullscreen_snapshot() -> PerMonitorFullscreenSnapshot {
             .into_iter()
             .next()
             .map(MonitorRect::to_pixel_rect);
+        let own_pid = GetCurrentProcessId();
 
         let fg = GetForegroundWindow();
         let foreground = if fg.0.is_null() {
             None
         } else {
-            let visible = IsWindowVisible(fg).as_bool() && !IsIconic(fg).as_bool();
-            let is_maximized = IsZoomed(fg).as_bool();
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(fg, Some(&mut pid));
-            let is_own_process = pid == GetCurrentProcessId();
-
-            let mut cls_buf = [0u16; 256];
-            let len = GetClassNameW(fg, &mut cls_buf);
-            let class_name = if len > 0 {
-                String::from_utf16_lossy(&cls_buf[..len as usize])
-            } else {
-                String::new()
-            };
-
-            let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
-            let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let (monitor_rect, work_area_rect) = if GetMonitorInfoW(hmon, &mut info).as_bool() {
-                (
-                    PixelRect::new(
-                        info.rcMonitor.left,
-                        info.rcMonitor.top,
-                        info.rcMonitor.right,
-                        info.rcMonitor.bottom,
-                    ),
-                    PixelRect::new(
-                        info.rcWork.left,
-                        info.rcWork.top,
-                        info.rcWork.right,
-                        info.rcWork.bottom,
-                    ),
-                )
-            } else {
-                (primary_monitor, primary_monitor)
-            };
-
-            query_window_and_extended_rect(fg).map(|(window_rect, extended_rect)| {
-                DetailedForegroundWindow {
-                    visible,
-                    is_own_process,
-                    is_maximized,
-                    class_name,
-                    style,
-                    window_rect,
-                    extended_rect,
-                    monitor_rect,
-                    work_area_rect,
-                }
-            })
+            query_detailed_window_info(fg, own_pid, primary_monitor)
         };
+        let zorder_windows = query_zorder_fullscreen_candidates(own_pid, primary_monitor);
 
         PerMonitorFullscreenSnapshot {
             notification_state,
             foreground,
+            zorder_windows,
             primary_monitor,
             secondary_monitor,
         }
@@ -2354,23 +2481,25 @@ pub fn query_per_monitor_fullscreen_snapshot() -> PerMonitorFullscreenSnapshot {
 }
 
 /// Detects fullscreen games / video players independently for primary and secondary monitors
-/// AND reports `fg_is_own_process` so `WindowCoordinator` can freeze fullscreen state whenever
-/// TestBar's own Start/Flyout window holds foreground focus.
+/// (including non-focused monitors via Z-order) AND reports `fg_is_own_process` so
+/// `WindowCoordinator` can freeze fullscreen state whenever TestBar's own Start/Flyout holds focus.
 pub fn detect_fullscreen_per_monitor_with_fg() -> (MonitorFullscreenState, bool) {
     let snap = query_per_monitor_fullscreen_snapshot();
     let fg_is_own = snap.fg_is_own_process();
-    let primary = classify_fullscreen_for_monitor(
+    let primary = classify_fullscreen_for_monitor_zorder(
         snap.notification_state,
         snap.foreground.as_ref(),
+        &snap.zorder_windows,
         snap.primary_monitor,
         true,
     );
     let secondary = snap
         .secondary_monitor
         .map(|sec| {
-            classify_fullscreen_for_monitor(
+            classify_fullscreen_for_monitor_zorder(
                 snap.notification_state,
                 snap.foreground.as_ref(),
+                &snap.zorder_windows,
                 sec,
                 false,
             )
@@ -2406,6 +2535,7 @@ pub enum KeyTransition {
 pub enum WinKeyAction {
     None,
     ToggleStart,
+    OpenWinXMenu,
     LockWorkstation,
 }
 
@@ -2735,6 +2865,18 @@ impl WinKeyStateMachine {
                 };
             }
 
+            // Pure Win+X (no Ctrl/Shift/Alt): swallow 'X' and open PrismBar's glass Win+X menu
+            // instead of native Windows Win+X; keep Win held as combo_used so Win UP stays swallowed.
+            if vk == b'X' as u16 && !alt_down && !phys.modifier_down {
+                self.combo_used = true;
+                self.win_forwarded = false;
+                return WinHookDecision {
+                    swallow: true,
+                    forward_win_chord_vk: None,
+                    action: WinKeyAction::OpenWinXMenu,
+                };
+            }
+
             // All other chords (Win+D/E/R/V/Tab/Shift+S/Arrows/Space/1..9/...):
             // atomically inject [win_vk DOWN, key DOWN] and swallow physical key DOWN!
             self.win_forwarded = true;
@@ -2874,16 +3016,40 @@ impl Drop for HookThreadGuard {
     }
 }
 
-/// Posts `WM_QUIT` to the active global shell hook thread and waits briefly (up to 150ms)
-/// so `UnhookWindowsHookEx` completes cleanly before `app.exit(0)`.
+struct WinEventThreadGuard;
+
+impl Drop for WinEventThreadGuard {
+    fn drop(&mut self) {
+        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                let _ = guard.take();
+            }
+        });
+        WINEVENT_THREAD_ID.store(0, Ordering::SeqCst);
+        WINEVENT_THREAD_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Posts `WM_QUIT` to both the low-level input hook thread and the separate WinEvent watcher thread,
+/// waiting briefly (up to 150ms) so all OS hooks unhook cleanly before `app.exit(0)`.
 pub(crate) fn stop_shell_hook_thread() {
     let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
     if tid != 0 {
         unsafe {
             let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
+    }
+    let winevent_tid = WINEVENT_THREAD_ID.load(Ordering::SeqCst);
+    if winevent_tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(winevent_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    if tid != 0 || winevent_tid != 0 {
         for _ in 0..15 {
-            if !HOOK_THREAD_ACTIVE.load(Ordering::Acquire) {
+            if !HOOK_THREAD_ACTIVE.load(Ordering::Acquire)
+                && !WINEVENT_THREAD_ACTIVE.load(Ordering::Acquire)
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2898,6 +3064,7 @@ const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
 const EVENT_OBJECT_SHOW: u32 = 0x8002;
 const EVENT_OBJECT_HIDE: u32 = 0x8003;
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
@@ -2912,6 +3079,7 @@ struct DesktopActivityNotifier {
 }
 
 static DESKTOP_ACTIVITY: OnceLock<DesktopActivityNotifier> = OnceLock::new();
+static FULLSCREEN_ACTIVITY: OnceLock<DesktopActivityNotifier> = OnceLock::new();
 
 fn desktop_activity_notifier() -> &'static DesktopActivityNotifier {
     DESKTOP_ACTIVITY.get_or_init(|| DesktopActivityNotifier {
@@ -2921,33 +3089,15 @@ fn desktop_activity_notifier() -> &'static DesktopActivityNotifier {
     })
 }
 
-/// Pure WinEvent filter deciding whether an OS shell event should wake the event-driven
-/// desktop poller. Strictly filters `EVENT_OBJECT_CREATE/DESTROY/SHOW/HIDE` to top-level
-/// `OBJID_WINDOW && CHILDID_SELF` events (rejecting caret/cursor/child-control noise).
-pub(crate) fn is_desktop_activity_event(
-    event: u32,
-    id_object: i32,
-    id_child: i32,
-    is_child_hwnd: bool,
-) -> bool {
-    match event {
-        EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND => true,
-        EVENT_OBJECT_CREATE
-        | EVENT_OBJECT_DESTROY
-        | EVENT_OBJECT_SHOW
-        | EVENT_OBJECT_HIDE => {
-            id_object == OBJID_WINDOW && id_child == CHILDID_SELF && !is_child_hwnd
-        }
-        EVENT_OBJECT_UNCLOAKED => id_object == OBJID_WINDOW && id_child == CHILDID_SELF,
-        _ => false,
-    }
+fn fullscreen_activity_notifier() -> &'static DesktopActivityNotifier {
+    FULLSCREEN_ACTIVITY.get_or_init(|| DesktopActivityNotifier {
+        seq: AtomicU64::new(0),
+        mu: Mutex::new(()),
+        cvar: Condvar::new(),
+    })
 }
 
-/// Non-blocking desktop activity signal safe for `WinEventProc` callbacks:
-/// atomically increments the sequence counter and wakes any waiting poller via `Condvar`
-/// without ever sleeping or blocking on I/O.
-pub(crate) fn notify_desktop_activity() {
-    let n = desktop_activity_notifier();
+fn signal_activity_notifier(n: &DesktopActivityNotifier) {
     n.seq.fetch_add(1, Ordering::Release);
     // `mu` is only ever held for ~10ns by the waiter's seq-check before SleepConditionVariableSRW;
     // up to 4 spin attempts guarantee zero missed wakeups while remaining strictly non-blocking.
@@ -2961,21 +3111,11 @@ pub(crate) fn notify_desktop_activity() {
     n.cvar.notify_all();
 }
 
-/// Returns the current monotonic desktop activity sequence number.
-pub fn current_desktop_activity_seq() -> u64 {
-    desktop_activity_notifier().seq.load(Ordering::Acquire)
-}
-
-/// Sleeps the caller until a relevant top-level desktop WinEvent (`FOREGROUND`, `MINIMIZE`,
-/// `CREATE/DESTROY/SHOW/HIDE`, `UNCLOAKED`) increments the sequence counter past `*last_seq`,
-/// or until `timeout` elapses.
-///
-/// Returns `true` if woken by an OS desktop event (updating `*last_seq`), or `false` on timeout.
-pub fn wait_for_desktop_activity_or_timeout(
+fn wait_activity_notifier_or_timeout(
+    n: &DesktopActivityNotifier,
     last_seq: &mut u64,
     timeout: std::time::Duration,
 ) -> bool {
-    let n = desktop_activity_notifier();
     let cur = n.seq.load(Ordering::Acquire);
     if cur != *last_seq {
         *last_seq = cur;
@@ -3011,6 +3151,87 @@ pub fn wait_for_desktop_activity_or_timeout(
             return false;
         }
     }
+}
+
+/// Pure WinEvent filter deciding whether an OS shell event should wake the event-driven
+/// desktop poller. Strictly filters `EVENT_OBJECT_CREATE/DESTROY/SHOW/HIDE` to top-level
+/// `OBJID_WINDOW && CHILDID_SELF` events (rejecting caret/cursor/child-control noise).
+pub(crate) fn is_desktop_activity_event(
+    event: u32,
+    id_object: i32,
+    id_child: i32,
+    is_child_hwnd: bool,
+) -> bool {
+    match event {
+        EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND => true,
+        EVENT_OBJECT_CREATE
+        | EVENT_OBJECT_DESTROY
+        | EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_HIDE => {
+            id_object == OBJID_WINDOW && id_child == CHILDID_SELF && !is_child_hwnd
+        }
+        EVENT_OBJECT_UNCLOAKED => id_object == OBJID_WINDOW && id_child == CHILDID_SELF,
+        _ => false,
+    }
+}
+
+/// Pure WinEvent filter deciding whether an `EVENT_OBJECT_LOCATIONCHANGE` event belongs to a
+/// top-level window (e.g. browser/video entering or exiting fullscreen) so the lightweight
+/// fullscreen watcher wakes in ~16ms without waking heavy window-group/icon polling.
+pub(crate) fn is_fullscreen_location_event(
+    event: u32,
+    id_object: i32,
+    id_child: i32,
+    is_child_hwnd: bool,
+) -> bool {
+    event == EVENT_OBJECT_LOCATIONCHANGE
+        && id_object == OBJID_WINDOW
+        && id_child == CHILDID_SELF
+        && !is_child_hwnd
+}
+
+/// Non-blocking fullscreen activity signal safe for `WinEventProc` callbacks.
+pub(crate) fn notify_fullscreen_activity() {
+    signal_activity_notifier(fullscreen_activity_notifier());
+}
+
+/// Non-blocking desktop activity signal safe for `WinEventProc` callbacks:
+/// atomically increments the sequence counter and wakes both the desktop poller and
+/// the fast fullscreen watcher without ever sleeping or blocking on I/O.
+pub(crate) fn notify_desktop_activity() {
+    signal_activity_notifier(desktop_activity_notifier());
+    signal_activity_notifier(fullscreen_activity_notifier());
+}
+
+/// Returns the current monotonic desktop activity sequence number.
+pub fn current_desktop_activity_seq() -> u64 {
+    desktop_activity_notifier().seq.load(Ordering::Acquire)
+}
+
+/// Returns the current monotonic fullscreen activity sequence number.
+pub fn current_fullscreen_activity_seq() -> u64 {
+    fullscreen_activity_notifier().seq.load(Ordering::Acquire)
+}
+
+/// Sleeps the caller until a relevant top-level desktop WinEvent (`FOREGROUND`, `MINIMIZE`,
+/// `CREATE/DESTROY/SHOW/HIDE`, `UNCLOAKED`) increments the sequence counter past `*last_seq`,
+/// or until `timeout` elapses.
+///
+/// Returns `true` if woken by an OS desktop event (updating `*last_seq`), or `false` on timeout.
+pub fn wait_for_desktop_activity_or_timeout(
+    last_seq: &mut u64,
+    timeout: std::time::Duration,
+) -> bool {
+    wait_activity_notifier_or_timeout(desktop_activity_notifier(), last_seq, timeout)
+}
+
+/// Sleeps the caller until a top-level window location/size change or desktop event increments
+/// the fullscreen activity counter past `*last_seq`, or until `timeout` elapses.
+pub fn wait_for_fullscreen_activity_or_timeout(
+    last_seq: &mut u64,
+    timeout: std::time::Duration,
+) -> bool {
+    wait_activity_notifier_or_timeout(fullscreen_activity_notifier(), last_seq, timeout)
 }
 
 type WinEventProc = unsafe extern "system" fn(
@@ -3386,13 +3607,29 @@ unsafe extern "system" fn win_event_start_guard_proc(
     }));
 }
 
-/// Low-level keyboard & mouse hook thread that intercepts ONLY lone Win taps
-/// (leaving Win+E/D/R/L/V/Shift+S/Tab untouched), suppresses stray native Win11
-/// `StartMenuExperienceHost.exe` popups via `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND` +
-/// `EVENT_OBJECT_UNCLOAKED`, AD-2), wakes the event-driven desktop poller on top-level window
-/// lifecycle & minimize events, forwards global mouse clicks via non-blocking `try_send`
-/// into a bounded `sync_channel(64)` drained by a dedicated worker, and registers global
-/// emergency restore hotkey `Ctrl+Alt+Shift+Esc`.
+unsafe extern "system" fn win_event_fullscreen_location_proc(
+    _h_win_event_hook: isize,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if hwnd.0.is_null() || id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
+        return;
+    }
+    let is_child_hwnd = ((GetWindowLongPtrW(hwnd, GWL_STYLE) as u32) & WS_CHILD.0) != 0;
+    if is_fullscreen_location_event(event, id_object, id_child, is_child_hwnd) {
+        notify_fullscreen_activity();
+    }
+}
+
+/// Low-level keyboard & mouse hook thread (`THREAD_PRIORITY_HIGHEST`) strictly isolated from
+/// `SetWinEventHook` floods so Windows' 300ms `LowLevelHooksTimeout` can NEVER silently unhook
+/// `WH_KEYBOARD_LL` when Start/WebView2 opens. A dedicated companion `prismbar-win-events` thread
+/// owns all `SetWinEventHook` callbacks (native Start suppressor, desktop activity, and instant
+/// `EVENT_OBJECT_LOCATIONCHANGE` fullscreen tracking).
 pub fn start_shell_hook_thread<F>(on_event: F)
 where
     F: Fn(ShellHookEvent) + Send + 'static,
@@ -3405,125 +3642,176 @@ where
     }
 
     let (sender, _worker_handle) = HookEventChannel::new().spawn_worker(on_event);
-    std::thread::spawn(move || unsafe {
-        let _active_guard = HookThreadGuard;
-        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
-        let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
-        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
-            *slot.borrow_mut() = Some(sender);
+    let winevent_sender = sender.clone();
+
+    // Thread 2 (dedicated WinEvent loop): completely decoupled from WH_KEYBOARD_LL / WH_MOUSE_LL!
+    if WINEVENT_THREAD_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let _ = std::thread::Builder::new()
+            .name("prismbar-win-events".to_string())
+            .spawn(move || unsafe {
+                let _guard = WinEventThreadGuard;
+                WINEVENT_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+                let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                    *slot.borrow_mut() = Some(winevent_sender);
+                });
+
+                let fg_event_hook = SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    0,
+                    win_event_start_guard_proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let uncloak_event_hook = SetWinEventHook(
+                    EVENT_OBJECT_UNCLOAKED,
+                    EVENT_OBJECT_UNCLOAKED,
+                    0,
+                    win_event_start_guard_proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let minimize_event_hook = SetWinEventHook(
+                    EVENT_SYSTEM_MINIMIZESTART,
+                    EVENT_SYSTEM_MINIMIZEEND,
+                    0,
+                    win_event_desktop_activity_proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let object_window_event_hook = SetWinEventHook(
+                    EVENT_OBJECT_CREATE,
+                    EVENT_OBJECT_HIDE,
+                    0,
+                    win_event_desktop_activity_proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let location_event_hook = SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    0,
+                    win_event_fullscreen_location_proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+
+                if fg_event_hook != 0
+                    || uncloak_event_hook != 0
+                    || minimize_event_hook != 0
+                    || object_window_event_hook != 0
+                    || location_event_hook != 0
+                {
+                    let mut msg = MSG::default();
+                    loop {
+                        let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+                        if ret.0 <= 0 {
+                            break;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+
+                if location_event_hook != 0 {
+                    let _ = UnhookWinEvent(location_event_hook);
+                }
+                if object_window_event_hook != 0 {
+                    let _ = UnhookWinEvent(object_window_event_hook);
+                }
+                if minimize_event_hook != 0 {
+                    let _ = UnhookWinEvent(minimize_event_hook);
+                }
+                if uncloak_event_hook != 0 {
+                    let _ = UnhookWinEvent(uncloak_event_hook);
+                }
+                if fg_event_hook != 0 {
+                    let _ = UnhookWinEvent(fg_event_hook);
+                }
+            });
+    }
+
+    // Thread 1 (dedicated high-priority WH_KEYBOARD_LL + WH_MOUSE_LL + Emergency Hotkey loop)
+    let _ = std::thread::Builder::new()
+        .name("prismbar-ll-hooks".to_string())
+        .spawn(move || unsafe {
+            let _active_guard = HookThreadGuard;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+            let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
+            let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                *slot.borrow_mut() = Some(sender);
+            });
+
+            let hotkey_ok = RegisterHotKey(
+                HWND::default(),
+                HOTKEY_EMERGENCY_ID,
+                MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+                VK_ESCAPE.0 as u32,
+            )
+            .is_ok();
+
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
+            let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), None, 0);
+
+            if !hotkey_ok && hook.is_err() && mouse_hook.is_err() {
+                return;
+            }
+
+            let mut msg = MSG::default();
+            let mut emergency_triggered = false;
+            loop {
+                let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+                if ret.0 <= 0 {
+                    break;
+                }
+                if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_EMERGENCY_ID {
+                    emergency_triggered = true;
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            // Unhook global hooks and hotkey BEFORE performing any taskbar restoration.
+            if let Ok(h) = hook {
+                let _ = UnhookWindowsHookEx(h);
+            }
+            if let Ok(mh) = mouse_hook {
+                let _ = UnhookWindowsHookEx(mh);
+            }
+            if hotkey_ok {
+                let _ = UnregisterHotKey(HWND::default(), HOTKEY_EMERGENCY_ID);
+            }
+
+            let winevent_tid = WINEVENT_THREAD_ID.load(Ordering::SeqCst);
+            if winevent_tid != 0 {
+                let _ = PostThreadMessageW(winevent_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+
+            let sender = HOOK_EVENT_SENDER
+                .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut g| g.take()))
+                .ok()
+                .flatten();
+            let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
+
+            if emergency_triggered {
+                if NATIVE_HIDDEN.load(Ordering::SeqCst) {
+                    restore_native_taskbar_nonblocking();
+                }
+                if let Some(tx) = sender {
+                    let _ = tx.send_blocking(ShellHookEvent::EmergencyRestore);
+                }
+            }
         });
-
-        let hotkey_ok = RegisterHotKey(
-            HWND::default(),
-            HOTKEY_EMERGENCY_ID,
-            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-            VK_ESCAPE.0 as u32,
-        )
-        .is_ok();
-
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
-        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), None, 0);
-        let fg_event_hook = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            0,
-            win_event_start_guard_proc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        );
-        let uncloak_event_hook = SetWinEventHook(
-            EVENT_OBJECT_UNCLOAKED,
-            EVENT_OBJECT_UNCLOAKED,
-            0,
-            win_event_start_guard_proc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        );
-        let minimize_event_hook = SetWinEventHook(
-            EVENT_SYSTEM_MINIMIZESTART,
-            EVENT_SYSTEM_MINIMIZEEND,
-            0,
-            win_event_desktop_activity_proc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        );
-        let object_window_event_hook = SetWinEventHook(
-            EVENT_OBJECT_CREATE,
-            EVENT_OBJECT_HIDE,
-            0,
-            win_event_desktop_activity_proc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        );
-
-        if !hotkey_ok
-            && hook.is_err()
-            && mouse_hook.is_err()
-            && fg_event_hook == 0
-            && uncloak_event_hook == 0
-            && minimize_event_hook == 0
-            && object_window_event_hook == 0
-        {
-            return;
-        }
-
-        let mut msg = MSG::default();
-        let mut emergency_triggered = false;
-        loop {
-            let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
-            if ret.0 <= 0 {
-                break;
-            }
-            if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_EMERGENCY_ID {
-                emergency_triggered = true;
-                break;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        // Unhook global hooks and hotkey BEFORE performing any taskbar restoration.
-        if object_window_event_hook != 0 {
-            let _ = UnhookWinEvent(object_window_event_hook);
-        }
-        if minimize_event_hook != 0 {
-            let _ = UnhookWinEvent(minimize_event_hook);
-        }
-        if uncloak_event_hook != 0 {
-            let _ = UnhookWinEvent(uncloak_event_hook);
-        }
-        if fg_event_hook != 0 {
-            let _ = UnhookWinEvent(fg_event_hook);
-        }
-        if let Ok(h) = hook {
-            let _ = UnhookWindowsHookEx(h);
-        }
-        if let Ok(mh) = mouse_hook {
-            let _ = UnhookWindowsHookEx(mh);
-        }
-        if hotkey_ok {
-            let _ = UnregisterHotKey(HWND::default(), HOTKEY_EMERGENCY_ID);
-        }
-
-        let sender = HOOK_EVENT_SENDER
-            .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut g| g.take()))
-            .ok()
-            .flatten();
-        let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
-
-        if emergency_triggered {
-            if NATIVE_HIDDEN.load(Ordering::SeqCst) {
-                restore_native_taskbar_nonblocking();
-            }
-            if let Some(tx) = sender {
-                let _ = tx.send_blocking(ShellHookEvent::EmergencyRestore);
-            }
-        }
-    });
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3734,6 +4022,15 @@ where
                 if let Ok(guard) = slot.try_borrow() {
                     if let Some(sender) = guard.as_ref() {
                         let _ = sender.try_send(ShellHookEvent::ToggleStart);
+                    }
+                }
+            });
+        }
+        WinKeyAction::OpenWinXMenu => {
+            let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                if let Ok(guard) = slot.try_borrow() {
+                    if let Some(sender) = guard.as_ref() {
+                        let _ = sender.try_send(ShellHookEvent::OpenWinXMenu);
                     }
                 }
             });
@@ -5737,6 +6034,24 @@ mod tests {
         ));
         assert!(!is_desktop_activity_event(EVENT_OBJECT_UNCLOAKED, -4, 0, false));
         assert!(!is_desktop_activity_event(0x800B, OBJID_WINDOW, CHILDID_SELF, false)); // LOCATIONCHANGE
+        assert!(is_fullscreen_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            OBJID_WINDOW,
+            CHILDID_SELF,
+            false
+        ));
+        assert!(!is_fullscreen_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            OBJID_WINDOW,
+            CHILDID_SELF,
+            true
+        ));
+        assert!(!is_fullscreen_location_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            -4,
+            CHILDID_SELF,
+            false
+        ));
 
         // Timeout returns false without mutating seq
         let mut seq = current_desktop_activity_seq();
@@ -5902,5 +6217,59 @@ mod tests {
                 "{forbidden:?} must NEVER be matched by is_restartable_start_host_exe"
             );
         }
+    }
+
+    #[test]
+    fn win_x_opens_prismbar_menu_without_forwarding_or_toggling_start() {
+        let mut sm = WinKeyStateMachine::new();
+        let idle = PhysicalKeySnapshot::default();
+        let d_win = sm.on_ll_key_event(
+            VK_LWIN.0,
+            KeyTransition::Down,
+            LLKHF_EXTENDED_FLAG,
+            0,
+            idle,
+            false,
+        );
+        assert_eq!(d_win, WinHookDecision::SWALLOW);
+
+        let d_x = sm.on_ll_key_event(b'X' as u16, KeyTransition::Down, 0, 0, idle, false);
+        assert!(d_x.swallow);
+        assert_eq!(d_x.forward_win_chord_vk, None);
+        assert_eq!(d_x.action, WinKeyAction::OpenWinXMenu);
+
+        let d_x_up = sm.on_ll_key_event(b'X' as u16, KeyTransition::Up, 0, 0, idle, false);
+        assert_eq!(d_x_up, WinHookDecision::PASS);
+
+        let d_win_up = sm.on_ll_key_event(
+            VK_LWIN.0,
+            KeyTransition::Up,
+            LLKHF_EXTENDED_FLAG,
+            0,
+            idle,
+            false,
+        );
+        assert!(d_win_up.swallow);
+        assert_eq!(d_win_up.action, WinKeyAction::None);
+
+        // Win+Shift+X must still forward as a regular chord rather than opening Win+X menu
+        let mut sm2 = WinKeyStateMachine::new();
+        let _ = sm2.on_ll_key_event(
+            VK_LWIN.0,
+            KeyTransition::Down,
+            LLKHF_EXTENDED_FLAG,
+            0,
+            idle,
+            false,
+        );
+        let shift_held = PhysicalKeySnapshot {
+            lwin_down: false,
+            rwin_down: false,
+            modifier_down: true,
+        };
+        let d_shift_x = sm2.on_ll_key_event(b'X' as u16, KeyTransition::Down, 0, 0, shift_held, false);
+        assert!(d_shift_x.swallow);
+        assert_eq!(d_shift_x.forward_win_chord_vk, Some(VK_LWIN.0));
+        assert_eq!(d_shift_x.action, WinKeyAction::None);
     }
 }

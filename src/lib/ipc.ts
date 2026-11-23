@@ -536,10 +536,32 @@ export type FlyoutKind =
   | 'telemetry'
   | 'context_app'
   | 'context_bar'
+  | 'context_start'
   | 'osd'
   | 'quick'
   | 'ctx_app'
-  | 'ctx_taskbar';
+  | 'ctx_taskbar'
+  | 'ctx_start';
+
+export type WinXAction =
+  | 'apps'
+  | 'system'
+  | 'device_manager'
+  | 'disk_management'
+  | 'computer_management'
+  | 'event_viewer'
+  | 'network_connections'
+  | 'terminal'
+  | 'terminal_admin'
+  | 'task_manager'
+  | 'settings'
+  | 'explorer'
+  | 'run'
+  | 'desktop'
+  | 'lock'
+  | 'sleep'
+  | 'reboot'
+  | 'shutdown';
 
 export interface JumpListItem {
   title: string;

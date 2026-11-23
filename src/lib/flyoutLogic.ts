@@ -50,7 +50,7 @@ export const INITIAL_FLYOUT_ANIM_STATE: FlyoutAnimState = {
 };
 
 export function getFlyoutExitMs(kind: FlyoutKind | undefined): number {
-  if (kind && (isAppContextKind(kind) || isBarContextKind(kind))) {
+  if (kind && (isAppContextKind(kind) || isBarContextKind(kind) || isStartContextKind(kind))) {
     return CONTEXT_FLYOUT_EXIT_MS;
   }
   return FLYOUT_EXIT_MS;
@@ -212,6 +212,10 @@ export function isAppContextKind(kind: FlyoutKind): boolean {
 
 export function isBarContextKind(kind: FlyoutKind): boolean {
   return kind === 'context_bar' || kind === 'ctx_taskbar';
+}
+
+export function isStartContextKind(kind: FlyoutKind): boolean {
+  return kind === 'context_start' || kind === 'ctx_start';
 }
 
 export function removePreviewWindow(windows: OpenWindowInfo[], hwnd: number): OpenWindowInfo[] {

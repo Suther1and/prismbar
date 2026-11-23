@@ -742,6 +742,22 @@ export function buildBarContextMenuRequest(
   };
 }
 
+export function buildStartContextMenuRequest(
+  anchorXLogical: number,
+  monitor: TaskbarMonitor,
+): FlyoutRequest {
+  return {
+    kind: 'context_start',
+    anchorXLogical,
+    anchorInTaskbar: true,
+    width: 280,
+    height: 446,
+    noActivate: false,
+    monitor,
+    payload: {},
+  };
+}
+
 /**
  * Constructs a canonical `PinItem` when pinning an app from the taskbar right-click menu,
  * preserving `matchExe`, `matchAumid`, `iconKey`, and `args` for clean deduplication (AD-4).
