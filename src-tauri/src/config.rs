@@ -4991,12 +4991,16 @@ pub fn format_autostart_exec_path(exe_path: &Path) -> Result<(String, Option<Str
     if cleaned.is_empty() {
         return Err("autostart executable path is empty".to_string());
     }
-    let working_dir = Path::new(cleaned)
-        .parent()
-        .and_then(|p| p.to_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+    let working_dir = cleaned.rfind(['\\', '/']).and_then(|idx| {
+        let parent = cleaned[..idx].trim();
+        if parent.is_empty() {
+            None
+        } else if parent.len() == 2 && parent.ends_with(':') {
+            Some(format!("{parent}\\"))
+        } else {
+            Some(parent.to_string())
+        }
+    });
     Ok((cleaned.to_string(), working_dir))
 }
 
