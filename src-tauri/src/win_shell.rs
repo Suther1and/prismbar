@@ -44,7 +44,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD,
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
-    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON,
+    VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
@@ -88,6 +89,8 @@ pub const TASKBAR_CREATED_REHIDE_DELAYS_MS: [u64; 3] = [100, 300, 650];
 pub const WM_APPBAR_CALLBACK: u32 = WM_APP + 10;
 pub const WM_APPBAR_UPDATE_MODE: u32 = WM_APP + 12;
 pub const WM_APPBAR_ENSURE_REGISTERED: u32 = WM_APP + 13;
+const WM_APP_REINSTALL_KB_HOOK: u32 = WM_APP + 0x51;
+const KB_REHOOK_COOLDOWN_MS: u64 = 1000;
 pub const HOOK_EVENT_CHANNEL_CAPACITY: usize = 64;
 pub const VK_DUMMY_MASK: u16 = 0xE8;
 pub const TESTBAR_INJECTED_EXTRA_INFO: usize = 0x5442_4152; // "TBAR" tag for our own SendInput chord forwards
@@ -118,8 +121,13 @@ static APPBAR_MSG_WINDOW: Mutex<Option<AppBarMessageWindow>> = Mutex::new(None);
 static HOOK_OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static MOUSE_HOOK_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MOUSE_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static WINEVENT_THREAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WINEVENT_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static WIN_KEY_HELD_ATOMIC: AtomicBool = AtomicBool::new(false);
+static WIN_COMBO_CLICK_FLAG: AtomicBool = AtomicBool::new(false);
+static LAST_KB_REHOOK_MS: AtomicU64 = AtomicU64::new(0);
 static FG_IS_ELEVATED: AtomicBool = AtomicBool::new(false);
 static LAST_ELEVATED_CHECK_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -1214,6 +1222,83 @@ pub fn get_window_pixel_rect(hwnd_raw: isize) -> Option<PixelRect> {
             None
         }
     }
+}
+
+/// Re-asserts `HWND_TOPMOST` Z-order on an already-visible window without activating or
+/// moving it (used right after Start demotes a fullscreen game out of DWM's fullscreen band
+/// so the revealed taskbar stays strictly above the game for hover and clicks).
+pub fn ensure_window_topmost_noactivate(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        );
+    }
+}
+
+/// Returns `true` when the current Win32 foreground top-level window matches any non-zero HWND in `hwnds`.
+pub fn is_foreground_hwnd_any(hwnds: &[isize]) -> bool {
+    if hwnds.is_empty() {
+        return false;
+    }
+    let fg_raw = unsafe { GetForegroundWindow().0 as isize };
+    fg_raw != 0 && hwnds.iter().any(|&h| h != 0 && h == fg_raw)
+}
+
+/// Returns `true` when the live OS cursor lies inside any rect in `rects`.
+pub fn is_cursor_in_any_rect(rects: &[PixelRect]) -> bool {
+    if rects.is_empty() {
+        return false;
+    }
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            return rects.iter().any(|r| r.contains(pt.x, pt.y));
+        }
+        false
+    }
+}
+
+/// Returns `true` when any primary mouse button (`LBUTTON` / `RBUTTON` / `MBUTTON`) is currently pressed.
+pub fn is_any_mouse_button_down() -> bool {
+    is_vk_physically_down(VK_LBUTTON)
+        || is_vk_physically_down(VK_RBUTTON)
+        || is_vk_physically_down(VK_MBUTTON)
+}
+
+/// Grants foreground activation permission to newly spawned processes (must be called while
+/// our process still owns foreground focus, e.g. right before `ShellExecuteW` + closing Start).
+pub fn allow_set_foreground_any() {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+}
+
+/// Returns `true` when the given raw HWND belongs to Windows 11's native Start Menu host.
+pub fn is_hwnd_native_start_menu_raw(hwnd_raw: isize) -> bool {
+    if hwnd_raw == 0 {
+        return false;
+    }
+    is_hwnd_native_start_menu(HWND(hwnd_raw as *mut _))
+}
+
+/// Returns `true` when Windows 11's native Start Menu (`StartMenuExperienceHost.exe`)
+/// currently holds foreground focus.
+pub fn is_foreground_native_start_menu() -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    !fg.0.is_null() && is_hwnd_native_start_menu(fg)
 }
 
 /// Positions and resizes a window in physical pixels without activating it and
@@ -3016,6 +3101,20 @@ impl Drop for HookThreadGuard {
     }
 }
 
+struct MouseHookThreadGuard;
+
+impl Drop for MouseHookThreadGuard {
+    fn drop(&mut self) {
+        let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                let _ = guard.take();
+            }
+        });
+        MOUSE_HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+        MOUSE_HOOK_THREAD_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
 struct WinEventThreadGuard;
 
 impl Drop for WinEventThreadGuard {
@@ -3030,13 +3129,45 @@ impl Drop for WinEventThreadGuard {
     }
 }
 
-/// Posts `WM_QUIT` to both the low-level input hook thread and the separate WinEvent watcher thread,
-/// waiting briefly (up to 150ms) so all OS hooks unhook cleanly before `app.exit(0)`.
+/// Pure cooldown gate for keyboard hook self-healing (`KB_REHOOK_COOLDOWN_MS`).
+pub(crate) fn should_reinstall_keyboard_hook(last_ms: u64, now_ms: u64) -> bool {
+    last_ms == 0 || now_ms < last_ms || (now_ms - last_ms) >= KB_REHOOK_COOLDOWN_MS
+}
+
+/// Requests a non-blocking re-install of `WH_KEYBOARD_LL` on the dedicated keyboard hook thread
+/// (rate-limited to at most once per `KB_REHOOK_COOLDOWN_MS`) to auto-heal if Windows silently
+/// dropped the hook during a fullscreen game mode switch or CPU stall.
+pub(crate) fn request_reinstall_keyboard_hook(now_ms: u64) -> bool {
+    let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if tid == 0 {
+        return false;
+    }
+    let prev = LAST_KB_REHOOK_MS.load(Ordering::Acquire);
+    if !should_reinstall_keyboard_hook(prev, now_ms) {
+        return false;
+    }
+    if LAST_KB_REHOOK_MS
+        .compare_exchange(prev, now_ms.max(1), Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    unsafe { PostThreadMessageW(tid, WM_APP_REINSTALL_KB_HOOK, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+/// Posts `WM_QUIT` to the low-level keyboard hook thread, mouse hook thread, and separate WinEvent
+/// watcher thread, waiting briefly (up to 150ms) so all OS hooks unhook cleanly before `app.exit(0)`.
 pub(crate) fn stop_shell_hook_thread() {
     let tid = HOOK_THREAD_ID.load(Ordering::SeqCst);
     if tid != 0 {
         unsafe {
             let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    let mouse_tid = MOUSE_HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if mouse_tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(mouse_tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
     let winevent_tid = WINEVENT_THREAD_ID.load(Ordering::SeqCst);
@@ -3045,9 +3176,10 @@ pub(crate) fn stop_shell_hook_thread() {
             let _ = PostThreadMessageW(winevent_tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
-    if tid != 0 || winevent_tid != 0 {
+    if tid != 0 || mouse_tid != 0 || winevent_tid != 0 {
         for _ in 0..15 {
             if !HOOK_THREAD_ACTIVE.load(Ordering::Acquire)
+                && !MOUSE_HOOK_THREAD_ACTIVE.load(Ordering::Acquire)
                 && !WINEVENT_THREAD_ACTIVE.load(Ordering::Acquire)
             {
                 break;
@@ -3643,6 +3775,7 @@ where
 
     let (sender, _worker_handle) = HookEventChannel::new().spawn_worker(on_event);
     let winevent_sender = sender.clone();
+    let mouse_sender = sender.clone();
 
     // Thread 2 (dedicated WinEvent loop): completely decoupled from WH_KEYBOARD_LL / WH_MOUSE_LL!
     if WINEVENT_THREAD_ACTIVE
@@ -3739,13 +3872,49 @@ where
             });
     }
 
-    // Thread 1 (dedicated high-priority WH_KEYBOARD_LL + WH_MOUSE_LL + Emergency Hotkey loop)
+    // Thread 3 (dedicated WH_MOUSE_LL loop): completely decoupled from WH_KEYBOARD_LL so
+    // high-polling-rate (1000-8000 Hz) gaming mice can never delay Win-key interception.
+    if MOUSE_HOOK_THREAD_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let _ = std::thread::Builder::new()
+            .name("prismbar-ll-mouse".to_string())
+            .spawn(move || unsafe {
+                let _guard = MouseHookThreadGuard;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+                MOUSE_HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+                let _ = HOOK_EVENT_SENDER.try_with(|slot| {
+                    *slot.borrow_mut() = Some(mouse_sender);
+                });
+
+                let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), None, 0);
+                if mouse_hook.is_ok() {
+                    let mut msg = MSG::default();
+                    loop {
+                        let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+                        if ret.0 <= 0 {
+                            break;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                if let Ok(mh) = mouse_hook {
+                    let _ = UnhookWindowsHookEx(mh);
+                }
+            });
+    }
+
+    // Thread 1 (dedicated high-priority WH_KEYBOARD_LL + Emergency Hotkey loop with self-heal re-hook)
     let _ = std::thread::Builder::new()
         .name("prismbar-ll-hooks".to_string())
         .spawn(move || unsafe {
             let _active_guard = HookThreadGuard;
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+            WIN_KEY_HELD_ATOMIC.store(false, Ordering::Release);
+            WIN_COMBO_CLICK_FLAG.store(false, Ordering::Release);
             let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
             let _ = HOOK_EVENT_SENDER.try_with(|slot| {
                 *slot.borrow_mut() = Some(sender);
@@ -3759,10 +3928,17 @@ where
             )
             .is_ok();
 
-            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
-            let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), None, 0);
+            let mut hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
 
-            if !hotkey_ok && hook.is_err() && mouse_hook.is_err() {
+            if !hotkey_ok && hook.is_err() {
+                let mouse_tid = MOUSE_HOOK_THREAD_ID.load(Ordering::SeqCst);
+                if mouse_tid != 0 {
+                    let _ = PostThreadMessageW(mouse_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
+                let winevent_tid = WINEVENT_THREAD_ID.load(Ordering::SeqCst);
+                if winevent_tid != 0 {
+                    let _ = PostThreadMessageW(winevent_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
                 return;
             }
 
@@ -3777,6 +3953,16 @@ where
                     emergency_triggered = true;
                     break;
                 }
+                if msg.message == WM_APP_REINSTALL_KB_HOOK {
+                    if let Ok(old_h) = hook {
+                        let _ = UnhookWindowsHookEx(old_h);
+                    }
+                    WIN_KEY_HELD_ATOMIC.store(false, Ordering::Release);
+                    WIN_COMBO_CLICK_FLAG.store(false, Ordering::Release);
+                    let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
+                    hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), None, 0);
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -3785,13 +3971,14 @@ where
             if let Ok(h) = hook {
                 let _ = UnhookWindowsHookEx(h);
             }
-            if let Ok(mh) = mouse_hook {
-                let _ = UnhookWindowsHookEx(mh);
-            }
             if hotkey_ok {
                 let _ = UnregisterHotKey(HWND::default(), HOTKEY_EMERGENCY_ID);
             }
 
+            let mouse_tid = MOUSE_HOOK_THREAD_ID.load(Ordering::SeqCst);
+            if mouse_tid != 0 {
+                let _ = PostThreadMessageW(mouse_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
             let winevent_tid = WINEVENT_THREAD_ID.load(Ordering::SeqCst);
             if winevent_tid != 0 {
                 let _ = PostThreadMessageW(winevent_tid, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -3801,6 +3988,8 @@ where
                 .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut g| g.take()))
                 .ok()
                 .flatten();
+            WIN_KEY_HELD_ATOMIC.store(false, Ordering::Release);
+            WIN_COMBO_CLICK_FLAG.store(false, Ordering::Release);
             let _ = HOOK_WIN_KEY_STATE.try_with(|state| state.set(WinKeyStateMachine::new()));
 
             if emergency_triggered {
@@ -3841,6 +4030,9 @@ fn dispatch_ll_mouse_event(msg: u32, x: i32, y: i32, overlay_open: bool) {
     }
     // Any mouse click while Win is held (even when no TestBar overlay is open) marks
     // combo_used = true so Win+Click never falsely pops Start on Win release.
+    if WIN_KEY_HELD_ATOMIC.load(Ordering::Acquire) {
+        WIN_COMBO_CLICK_FLAG.store(true, Ordering::Release);
+    }
     let _ = HOOK_WIN_KEY_STATE.try_with(|cell| {
         let mut state = cell.get();
         if state.is_any_win_down() {
@@ -3862,15 +4054,18 @@ fn dispatch_ll_mouse_event(msg: u32, x: i32, y: i32, overlay_open: bool) {
 
 unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && lparam.0 != 0 {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            dispatch_ll_mouse_event(
-                wparam.0 as u32,
-                ms.pt.x,
-                ms.pt.y,
-                HOOK_OVERLAY_OPEN.load(Ordering::Acquire),
-            );
-        }));
+        let msg = wparam.0 as u32;
+        if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                dispatch_ll_mouse_event(
+                    msg,
+                    ms.pt.x,
+                    ms.pt.y,
+                    HOOK_OVERLAY_OPEN.load(Ordering::Acquire),
+                );
+            }));
+        }
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
@@ -3991,12 +4186,18 @@ where
             if fg_elevated && !state.is_any_win_down() {
                 return WinHookDecision::PASS;
             }
+            if state.is_any_win_down() && WIN_COMBO_CLICK_FLAG.swap(false, Ordering::AcqRel) {
+                state.mark_combo_used();
+            } else if !state.is_any_win_down() && is_win && transition == KeyTransition::Down {
+                WIN_COMBO_CLICK_FLAG.store(false, Ordering::Release);
+            }
             let phys = if transition == KeyTransition::Down && (state.is_any_win_down() || is_win) {
                 query_physical()
             } else {
                 PhysicalKeySnapshot::default()
             };
             let dec = state.on_ll_key_event(vk, transition, flags, dw_extra_info, phys, fg_elevated);
+            WIN_KEY_HELD_ATOMIC.store(state.is_any_win_down(), Ordering::Release);
             cell.set(state);
             dec
         })
@@ -6271,5 +6472,25 @@ mod tests {
         assert!(d_shift_x.swallow);
         assert_eq!(d_shift_x.forward_win_chord_vk, Some(VK_LWIN.0));
         assert_eq!(d_shift_x.action, WinKeyAction::None);
+    }
+
+    #[test]
+    fn keyboard_hook_reinstall_cooldown_and_mouse_isolation_invariants() {
+        assert!(should_reinstall_keyboard_hook(0, 100));
+        assert!(!should_reinstall_keyboard_hook(1000, 1500));
+        assert!(!should_reinstall_keyboard_hook(1000, 1999));
+        assert!(should_reinstall_keyboard_hook(1000, 2000));
+        assert!(should_reinstall_keyboard_hook(2000, 100));
+
+        // Verify mouse hook is isolated on its own thread and keyboard hook supports self-heal reinstall
+        let src = include_str!("win_shell.rs");
+        assert!(
+            src.contains("prismbar-ll-mouse"),
+            "WH_MOUSE_LL must run on a dedicated thread isolated from WH_KEYBOARD_LL"
+        );
+        assert!(
+            src.contains("WM_APP_REINSTALL_KB_HOOK"),
+            "keyboard hook thread must support self-healing WH_KEYBOARD_LL reinstall"
+        );
     }
 }

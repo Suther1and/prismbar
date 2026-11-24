@@ -588,6 +588,7 @@ export interface StartStateEvent {
   gen: number;
   monitor?: 'primary' | 'secondary' | string | null;
   immediate?: boolean;
+  fullscreenOverlay?: boolean;
 }
 
 export interface StartShownEvent {
@@ -602,13 +603,14 @@ export interface FlyoutHideEvent {
 
 export function normalizeStartStatePayload(payload: boolean | StartStateEvent): StartStateEvent {
   if (typeof payload === 'boolean') {
-    return { open: payload, gen: 0, monitor: null, immediate: false };
+    return { open: payload, gen: 0, monitor: null, immediate: false, fullscreenOverlay: false };
   }
   return {
     open: Boolean(payload?.open),
     gen: typeof payload?.gen === 'number' && Number.isFinite(payload.gen) ? payload.gen : 0,
     monitor: payload?.monitor ?? null,
     immediate: Boolean(payload?.immediate),
+    fullscreenOverlay: Boolean(payload?.fullscreenOverlay),
   };
 }
 

@@ -145,6 +145,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
   );
   const [timerNowMs, setTimerNowMs] = useState<number>(() => Date.now());
   const [startOpen, setStartOpen] = useState(false);
+  const [startFullscreenOverlay, setStartFullscreenOverlay] = useState(false);
   const [activeFlyout, setActiveFlyout] = useState<string>('');
   const [now, setNow] = useState(() => new Date());
   const [iconMap, setIconMap] = useState<Record<string, string>>({});
@@ -355,7 +356,11 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
           ]
         : []),
       onEvent<boolean | StartStateEvent>('start-state', (ev) => {
-        setStartOpen(normalizeStartStatePayload(ev).open);
+        const norm = normalizeStartStatePayload(ev);
+        setStartOpen(norm.open);
+        setStartFullscreenOverlay(
+          Boolean(norm.open && norm.fullscreenOverlay && (!norm.monitor || norm.monitor === monitor)),
+        );
       }),
       onEvent<{ kind: string }>('flyout-show', (f) => {
         activeFlyoutRef.current = f.kind;
@@ -992,7 +997,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         target: action.target,
         args: action.args,
         asAdmin: Boolean(matchedPin?.runAsAdmin),
-        closeStart: false,
+        closeStart: true,
       }).catch(() => {
         clearLaunchHop(item.id);
       });
@@ -1025,7 +1030,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
         target: launchTarget,
         args: item.args ?? null,
         asAdmin: false,
-        closeStart: false,
+        closeStart: true,
       }).catch(() => {
         clearLaunchHop(item.id);
       });
@@ -1043,7 +1048,9 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
       leaveTimer.current = null;
     }
     if (dragPinId) return;
-    if (!shouldTriggerPreviewHover(item, startOpen, activeFlyoutRef.current)) return;
+    if (!shouldTriggerPreviewHover(item, startOpen, activeFlyoutRef.current, startFullscreenOverlay)) {
+      return;
+    }
 
     const delayMs = getPreviewHoverDelayMs(
       activeFlyoutRef.current,
@@ -1112,9 +1119,7 @@ export const TaskbarView: React.FC<TaskbarViewProps> = ({ monitorOverride }) => 
 
   const handleBarClick = (e: React.MouseEvent<HTMLElement>) => {
     if ((e.target as HTMLElement).closest('button')) return;
-    if (startOpen || activeFlyoutRef.current !== '') {
-      dismissOverlays().catch(() => {});
-    }
+    dismissOverlays().catch(() => {});
   };
 
   // Pointer-based icon reordering for BOTH pinned & unpinned open taskbar items

@@ -42,15 +42,16 @@ use windows::Win32::UI::Shell::{
     SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DrawIconEx, EnumChildWindows, EnumWindows, GetClassLongPtrW, GetClassNameW,
-    GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongPtrW, GetWindowPlacement,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SendMessageTimeoutW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, DI_NORMAL, GCLP_HICON,
-    GCLP_HICONSM, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HICON, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG,
-    ICON_SMALL, ICON_SMALL2, MONITORINFOF_PRIMARY, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WINDOWPLACEMENT,
-    WM_CLOSE, WM_GETICON, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_VISIBLE,
+    AllowSetForegroundWindow, BringWindowToTop, DestroyIcon, DrawIconEx, EnumChildWindows,
+    EnumWindows, GetClassLongPtrW, GetClassNameW, GetForegroundWindow, GetIconInfo, GetWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    ShowWindowAsync, ASFW_ANY, DI_NORMAL, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER, HICON, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, ICON_SMALL2,
+    MONITORINFOF_PRIMARY, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, WINDOWPLACEMENT, WM_CLOSE, WM_GETICON,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_VISIBLE,
 };
 
 use crate::coordinator::PixelRect;
@@ -1967,6 +1968,7 @@ pub fn focus_or_toggle_window(hwnd_raw: isize, toggle_minimize: bool) {
             let _ = ShowWindowAsync(hwnd, SW_MINIMIZE);
             return;
         }
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         } else {
@@ -1994,6 +1996,7 @@ pub fn focus_or_toggle_window(hwnd_raw: isize, toggle_minimize: bool) {
         let target_attached =
             attach_target && AttachThreadInput(cur_tid, target_tid, true).as_bool();
 
+        let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
 
         if target_attached {
@@ -2736,6 +2739,7 @@ pub fn launch_target_with_args(
     let _com = ComGuard::init_sta();
     let work_dir_wide = resolve_launch_working_dir(final_target.as_ref()).map(|d| wide(&d));
     unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
         let verb = wide(effective_verb);
         let file = wide(final_target.as_ref());
         let params_wide = spec.args.as_deref().map(wide);

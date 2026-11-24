@@ -107,6 +107,8 @@ pub struct StartStateEvent {
     pub monitor: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub immediate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fullscreen_overlay: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +200,7 @@ pub struct AppState {
     pub flyout_glide_gen: Arc<AtomicU64>,
     pub dpi_override: AtomicU32,
     pub last_external_fg: Arc<AtomicIsize>,
+    pub suppress_native_start_auto_open_until_ms: Arc<AtomicU64>,
     pub index_refresh_running: Arc<AtomicBool>,
     pub start_hydration_running: Arc<AtomicBool>,
 }
@@ -254,8 +257,10 @@ fn capture_external_foreground_hwnd(state: &AppState) -> isize {
             GetWindowThreadProcessId(fg, Some(&mut pid));
             if pid != 0 && pid != GetCurrentProcessId() {
                 let raw = fg.0 as isize;
-                state.last_external_fg.store(raw, Ordering::Release);
-                return raw;
+                if !win_shell::is_hwnd_native_start_menu_raw(raw) {
+                    state.last_external_fg.store(raw, Ordering::Release);
+                    return raw;
+                }
             }
         }
     }
@@ -990,6 +995,74 @@ fn active_shell_window_rects(app: &AppHandle) -> Vec<PixelRect> {
     rects
 }
 
+fn is_cursor_on_taskbar_surface(app: &AppHandle) -> bool {
+    let st = app.state::<AppState>();
+    let (show_primary, show_secondary) = {
+        let coord = lock_unpoisoned(&st.coordinator);
+        (
+            coord.should_show_taskbar(),
+            coord.should_show_secondary_taskbar() && st.secondary_taskbar_visible.load(Ordering::Acquire),
+        )
+    };
+    let mut rects = Vec::with_capacity(2);
+    for (label, include) in [
+        ("taskbar", show_primary),
+        ("taskbar-secondary", show_secondary),
+    ] {
+        if !include {
+            continue;
+        }
+        if let Some(win) = app.get_webview_window(label) {
+            if let Some(hwnd) = win_hwnd(&win) {
+                if let Some(r) = win_shell::get_window_pixel_rect(hwnd) {
+                    rects.push(r);
+                }
+            }
+        }
+    }
+    win_shell::is_cursor_in_any_rect(&rects)
+}
+
+fn is_focus_or_cursor_on_shell_surface(
+    app: &AppHandle,
+    include_preview_flyout: bool,
+    include_start: bool,
+) -> bool {
+    let st = app.state::<AppState>();
+    let (start_vis, active_flyout, show_primary, show_secondary) = {
+        let coord = lock_unpoisoned(&st.coordinator);
+        (
+            coord.is_start_visible(),
+            coord.active_flyout(),
+            coord.should_show_taskbar(),
+            coord.should_show_secondary_taskbar() && st.secondary_taskbar_visible.load(Ordering::Acquire),
+        )
+    };
+    let include_flyout = include_preview_flyout && active_flyout == Some(FlyoutKind::Preview);
+    let mut hwnds = Vec::with_capacity(4);
+    let mut rects = Vec::with_capacity(4);
+    for (label, include) in [
+        ("taskbar", show_primary),
+        ("taskbar-secondary", show_secondary),
+        ("flyout", include_flyout),
+        ("start", include_start && start_vis),
+    ] {
+        if !include {
+            continue;
+        }
+        if let Some(win) = app.get_webview_window(label) {
+            if let Some(hwnd) = win_hwnd(&win) {
+                hwnds.push(hwnd);
+                if let Some(r) = win_shell::get_window_pixel_rect(hwnd) {
+                    rects.push(r);
+                }
+            }
+        }
+    }
+    win_shell::is_foreground_hwnd_any(&hwnds)
+        || (win_shell::is_any_mouse_button_down() && win_shell::is_cursor_in_any_rect(&rects))
+}
+
 /// DPI-only scale factor (used by `taskbar` & `taskbar-secondary` where `TextScaleFactor` is neutralized).
 fn effective_taskbar_dpi_scale(dpi_override: Option<u32>, fallback_sf: f64) -> f64 {
     if let Some(dpi) = dpi_override.filter(|&d| d > 0) {
@@ -1254,12 +1327,13 @@ fn sync_secondary_taskbar(app: &AppHandle) {
             backdrop::sync_z_order("taskbar-secondary", hwnd);
             if !was_visible {
                 let win_snap = lock_unpoisoned(&st.last_window_groups).clone();
-                let (start_open, start_gen, start_mon) = {
+                let (start_open, start_gen, start_mon, start_fs_overlay) = {
                     let c = lock_unpoisoned(&st.coordinator);
                     (
                         c.is_start_open(),
                         c.start_anim_gen(),
                         c.start_target_monitor().map(str::to_string),
+                        c.is_any_fullscreen_overlay_active(),
                     )
                 };
                 let _ = app.emit_to("taskbar-secondary", "config-updated", &cfg_snapshot);
@@ -1272,6 +1346,7 @@ fn sync_secondary_taskbar(app: &AppHandle) {
                         gen: start_gen,
                         monitor: start_mon,
                         immediate: false,
+                        fullscreen_overlay: start_open && start_fs_overlay,
                     },
                 );
             }
@@ -1754,6 +1829,8 @@ fn apply_coordinator_actions(
                 || actions.secondary_taskbar_visible == Some(false)));
 
     if hide_start_now {
+        st.suppress_native_start_auto_open_until_ms
+            .store(monotonic_ms().saturating_add(450), Ordering::Release);
         *lock_unpoisoned(&st.active_start_metrics) = None;
         *lock_unpoisoned(&st.pending_start_exit) = None;
         let hide_gen = actions
@@ -1768,6 +1845,7 @@ fn apply_coordinator_actions(
                 gen: hide_gen,
                 monitor: None,
                 immediate: true,
+                fullscreen_overlay: false,
             },
         );
         if let Some(win) = app.get_webview_window("start") {
@@ -1778,6 +1856,8 @@ fn apply_coordinator_actions(
         }
         schedule_post_close_fullscreen_check(app);
     } else if actions.start_visible == Some(false) {
+        st.suppress_native_start_auto_open_until_ms
+            .store(monotonic_ms().saturating_add(450), Ordering::Release);
         *lock_unpoisoned(&st.active_start_metrics) = None;
         let hide_gen = actions
             .start_anim_gen
@@ -1798,6 +1878,7 @@ fn apply_coordinator_actions(
                     gen: hide_gen,
                     monitor: None,
                     immediate: false,
+                    fullscreen_overlay: false,
                 },
             );
         }
@@ -2011,6 +2092,20 @@ fn apply_coordinator_actions(
         }
 
         // Emit start-state and dirty-gated cached hydration BEFORE SW_SHOW (0 redundant JSON when unchanged!)
+        let (primary_fs_overlay, secondary_fs_overlay, should_show_primary, should_show_secondary) = {
+            let coord = lock_unpoisoned(&st.coordinator);
+            (
+                coord.is_fullscreen_overlay_active(),
+                coord.is_secondary_fullscreen_overlay_active(),
+                coord.should_show_taskbar(),
+                coord.should_show_secondary_taskbar(),
+            )
+        };
+        let start_fs_overlay = if resolved_monitor.as_deref() == Some("secondary") {
+            secondary_fs_overlay
+        } else {
+            primary_fs_overlay
+        };
         let _ = app.emit(
             "start-state",
             StartStateEvent {
@@ -2018,6 +2113,7 @@ fn apply_coordinator_actions(
                 gen: show_gen,
                 monitor: resolved_monitor.clone(),
                 immediate: false,
+                fullscreen_overlay: start_fs_overlay,
             },
         );
         let cfg_snapshot = lock_unpoisoned(&st.config).clone();
@@ -2036,6 +2132,30 @@ fn apply_coordinator_actions(
         if let (Some(win), Some(hwnd)) = (&start_win, start_hwnd) {
             win_shell::set_window_visible(hwnd, true, false);
             let _ = win.set_focus();
+        }
+
+        // After Start takes foreground focus (demoting any fullscreen game out of DWM's
+        // fullscreen topmost band), re-assert HWND_TOPMOST on revealed taskbar(s) so mouse
+        // hover and clicks always hit the taskbar cleanly above the game.
+        if (actions.taskbar_visible == Some(true) || primary_fs_overlay) && should_show_primary {
+            if let Some(tb) = app.get_webview_window("taskbar") {
+                if let Some(tb_hwnd) = win_hwnd(&tb) {
+                    win_shell::set_window_hit_transparent(tb_hwnd, false);
+                    win_shell::ensure_window_topmost_noactivate(tb_hwnd);
+                    backdrop::sync_z_order("taskbar", tb_hwnd);
+                }
+            }
+        }
+        if (actions.secondary_taskbar_visible == Some(true) || secondary_fs_overlay)
+            && should_show_secondary
+        {
+            if let Some(tb2) = app.get_webview_window("taskbar-secondary") {
+                if let Some(tb2_hwnd) = win_hwnd(&tb2) {
+                    win_shell::set_window_hit_transparent(tb2_hwnd, false);
+                    win_shell::ensure_window_topmost_noactivate(tb2_hwnd);
+                    backdrop::sync_z_order("taskbar-secondary", tb2_hwnd);
+                }
+            }
         }
 
         // Strictly AFTER SW_SHOW: trigger StartView's post-visible double-rAF WAAPI + DComp spring!
@@ -2901,7 +3021,10 @@ fn close_preview_if_outside(app: AppHandle, state: State<AppState>) {
     if win_shell::is_cursor_near_window(hwnd_raw, 6, 6, 18) {
         return;
     }
-    dispatch_coordinator(&app, None, |coord| coord.request_close_preview());
+    let keep_fs_overlay = is_cursor_on_taskbar_surface(&app);
+    dispatch_coordinator(&app, None, |coord| {
+        coord.request_close_preview_ex(keep_fs_overlay)
+    });
 }
 
 #[tauri::command]
@@ -3507,15 +3630,17 @@ async fn get_window_thumbnail(hwnd: isize) -> Result<Option<String>, String> {
 
 #[tauri::command]
 async fn focus_window(app: AppHandle, hwnd: isize, toggle_minimize: bool) -> Result<(), String> {
-    let h = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        close_start_and_flyout(&h, false, true);
-    });
     tauri::async_runtime::spawn_blocking(move || {
         windows_tracker::focus_or_toggle_window(hwnd, toggle_minimize);
     })
     .await
-    .map_err(|e| format!("task join error: {e}"))
+    .map_err(|e| format!("task join error: {e}"))?;
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = reevaluate_fullscreen(&h, None);
+        close_start_and_flyout(&h, true, true);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -3568,17 +3693,20 @@ async fn launch_item(
     as_admin: bool,
     close_start: bool,
 ) -> Result<(), String> {
-    if close_start {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            close_start_and_flyout(&h, true, true);
-        });
-    }
-    tauri::async_runtime::spawn_blocking(move || {
+    win_shell::allow_set_foreground_any();
+    let launch_res = tauri::async_runtime::spawn_blocking(move || {
         windows_tracker::launch_target_with_args(&target, args.as_deref(), as_admin)
     })
     .await
-    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(|e| format!("task join error: {e}"))?;
+    if close_start {
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let _ = reevaluate_fullscreen(&h, None);
+            close_start_and_flyout(&h, true, true);
+        });
+    }
+    launch_res
 }
 
 #[tauri::command]
@@ -3588,22 +3716,19 @@ async fn launch_new_window(
     args: Option<String>,
     close_start: Option<bool>,
 ) -> Result<(), String> {
-    if close_start.unwrap_or(false) {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            close_start_and_flyout(&h, true, true);
-        });
-    } else {
-        let h = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            close_start_and_flyout(&h, false, true);
-        });
-    }
-    tauri::async_runtime::spawn_blocking(move || {
+    win_shell::allow_set_foreground_any();
+    let launch_res = tauri::async_runtime::spawn_blocking(move || {
         windows_tracker::launch_new_window_instance(&exe_path, args.as_deref())
     })
     .await
-    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(|e| format!("task join error: {e}"))?;
+    let should_close_start = close_start.unwrap_or(false);
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = reevaluate_fullscreen(&h, None);
+        close_start_and_flyout(&h, should_close_start, true);
+    });
+    launch_res
 }
 
 #[tauri::command]
@@ -5373,6 +5498,8 @@ pub fn run(hide_native: bool) {
     let flyout_backdrop_shown_gen = Arc::new(AtomicU64::new(u64::MAX));
     let flyout_glide_gen = Arc::new(AtomicU64::new(0));
     let last_external_fg = Arc::new(AtomicIsize::new(0));
+    let suppress_native_start_auto_open_until_ms =
+        Arc::new(AtomicU64::new(monotonic_ms().saturating_add(2000)));
     let index_refresh_running = Arc::new(AtomicBool::new(false));
     let start_hydration_running = Arc::new(AtomicBool::new(false));
     let initial_glass_depth = initial_cfg.glass_depth.clone();
@@ -5418,6 +5545,9 @@ pub fn run(hide_native: bool) {
         flyout_glide_gen: Arc::clone(&flyout_glide_gen),
         dpi_override: AtomicU32::new(0),
         last_external_fg: Arc::clone(&last_external_fg),
+        suppress_native_start_auto_open_until_ms: Arc::clone(
+            &suppress_native_start_auto_open_until_ms,
+        ),
         index_refresh_running: Arc::clone(&index_refresh_running),
         start_hydration_running: Arc::clone(&start_hydration_running),
     };
@@ -5615,6 +5745,11 @@ pub fn run(hide_native: bool) {
                                                 *lock_unpoisoned(&st.last_start_rect) = None;
                                             }
                                             ShellAppBarEvent::TaskbarCreated => {
+                                                let st = h.state::<AppState>();
+                                                st.suppress_native_start_auto_open_until_ms.store(
+                                                    monotonic_ms().saturating_add(2000),
+                                                    Ordering::Release,
+                                                );
                                                 let _ = system_widgets::push_session_alert(
                                                     "info",
                                                     "Проводник перезапущен",
@@ -5650,6 +5785,17 @@ pub fn run(hide_native: bool) {
                         backdrop::sync_z_order("taskbar", hwnd);
                     }
                 }
+                let h_blur = handle.clone();
+                tb.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::Focused(false) = ev {
+                        let _ = win_shell::refresh_foreground_elevated_state();
+                        let moved_to_shell =
+                            is_focus_or_cursor_on_shell_surface(&h_blur, true, true);
+                        dispatch_coordinator(&h_blur, None, |coord| {
+                            coord.on_taskbar_focus_lost(moved_to_shell)
+                        });
+                    }
+                });
             }
 
             if let Some(tb2) = app.get_webview_window("taskbar-secondary") {
@@ -5665,6 +5811,17 @@ pub fn run(hide_native: bool) {
                     }
                 }
                 set_webview_memory_low(&tb2, true);
+                let h_blur = handle.clone();
+                tb2.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::Focused(false) = ev {
+                        let _ = win_shell::refresh_foreground_elevated_state();
+                        let moved_to_shell =
+                            is_focus_or_cursor_on_shell_surface(&h_blur, true, true);
+                        dispatch_coordinator(&h_blur, None, |coord| {
+                            coord.on_taskbar_focus_lost(moved_to_shell)
+                        });
+                    }
+                });
             }
             sync_secondary_taskbar(&handle);
 
@@ -5678,8 +5835,10 @@ pub fn run(hide_native: bool) {
                 start_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
                         let _ = win_shell::refresh_foreground_elevated_state();
+                        let moved_to_shell =
+                            is_focus_or_cursor_on_shell_surface(&h_blur, true, false);
                         dispatch_coordinator(&h_blur, None, |coord| {
-                            coord.on_start_focus_lost(monotonic_ms())
+                            coord.on_start_focus_lost_ex(monotonic_ms(), moved_to_shell)
                         });
                     }
                 });
@@ -5695,8 +5854,10 @@ pub fn run(hide_native: bool) {
                 fly_win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
                         let _ = win_shell::refresh_foreground_elevated_state();
+                        let moved_to_taskbar =
+                            is_focus_or_cursor_on_shell_surface(&h_blur, false, false);
                         dispatch_coordinator(&h_blur, None, |coord| {
-                            coord.on_flyout_focus_lost(monotonic_ms())
+                            coord.on_flyout_focus_lost_ex(monotonic_ms(), moved_to_taskbar)
                         });
                     }
                 });
@@ -5752,9 +5913,40 @@ pub fn run(hide_native: bool) {
                 ShellHookEvent::NativeStartSuppressed(start_menu_hwnd) => {
                     let h = h_hook.clone();
                     let _ = h_hook.run_on_main_thread(move || {
+                        let now = monotonic_ms();
+                        let _ = win_shell::request_reinstall_keyboard_hook(now);
                         let st = h.state::<AppState>();
                         if lock_unpoisoned(&st.coordinator).is_start_open() {
                             refocus_start_if_open(&h, &st);
+                        } else if win_shell::is_foreground_native_start_menu()
+                            && now
+                                >= st
+                                    .suppress_native_start_auto_open_until_ms
+                                    .load(Ordering::Acquire)
+                        {
+                            // Native Start Menu actually took foreground (e.g. Windows dropped
+                            // WH_KEYBOARD_LL during a fullscreen transition or an elevated window
+                            // bypassed the hook): heal the hook and take over cleanly with PrismBar Start.
+                            dispatch_coordinator(&h, None, |coord| {
+                                coord.request_toggle_start(Some(true), now)
+                            });
+                            if win_shell::is_foreground_native_start_menu() {
+                                let start_hwnd = h
+                                    .get_webview_window("start")
+                                    .and_then(|w| win_hwnd(&w))
+                                    .unwrap_or(0);
+                                win_shell::dismiss_native_start_menu(start_menu_hwnd, start_hwnd);
+                                // Defer refocus past any fallback Escape injection so StartView
+                                // can never receive the injected Escape key.
+                                let h_refocus = h.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                                    let h_inner = h_refocus.clone();
+                                    let _ = h_refocus.run_on_main_thread(move || {
+                                        refocus_start_if_open(&h_inner, &h_inner.state::<AppState>());
+                                    });
+                                });
+                            }
                         } else {
                             let stored = st.last_external_fg.load(Ordering::Acquire);
                             let fallback = if stored == start_menu_hwnd { 0 } else { stored };
@@ -6159,6 +6351,7 @@ mod integration_tests {
             flyout_glide_gen: Arc::new(AtomicU64::new(0)),
             dpi_override: AtomicU32::new(0),
             last_external_fg: Arc::new(AtomicIsize::new(0)),
+            suppress_native_start_auto_open_until_ms: Arc::new(AtomicU64::new(0)),
             index_refresh_running: Arc::new(AtomicBool::new(false)),
             start_hydration_running: Arc::new(AtomicBool::new(false)),
         }
@@ -7205,6 +7398,7 @@ mod integration_tests {
             gen: 7,
             monitor: Some("secondary".to_string()),
             immediate: false,
+            fullscreen_overlay: false,
         };
         let start_json = serde_json::to_value(&start_ev).unwrap();
         assert_eq!(start_json["open"], true);

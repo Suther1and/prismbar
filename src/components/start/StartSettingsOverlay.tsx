@@ -402,7 +402,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
   onOpenAccessibilitySettings = openAccessibilitySettings,
   onSetMacSettings = (params) => setMacSettings(params).then(() => {}),
   onQuitApp,
-  appVersion = '3.3.1',
+  appVersion = '3.3.2',
   updateInfo = null,
   updateStatus = 'idle',
   updateProgress = null,
@@ -1838,7 +1838,7 @@ export const StartSettingsOverlay: React.FC<StartSettingsOverlayProps> = ({
             <div className="studio-update-card">
               <div className="studio-update-head">
                 <div>
-                  <div className="studio-update-version">PrismBar v{appVersion || '3.3.1'}</div>
+                  <div className="studio-update-version">PrismBar v{appVersion || '3.3.2'}</div>
                   <div className={`studio-update-status ${statusToneClass}`.trim()}>
                     {statusText}
                   </div>

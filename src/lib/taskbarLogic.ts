@@ -611,15 +611,17 @@ export function planSoundFeedbackAction(
 }
 
 /**
- * Hover preview must never trigger for idle pins, while Start is open, or while an
- * interactive click flyout (tray, sound, calendar, context menu) is active (AD-1).
+ * Hover preview must never trigger for idle pins, while an interactive click flyout
+ * (tray, sound, calendar, context menu) is active, or while Start is open on desktop
+ * (allowed during fullscreen Start overlays so users can inspect/focus windows over games).
  */
 export function shouldTriggerPreviewHover(
   item: Pick<MergedBarItem, 'group'>,
   startOpen: boolean,
   activeFlyout: string,
+  allowDuringStart = false,
 ): boolean {
-  if (startOpen) return false;
+  if (startOpen && !allowDuringStart) return false;
   if (isInteractiveFlyoutActive(activeFlyout)) return false;
   return Boolean(item.group && item.group.windows.length > 0);
 }

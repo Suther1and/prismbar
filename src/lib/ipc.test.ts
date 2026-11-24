@@ -536,26 +536,36 @@ describe('normalizeStartStatePayload and typed Wave 1B IPC wrappers', () => {
       gen: 0,
       monitor: null,
       immediate: false,
+      fullscreenOverlay: false,
     });
     expect(normalizeStartStatePayload(false)).toEqual({
       open: false,
       gen: 0,
       monitor: null,
       immediate: false,
+      fullscreenOverlay: false,
     });
     expect(
-      normalizeStartStatePayload({ open: true, gen: 9, monitor: 'secondary', immediate: false }),
+      normalizeStartStatePayload({
+        open: true,
+        gen: 9,
+        monitor: 'secondary',
+        immediate: false,
+        fullscreenOverlay: true,
+      }),
     ).toEqual({
       open: true,
       gen: 9,
       monitor: 'secondary',
       immediate: false,
+      fullscreenOverlay: true,
     });
     expect(normalizeStartStatePayload({ open: false, gen: 10, immediate: true })).toEqual({
       open: false,
       gen: 10,
       monitor: null,
       immediate: true,
+      fullscreenOverlay: false,
     });
   });
 

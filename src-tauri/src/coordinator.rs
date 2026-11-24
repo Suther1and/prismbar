@@ -581,7 +581,14 @@ impl WindowCoordinator {
     }
 
     pub fn has_open_overlay(&self) -> bool {
-        self.start_open || self.active_flyout.is_some()
+        self.start_open
+            || self.active_flyout.is_some()
+            || self.fullscreen_overlay_active
+            || self.secondary_fullscreen_overlay_active
+    }
+
+    pub fn is_any_fullscreen_overlay_active(&self) -> bool {
+        self.fullscreen_overlay_active || self.secondary_fullscreen_overlay_active
     }
 
     pub fn is_fullscreen_suppressed(&self) -> bool {
@@ -673,6 +680,15 @@ impl WindowCoordinator {
         Some(closed)
     }
 
+    fn close_preview_if_active(&mut self, actions: &mut CoordinatorActions) {
+        if self.active_flyout == Some(FlyoutKind::Preview) {
+            let _ = self.close_flyout(actions);
+            if self.is_any_fullscreen_overlay_active() {
+                actions.hide_flyout_immediate = true;
+            }
+        }
+    }
+
     /// Synchronously hides temporarily revealed fullscreen taskbar(s) when the last overlay
     /// (Start or a Flyout opened from that revealed taskbar) closes.
     fn reconcile_fullscreen_overlay_after_close(&mut self, actions: &mut CoordinatorActions) {
@@ -715,6 +731,7 @@ impl WindowCoordinator {
             actions.start_anim_gen = Some(gen);
         }
         actions.hide_start_immediate = true;
+        self.close_preview_if_active(&mut actions);
         self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
@@ -736,12 +753,20 @@ impl WindowCoordinator {
     ) -> CoordinatorActions {
         let target = force.unwrap_or(!self.start_open);
         if target == self.start_open {
+            if !target && self.is_any_fullscreen_overlay_active() {
+                let mut actions = CoordinatorActions::default();
+                self.close_preview_if_active(&mut actions);
+                self.reconcile_fullscreen_overlay_after_close(&mut actions);
+                return actions;
+            }
             return CoordinatorActions::default();
         }
 
         let mut actions = CoordinatorActions::default();
         if target {
             if force.is_none() && self.is_debounced(TriggerId::Start, now_ms) {
+                self.close_preview_if_active(&mut actions);
+                self.reconcile_fullscreen_overlay_after_close(&mut actions);
                 return actions;
             }
             let had_flyout = self.close_flyout(&mut actions).is_some();
@@ -786,6 +811,7 @@ impl WindowCoordinator {
             actions.start_target_monitor = self.start_target_monitor.clone();
         } else {
             self.close_start(&mut actions);
+            self.close_preview_if_active(&mut actions);
             self.reconcile_fullscreen_overlay_after_close(&mut actions);
         }
         actions
@@ -801,10 +827,16 @@ impl WindowCoordinator {
         monitor: Option<&str>,
         now_ms: u64,
     ) -> CoordinatorActions {
-        let monitor_suppressed = if monitor == Some("secondary") {
-            self.secondary_fullscreen && !self.secondary_fullscreen_overlay_active
+        let (monitor_suppressed, monitor_fullscreen_overlay) = if monitor == Some("secondary") {
+            (
+                self.secondary_fullscreen && !self.secondary_fullscreen_overlay_active,
+                self.secondary_fullscreen && self.secondary_fullscreen_overlay_active,
+            )
         } else {
-            self.primary_fullscreen && !self.fullscreen_overlay_active
+            (
+                self.primary_fullscreen && !self.fullscreen_overlay_active,
+                self.primary_fullscreen && self.fullscreen_overlay_active,
+            )
         };
         if monitor_suppressed {
             return CoordinatorActions::default();
@@ -818,7 +850,7 @@ impl WindowCoordinator {
                     return actions;
                 }
             }
-            if kind == FlyoutKind::Preview && self.start_open {
+            if kind == FlyoutKind::Preview && self.start_open && !monitor_fullscreen_overlay {
                 return actions;
             }
         } else {
@@ -830,6 +862,7 @@ impl WindowCoordinator {
             if self.active_flyout.map_or(true, |a| a.is_non_activating())
                 && self.is_debounced(TriggerId::Flyout(kind), now_ms)
             {
+                self.reconcile_fullscreen_overlay_after_close(&mut actions);
                 return actions;
             }
             let had_start = self.start_open;
@@ -858,11 +891,19 @@ impl WindowCoordinator {
     }
 
     pub fn request_close_preview(&mut self) -> CoordinatorActions {
-        if self.active_flyout == Some(FlyoutKind::Preview) {
-            self.request_close_flyout()
-        } else {
-            CoordinatorActions::default()
+        self.request_close_preview_ex(false)
+    }
+
+    pub fn request_close_preview_ex(&mut self, keep_fullscreen_overlay: bool) -> CoordinatorActions {
+        if self.active_flyout != Some(FlyoutKind::Preview) {
+            return CoordinatorActions::default();
         }
+        let mut actions = CoordinatorActions::default();
+        let _ = self.close_flyout(&mut actions);
+        if !keep_fullscreen_overlay {
+            self.reconcile_fullscreen_overlay_after_close(&mut actions);
+        }
+        actions
     }
 
     pub fn request_close_osd(&mut self) -> CoordinatorActions {
@@ -874,6 +915,18 @@ impl WindowCoordinator {
     }
 
     pub fn on_start_focus_lost(&mut self, now_ms: u64) -> CoordinatorActions {
+        self.on_start_focus_lost_ex(now_ms, false)
+    }
+
+    /// Dismisses Start on focus loss. When `focus_moved_to_shell` is `true` (clicking a taskbar
+    /// icon/widget or Preview card while Start is open over a fullscreen game), preserves the
+    /// revealed fullscreen taskbar so `WM_LBUTTONUP` / `onClick` completes instead of making the
+    /// taskbar hit-transparent mid-click.
+    pub fn on_start_focus_lost_ex(
+        &mut self,
+        now_ms: u64,
+        focus_moved_to_shell: bool,
+    ) -> CoordinatorActions {
         if !self.start_open || self.is_modal_picker_active() {
             return CoordinatorActions::default();
         }
@@ -885,11 +938,24 @@ impl WindowCoordinator {
         let mut actions = CoordinatorActions::default();
         self.close_start(&mut actions);
         self.last_dismissed_ms.insert(TriggerId::Start, now_ms);
-        self.reconcile_fullscreen_overlay_after_close(&mut actions);
+        if !focus_moved_to_shell {
+            if self.active_flyout == Some(FlyoutKind::Preview) {
+                let _ = self.close_flyout(&mut actions);
+            }
+            self.reconcile_fullscreen_overlay_after_close(&mut actions);
+        }
         actions
     }
 
     pub fn on_flyout_focus_lost(&mut self, now_ms: u64) -> CoordinatorActions {
+        self.on_flyout_focus_lost_ex(now_ms, false)
+    }
+
+    pub fn on_flyout_focus_lost_ex(
+        &mut self,
+        now_ms: u64,
+        focus_moved_to_taskbar: bool,
+    ) -> CoordinatorActions {
         if !self.active_flyout.is_some_and(FlyoutKind::is_interactive_click) {
             return CoordinatorActions::default();
         }
@@ -903,6 +969,19 @@ impl WindowCoordinator {
             self.last_dismissed_ms
                 .insert(TriggerId::Flyout(kind), now_ms);
         }
+        if !focus_moved_to_taskbar {
+            self.reconcile_fullscreen_overlay_after_close(&mut actions);
+        }
+        actions
+    }
+
+    /// Collapses a temporarily revealed fullscreen taskbar when focus leaves the taskbar to an
+    /// external window (e.g. clicking back into the game) while no Start Menu or Flyout is open.
+    pub fn on_taskbar_focus_lost(&mut self, focus_moved_to_shell: bool) -> CoordinatorActions {
+        if focus_moved_to_shell || self.start_open || self.active_flyout.is_some() {
+            return CoordinatorActions::default();
+        }
+        let mut actions = CoordinatorActions::default();
         self.reconcile_fullscreen_overlay_after_close(&mut actions);
         actions
     }
@@ -914,7 +993,7 @@ impl WindowCoordinator {
         active_shell_rects: &[PixelRect],
         now_ms: u64,
     ) -> CoordinatorActions {
-        if !self.start_open && self.active_flyout.is_none() {
+        if !self.has_open_overlay() {
             return CoordinatorActions::default();
         }
         if active_shell_rects.iter().any(|r| r.contains(x, y)) {
@@ -2640,5 +2719,111 @@ mod tests {
             mon2,
             false,
         ));
+    }
+
+    #[test]
+    fn fullscreen_start_overlay_allows_preview_and_preserves_taskbar_across_taskbar_clicks() {
+        let mut coord = WindowCoordinator::new();
+
+        // Enter fullscreen game on primary monitor
+        let enter_fs = coord.set_monitor_fullscreen(true, false, 100);
+        assert_eq!(enter_fs.taskbar_visible, Some(false));
+
+        // Press Win -> Start + Taskbar open atomically
+        let open = coord.request_toggle_start(None, 200);
+        assert_eq!(open.start_visible, Some(true));
+        assert_eq!(open.taskbar_visible, Some(true));
+        assert!(coord.is_fullscreen_overlay_active());
+        assert!(coord.has_open_overlay());
+
+        // Hovering a running app on the bottom taskbar opens Preview even while Start is open
+        let prev = coord.request_open_flyout_on_monitor(FlyoutKind::Preview, Some("primary"), 250);
+        assert_eq!(prev.flyout_visible, Some(true));
+        assert_eq!(prev.flyout_non_activating, Some(true));
+        assert!(coord.is_start_open());
+        assert_eq!(coord.active_flyout(), Some(FlyoutKind::Preview));
+
+        // Clicking a taskbar icon (e.g. Explorer) blurs Start onto taskbar on WM_LBUTTONDOWN:
+        // Start closes, but taskbar MUST stay visible so WM_LBUTTONUP / onClick fires!
+        let blur_to_tb = coord.on_start_focus_lost_ex(500, true);
+        assert_eq!(blur_to_tb.start_visible, Some(false));
+        assert_eq!(blur_to_tb.taskbar_visible, None);
+        assert!(coord.is_fullscreen_overlay_active());
+        assert!(coord.should_show_taskbar());
+        assert!(coord.has_open_overlay());
+
+        // Closing Preview while cursor moves onto taskbar preserves taskbar
+        let close_prev = coord.request_close_preview_ex(true);
+        assert_eq!(close_prev.flyout_visible, Some(false));
+        assert_eq!(close_prev.taskbar_visible, None);
+        assert!(coord.is_fullscreen_overlay_active());
+        assert!(coord.has_open_overlay());
+
+        // Clicking Sound button on WM_LBUTTONUP opens Sound flyout over the game
+        let sound = coord.request_open_flyout_on_monitor(FlyoutKind::Sound, Some("primary"), 540);
+        assert_eq!(sound.flyout_visible, Some(true));
+        assert_eq!(sound.taskbar_visible, None);
+        assert!(coord.is_fullscreen_overlay_active());
+
+        // Re-clicking Sound button: WM_LBUTTONDOWN blurs Sound onto taskbar (preserving taskbar),
+        // then debounced WM_LBUTTONUP reconciles and collapses taskbar back into the game.
+        let blur_sound_to_tb = coord.on_flyout_focus_lost_ex(800, true);
+        assert_eq!(blur_sound_to_tb.flyout_visible, Some(false));
+        assert_eq!(blur_sound_to_tb.taskbar_visible, None);
+        assert!(coord.is_fullscreen_overlay_active());
+        let debounced_sound =
+            coord.request_open_flyout_on_monitor(FlyoutKind::Sound, Some("primary"), 840);
+        assert_eq!(debounced_sound.flyout_visible, None);
+        assert_eq!(debounced_sound.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+
+        // Re-open Start over game -> click Start button (blur to taskbar + debounced toggleStart)
+        let _ = coord.request_toggle_start(None, 1200);
+        let blur_start_btn = coord.on_start_focus_lost_ex(1500, true);
+        assert_eq!(blur_start_btn.start_visible, Some(false));
+        assert_eq!(blur_start_btn.taskbar_visible, None);
+        let debounced_start = coord.request_toggle_start(None, 1550);
+        assert_eq!(debounced_start.start_visible, None);
+        assert_eq!(debounced_start.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+
+        // Re-open Start over game -> blur onto taskbar -> click outside (back into game) hides taskbar
+        let _ = coord.request_toggle_start(None, 2000);
+        let _ = coord.on_start_focus_lost_ex(2300, true);
+        assert!(coord.is_fullscreen_overlay_active());
+        let outside_click = coord.on_global_mouse_down(50, 50, &[PixelRect::new(400, 1000, 1200, 1080)], 2350);
+        assert_eq!(outside_click.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+
+        // Re-open Start + Preview over game -> blur directly to game hides Start, Preview, and Taskbar
+        let _ = coord.request_toggle_start(None, 2800);
+        let _ = coord.request_open_flyout_on_monitor(FlyoutKind::Preview, Some("primary"), 2850);
+        let blur_to_game = coord.on_start_focus_lost_ex(3100, false);
+        assert_eq!(blur_to_game.start_visible, Some(false));
+        assert_eq!(blur_to_game.flyout_visible, Some(false));
+        assert_eq!(blur_to_game.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+
+        // Re-open Start + Preview over game -> closing Start via Win/Esc closes Preview & Taskbar too
+        let _ = coord.request_toggle_start(None, 3500);
+        let _ = coord.request_open_flyout_on_monitor(FlyoutKind::Preview, Some("primary"), 3550);
+        let close_via_win = coord.request_toggle_start(None, 3600);
+        assert_eq!(close_via_win.start_visible, Some(false));
+        assert_eq!(close_via_win.flyout_visible, Some(false));
+        assert!(close_via_win.hide_flyout_immediate);
+        assert_eq!(close_via_win.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
+        assert_eq!(coord.active_flyout(), None);
+
+        // Re-open Start + Preview over game -> click Start button (blur to taskbar + debounced toggleStart)
+        // closes Preview AND collapses Taskbar cleanly!
+        let _ = coord.request_toggle_start(None, 4000);
+        let _ = coord.request_open_flyout_on_monitor(FlyoutKind::Preview, Some("primary"), 4050);
+        let _ = coord.on_start_focus_lost_ex(4300, true);
+        let debounced_with_preview = coord.request_toggle_start(None, 4350);
+        assert_eq!(debounced_with_preview.flyout_visible, Some(false));
+        assert!(debounced_with_preview.hide_flyout_immediate);
+        assert_eq!(debounced_with_preview.taskbar_visible, Some(false));
+        assert!(!coord.is_fullscreen_overlay_active());
     }
 }

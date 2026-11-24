@@ -442,9 +442,12 @@ describe('Warm preview scrubbing, hover preemption & flyout payload builders', (
 
     expect(shouldTriggerPreviewHover(idle, false, '')).toBe(false);
     expect(shouldTriggerPreviewHover(running, true, '')).toBe(false);
+    expect(shouldTriggerPreviewHover(running, true, '', true)).toBe(true);
+    expect(shouldTriggerPreviewHover(idle, true, '', true)).toBe(false);
 
     for (const clickFlyout of ['tray', 'sound', 'quick', 'calendar', 'context_app', 'context_bar']) {
       expect(shouldTriggerPreviewHover(running, false, clickFlyout)).toBe(false);
+      expect(shouldTriggerPreviewHover(running, true, clickFlyout, true)).toBe(false);
     }
   });
 
